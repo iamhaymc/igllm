@@ -185,6 +185,14 @@ static void mem_free(void *block) {
 #endif
 }
 
+/* Copies a name into a fixed slot, truncating rather than overrunning. */
+static void text_fill(char *slot_data, size_t slot_limit, const char *text) {
+  size_t length = text ? strlen(text) : 0;
+  if (length >= slot_limit) length = slot_limit - 1;
+  if (length > 0) memcpy(slot_data, text, length);
+  slot_data[length] = '\0';
+}
+
 static char *text_copy(const char *text, size_t length) {
   char *copy = (char *)mem_alloc(length + 1);
   if (!copy) return NULL;
@@ -1990,6 +1998,7 @@ typedef struct model_form {
   int pad_id;
   char kind_list[MODEL_LAYER_LIMIT];
   rope_form rope_list[MODEL_KIND_COUNT];
+  char rope_kind[MODEL_KIND_COUNT][16];
 } model_form;
 
 typedef struct layer_wing {
@@ -2223,6 +2232,8 @@ static void rope_build(rope_form *rope, int head_size, const char *type_text) {
   int angle_index;
   int half_count = head_size / 2;
   int turn_count = half_count;
+  mem_free(rope->step_list);
+  rope->step_list = NULL;
   if (type_text && strcmp(type_text, "proportional") == 0)
     turn_count = (int)((double)rope->part_share * head_size / 2.0);
   if (turn_count > half_count) turn_count = half_count;
@@ -2310,7 +2321,7 @@ static app_code config_read(app_model *model, const char *folder_path) {
   form->head_count = (int)json_field_number(tree, text_index, "num_attention_heads", 8);
   form->kv_count = (int)json_field_number(tree, text_index, "num_key_value_heads", 4);
   form->head_size = (int)json_field_number(tree, text_index, "head_dim", 256);
-  form->whole_head_size = (int)json_field_number(tree, text_index, "global_head_dim", 512);
+  form->whole_head_size = (int)json_field_number(tree, text_index, "global_head_dim", 0);
   form->whole_kv_count =
       (int)json_field_number(tree, text_index, "num_global_key_value_heads", form->kv_count);
   form->slide_span = (int)json_field_number(tree, text_index, "sliding_window", 512);
@@ -2336,6 +2347,18 @@ static app_code config_read(app_model *model, const char *folder_path) {
       form->close_id = (int)json_number(tree, close_index, 1.0);
   }
   if (form->layer_count > MODEL_LAYER_LIMIT) { json_free(tree); return APP_FAIL_SUPPORT; }
+  if (form->whole_head_size < 1) {
+    /* `global_head_dim` is a constructor argument upstream, not a stored field:
+     * what `save_pretrained` writes is a `per_layer_config` map of the layers
+     * that override it. Read that, and fall back to the plain head size. */
+    int32_t over_index = json_field(tree, text_index, "per_layer_config");
+    int32_t child_index = over_index >= 0 ? tree->node_list[over_index].head_child : -1;
+    for (; child_index >= 0; child_index = tree->node_list[child_index].next_peer) {
+      int over_size = (int)json_field_number(tree, child_index, "head_dim", 0);
+      if (over_size > form->whole_head_size) form->whole_head_size = over_size;
+    }
+    if (form->whole_head_size < 1) form->whole_head_size = form->head_size;
+  }
   if (form->moe_flag) {
     if (form->expert_count < 1) { json_free(tree); return APP_FAIL_SUPPORT; }
     if (form->expert_top < 1 || form->expert_top > form->expert_count)
@@ -2359,9 +2382,11 @@ static app_code config_read(app_model *model, const char *folder_path) {
     const char *type_text = NULL;
     config_rope_read(tree, text_index, "sliding_attention", &form->rope_list[MODEL_KIND_SLIDE],
                      10000.0, &type_text);
+    text_fill(form->rope_kind[MODEL_KIND_SLIDE], sizeof(form->rope_kind[0]), type_text);
     rope_build(&form->rope_list[MODEL_KIND_SLIDE], form->head_size, type_text);
     config_rope_read(tree, text_index, "full_attention", &form->rope_list[MODEL_KIND_WHOLE],
                      1000000.0, &type_text);
+    text_fill(form->rope_kind[MODEL_KIND_WHOLE], sizeof(form->rope_kind[0]), type_text);
     rope_build(&form->rope_list[MODEL_KIND_WHOLE], form->whole_head_size, type_text);
   }
 
@@ -2601,6 +2626,21 @@ static app_code model_bind(app_model *model) {
       if (gain_span) wing->layer_gain = real_read(gain_span->data_base, gain_span->type_kind, 0);
     }
   }
+
+  /* The rope tables are rebuilt from the head size the tensors imply, because
+   * that is the only source that cannot disagree with the weights. The
+   * configuration is a hint; `q_proj` is the truth. */
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    layer_wing *wing = &model->wing_list[layer_index];
+    rope_form *rope = &form->rope_list[(int)wing->kind_mark];
+    if (wing->head_size < 2 || rope->half_count == wing->head_size / 2) continue;
+    rope_build(rope, wing->head_size, form->rope_kind[(int)wing->kind_mark]);
+    if (!rope->step_list) return APP_FAIL_MEMORY;
+  }
+  form->head_size = model->wing_list[0].head_size;
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index)
+    if (model->wing_list[layer_index].kind_mark == MODEL_KIND_WHOLE)
+      form->whole_head_size = model->wing_list[layer_index].head_size;
 
   /* Cache depth: full length where another layer reads these keys, window otherwise. */
   for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
@@ -3705,6 +3745,9 @@ app_code session_open(app_model *model, app_session **session_out) {
   }
   if (form->moe_flag && 2 * form->expert_inner > inner_peak) inner_peak = 2 * form->expert_inner;
   half_peak = head_peak / 2 + 1;
+  for (layer_index = 0; layer_index < MODEL_KIND_COUNT; ++layer_index)
+    if (form->rope_list[layer_index].half_count >= half_peak)
+      half_peak = form->rope_list[layer_index].half_count + 1;
   wide_peak = form->head_count * head_peak;
   if (form->state_size > wide_peak) wide_peak = form->state_size;
 
