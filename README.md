@@ -13,6 +13,10 @@ party library, and no build system beyond a C compiler.
   memory-mapped checkpoint
 - **accelerator ready** — every kernel is reached through a backend table of
   function pointers
+- **batched prefill** — prompt tokens run in lanes, so a projection is a
+  matrix product rather than a matrix-vector product per token
+- **mixture-of-experts** — routed blocks run beside the shared expert, with
+  the stacked expert weights sliced as views
 
 ## Quickstart
 
@@ -74,6 +78,9 @@ sanitizers, or `--tuned` to allow host specific instructions.
 
 ## Status
 
-The engine builds clean and passes its unit tests on POSIX and Windows.
-Numerical parity against the reference has **not** been measured yet, because
-the checkpoint was unreachable from the development sandbox; see `TODO.md`.
+The engine builds clean and passes its unit tests on POSIX and Windows, and
+under the address and behaviour sanitizers. Text generation, mixture-of-experts
+blocks, and batched prefill are implemented; the vision and audio towers are
+not, so the engine is text-only today. Numerical parity against the reference
+has **not** been measured yet, because the checkpoint was unreachable from the
+development sandbox; see `TODO.md`.

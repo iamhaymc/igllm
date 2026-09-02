@@ -10,15 +10,15 @@ Open development tasks, most consequential first.
   `model_prefix_pick` if the export uses a prefix the loader does not expect.
 - Confirm the chat frame against the `chat_template` in the checkpoint rather
   than the assumed `<start_of_turn>user … <end_of_turn>` shape.
-- Support mixture-of-experts blocks. `config_read` currently refuses a
-  configuration with `enable_moe_block` set.
-- Support the vision and audio towers. The engine is text-only today.
-- Batch the prefill. Prompt tokens are processed one at a time, so prefill
-  runs at decode cost per token; a batched path would turn the projections
-  into matrix products.
-- Add vector paths for `kern_dot_code`. The packed dot product is scalar on
-  every target; the two and four bit cases are the ones worth widening.
+- Support the vision and audio towers. The engine is text-only today. The
+  reference shape is a 16-layer bidirectional vision encoder with 2-D rotary
+  positions and a 3x3 average pooler, and a 12-layer audio encoder with a
+  convolutional subsampler and relative-position attention, each followed by
+  a projection into the text embedding space. It also needs an image reader,
+  a bicubic resize, a WAV reader, and a mel filterbank.
 - Add an AVX-512 path beside AVX2, selected by the same macro layer.
+- Widen `kern_dot_code` for the odd bit widths. Two and four bits are
+  vectorized; three, five, six, and seven still walk the bit stream.
 - Cache dequantized scales for the hottest planes. Gains are converted from
   their stored dtype on every group; a per-plane float mirror trades memory
   for a shorter inner loop.

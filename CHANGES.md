@@ -122,9 +122,80 @@ behaviour sanitizers.
 
 ### Known gaps
 
-Mixture-of-experts blocks are refused rather than mis-executed. The vision
-and audio towers are absent. Prefill is one token at a time. Most
+The vision and audio towers are absent. Most
 importantly, numerical parity has not been measured, because the checkpoint
 was unreachable from the development sandbox — every name and layout here
 comes from the reference source, not from the files. `TODO.md` tracks all of
 this.
+
+---
+
+## 0.1.1 — mixture blocks, batched prefill, wider packed dot
+
+### Mixture-of-experts
+
+**The block is a second branch, not a replacement.** The reference runs the
+dense mlp as a shared expert and adds a routed branch beside it, each under
+its own post-norm, summed under a third. `session_layer` follows that shape
+exactly rather than the more familiar "either dense or routed" form, because
+the checkpoint carries all three norms and dropping any of them would be a
+silent numeric error.
+
+**The router reads the pre-mlp residual.** Not the normalized activation the
+shared expert sees. Softmax over the experts, top *k*, renormalize the kept
+weights to sum to one, then scale each by its `per_expert_scale`.
+
+**Stacked expert weights are sliced, not copied.** `gate_up_proj` arrives as
+one `[experts, 2*inner, hidden]` parameter with no `.weight` suffix.
+`plane_bind_part` drops the leading axis by offsetting the payload, the
+scales, and the zero points, so an expert is a view and the engine still
+keeps no second copy of the weights.
+
+**The mixture branch stays one lane wide.** Every token picks its own
+experts, so batching it would mean either running all experts for the batch
+or gathering per expert. Neither pays at the batch sizes prefill uses.
+
+### Batched prefill
+
+**Lanes, not a separate path.** Every session scratch buffer holds
+`KERN_LANE_LIMIT` lanes with a named stride, and the whole graph takes a lane
+count. Decode is a batch of one, so there is exactly one code path and the
+batched arithmetic is exercised by every token the engine produces.
+
+**Codes are unpacked once per batch.** `kern_row_code_many` spreads a group
+of packed codes into a small float scratch and dots it against every lane, so
+a batch pays the decode cost of a single vector. That is where the projection
+becomes a matrix product: the weight traffic is amortized across the batch
+rather than repeated per token.
+
+**Keys are stored and read lane by lane.** A sliding layer's cache is a ring
+narrower than the batch, so projecting the whole batch and then writing every
+key would overwrite slots a lane still needs. The projections are batched;
+the cache write and the attention read stay in position order.
+
+### Wider packed dot
+
+**Two and four bits are widened; three and five are not.** A four-bit code is
+a nibble and a two-bit code is a quarter byte, so both unpack with shifts and
+masks over whole vectors. The odd widths straddle byte boundaries and would
+cost more in shuffles than the scalar loop costs outright.
+
+**Alignment is checked, not assumed.** The vector paths need the group to
+start on a byte boundary — even for four bits, a multiple of four for two —
+and fall through to the bit-stream loop when it does not. The previous scalar
+code silently assumed both, and dropped the tail of a group whose span was
+not a multiple of the step.
+
+### Testing
+
+**The whole graph now runs in the suite.** `test_wing` writes a complete
+miniature checkpoint — config, tokenizer, and a safetensors file with every
+tensor the loader binds, dense and mixture — then asserts that a batched
+prefill lands on exactly the logits produced by feeding the same tokens one
+at a time. That is what caught the ring-buffer ordering bug above.
+
+### Known gaps
+
+The vision and audio towers are still absent. Numerical parity against the
+reference has still not been measured, because the checkpoint remains
+unreachable from the development sandbox. `TODO.md` tracks the rest.

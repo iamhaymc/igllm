@@ -916,6 +916,7 @@ static int test_wing_write(int moe_flag) {
   header_fill += (size_t)snprintf(header_text, header_size, "{");
   for (slot = 0; slot < kit->item_count; ++slot) {
     char shape_text[64];
+    int wrote;
     if (kit->size_list[slot][2] > 0)
       snprintf(shape_text, sizeof(shape_text), "[%d,%d,%d]", kit->size_list[slot][0],
                kit->size_list[slot][1], kit->size_list[slot][2]);
@@ -924,14 +925,24 @@ static int test_wing_write(int moe_flag) {
                kit->size_list[slot][1]);
     else
       snprintf(shape_text, sizeof(shape_text), "[%d]", kit->size_list[slot][0]);
-    header_fill += (size_t)snprintf(header_text + header_fill, header_size - header_fill,
-                                    "%s\"%s\":{\"dtype\":\"F32\",\"shape\":%s,"
-                                    "\"data_offsets\":[%lu,%lu]}",
-                                    slot ? "," : "", kit->name_list[slot], shape_text,
-                                    (unsigned long)kit->from_list[slot],
-                                    (unsigned long)(kit->from_list[slot] + kit->span_list[slot]));
+    wrote = snprintf(header_text + header_fill, header_size - header_fill,
+                     "%s\"%s\":{\"dtype\":\"F32\",\"shape\":%s,"
+                     "\"data_offsets\":[%lu,%lu]}",
+                     slot ? "," : "", kit->name_list[slot], shape_text,
+                     (unsigned long)kit->from_list[slot],
+                     (unsigned long)(kit->from_list[slot] + kit->span_list[slot]));
+    /* The header room is generous, but a truncated entry would silently
+     * produce a broken checkpoint, so refuse instead. */
+    if (wrote < 0 || (size_t)wrote >= header_size - header_fill) {
+      mem_free(header_text);
+      mem_free(kit);
+      return 0;
+    }
+    header_fill += (size_t)wrote;
   }
-  header_fill += (size_t)snprintf(header_text + header_fill, header_size - header_fill, "}");
+  if (header_fill + 1 >= header_size) { mem_free(header_text); mem_free(kit); return 0; }
+  header_text[header_fill++] = '}';
+  header_text[header_fill] = '\0';
 
   pad_count = (8 - (header_fill % 8)) % 8;
   header_count = (uint64_t)(header_fill + pad_count);

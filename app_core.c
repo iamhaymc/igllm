@@ -2538,11 +2538,14 @@ static app_code model_bind(app_model *model) {
 
     if (form->moe_flag) {
       int expert_index;
+      int inner_size;
       snprintf(stem_text, sizeof(stem_text), "%slayers.%d.router.proj", model->prefix_text,
                layer_index);
       code = plane_bind(model, stem_text, &wing->route_sheet);
       if (code != APP_OKAY) return code;
-      if (wing->route_sheet.row_count > 0) form->expert_count = wing->route_sheet.row_count;
+      /* Every layer must agree on the expert count, because the session rooms
+       * and the free walk are sized once from the form. */
+      if (wing->route_sheet.row_count != form->expert_count) return APP_FAIL_FORMAT;
 
       snprintf(stem_text, sizeof(stem_text), "%slayers.%d.router.scale", model->prefix_text,
                layer_index);
@@ -2568,11 +2571,12 @@ static app_code model_bind(app_model *model) {
         if (code != APP_OKAY) return code;
       }
       /* gate_up_proj stacks the gate rows above the rise rows, so the expert
-       * width is half its row count whatever the configuration claims. */
-      form->expert_inner = wing->expert_rise_list[0].row_count / 2;
-      if (form->expert_inner < 1) return APP_FAIL_FORMAT;
-      if (form->expert_top < 1 || form->expert_top > form->expert_count)
-        form->expert_top = form->expert_count;
+       * width is half its row count whatever the configuration claims. It too
+       * has to hold for every layer. */
+      inner_size = wing->expert_rise_list[0].row_count / 2;
+      if (inner_size < 1) return APP_FAIL_FORMAT;
+      if (layer_index == 0) form->expert_inner = inner_size;
+      else if (inner_size != form->expert_inner) return APP_FAIL_FORMAT;
 
       snprintf(stem_text, sizeof(stem_text), "%slayers.%d.post_feedforward_layernorm_1",
                model->prefix_text, layer_index);
