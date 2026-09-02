@@ -409,6 +409,48 @@ static void test_plane(void) {
   }
 }
 
+/* Binds one slice of a stacked expert tensor and checks the view lands right. */
+static void test_expert(void) {
+  const char header_text[] =
+      "{\"experts.gate_up_proj\":{\"dtype\":\"F32\",\"shape\":[3,2,4],\"data_offsets\":[0,96]}}";
+  size_t header_size = sizeof(header_text) - 1;
+  size_t pad_count = (8 - (header_size % 8)) % 8;
+  size_t body_size = 96;
+  size_t file_size = 8 + header_size + pad_count + body_size;
+  uint8_t *file_data = (uint8_t *)mem_clear(file_size);
+  uint64_t header_count = (uint64_t)(header_size + pad_count);
+  float value_list[24];
+  app_model *model = (app_model *)mem_clear(sizeof(app_model));
+  int byte_index, slot;
+
+  test_open("expert");
+  for (slot = 0; slot < 24; ++slot) value_list[slot] = (float)slot;
+  for (byte_index = 0; byte_index < 8; ++byte_index)
+    file_data[byte_index] = (uint8_t)((header_count >> (8 * byte_index)) & 0xFFu);
+  memcpy(file_data + 8, header_text, header_size);
+  for (byte_index = 0; byte_index < (int)pad_count; ++byte_index)
+    file_data[8 + header_size + byte_index] = ' ';
+  memcpy(file_data + 8 + header_count, value_list, sizeof(value_list));
+  test_true(test_file_write("model.safetensors", file_data, file_size), "expert fixture written");
+  mem_free(file_data);
+
+  test_true(store_open(&model->store, test_yard_path) == APP_OKAY, "expert fixture opens");
+  {
+    plane sheet;
+    float row_list[4];
+    test_true(plane_bind_part(model, "experts.gate_up_proj", 2, 3, &sheet) == APP_OKAY,
+              "plane_bind_part accepts a stacked tensor");
+    test_true(sheet.row_count == 2 && sheet.col_count == 4, "the slice drops the expert axis");
+    plane_row(&sheet, 1, row_list);
+    test_near(row_list[0], 20.0, 0, "the slice lands on the right expert");
+    test_near(row_list[3], 23.0, 0, "the slice keeps its row stride");
+    test_true(plane_bind_part(model, "experts.gate_up_proj", 0, 1, &sheet) == APP_FAIL_FORMAT,
+              "plane_bind_part rejects a rank mismatch");
+  }
+  store_close(&model->store);
+  mem_free(model);
+}
+
 static void test_kernel(void) {
   test_open("kernel");
 
@@ -439,6 +481,38 @@ static void test_kernel(void) {
     mem_free(act_list);
     mem_free(row_list);
     mem_free(half_list);
+  }
+
+  { /* Packed dot against a plain bit-stream loop, over every widened width. */
+    int bit_list[4] = {2, 3, 4, 8};
+    int span_list[6] = {1, 3, 15, 16, 31, 64};
+    int bit_slot, span_slot;
+    for (bit_slot = 0; bit_slot < 4; ++bit_slot) {
+      int bit_count = bit_list[bit_slot];
+      int element_count = 128;
+      uint32_t mask_value = (uint32_t)((1u << bit_count) - 1u);
+      uint8_t *code_data = (uint8_t *)mem_clear((size_t)(element_count * bit_count + 7) / 8 + 8);
+      float *act_list = (float *)mem_clear(sizeof(float) * (size_t)element_count);
+      int element_index;
+      for (element_index = 0; element_index < element_count; ++element_index) {
+        test_pack_write(code_data, (size_t)element_index, bit_count,
+                        (uint32_t)(element_index * 11 + bit_slot * 5) & mask_value);
+        act_list[element_index] = (float)sin((double)element_index * 0.19);
+      }
+      for (span_slot = 0; span_slot < 6; ++span_slot) {
+        int span_count = span_list[span_slot];
+        int from_index = span_slot * 8; /* a byte boundary in every widened width */
+        double want_value = 0.0;
+        int slot;
+        for (slot = 0; slot < span_count; ++slot)
+          want_value += (double)pack_read(code_data, (size_t)(from_index + slot), bit_count) *
+                        (double)act_list[from_index + slot];
+        test_near(kern_dot_code(code_data, from_index, span_count, act_list + from_index, bit_count),
+                  want_value, 1e-3, "kern_dot_code matches the bit-stream reference");
+      }
+      mem_free(code_data);
+      mem_free(act_list);
+    }
   }
 
   { /* Quantized matvec against the dense matrix it encodes. */
@@ -746,6 +820,7 @@ int main(void) {
   test_number();
   test_pack();
   test_plane();
+  test_expert();
   test_kernel();
   test_rope();
   test_token();
