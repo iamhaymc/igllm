@@ -2254,6 +2254,7 @@ typedef struct token_pair {
 struct token_book {
   int      size_count;
   char   **text_list;
+  uint8_t *mark_list; /* one when the entry is a control token */
   int32_t *slot_list; /* text -> id */
   int      slot_mask;
 
@@ -2308,6 +2309,7 @@ static void token_free(token_book *book) {
     for (text_index = 0; text_index < book->size_count; ++text_index) mem_free(book->text_list[text_index]);
     mem_free(book->text_list);
   }
+  mem_free(book->mark_list);
   mem_free(book->slot_list);
   mem_free(book->pair_list);
   mem_free(book->pair_slot);
@@ -2352,7 +2354,8 @@ static app_code token_load(const char *folder_path, int vocab_hint, token_book *
   book->size_count = json_count(tree, vocab_index);
   if (book->size_count < vocab_hint) book->size_count = vocab_hint;
   book->text_list = (char **)mem_clear(sizeof(char *) * (size_t)book->size_count);
-  if (!book->text_list) { json_free(tree); token_free(book); return APP_FAIL_MEMORY; }
+  book->mark_list = (uint8_t *)mem_clear((size_t)book->size_count);
+  if (!book->text_list || !book->mark_list) { json_free(tree); token_free(book); return APP_FAIL_MEMORY; }
   for (child_index = tree->node_list[vocab_index].head_child; child_index >= 0;
        child_index = tree->node_list[child_index].next_peer) {
     const char *entry_text = json_text_at(tree, tree->node_list[child_index].name_start);
@@ -2369,6 +2372,7 @@ static app_code token_load(const char *folder_path, int vocab_hint, token_book *
     int entry_id = (int)json_field_number(tree, child_index, "id", -1.0);
     if (!entry_text || entry_id < 0 || entry_id >= book->size_count) continue;
     if (!book->text_list[entry_id]) book->text_list[entry_id] = text_copy(entry_text, strlen(entry_text));
+    if (json_field_flag(tree, child_index, "special", 0)) book->mark_list[entry_id] = 1;
   }
 
   slot_size = 64;
@@ -2609,6 +2613,7 @@ static int token_decode_book(const token_book *book, int32_t id_value, char *tex
   int out_count = 0;
   size_t text_index = 0;
   if (id_value < 0 || id_value >= book->size_count || !book->text_list[id_value]) return 0;
+  if (book->mark_list && book->mark_list[id_value]) return 0;
   entry_text = book->text_list[id_value];
   if (entry_text[0] == '<' && entry_text[1] == '0' && entry_text[2] == 'x' && entry_text[3] &&
       entry_text[4] && entry_text[5] == '>' && entry_text[6] == '\0') {
@@ -3210,9 +3215,12 @@ app_code session_prime(app_session *session, const int32_t *id_list, int id_coun
   int id_index;
   if (!session || !id_list || id_count < 1) return APP_FAIL_ARGUMENT;
   if (session->fill_count + id_count > session->model->form.window_limit) return APP_FAIL_STATE;
+  for (id_index = 0; id_index < id_count; ++id_index)
+    if (id_list[id_index] < 0 || id_list[id_index] >= session->model->embed_sheet.row_count)
+      return APP_FAIL_ARGUMENT;
   from_time = time_now();
   for (id_index = 0; id_index + 1 < id_count; ++id_index)
-    if (!session_pass(session, id_list[id_index], 0) && 0) return APP_FAIL_STATE;
+    session_pass(session, id_list[id_index], 0);
   session->tally.prime_seconds += time_now() - from_time;
   session->tally.prime_tokens += (size_t)(id_count > 0 ? id_count - 1 : 0);
   return APP_OKAY;
