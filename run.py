@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""run.py - install, build, test, and run workflows for the igllm engine.
+
+The engine is a single translation unit, so every workflow reduces to one
+compiler invocation. No make, cmake, or third party build tool is involved.
+
+    python3 run.py install          # optional python packages for parity work
+    python3 run.py build            # build the cli and the unit tests
+    python3 run.py test             # build, then run the unit tests
+    python3 run.py check            # test, plus the reference comparison
+    python3 run.py run -- <args>    # build, then run the cli with <args>
+    python3 run.py clean            # remove build products
+"""
+
+import argparse
+import os
+import platform
+import shutil
+import subprocess
+import sys
+
+ROOT_PATH = os.path.dirname(os.path.abspath(__file__))
+WORK_PATH = os.path.join(ROOT_PATH, "build")
+
+MAIN_SOURCE = "app_main.c"
+TEST_SOURCE = "app_test.c"
+MAIN_TARGET = "igllm"
+TEST_TARGET = "igllm_test"
+
+PARITY_PACKS = ["torch", "transformers", "compressed-tensors", "numpy", "safetensors"]
+
+
+# -- toolchain ------------------------------------------------------------
+
+
+def tool_pick():
+    """Returns (kind, program) for the first usable compiler."""
+    named = os.environ.get("CC")
+    if named:
+        kind = "msvc" if os.path.basename(named).lower().startswith("cl") else "unix"
+        return kind, named
+    if platform.system() == "Windows":
+        for program in ("clang", "gcc", "cl"):
+            found = shutil.which(program)
+            if found:
+                return ("msvc" if program == "cl" else "unix"), found
+    for program in ("cc", "clang", "gcc"):
+        found = shutil.which(program)
+        if found:
+            return "unix", found
+    raise SystemExit("no C compiler found; set CC to one")
+
+
+def tool_line(kind, program, source, target, tuned, debug):
+    """Builds the full command line for one translation unit."""
+    source_path = os.path.join(ROOT_PATH, source)
+    if kind == "msvc":
+        line = [program, "/nologo", "/std:c11", "/W3", source_path]
+        line += ["/Od", "/Zi"] if debug else ["/O2"]
+        if tuned:
+            line += ["/arch:AVX2"]
+        line += ["/Fe:" + target, "/Fo:" + os.path.join(WORK_PATH, "")]
+        return line
+    line = [program, "-std=c11", "-Wall", "-Wextra", source_path, "-o", target]
+    line += ["-O0", "-g", "-fsanitize=address,undefined"] if debug else ["-O3"]
+    if tuned and platform.machine().lower() in ("x86_64", "amd64", "x86", "i386", "i686"):
+        line += ["-mavx2", "-mfma"]
+    line += ["-lm"]
+    if platform.system() != "Windows":
+        line += ["-lpthread"]
+    return line
+
+
+def target_path(name):
+    leaf = name + (".exe" if platform.system() == "Windows" else "")
+    return os.path.join(WORK_PATH, leaf)
+
+
+def step_show(title, line):
+    print("[%s] %s" % (title, " ".join(line)), flush=True)
+
+
+# -- workflows ------------------------------------------------------------
+
+
+def work_install(flag):
+    """Installs the python packages the parity comparison needs."""
+    line = [sys.executable, "-m", "pip", "install", "--upgrade"] + PARITY_PACKS
+    step_show("install", line)
+    return subprocess.call(line)
+
+
+def work_build(flag):
+    os.makedirs(WORK_PATH, exist_ok=True)
+    kind, program = tool_pick()
+    plan = [(MAIN_SOURCE, MAIN_TARGET), (TEST_SOURCE, TEST_TARGET)]
+    if flag.only:
+        plan = [item for item in plan if item[1] == flag.only]
+    for source, target in plan:
+        line = tool_line(kind, program, source, target_path(target), flag.tuned, flag.debug)
+        step_show("build", line)
+        code = subprocess.call(line, cwd=WORK_PATH)
+        if code != 0:
+            return code
+    return 0
+
+
+def work_test(flag):
+    code = work_build(flag)
+    if code != 0:
+        return code
+    line = [target_path(TEST_TARGET)]
+    step_show("test", line)
+    return subprocess.call(line)
+
+
+def work_check(flag):
+    code = work_test(flag)
+    if code != 0:
+        return code
+    line = [sys.executable, os.path.join(ROOT_PATH, "app_test.py")]
+    if flag.model:
+        line += ["--model", flag.model]
+    step_show("check", line)
+    return subprocess.call(line)
+
+
+def work_run(flag):
+    code = work_build(flag)
+    if code != 0:
+        return code
+    line = [target_path(MAIN_TARGET)] + flag.rest
+    step_show("run", line)
+    return subprocess.call(line)
+
+
+def work_clean(flag):
+    del flag
+    if os.path.isdir(WORK_PATH):
+        shutil.rmtree(WORK_PATH)
+    print("[clean] removed %s" % WORK_PATH)
+    return 0
+
+
+WORK_TABLE = {
+    "install": work_install,
+    "build": work_build,
+    "test": work_test,
+    "check": work_check,
+    "run": work_run,
+    "clean": work_clean,
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="igllm workflows")
+    parser.add_argument("work", choices=sorted(WORK_TABLE), help="workflow to perform")
+    parser.add_argument("--debug", action="store_true", help="unoptimized build with sanitizers")
+    parser.add_argument("--tuned", action="store_true", help="allow host specific instructions")
+    parser.add_argument("--only", help="build a single target")
+    parser.add_argument("--model", help="checkpoint folder for the check workflow")
+    parser.add_argument("rest", nargs=argparse.REMAINDER, help="arguments passed to the cli")
+    flag = parser.parse_args()
+    if flag.rest and flag.rest[0] == "--":
+        flag.rest = flag.rest[1:]
+    return WORK_TABLE[flag.work](flag)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
