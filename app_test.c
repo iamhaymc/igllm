@@ -552,6 +552,43 @@ static void test_kernel(void) {
     }
   }
 
+  { /* A batched product agrees with the same rows fed one at a time. */
+    int bit_list[4] = {2, 3, 4, 8};
+    int trial_index;
+    for (trial_index = 0; trial_index < 4; ++trial_index) {
+      test_plane_kit kit;
+      int row_count = 70, col_count = 130, lane_count = 19;
+      float *act_list = (float *)mem_clear(sizeof(float) * (size_t)(col_count * lane_count));
+      float *many_list = (float *)mem_clear(sizeof(float) * (size_t)(row_count * lane_count));
+      float *one_list = (float *)mem_clear(sizeof(float) * (size_t)row_count);
+      pool_group pool;
+      back_desk desk;
+      int lane_index, row_index, col_index, okay_flag = 1;
+      test_plane_open(&kit, row_count, col_count, bit_list[trial_index], 48, 1);
+      for (lane_index = 0; lane_index < lane_count * col_count; ++lane_index)
+        act_list[lane_index] = (float)sin((double)lane_index * 0.13);
+      pool_open(&pool, 3);
+      back_open(&desk, &pool, kit.sheet.group_count);
+      desk.mat_mat(&desk, &kit.sheet, act_list, col_count, lane_count, many_list, row_count);
+      for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+        desk.mat_vec(&desk, &kit.sheet, act_list + lane_index * col_count, one_list);
+        for (row_index = 0; row_index < row_count; ++row_index) {
+          float gap = many_list[lane_index * row_count + row_index] - one_list[row_index];
+          if (gap < 0.0f) gap = -gap;
+          if (gap > 1e-3f) okay_flag = 0;
+        }
+      }
+      test_true(okay_flag, "back_mat_mat matches a lane at a time");
+      (void)col_index;
+      back_close(&desk);
+      pool_close(&pool);
+      mem_free(act_list);
+      mem_free(many_list);
+      mem_free(one_list);
+      test_plane_close(&kit);
+    }
+  }
+
   { /* RMS norm, plain weight, no one-plus term. */
     float value_list[4] = {1.0f, 2.0f, 3.0f, 4.0f};
     float gain_list[4] = {0.5f, 1.0f, 1.5f, 2.0f};
@@ -788,6 +825,202 @@ static void test_token(void) {
 /* 8. public surface                                                        */
 /* ======================================================================== */
 
+/* ======================================================================== */
+/* 9. whole graph on a synthetic checkpoint                                 */
+/* ======================================================================== */
+
+#define TEST_WING_LIMIT 128
+
+typedef struct test_wing_kit {
+  char   name_list[TEST_WING_LIMIT][96];
+  int    size_list[TEST_WING_LIMIT][3];
+  size_t from_list[TEST_WING_LIMIT];
+  size_t span_list[TEST_WING_LIMIT];
+  int    item_count;
+  size_t body_size;
+} test_wing_kit;
+
+static void test_wing_add(test_wing_kit *kit, const char *name_text, int high_size, int wide_size,
+                          int deep_size) {
+  int slot = kit->item_count;
+  size_t value_count;
+  if (slot >= TEST_WING_LIMIT) return;
+  kit->item_count += 1;
+  snprintf(kit->name_list[slot], sizeof(kit->name_list[slot]), "%s", name_text);
+  kit->size_list[slot][0] = high_size;
+  kit->size_list[slot][1] = wide_size;
+  kit->size_list[slot][2] = deep_size;
+  value_count = (size_t)high_size * (size_t)(wide_size > 0 ? wide_size : 1) *
+                (size_t)(deep_size > 0 ? deep_size : 1);
+  kit->from_list[slot] = kit->body_size;
+  kit->span_list[slot] = value_count * sizeof(float);
+  kit->body_size += kit->span_list[slot];
+}
+
+/* Writes a complete miniature checkpoint so the whole graph can be exercised. */
+static int test_wing_write(int moe_flag) {
+  static const int state_size = 16, inner_size = 24, layer_count = 2, head_count = 2;
+  static const int head_size = 8, kv_count = 1, ple_size = 4, vocab_count = 27;
+  static const int expert_count = 4, expert_inner = 6;
+  test_wing_kit *kit = (test_wing_kit *)mem_clear(sizeof(test_wing_kit));
+  char name_text[96];
+  char *header_text;
+  size_t header_size, pad_count, file_size, header_fill = 0;
+  uint8_t *file_data;
+  float *body_data;
+  uint64_t header_count;
+  int layer_index, slot, byte_index, okay_flag;
+  char config_text[1024];
+
+  if (!kit) return 0;
+  test_wing_add(kit, "model.embed_tokens.weight", vocab_count, state_size, 0);
+  test_wing_add(kit, "model.embed_tokens_per_layer.weight", 32, layer_count * ple_size, 0);
+  test_wing_add(kit, "model.per_layer_model_projection.weight", layer_count * ple_size, state_size, 0);
+  test_wing_add(kit, "model.per_layer_projection_norm.weight", ple_size, 0, 0);
+  test_wing_add(kit, "model.norm.weight", state_size, 0, 0);
+  for (layer_index = 0; layer_index < layer_count; ++layer_index) {
+#define TEST_WING_NAME(leaf) \
+  (snprintf(name_text, sizeof(name_text), "model.layers.%d.%s", layer_index, leaf), name_text)
+    test_wing_add(kit, TEST_WING_NAME("self_attn.q_proj.weight"), head_count * head_size, state_size, 0);
+    test_wing_add(kit, TEST_WING_NAME("self_attn.k_proj.weight"), kv_count * head_size, state_size, 0);
+    test_wing_add(kit, TEST_WING_NAME("self_attn.v_proj.weight"), kv_count * head_size, state_size, 0);
+    test_wing_add(kit, TEST_WING_NAME("self_attn.o_proj.weight"), state_size, head_count * head_size, 0);
+    test_wing_add(kit, TEST_WING_NAME("self_attn.q_norm.weight"), head_size, 0, 0);
+    test_wing_add(kit, TEST_WING_NAME("self_attn.k_norm.weight"), head_size, 0, 0);
+    test_wing_add(kit, TEST_WING_NAME("mlp.gate_proj.weight"), inner_size, state_size, 0);
+    test_wing_add(kit, TEST_WING_NAME("mlp.up_proj.weight"), inner_size, state_size, 0);
+    test_wing_add(kit, TEST_WING_NAME("mlp.down_proj.weight"), state_size, inner_size, 0);
+    test_wing_add(kit, TEST_WING_NAME("input_layernorm.weight"), state_size, 0, 0);
+    test_wing_add(kit, TEST_WING_NAME("post_attention_layernorm.weight"), state_size, 0, 0);
+    test_wing_add(kit, TEST_WING_NAME("pre_feedforward_layernorm.weight"), state_size, 0, 0);
+    test_wing_add(kit, TEST_WING_NAME("post_feedforward_layernorm.weight"), state_size, 0, 0);
+    test_wing_add(kit, TEST_WING_NAME("per_layer_input_gate.weight"), ple_size, state_size, 0);
+    test_wing_add(kit, TEST_WING_NAME("per_layer_projection.weight"), state_size, ple_size, 0);
+    test_wing_add(kit, TEST_WING_NAME("post_per_layer_input_norm.weight"), state_size, 0, 0);
+    if (!moe_flag) continue;
+    test_wing_add(kit, TEST_WING_NAME("router.proj.weight"), expert_count, state_size, 0);
+    test_wing_add(kit, TEST_WING_NAME("router.scale"), state_size, 0, 0);
+    test_wing_add(kit, TEST_WING_NAME("router.per_expert_scale"), expert_count, 0, 0);
+    test_wing_add(kit, TEST_WING_NAME("experts.gate_up_proj"), expert_count, 2 * expert_inner,
+                  state_size);
+    test_wing_add(kit, TEST_WING_NAME("experts.down_proj"), expert_count, state_size, expert_inner);
+    test_wing_add(kit, TEST_WING_NAME("post_feedforward_layernorm_1.weight"), state_size, 0, 0);
+    test_wing_add(kit, TEST_WING_NAME("pre_feedforward_layernorm_2.weight"), state_size, 0, 0);
+    test_wing_add(kit, TEST_WING_NAME("post_feedforward_layernorm_2.weight"), state_size, 0, 0);
+#undef TEST_WING_NAME
+  }
+
+  header_size = 256 * (size_t)kit->item_count + 64;
+  header_text = (char *)mem_clear(header_size);
+  if (!header_text) { mem_free(kit); return 0; }
+  header_fill += (size_t)snprintf(header_text, header_size, "{");
+  for (slot = 0; slot < kit->item_count; ++slot) {
+    char shape_text[64];
+    if (kit->size_list[slot][2] > 0)
+      snprintf(shape_text, sizeof(shape_text), "[%d,%d,%d]", kit->size_list[slot][0],
+               kit->size_list[slot][1], kit->size_list[slot][2]);
+    else if (kit->size_list[slot][1] > 0)
+      snprintf(shape_text, sizeof(shape_text), "[%d,%d]", kit->size_list[slot][0],
+               kit->size_list[slot][1]);
+    else
+      snprintf(shape_text, sizeof(shape_text), "[%d]", kit->size_list[slot][0]);
+    header_fill += (size_t)snprintf(header_text + header_fill, header_size - header_fill,
+                                    "%s\"%s\":{\"dtype\":\"F32\",\"shape\":%s,"
+                                    "\"data_offsets\":[%lu,%lu]}",
+                                    slot ? "," : "", kit->name_list[slot], shape_text,
+                                    (unsigned long)kit->from_list[slot],
+                                    (unsigned long)(kit->from_list[slot] + kit->span_list[slot]));
+  }
+  header_fill += (size_t)snprintf(header_text + header_fill, header_size - header_fill, "}");
+
+  pad_count = (8 - (header_fill % 8)) % 8;
+  header_count = (uint64_t)(header_fill + pad_count);
+  file_size = 8 + (size_t)header_count + kit->body_size;
+  file_data = (uint8_t *)mem_clear(file_size);
+  if (!file_data) { mem_free(header_text); mem_free(kit); return 0; }
+  for (byte_index = 0; byte_index < 8; ++byte_index)
+    file_data[byte_index] = (uint8_t)((header_count >> (8 * byte_index)) & 0xFFu);
+  memcpy(file_data + 8, header_text, header_fill);
+  for (byte_index = 0; byte_index < (int)pad_count; ++byte_index)
+    file_data[8 + header_fill + byte_index] = ' ';
+  body_data = (float *)(file_data + 8 + (size_t)header_count);
+  for (slot = 0; slot < kit->item_count; ++slot) {
+    size_t from_slot = kit->from_list[slot] / sizeof(float);
+    size_t value_count = kit->span_list[slot] / sizeof(float);
+    size_t value_index;
+    for (value_index = 0; value_index < value_count; ++value_index)
+      body_data[from_slot + value_index] =
+          (float)(0.6 * sin((double)(value_index * 13 + (size_t)slot * 7 + 1) * 0.37));
+  }
+  okay_flag = test_file_write("model.safetensors", file_data, file_size);
+  mem_free(file_data);
+  mem_free(header_text);
+  mem_free(kit);
+
+  snprintf(config_text, sizeof(config_text),
+           "{\"vocab_size\":%d,\"hidden_size\":%d,\"intermediate_size\":%d,"
+           "\"num_hidden_layers\":%d,\"num_attention_heads\":%d,\"num_key_value_heads\":%d,"
+           "\"head_dim\":%d,\"global_head_dim\":%d,\"sliding_window\":4,"
+           "\"vocab_size_per_layer_input\":32,\"hidden_size_per_layer_input\":%d,"
+           "\"num_kv_shared_layers\":0,\"rms_norm_eps\":1e-6,\"max_position_embeddings\":64,"
+           "\"bos_token_id\":1,\"eos_token_id\":2,\"pad_token_id\":0,"
+           "\"layer_types\":[\"sliding_attention\",\"full_attention\"],"
+           "\"enable_moe_block\":%s,\"num_experts\":%d,\"top_k_experts\":2,"
+           "\"moe_intermediate_size\":%d}",
+           vocab_count, state_size, inner_size, layer_count, head_count, kv_count, head_size,
+           head_size, ple_size, moe_flag ? "true" : "false", expert_count, expert_inner);
+  if (!test_file_write("config.json", config_text, strlen(config_text))) okay_flag = 0;
+  if (!test_file_write("tokenizer.json", test_token_json, sizeof(test_token_json) - 1)) okay_flag = 0;
+  return okay_flag;
+}
+
+/* A batched prefill has to land on exactly the same state as a token at a time. */
+static void test_wing(void) {
+  static const int32_t id_list[21] = {1, 7, 8, 9, 10, 11, 12, 13, 7,  8, 9,
+                                      10, 11, 12, 13, 7, 8, 9, 10, 11, 12};
+  int moe_flag;
+  test_open("wing");
+  for (moe_flag = 0; moe_flag < 2; ++moe_flag) {
+    app_setup setup = app_setup_plain();
+    app_model *model = NULL;
+    app_session *wide_session = NULL;
+    app_session *thin_session = NULL;
+    float *want_list = NULL;
+    const float *have_list;
+    int okay_flag = 1, slot;
+    setup.thread_count = 2;
+    if (!test_wing_write(moe_flag)) { test_true(0, "the synthetic checkpoint is written"); return; }
+    test_true(model_load(test_yard_path, &setup, &model) == APP_OKAY,
+              moe_flag ? "a mixture checkpoint loads" : "a dense checkpoint loads");
+    if (!model) return;
+    test_true(session_open(model, &thin_session) == APP_OKAY, "a session opens");
+    test_true(session_open(model, &wide_session) == APP_OKAY, "a second session opens");
+    if (!thin_session || !wide_session) { model_free(model); return; }
+
+    for (slot = 0; slot < 21; ++slot) have_list = session_step(thin_session, id_list[slot]);
+    want_list = (float *)mem_clear(sizeof(float) * 27);
+    memcpy(want_list, have_list, sizeof(float) * 27);
+
+    test_true(session_prime(wide_session, id_list, 21) == APP_OKAY, "a batched prefill runs");
+    have_list = session_step(wide_session, id_list[20]);
+    test_true(have_list != NULL, "the batched pass reaches the head");
+    if (have_list) {
+      for (slot = 0; slot < 27; ++slot) {
+        float gap = have_list[slot] - want_list[slot];
+        if (gap < 0.0f) gap = -gap;
+        if (gap > 1e-3f) okay_flag = 0;
+      }
+    }
+    test_true(okay_flag, "a batched prefill matches one token at a time");
+    test_true(session_fill(wide_session) == session_fill(thin_session),
+              "both routes land on the same position");
+    mem_free(want_list);
+    session_close(wide_session);
+    session_close(thin_session);
+    model_free(model);
+  }
+}
+
 static void test_face(void) {
   app_setup setup = app_setup_plain();
   app_taste taste = app_taste_plain();
@@ -824,6 +1057,7 @@ int main(void) {
   test_kernel();
   test_rope();
   test_token();
+  test_wing();
   test_face();
 
   test_yard_close();
