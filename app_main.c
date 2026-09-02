@@ -24,6 +24,7 @@ static void main_usage(void) {
   printf("  complete   raw continuation of the prompt text\n");
   printf("  bench      timed prefill and decode report\n");
   printf("  tokens     print the token ids of the prompt\n");
+  printf("  logits     print the next token distribution as json\n");
   printf("  probe      print the resolved model shape\n\n");
   printf("options:\n");
   printf("  --model <folder>    checkpoint folder in huggingface layout\n");
@@ -151,6 +152,72 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
   return 0;
 }
 
+static int main_logits(app_model *model, const main_flag *flag) {
+  app_session *session = NULL;
+  int32_t *id_list;
+  int id_count, show_count, slot_index;
+  const float *logit_list;
+  int vocab_count = model_vocab_count(model);
+  app_code code = session_open(model, &session);
+
+  if (code != APP_OKAY) {
+    fprintf(stderr, "session: %s\n", app_code_text(code));
+    return 1;
+  }
+  id_list = (int32_t *)malloc(sizeof(int32_t) * MAIN_PROMPT_LIMIT);
+  if (!id_list) { session_close(session); return 1; }
+  id_count = main_prompt_ids(model, flag, id_list, MAIN_PROMPT_LIMIT);
+  if (id_count < 1 || session_prime(session, id_list, id_count) != APP_OKAY) {
+    fprintf(stderr, "prime failed\n");
+    free(id_list);
+    session_close(session);
+    return 1;
+  }
+  logit_list = session_step(session, id_list[id_count - 1]);
+  if (!logit_list) {
+    free(id_list);
+    session_close(session);
+    return 1;
+  }
+
+  show_count = flag->serve_limit > 0 && flag->serve_limit < vocab_count ? flag->serve_limit : 16;
+  printf("{\"tokens\":[");
+  for (slot_index = 0; slot_index < id_count; ++slot_index)
+    printf("%s%d", slot_index ? "," : "", id_list[slot_index]);
+  printf("],\"top\":[");
+  {
+    /* Partial selection of the highest scoring ids, without sorting the vocabulary. */
+    int *rank_list = (int *)malloc(sizeof(int) * (size_t)show_count);
+    int rank_count = 0, rank_index, vocab_index;
+    for (vocab_index = 0; vocab_index < vocab_count; ++vocab_index) {
+      float value = logit_list[vocab_index];
+      if (rank_count < show_count) {
+        rank_list[rank_count++] = vocab_index;
+      } else if (value > logit_list[rank_list[rank_count - 1]]) {
+        rank_list[rank_count - 1] = vocab_index;
+      } else {
+        continue;
+      }
+      for (rank_index = rank_count - 1; rank_index > 0; --rank_index) {
+        if (logit_list[rank_list[rank_index]] <= logit_list[rank_list[rank_index - 1]]) break;
+        {
+          int keep_value = rank_list[rank_index];
+          rank_list[rank_index] = rank_list[rank_index - 1];
+          rank_list[rank_index - 1] = keep_value;
+        }
+      }
+    }
+    for (rank_index = 0; rank_index < rank_count; ++rank_index)
+      printf("%s{\"id\":%d,\"logit\":%.6f}", rank_index ? "," : "", rank_list[rank_index],
+             (double)logit_list[rank_list[rank_index]]);
+    free(rank_list);
+  }
+  printf("]}\n");
+  free(id_list);
+  session_close(session);
+  return 0;
+}
+
 static int main_tokens(app_model *model, const main_flag *flag) {
   int32_t id_list[MAIN_PROMPT_LIMIT];
   int id_count = main_prompt_ids(model, flag, id_list, MAIN_PROMPT_LIMIT);
@@ -205,6 +272,8 @@ int main(int argc, char **argv) {
     result_code = main_serve(model, &flag, 0);
   else if (strcmp(flag.task_text, "bench") == 0)
     result_code = main_serve(model, &flag, 1);
+  else if (strcmp(flag.task_text, "logits") == 0)
+    result_code = main_logits(model, &flag);
   else if (strcmp(flag.task_text, "tokens") == 0)
     result_code = main_tokens(model, &flag);
   else if (strcmp(flag.task_text, "probe") == 0)
