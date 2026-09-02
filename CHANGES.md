@@ -199,3 +199,96 @@ at a time. That is what caught the ring-buffer ordering bug above.
 The vision and audio towers are still absent. Numerical parity against the
 reference has still not been measured, because the checkpoint remains
 unreachable from the development sandbox. `TODO.md` tracks the rest.
+
+---
+
+## 0.3.0 — a synthetic parity oracle
+
+### Why
+
+Everything above was argued from the reference source rather than measured
+against it, because the checkpoint could not be downloaded. But parity does
+not actually need the shipped weights — it needs *some* weights both engines
+agree on. `app_fake.py` makes them, and the download stops being a blocker
+for the arithmetic. It remains a blocker for the file naming and the real
+tokenizer, and `README.md` now says exactly that instead of disclaiming
+everything at once.
+
+### The checkpoint comes from the reference, not from a reading of it
+
+`app_fake.py` builds a `Gemma4Config`, instantiates the reference model, and
+lets `save_pretrained` write `config.json` and `model.safetensors`. The
+alternative — writing the fixture by hand, as `test_wing` does — produces a
+file that agrees with the loader's assumptions by construction, and so cannot
+contradict them. A generated file can.
+
+**Every parameter is reseeded.** The reference initializer sets norm weights
+to exactly 1.0, and 1.0 makes a misindexed norm indistinguishable from a
+correct one. `form_check` then rejects any model with a parameter left near
+zero. That guard was not speculative: `post_feedforward_layernorm_2` does not
+end in `norm.weight`, an early name-based test missed it, and the mixture
+branch it gates came out at 4e-7 — small enough that an engine emitting
+zeros would have passed. The test is on the module type now.
+
+**The packing is upstream's.** `weight_packed` is produced by
+`compressed_tensors.pack_to_int32` rather than by a second implementation of
+the bitstream, so agreement means agreement with the exporter. A dequantized
+twin is written alongside, and the engine reading the packed files is
+compared against the reference reading the dequantized ones, which separates
+the unpacking and the scale convention from the arithmetic.
+
+### Comparison is layer-wise
+
+A logit gap says something is wrong and nothing about where. `APP_TRACE`
+compiles in a dump of named activations — embedding, per-layer attention,
+feed-forward or mixture, residual, final norm, logits — and `app_diff.py`
+compares them in order against forward hooks on the reference, stopping at
+the first tensor that drifts. The dump is behind a macro and compiles to
+nothing by default, so a normal build pays nothing for it.
+
+**The tolerance is measured.** Running the reference over a whole sequence
+and then one token at a time behind its cache is the same arithmetic in a
+different summation order; the largest gap between them, 1.55e-6, is the
+floor below which a difference means nothing. Tolerance is eight times it.
+
+**The oracle was tested by breaking the engine.** Perturbing a single expert
+weight makes the harness name that layer and stay quiet about the earlier
+ones. Without that, a harness that always passes looks exactly like a correct
+engine.
+
+### What it found
+
+Two real bugs, neither reachable from the unit tests.
+
+`config_read` defaulted `global_head_dim` to 512. A `save_pretrained` config
+never contains that key — the reference pops it in `__post_init__` and writes
+`per_layer_config` instead — so the full-attention rotary table was built for
+head dimension 512 while the weights had 16, and `rope_wave` wrote past its
+buffer. `test_wing` missed it because a hand-built config includes the key.
+The fix reads `per_layer_config`, and then `model_bind` rebuilds the tables
+from the head size implied by `q_proj`, because the tensors are the only
+source that cannot disagree with the weights.
+
+`run.py` used `argparse.REMAINDER` for its trailing arguments, which
+swallowed its own flags: `--debug` and `--trace` parsed successfully and did
+nothing. That explains an earlier session's note that the sanitizer build
+"did not appear to change the flags" — it did not. The argument vector is
+split on the first bare `--` now.
+
+The sweep also retroactively confirmed the mixture blocks and the batched
+prefill from 0.2.0, which had been argued rather than measured.
+
+### Coverage
+
+Eleven configurations by six prompt lengths: dense and mixture, float and
+packed at two, three, four, five and eight bits, group sizes that divide the
+row and group sizes that do not, the double-wide feed-forward, shared key and
+value projections, and lengths that straddle both the sliding window and the
+prefill chunk. Clean under the sanitizers and on AVX2 and NEON.
+
+### Known gaps
+
+The vision and audio towers are still absent — but they are now buildable
+against something, which is the point of the exercise. The tensor naming of
+the shipped export, the real tokenizer's merges, real vocabulary edge cases,
+and speed at full scale still need the checkpoint.

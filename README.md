@@ -55,11 +55,13 @@ Common flags: `--model`, `--prompt`, `--serve`, `--threads`, `--window`,
 | `python3 run.py build`        | compile `igllm` and `igllm_test`              |
 | `python3 run.py test`         | build, then run the unit tests                |
 | `python3 run.py check --model <folder>` | test, then compare to the reference |
+| `python3 run.py parity`       | build a synthetic checkpoint, diff layer by layer |
 | `python3 run.py run -- <args>`| build, then run the cli                       |
 | `python3 run.py clean`        | remove build products                         |
 
 Add `--debug` for an unoptimized build with the address and behaviour
-sanitizers, or `--tuned` to allow host specific instructions.
+sanitizers, `--tuned` to allow host specific instructions, or `--trace` to
+compile in the activation dump the parity harness reads.
 
 ## Files
 
@@ -69,6 +71,8 @@ sanitizers, or `--tuned` to allow host specific instructions.
 | `app_main.c`  | the command line front end                     |
 | `app_test.c`  | the unit tests                                 |
 | `app_test.py` | comparison against the transformers reference  |
+| `app_fake.py` | builds a synthetic checkpoint and quantizes it |
+| `app_diff.py` | layer by layer comparison against the reference |
 | `run.py`      | install, build, test, run workflows            |
 | `GUIDE.md`    | a complete tour of the implementation          |
 | `CHANGES.md`  | development progress and rationale             |
@@ -81,6 +85,14 @@ sanitizers, or `--tuned` to allow host specific instructions.
 The engine builds clean and passes its unit tests on POSIX and Windows, and
 under the address and behaviour sanitizers. Text generation, mixture-of-experts
 blocks, and batched prefill are implemented; the vision and audio towers are
-not, so the engine is text-only today. Numerical parity against the reference
-has **not** been measured yet, because the checkpoint was unreachable from the
-development sandbox; see `TODO.md`.
+not, so the engine is text-only today.
+
+Numerical parity is **verified against the reference implementation on
+synthetic weights, and not yet against the shipped checkpoint**, which was
+unreachable from the development sandbox. `run.py parity` generates a small
+checkpoint with the reference library itself, runs both engines, and compares
+every intermediate activation; eleven configurations covering dense and mixture
+blocks, every packed bit width, and six prompt lengths agree to within the
+measured floating point noise floor. What that does not cover is the tensor
+naming and the tokenizer of the real files, and speed at full scale. See
+`TODO.md`.

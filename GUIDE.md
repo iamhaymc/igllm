@@ -14,7 +14,9 @@ and where an accelerator would attach.
 | `app_main.c`  | the command line front end                                   |
 | `app_test.c`  | the unit tests                                               |
 | `app_test.py` | parity and throughput comparison against transformers        |
-| `run.py`      | install, build, test, check, run, clean workflows            |
+| `app_fake.py` | builds a synthetic checkpoint and quantizes it               |
+| `app_diff.py` | layer by layer comparison against transformers               |
+| `run.py`      | install, build, test, check, parity, run, clean workflows    |
 
 `app_core.c` is a single translation unit. `app_main.c` and `app_test.c`
 each `#include "app_core.c"`, so a build is one compiler invocation per
@@ -385,6 +387,61 @@ overlap, the largest absolute logit gap, and the greedy continuation, then
 reports the decode throughput of each side and their ratio. It skips
 cleanly, exiting zero, when the checkpoint or the python packages are
 absent, so it is safe in a pipeline.
+
+### 6.1 The synthetic oracle
+
+`app_test.py` needs the shipped checkpoint. `app_fake.py` and `app_diff.py`
+need nothing but the python packages, and together they answer the question
+that matters — does this engine compute the same numbers as the reference —
+without any download at all. `python3 run.py parity` runs the whole thing.
+
+**`app_fake.py` builds the checkpoint.** It constructs a `Gemma4Config` at a
+size that fits in a test — 32 hidden, 4 layers, 4 heads — instantiates the
+reference model, reseeds every parameter, and calls `save_pretrained`. The
+reference library writes `config.json` and `model.safetensors` itself, so the
+tensor names, shapes, and layouts come from upstream rather than from a
+reading of upstream. That is the difference between this and `test_wing`,
+which is hand-built and therefore agrees with whatever the loader believes.
+
+Reseeding is not cosmetic. The reference initializer sets every norm weight
+to exactly 1.0, which hides any bug in how a norm is indexed, and leaves
+whole families of tensors identical, which hides any bug in which one is
+picked. `form_seed` gives every parameter its own values, and `form_check`
+refuses to emit a model with a parameter that stayed near zero — a muted
+branch agrees with any implementation at all.
+
+A second mode packs the float checkpoint the way the QAT export is packed:
+symmetric group-wise scales, a bit-packed `weight_packed` as I32 built by
+`compressed_tensors` itself, plus `weight_scale` and `weight_shape`. It then
+dequantizes in python and writes that as a third checkpoint. The engine
+reading the packed files is compared against the reference reading the
+dequantized ones, which isolates the unpacking and the scale convention from
+everything else.
+
+**`app_diff.py` compares.** Final logits tell you that something is wrong,
+never where. A build with `-DAPP_TRACE` — `run.py build --trace` — writes a
+named activation snapshot to the file named by `IGLLM_TRACE`: the embedding,
+then each layer's attention output, mixture or feed-forward output, and
+residual, then the final norm and the logits. The reference side captures the
+same tensors with forward hooks. The harness walks them in order and stops at
+the first one that exceeds tolerance, which names the broken function.
+
+The tolerance is measured, not guessed. `reference_floor` runs the reference
+twice over the same tokens — once over the whole sequence, once one token at
+a time behind its cache — which is the same arithmetic in a different
+summation order, and takes the largest gap as the noise floor. Tolerance is
+eight times that. The dump is compiled out by default, so a normal build
+carries none of it.
+
+The sweep covers the axes that change code paths: dense and mixture blocks,
+sliding and full attention, every packed bit width from two to eight, group
+sizes that do and do not divide the row, the double-wide feed-forward, shared
+key and value projections, and prompt lengths that straddle both the sliding
+window and the prefill chunk.
+
+The oracle itself was checked by breaking the engine on purpose: perturbing
+one expert weight makes it report that layer and stay silent about the ones
+before it. An oracle that never fails has not been shown to work.
 
 ## 7. Extending
 
