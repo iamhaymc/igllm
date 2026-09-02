@@ -3059,6 +3059,61 @@ static int token_decode_book(const token_book *book, int32_t id_value, char *tex
 /* 9. session layer                                                         */
 /* ======================================================================== */
 
+/* Named activation snapshots, for comparing against the reference one tensor
+ * at a time. A disagreement in the logits alone says only that something is
+ * wrong; a disagreement in `layer.3.attn` names the function. The whole
+ * facility compiles away unless APP_TRACE is defined, so a normal build pays
+ * nothing, not even a branch. */
+#if defined(APP_TRACE)
+
+static FILE *trace_file = NULL;
+
+static void trace_open(void) {
+  const char *path_text;
+  if (trace_file) return;
+  path_text = getenv("IGLLM_TRACE");
+  if (!path_text || !path_text[0]) return;
+  trace_file = fopen(path_text, "wb");
+  if (trace_file) fwrite("IGTRACE1", 1, 8, trace_file);
+}
+
+static void trace_save(const char *name_text, const float *value_list, int value_count) {
+  uint32_t name_size, slot_count;
+  trace_open();
+  if (!trace_file || !value_list || value_count < 1) return;
+  name_size = (uint32_t)strlen(name_text);
+  slot_count = (uint32_t)value_count;
+  fwrite(&name_size, sizeof(name_size), 1, trace_file);
+  fwrite(name_text, 1, name_size, trace_file);
+  fwrite(&slot_count, sizeof(slot_count), 1, trace_file);
+  fwrite(value_list, sizeof(float), (size_t)value_count, trace_file);
+}
+
+static void trace_lane(const char *stem_text, int layer_index, int place_index,
+                       const float *value_list, int value_count) {
+  char name_text[128];
+  if (layer_index >= 0)
+    snprintf(name_text, sizeof(name_text), "layer.%d.%s.%d", layer_index, stem_text, place_index);
+  else
+    snprintf(name_text, sizeof(name_text), "%s.%d", stem_text, place_index);
+  trace_save(name_text, value_list, value_count);
+}
+
+static void trace_close(void) {
+  if (!trace_file) return;
+  fclose(trace_file);
+  trace_file = NULL;
+}
+
+#define TRACE_LANE(stem, layer, place, data, count) \
+  trace_lane((stem), (layer), (place), (data), (count))
+#define TRACE_CLOSE() trace_close()
+
+#else
+#define TRACE_LANE(stem, layer, place, data, count) ((void)0)
+#define TRACE_CLOSE() ((void)0)
+#endif
+
 struct app_session {
   app_model *model;
   int        fill_count;
@@ -3339,6 +3394,7 @@ static void session_layer(app_session *session, int layer_index, int place_from,
                  session->lift_room);
   for (lane_index = 0; lane_index < lane_count; ++lane_index) {
     float *lift_data = session->lift_room + (size_t)lane_index * lift_stride;
+    TRACE_LANE("attn", layer_index, place_from + lane_index, lift_data, state_size);
     model->desk.norm_rms(&model->desk, lift_data, wing->after_attn_norm, state_size, form->norm_eps,
                          lift_data);
     kern_add(session->state_room + (size_t)lane_index * state_stride, lift_data, state_size);
@@ -3358,6 +3414,9 @@ static void session_layer(app_session *session, int layer_index, int place_from,
                           wing->inner_size);
   session_lift_many(session, &wing->drop_sheet, session->gate_room, session->gate_stride, lane_count,
                     session->lift_room, lift_stride);
+  for (lane_index = 0; lane_index < lane_count; ++lane_index)
+    TRACE_LANE("mlp", layer_index, place_from + lane_index,
+               session->lift_room + (size_t)lane_index * lift_stride, state_size);
 
   if (form->moe_flag) {
     /* The dense mlp above is the shared expert; the mixture reads the residual
@@ -3373,6 +3432,7 @@ static void session_layer(app_session *session, int layer_index, int place_from,
       model->desk.norm_rms(&model->desk, state_data, wing->before_moe_norm, state_size,
                            form->norm_eps, scrap_data);
       session_expert(session, wing, scrap_data, session->moe_room);
+      TRACE_LANE("moe", layer_index, place_from + lane_index, session->moe_room, state_size);
       model->desk.norm_rms(&model->desk, session->moe_room, wing->after_moe_norm, state_size,
                            form->norm_eps, session->moe_room);
       kern_add(lift_data, session->moe_room, state_size);
@@ -3409,6 +3469,10 @@ static void session_layer(app_session *session, int layer_index, int place_from,
     for (lane_index = 0; lane_index < lane_count; ++lane_index)
       kern_scale(session->state_room + (size_t)lane_index * state_stride, wing->layer_gain,
                  state_size);
+
+  for (lane_index = 0; lane_index < lane_count; ++lane_index)
+    TRACE_LANE("out", layer_index, place_from + lane_index,
+               session->state_room + (size_t)lane_index * state_stride, state_size);
 }
 
 /* A batch of tokens through the whole graph.  Logits are produced for the last
@@ -3429,6 +3493,7 @@ static const float *session_pass(app_session *session, const int32_t *id_list, i
     float *state_data = session->state_room + (size_t)lane_index * session->state_stride;
     plane_row(&model->embed_sheet, id_list[lane_index], state_data);
     kern_scale(state_data, (float)sqrt((double)form->state_size), form->state_size);
+    TRACE_LANE("embed", -1, place_from + lane_index, state_data, form->state_size);
   }
 
   if (form->ple_size > 0) {
@@ -3469,6 +3534,7 @@ static const float *session_pass(app_session *session, const int32_t *id_list, i
   model->desk.norm_rms(&model->desk,
                        session->state_room + (size_t)(lane_count - 1) * session->state_stride,
                        model->final_norm, form->state_size, form->norm_eps, session->scrap_room);
+  TRACE_LANE("final", -1, place_from + lane_count - 1, session->scrap_room, form->state_size);
   session_lift(session, &model->head_sheet, session->scrap_room, session->logit_room);
   if (form->logit_cap > 0.0f) {
     int value_index;
@@ -3476,6 +3542,8 @@ static const float *session_pass(app_session *session, const int32_t *id_list, i
       session->logit_room[value_index] =
           tanhf(session->logit_room[value_index] / form->logit_cap) * form->logit_cap;
   }
+  TRACE_LANE("logits", -1, place_from + lane_count - 1, session->logit_room,
+             model->head_sheet.row_count);
   return session->logit_room;
 }
 
@@ -3824,6 +3892,7 @@ app_code session_open(app_model *model, app_session **session_out) {
 
 void session_close(app_session *session) {
   if (!session) return;
+  TRACE_CLOSE();
   session_free_rooms(session);
   mem_free(session);
 }

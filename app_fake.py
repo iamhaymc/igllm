@@ -84,11 +84,21 @@ def form_seed(model, seed_value, magnitude):
     """
     import torch
 
+    # Which parameters are norms is decided by the module they belong to, not by
+    # their name. Gemma 4 has norms called `post_feedforward_layernorm_2`, and a
+    # name test for `norm.weight` misses them, leaves them near zero, and mutes
+    # the branch they gate. A muted branch agrees with anything.
+    around_one = set()
+    for stem, module in model.named_modules():
+        if type(module).__name__.endswith("RMSNorm") or type(module).__name__.endswith("LayerNorm"):
+            for leaf, _ in module.named_parameters(recurse=False):
+                around_one.add("%s.%s" % (stem, leaf) if stem else leaf)
+
     generator = torch.Generator().manual_seed(seed_value)
     spread = 0.02 if magnitude == "real" else 0.5
     for name, value in model.named_parameters():
         with torch.no_grad():
-            if name.endswith("norm.weight") or name.endswith("router.scale"):
+            if name in around_one or name.endswith("router.scale"):
                 value.copy_(1.0 + spread * 5.0 *
                             torch.randn(value.shape, generator=generator))
             elif name.endswith("per_expert_scale"):
@@ -96,6 +106,20 @@ def form_seed(model, seed_value, magnitude):
             else:
                 value.copy_(spread * torch.randn(value.shape, generator=generator))
     return model
+
+
+def form_check(model):
+    """Returns the parameters that stayed suspiciously close to zero.
+
+    A synthetic model that quietly zeroes a norm makes the branch behind it
+    vanish, and a vanished branch matches any implementation at all. This is the
+    guard against a comparison that passes for the wrong reason.
+    """
+    limp_list = []
+    for name, value in model.named_parameters():
+        if float(value.detach().abs().max()) < 1e-3:
+            limp_list.append(name)
+    return limp_list
 
 
 # -- tokenizer ------------------------------------------------------------
@@ -272,6 +296,9 @@ def fake_build(out_path, preset, seed_value, magnitude, bit_count, group_size, e
     torch.manual_seed(seed_value)
     model = Gemma4ForCausalLM(form)
     form_seed(model, seed_value, magnitude)
+    limp_list = form_check(model)
+    if limp_list:
+        raise ValueError("degenerate synthetic weights: %s" % ", ".join(limp_list[:4]))
     model.eval()
     os.makedirs(plain_path, exist_ok=True)
     model.save_pretrained(plain_path, safe_serialization=True)
