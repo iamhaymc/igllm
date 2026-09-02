@@ -185,6 +185,14 @@ static void mem_free(void *block) {
 #endif
 }
 
+/* Copies a name into a fixed slot, truncating rather than overrunning. */
+static void text_fill(char *slot_data, size_t slot_limit, const char *text) {
+  size_t length = text ? strlen(text) : 0;
+  if (length >= slot_limit) length = slot_limit - 1;
+  if (length > 0) memcpy(slot_data, text, length);
+  slot_data[length] = '\0';
+}
+
 static char *text_copy(const char *text, size_t length) {
   char *copy = (char *)mem_alloc(length + 1);
   if (!copy) return NULL;
@@ -1374,6 +1382,11 @@ static void quant_act(float *value_list, int value_count, const quant_rule *rule
 /* 6. kernel layer                                                          */
 /* ======================================================================== */
 
+/* How many tokens one batched projection carries, and how many codes are
+ * unpacked into scratch at a time while it runs. */
+#define KERN_LANE_LIMIT   16
+#define KERN_SPREAD_LIMIT 256
+
 static float kern_dot_real(const void *row_data, store_type row_type, const float *act_data,
                            int span_count) {
   int slot;
@@ -1420,39 +1433,228 @@ static float kern_dot_real(const void *row_data, store_type row_type, const floa
   return total;
 }
 
-/* Sum of activation times code over one quantization group. */
+/* Horizontal sum of the widest accumulator the selected path uses. */
+#if defined(APP_SIMD_AVX2)
+static float kern_wide_total(__m256 wide_total) {
+  __m128 half_total =
+      _mm_add_ps(_mm256_castps256_ps128(wide_total), _mm256_extractf128_ps(wide_total, 1));
+  half_total = _mm_add_ps(half_total, _mm_movehl_ps(half_total, half_total));
+  half_total = _mm_add_ss(half_total, _mm_shuffle_ps(half_total, half_total, 0x55));
+  return _mm_cvtss_f32(half_total);
+}
+#elif defined(APP_SIMD_SSE2)
+static float kern_wide_total(__m128 wide_total) {
+  __m128 half_total = _mm_add_ps(wide_total, _mm_movehl_ps(wide_total, wide_total));
+  half_total = _mm_add_ss(half_total, _mm_shuffle_ps(half_total, half_total, 0x55));
+  return _mm_cvtss_f32(half_total);
+}
+#elif defined(APP_SIMD_NEON)
+static float kern_wide_total(float32x4_t wide_total) {
+  return vgetq_lane_f32(wide_total, 0) + vgetq_lane_f32(wide_total, 1) +
+         vgetq_lane_f32(wide_total, 2) + vgetq_lane_f32(wide_total, 3);
+}
+#endif
+
+/* Sum of activation times code over one quantization group.
+ *
+ * The two and four bit cases are the ones the checkpoint leans on, so each has
+ * a vector path behind the same macro layer the dense kernels use.  A group
+ * starts on a byte boundary in both of those widths whenever `from_index` is a
+ * multiple of the codes per byte; when it is not, the general bit-stream loop
+ * at the bottom still produces the right answer. */
 static float kern_dot_code(const uint8_t *code_row, int from_index, int span_count,
                            const float *act_data, int bit_count) {
   float total = 0.0f;
-  int slot;
-  if (bit_count == 4) {
+  int slot = 0;
+
+  if (bit_count == 4 && (from_index & 1) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 2;
-    float part_a = 0.0f, part_b = 0.0f;
-    for (slot = 0; slot + 2 <= span_count; slot += 2) {
-      uint8_t pair = byte_head[slot / 2];
-      part_a += (float)(pair & 0x0Fu) * act_data[slot];
-      part_b += (float)(pair >> 4) * act_data[slot + 1];
+#if defined(APP_SIMD_AVX2)
+    {
+      const __m128i low_mask = _mm_set1_epi8(0x0F);
+      __m256 wide_total = _mm256_setzero_ps();
+      for (; slot + 16 <= span_count; slot += 16) {
+        __m128i pack_data = _mm_loadl_epi64((const __m128i *)(const void *)(byte_head + slot / 2));
+        __m128i low_part = _mm_and_si128(pack_data, low_mask);
+        __m128i high_part = _mm_and_si128(_mm_srli_epi16(pack_data, 4), low_mask);
+        __m128i code_byte = _mm_unpacklo_epi8(low_part, high_part);
+        wide_total = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(code_byte)),
+                                     _mm256_loadu_ps(act_data + slot), wide_total);
+        wide_total = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(code_byte, 8))),
+            _mm256_loadu_ps(act_data + slot + 8), wide_total);
+      }
+      total = kern_wide_total(wide_total);
     }
-    total = part_a + part_b;
+#elif defined(APP_SIMD_SSE2)
+    {
+      const __m128i low_mask = _mm_set1_epi8(0x0F);
+      const __m128i zero_data = _mm_setzero_si128();
+      __m128 wide_total = _mm_setzero_ps();
+      for (; slot + 16 <= span_count; slot += 16) {
+        __m128i pack_data = _mm_loadl_epi64((const __m128i *)(const void *)(byte_head + slot / 2));
+        __m128i low_part = _mm_and_si128(pack_data, low_mask);
+        __m128i high_part = _mm_and_si128(_mm_srli_epi16(pack_data, 4), low_mask);
+        __m128i code_byte = _mm_unpacklo_epi8(low_part, high_part);
+        __m128i word_low = _mm_unpacklo_epi8(code_byte, zero_data);
+        __m128i word_high = _mm_unpackhi_epi8(code_byte, zero_data);
+        wide_total = _mm_add_ps(
+            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)),
+                                   _mm_loadu_ps(act_data + slot)));
+        wide_total = _mm_add_ps(
+            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)),
+                                   _mm_loadu_ps(act_data + slot + 4)));
+        wide_total = _mm_add_ps(
+            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)),
+                                   _mm_loadu_ps(act_data + slot + 8)));
+        wide_total = _mm_add_ps(
+            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)),
+                                   _mm_loadu_ps(act_data + slot + 12)));
+      }
+      total = kern_wide_total(wide_total);
+    }
+#elif defined(APP_SIMD_NEON)
+    {
+      float32x4_t wide_total = vdupq_n_f32(0.0f);
+      for (; slot + 16 <= span_count; slot += 16) {
+        uint8x8_t pack_data = vld1_u8(byte_head + slot / 2);
+        uint8x8x2_t code_byte =
+            vzip_u8(vand_u8(pack_data, vdup_n_u8(0x0F)), vshr_n_u8(pack_data, 4));
+        int part_index;
+        for (part_index = 0; part_index < 2; ++part_index) {
+          uint16x8_t code_word = vmovl_u8(code_byte.val[part_index]);
+          wide_total = vmlaq_f32(wide_total, vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_word))),
+                                 vld1q_f32(act_data + slot + part_index * 8));
+          wide_total = vmlaq_f32(wide_total, vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_word))),
+                                 vld1q_f32(act_data + slot + part_index * 8 + 4));
+        }
+      }
+      total = kern_wide_total(wide_total);
+    }
+#endif
+    for (; slot + 2 <= span_count; slot += 2) {
+      uint8_t pair = byte_head[slot / 2];
+      total += (float)(pair & 0x0Fu) * act_data[slot];
+      total += (float)(pair >> 4) * act_data[slot + 1];
+    }
+    if (slot < span_count) total += (float)(byte_head[slot / 2] & 0x0Fu) * act_data[slot];
     return total;
   }
+
   if (bit_count == 8) {
     const uint8_t *byte_head = code_row + (size_t)from_index;
-    for (slot = 0; slot < span_count; ++slot) total += (float)byte_head[slot] * act_data[slot];
+    for (; slot < span_count; ++slot) total += (float)byte_head[slot] * act_data[slot];
     return total;
   }
-  if (bit_count == 2) {
+
+  if (bit_count == 2 && (from_index & 3) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 4;
-    for (slot = 0; slot + 4 <= span_count; slot += 4) {
+#if defined(APP_SIMD_AVX2)
+    {
+      const __m256i step_data = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+      const __m256i code_mask = _mm256_set1_epi32(3);
+      __m256 wide_total = _mm256_setzero_ps();
+      for (; slot + 16 <= span_count; slot += 16) {
+        uint32_t word_value;
+        memcpy(&word_value, byte_head + slot / 4, 4);
+        wide_total = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_and_si256(
+                _mm256_srlv_epi32(_mm256_set1_epi32((int)(word_value & 0xFFFFu)), step_data),
+                code_mask)),
+            _mm256_loadu_ps(act_data + slot), wide_total);
+        wide_total = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_and_si256(
+                _mm256_srlv_epi32(_mm256_set1_epi32((int)(word_value >> 16)), step_data),
+                code_mask)),
+            _mm256_loadu_ps(act_data + slot + 8), wide_total);
+      }
+      total = kern_wide_total(wide_total);
+    }
+#elif defined(APP_SIMD_SSE2)
+    {
+      /* Each packed byte is spread across a 32 bit lane, then the four codes
+       * are lifted into their own byte by four whole-vector shifts and a
+       * select.  Masking to two bits removes the bits a 16 bit lane shift
+       * drags in from its neighbour. */
+      const __m128i zero_data = _mm_setzero_si128();
+      const __m128i code_mask = _mm_set1_epi8(3);
+      const __m128i pick_zero = _mm_set1_epi32(0x000000FF);
+      const __m128i pick_one = _mm_set1_epi32(0x0000FF00);
+      const __m128i pick_two = _mm_set1_epi32(0x00FF0000);
+      const __m128i pick_three = _mm_set1_epi32((int)0xFF000000u);
+      __m128 wide_total = _mm_setzero_ps();
+      for (; slot + 16 <= span_count; slot += 16) {
+        uint32_t word_value;
+        __m128i pack_data, spread_data, code_byte, word_low, word_high;
+        memcpy(&word_value, byte_head + slot / 4, 4);
+        pack_data = _mm_cvtsi32_si128((int)word_value);
+        spread_data = _mm_unpacklo_epi8(pack_data, pack_data);
+        spread_data = _mm_unpacklo_epi16(spread_data, spread_data);
+        code_byte = _mm_and_si128(
+            _mm_or_si128(
+                _mm_or_si128(_mm_and_si128(spread_data, pick_zero),
+                             _mm_and_si128(_mm_srli_epi16(spread_data, 2), pick_one)),
+                _mm_or_si128(_mm_and_si128(_mm_srli_epi16(spread_data, 4), pick_two),
+                             _mm_and_si128(_mm_srli_epi16(spread_data, 6), pick_three))),
+            code_mask);
+        word_low = _mm_unpacklo_epi8(code_byte, zero_data);
+        word_high = _mm_unpackhi_epi8(code_byte, zero_data);
+        wide_total = _mm_add_ps(
+            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)),
+                                   _mm_loadu_ps(act_data + slot)));
+        wide_total = _mm_add_ps(
+            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)),
+                                   _mm_loadu_ps(act_data + slot + 4)));
+        wide_total = _mm_add_ps(
+            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)),
+                                   _mm_loadu_ps(act_data + slot + 8)));
+        wide_total = _mm_add_ps(
+            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)),
+                                   _mm_loadu_ps(act_data + slot + 12)));
+      }
+      total = kern_wide_total(wide_total);
+    }
+#elif defined(APP_SIMD_NEON)
+    {
+      static const uint8_t low_pick[8] = {0, 0, 0, 0, 1, 1, 1, 1};
+      static const uint8_t high_pick[8] = {2, 2, 2, 2, 3, 3, 3, 3};
+      static const int8_t step_list[8] = {0, -2, -4, -6, 0, -2, -4, -6};
+      const int8x8_t step_data = vld1_s8(step_list);
+      float32x4_t wide_total = vdupq_n_f32(0.0f);
+      for (; slot + 16 <= span_count; slot += 16) {
+        uint32_t word_value;
+        uint8x8_t pack_data;
+        uint8x8_t part_list[2];
+        int part_index;
+        memcpy(&word_value, byte_head + slot / 4, 4);
+        pack_data = vreinterpret_u8_u32(vdup_n_u32(word_value));
+        part_list[0] = vtbl1_u8(pack_data, vld1_u8(low_pick));
+        part_list[1] = vtbl1_u8(pack_data, vld1_u8(high_pick));
+        for (part_index = 0; part_index < 2; ++part_index) {
+          uint16x8_t code_word = vmovl_u8(
+              vand_u8(vshl_u8(part_list[part_index], step_data), vdup_n_u8(3)));
+          wide_total = vmlaq_f32(wide_total, vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_word))),
+                                 vld1q_f32(act_data + slot + part_index * 8));
+          wide_total = vmlaq_f32(wide_total, vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_word))),
+                                 vld1q_f32(act_data + slot + part_index * 8 + 4));
+        }
+      }
+      total = kern_wide_total(wide_total);
+    }
+#endif
+    for (; slot + 4 <= span_count; slot += 4) {
       uint8_t quad = byte_head[slot / 4];
       total += (float)(quad & 3u) * act_data[slot];
       total += (float)((quad >> 2) & 3u) * act_data[slot + 1];
       total += (float)((quad >> 4) & 3u) * act_data[slot + 2];
       total += (float)((quad >> 6) & 3u) * act_data[slot + 3];
     }
+    for (; slot < span_count; ++slot)
+      total += (float)((byte_head[slot / 4] >> (2 * (slot & 3))) & 3u) * act_data[slot];
     return total;
   }
-  for (slot = 0; slot < span_count; ++slot)
+
+  for (; slot < span_count; ++slot)
     total += (float)pack_read(code_row, (size_t)(from_index + slot), bit_count) * act_data[slot];
   return total;
 }
@@ -1480,25 +1682,78 @@ static float kern_row_code(const plane *sheet, int row_index, const float *act_d
 
 typedef struct kern_job {
   const plane *sheet;
-  const float *act_data;
-  const float *sum_data;
-  float       *out_data;
+  const float *act_data;  /* lane_count rows of col_count, act_stride apart */
+  const float *sum_data;  /* lane_count rows of group_count, sum_stride apart */
+  float       *out_data;  /* lane_count rows of row_count, out_stride apart */
+  int          act_stride;
+  int          sum_stride;
+  int          out_stride;
+  int          lane_count;
 } kern_job;
+
+/* Codes are unpacked once per group and reused by every lane, so a batch pays
+ * the decode cost of a single vector and turns the projection into a product. */
+static void kern_row_code_many(const plane *sheet, int row_index, const kern_job *job) {
+  const uint8_t *code_row = sheet->code_data + (size_t)row_index * sheet->row_stride;
+  size_t gain_base = (size_t)row_index * (size_t)sheet->group_count;
+  float part_list[KERN_LANE_LIMIT];
+  float code_room[KERN_SPREAD_LIMIT];
+  int lane_index, group_index;
+  for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
+    job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] = 0.0f;
+  for (group_index = 0; group_index < sheet->group_count; ++group_index) {
+    int from_index = group_index * sheet->group_size;
+    int span_count = sheet->col_count - from_index;
+    float gain_value = plane_gain(sheet, gain_base + (size_t)group_index);
+    float bias_value = (float)(sheet->code_bias +
+                               (sheet->bias_data ? sheet->bias_data[gain_base + (size_t)group_index] : 0));
+    int done_count = 0;
+    if (span_count > sheet->group_size) span_count = sheet->group_size;
+    for (lane_index = 0; lane_index < job->lane_count; ++lane_index) part_list[lane_index] = 0.0f;
+    while (done_count < span_count) {
+      int chunk_count = span_count - done_count;
+      int slot;
+      if (chunk_count > KERN_SPREAD_LIMIT) chunk_count = KERN_SPREAD_LIMIT;
+      for (slot = 0; slot < chunk_count; ++slot)
+        code_room[slot] = (float)pack_read(code_row, (size_t)(from_index + done_count + slot),
+                                           sheet->bit_count);
+      for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
+        part_list[lane_index] += kern_dot_real(
+            code_room, STORE_F32,
+            job->act_data + (size_t)lane_index * (size_t)job->act_stride + from_index + done_count,
+            chunk_count);
+      done_count += chunk_count;
+    }
+    for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
+      job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] +=
+          gain_value * (part_list[lane_index] -
+                        bias_value *
+                            job->sum_data[(size_t)lane_index * (size_t)job->sum_stride +
+                                          (size_t)group_index]);
+  }
+}
 
 static void kern_mat_vec_band(void *state, int slice_index, int slice_count) {
   kern_job *job = (kern_job *)state;
   const plane *sheet = job->sheet;
-  int row_from, row_upto, row_index;
+  int row_from, row_upto, row_index, lane_index;
   slice_span(sheet->row_count, slice_index, slice_count, &row_from, &row_upto);
   if (sheet->form == PLANE_REAL) {
     size_t row_span = (size_t)sheet->col_count * store_type_bytes(sheet->real_type);
-    for (row_index = row_from; row_index < row_upto; ++row_index)
-      job->out_data[row_index] =
-          kern_dot_real((const uint8_t *)sheet->real_data + (size_t)row_index * row_span,
-                        sheet->real_type, job->act_data, sheet->col_count);
-  } else {
+    for (row_index = row_from; row_index < row_upto; ++row_index) {
+      const uint8_t *row_head = (const uint8_t *)sheet->real_data + (size_t)row_index * row_span;
+      for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
+        job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] =
+            kern_dot_real(row_head, sheet->real_type,
+                          job->act_data + (size_t)lane_index * (size_t)job->act_stride,
+                          sheet->col_count);
+    }
+  } else if (job->lane_count == 1) {
     for (row_index = row_from; row_index < row_upto; ++row_index)
       job->out_data[row_index] = kern_row_code(sheet, row_index, job->act_data, job->sum_data);
+  } else {
+    for (row_index = row_from; row_index < row_upto; ++row_index)
+      kern_row_code_many(sheet, row_index, job);
   }
 }
 
@@ -1596,6 +1851,8 @@ typedef struct back_desk {
   float      *sum_room; /* scratch for per-group activation sums */
   int         sum_limit;
   void (*mat_vec)(struct back_desk *desk, const plane *sheet, const float *act_data, float *out_data);
+  void (*mat_mat)(struct back_desk *desk, const plane *sheet, const float *act_data, int act_stride,
+                  int lane_count, float *out_data, int out_stride);
   void (*norm_rms)(struct back_desk *desk, const float *value_list, const float *gain_list,
                    int value_count, float eps_value, float *value_out);
   void (*soft_max)(struct back_desk *desk, float *value_list, int value_count);
@@ -1604,21 +1861,39 @@ typedef struct back_desk {
                     const float *sin_list);
 } back_desk;
 
+static void back_mat_mat(back_desk *desk, const plane *sheet, const float *act_data, int act_stride,
+                         int lane_count, float *out_data, int out_stride) {
+  int done_count = 0;
+  while (done_count < lane_count) {
+    int chunk_count = lane_count - done_count;
+    kern_job job;
+    if (chunk_count > KERN_LANE_LIMIT) chunk_count = KERN_LANE_LIMIT;
+    job.sheet = sheet;
+    job.act_data = act_data + (size_t)done_count * (size_t)act_stride;
+    job.out_data = out_data + (size_t)done_count * (size_t)out_stride;
+    job.act_stride = act_stride;
+    job.out_stride = out_stride;
+    job.sum_stride = sheet->group_count;
+    job.lane_count = chunk_count;
+    job.sum_data = NULL;
+    if (sheet->form == PLANE_CODE) {
+      int lane_index;
+      for (lane_index = 0; lane_index < chunk_count; ++lane_index)
+        kern_group_sum(sheet, job.act_data + (size_t)lane_index * (size_t)act_stride,
+                       desk->sum_room + (size_t)lane_index * (size_t)sheet->group_count);
+      job.sum_data = desk->sum_room;
+    }
+    if (desk->pool_ref && sheet->row_count >= 64)
+      pool_run(desk->pool_ref, kern_mat_vec_band, &job);
+    else
+      kern_mat_vec_band(&job, 0, 1);
+    done_count += chunk_count;
+  }
+}
+
 static void back_mat_vec(back_desk *desk, const plane *sheet, const float *act_data,
                          float *out_data) {
-  kern_job job;
-  job.sheet = sheet;
-  job.act_data = act_data;
-  job.out_data = out_data;
-  job.sum_data = NULL;
-  if (sheet->form == PLANE_CODE) {
-    kern_group_sum(sheet, act_data, desk->sum_room);
-    job.sum_data = desk->sum_room;
-  }
-  if (desk->pool_ref && sheet->row_count >= 64)
-    pool_run(desk->pool_ref, kern_mat_vec_band, &job);
-  else
-    kern_mat_vec_band(&job, 0, 1);
+  back_mat_mat(desk, sheet, act_data, 0, 1, out_data, 0);
 }
 
 static void back_norm_rms(back_desk *desk, const float *value_list, const float *gain_list,
@@ -1661,9 +1936,10 @@ static app_code back_open(back_desk *desk, pool_group *pool_ref, int sum_limit) 
   desk->name_text = back_flavor();
   desk->pool_ref = pool_ref;
   desk->sum_limit = sum_limit > 0 ? sum_limit : 1;
-  desk->sum_room = (float *)mem_clear(sizeof(float) * (size_t)desk->sum_limit);
+  desk->sum_room = (float *)mem_clear(sizeof(float) * (size_t)desk->sum_limit * KERN_LANE_LIMIT);
   if (!desk->sum_room) return APP_FAIL_MEMORY;
   desk->mat_vec = back_mat_vec;
+  desk->mat_mat = back_mat_mat;
   desk->norm_rms = back_norm_rms;
   desk->soft_max = back_soft_max;
   desk->gelu_gate = back_gelu_gate;
@@ -1711,6 +1987,9 @@ typedef struct model_form {
   int twin_flag;      /* attention_k_eq_v */
   int wide_flag;      /* use_double_wide_mlp */
   int moe_flag;
+  int expert_count;   /* num_experts */
+  int expert_top;     /* top_k_experts */
+  int expert_inner;   /* moe_intermediate_size */
   int window_limit;
   float norm_eps;
   float logit_cap;
@@ -1719,6 +1998,7 @@ typedef struct model_form {
   int pad_id;
   char kind_list[MODEL_LAYER_LIMIT];
   rope_form rope_list[MODEL_KIND_COUNT];
+  char rope_kind[MODEL_KIND_COUNT][16];
 } model_form;
 
 typedef struct layer_wing {
@@ -1735,6 +2015,17 @@ typedef struct layer_wing {
   plane query_sheet, key_sheet, value_sheet, exit_sheet;
   plane gate_sheet, rise_sheet, drop_sheet;
   plane ple_gate_sheet, ple_lift_sheet;
+
+  /* Mixture-of-experts side branch, present only when `enable_moe_block` is set.
+   * The dense mlp above stays in place as the always-on shared expert. */
+  plane  route_sheet;        /* router.proj, one row per expert */
+  float *route_scale;        /* router.scale, one gain per channel */
+  float *route_gain;         /* router.per_expert_scale */
+  plane *expert_rise_list;   /* experts.gate_up_proj, one view per expert */
+  plane *expert_drop_list;   /* experts.down_proj, one view per expert */
+  float *after_mlp_norm;     /* post_feedforward_layernorm_1, the dense branch */
+  float *before_moe_norm;    /* pre_feedforward_layernorm_2 */
+  float *after_moe_norm;     /* post_feedforward_layernorm_2 */
 
   float *query_norm, *key_norm;
   float *enter_norm, *after_attn_norm, *before_feed_norm, *after_feed_norm, *after_ple_norm;
@@ -1791,27 +2082,45 @@ static int zero_read(const uint32_t *word_list, int group_count, int group_index
   return (int)(window & ((1u << bit_count) - 1u)) - (1 << (bit_count - 1));
 }
 
-/* Resolves `prefix.name` to either a real or a code plane. */
-static app_code plane_bind(app_model *model, const char *stem, plane *sheet_out) {
+/* Locates `stem.weight`, or the bare `stem` when the reference holds the weight
+ * as a plain parameter rather than a module, as the stacked expert tensors do. */
+static const store_span *plane_find(app_model *model, const char *stem, const char *leaf) {
   char name_text[512];
   const store_span *span;
-  memset(sheet_out, 0, sizeof(*sheet_out));
-
-  snprintf(name_text, sizeof(name_text), "%s.weight", stem);
+  snprintf(name_text, sizeof(name_text), "%s.%s", stem, leaf);
   span = store_find(&model->store, name_text);
+  if (span) return span;
+  if (strcmp(leaf, "weight") != 0) return NULL;
+  return store_find(&model->store, stem);
+}
+
+/* Resolves `prefix.name` to either a real or a code plane.
+ *
+ * `part_count` above one selects one slice of a tensor that carries a leading
+ * expert axis; the slice is a view, so no payload is copied. */
+static app_code plane_bind_part(app_model *model, const char *stem, int part_index, int part_count,
+                                plane *sheet_out) {
+  const store_span *span;
+  memset(sheet_out, 0, sizeof(*sheet_out));
+  if (part_count < 1 || part_index < 0 || part_index >= part_count) return APP_FAIL_ARGUMENT;
+
+  span = plane_find(model, stem, "weight");
   if (span) {
-    if (span->rank_count != 2) return APP_FAIL_FORMAT;
+    size_t part_slots;
+    if (span->rank_count != (part_count > 1 ? 3 : 2)) return APP_FAIL_FORMAT;
+    if (part_count > 1 && (int)span->size_list[0] != part_count) return APP_FAIL_FORMAT;
     sheet_out->form = PLANE_REAL;
-    sheet_out->row_count = (int)span->size_list[0];
-    sheet_out->col_count = (int)span->size_list[1];
-    sheet_out->real_data = span->data_base;
+    sheet_out->row_count = (int)span->size_list[span->rank_count - 2];
+    sheet_out->col_count = (int)span->size_list[span->rank_count - 1];
+    part_slots = (size_t)sheet_out->row_count * (size_t)sheet_out->col_count;
+    sheet_out->real_data = (const uint8_t *)span->data_base +
+                           (size_t)part_index * part_slots * store_type_bytes(span->type_kind);
     sheet_out->real_type = span->type_kind;
-    model->weight_bytes += span->data_bytes;
+    if (part_index == 0) model->weight_bytes += span->data_bytes;
     return APP_OKAY;
   }
 
-  snprintf(name_text, sizeof(name_text), "%s.weight_packed", stem);
-  span = store_find(&model->store, name_text);
+  span = plane_find(model, stem, "weight_packed");
   if (!span) return APP_FAIL_MISSING;
   {
     const store_span *gain_span;
@@ -1820,22 +2129,26 @@ static app_code plane_bind(app_model *model, const char *stem, plane *sheet_out)
     int row_count, col_count, word_count, group_count, bit_count;
     char other_text[512];
 
-    if (span->rank_count != 2 || span->type_kind != STORE_I32) return APP_FAIL_SUPPORT;
-    row_count = (int)span->size_list[0];
-    word_count = (int)span->size_list[1];
+    if (span->rank_count != (part_count > 1 ? 3 : 2) || span->type_kind != STORE_I32)
+      return APP_FAIL_SUPPORT;
+    if (part_count > 1 && (int)span->size_list[0] != part_count) return APP_FAIL_FORMAT;
+    row_count = (int)span->size_list[span->rank_count - 2];
+    word_count = (int)span->size_list[span->rank_count - 1];
 
     snprintf(other_text, sizeof(other_text), "%s.weight_scale", stem);
     gain_span = store_find(&model->store, other_text);
     if (!gain_span) return APP_FAIL_MISSING;
     snprintf(other_text, sizeof(other_text), "%s.weight_shape", stem);
     shape_span = store_find(&model->store, other_text);
-    if (shape_span && shape_span->rank_count >= 1 && shape_span->size_list[0] >= 2)
-      col_count = (int)whole_read(shape_span->data_base, shape_span->type_kind, 1);
+    if (shape_span && shape_span->rank_count >= 1 &&
+        shape_span->size_list[shape_span->rank_count - 1] >= 2)
+      col_count = (int)whole_read(shape_span->data_base, shape_span->type_kind,
+                                  (size_t)shape_span->size_list[shape_span->rank_count - 1] - 1);
     else
       col_count = (int)((int64_t)word_count * 32 /
                         (model->book.weight_rule.bit_count ? model->book.weight_rule.bit_count : 4));
 
-    group_count = gain_span->rank_count >= 2 ? (int)gain_span->size_list[1] : 1;
+    group_count = gain_span->rank_count >= 2 ? (int)gain_span->size_list[gain_span->rank_count - 1] : 1;
     if (group_count < 1) group_count = 1;
     bit_count = plane_bits_of(col_count, word_count, model->book.weight_rule.bit_count);
     if (bit_count == 0) return APP_FAIL_FORMAT;
@@ -1843,32 +2156,42 @@ static app_code plane_bind(app_model *model, const char *stem, plane *sheet_out)
     sheet_out->form = PLANE_CODE;
     sheet_out->row_count = row_count;
     sheet_out->col_count = col_count;
-    sheet_out->code_data = span->data_base;
+    sheet_out->code_data = (const uint8_t *)span->data_base +
+                           (size_t)part_index * (size_t)row_count * (size_t)word_count * 4u;
     sheet_out->row_stride = (size_t)word_count * 4u;
-    sheet_out->gain_data = gain_span->data_base;
+    sheet_out->gain_data =
+        (const uint8_t *)gain_span->data_base +
+        (size_t)part_index * (size_t)row_count * (size_t)group_count *
+            store_type_bytes(gain_span->type_kind);
     sheet_out->gain_type = gain_span->type_kind;
     sheet_out->bit_count = bit_count;
     sheet_out->code_bias = 1 << (bit_count - 1);
     sheet_out->group_count = group_count;
     sheet_out->group_size = (col_count + group_count - 1) / group_count;
-    model->weight_bytes += span->data_bytes + gain_span->data_bytes;
+    if (part_index == 0) model->weight_bytes += span->data_bytes + gain_span->data_bytes;
 
     snprintf(other_text, sizeof(other_text), "%s.weight_zero_point", stem);
     zero_span = store_find(&model->store, other_text);
     if (zero_span && zero_span->type_kind == STORE_I32) {
       int8_t *bias_room = (int8_t *)mem_clear((size_t)row_count * (size_t)group_count);
+      int word_rows = (int)zero_span->size_list[zero_span->rank_count - 2];
+      const uint32_t *zero_data = (const uint32_t *)zero_span->data_base +
+                                  (size_t)part_index * (size_t)word_rows * (size_t)group_count;
       int row_index, group_index;
       if (!bias_room) return APP_FAIL_MEMORY;
       for (row_index = 0; row_index < row_count; ++row_index)
         for (group_index = 0; group_index < group_count; ++group_index)
           bias_room[(size_t)row_index * (size_t)group_count + (size_t)group_index] =
-              (int8_t)zero_read((const uint32_t *)zero_span->data_base, group_count, group_index,
-                                row_index, bit_count);
+              (int8_t)zero_read(zero_data, group_count, group_index, row_index, bit_count);
       sheet_out->bias_data = bias_room;
       sheet_out->own_block = bias_room;
     }
   }
   return APP_OKAY;
+}
+
+static app_code plane_bind(app_model *model, const char *stem, plane *sheet_out) {
+  return plane_bind_part(model, stem, 0, 1, sheet_out);
 }
 
 static app_code plane_bind_at(app_model *model, const char *shape_text, int layer_index,
@@ -1909,6 +2232,8 @@ static void rope_build(rope_form *rope, int head_size, const char *type_text) {
   int angle_index;
   int half_count = head_size / 2;
   int turn_count = half_count;
+  mem_free(rope->step_list);
+  rope->step_list = NULL;
   if (type_text && strcmp(type_text, "proportional") == 0)
     turn_count = (int)((double)rope->part_share * head_size / 2.0);
   if (turn_count > half_count) turn_count = half_count;
@@ -1996,7 +2321,7 @@ static app_code config_read(app_model *model, const char *folder_path) {
   form->head_count = (int)json_field_number(tree, text_index, "num_attention_heads", 8);
   form->kv_count = (int)json_field_number(tree, text_index, "num_key_value_heads", 4);
   form->head_size = (int)json_field_number(tree, text_index, "head_dim", 256);
-  form->whole_head_size = (int)json_field_number(tree, text_index, "global_head_dim", 512);
+  form->whole_head_size = (int)json_field_number(tree, text_index, "global_head_dim", 0);
   form->whole_kv_count =
       (int)json_field_number(tree, text_index, "num_global_key_value_heads", form->kv_count);
   form->slide_span = (int)json_field_number(tree, text_index, "sliding_window", 512);
@@ -2006,6 +2331,9 @@ static app_code config_read(app_model *model, const char *folder_path) {
   form->twin_flag = json_field_flag(tree, text_index, "attention_k_eq_v", 0);
   form->wide_flag = json_field_flag(tree, text_index, "use_double_wide_mlp", 0);
   form->moe_flag = json_field_flag(tree, text_index, "enable_moe_block", 0);
+  form->expert_count = (int)json_field_number(tree, text_index, "num_experts", 0);
+  form->expert_top = (int)json_field_number(tree, text_index, "top_k_experts", 0);
+  form->expert_inner = (int)json_field_number(tree, text_index, "moe_intermediate_size", 0);
   form->norm_eps = (float)json_field_number(tree, text_index, "rms_norm_eps", 1e-6);
   form->logit_cap = (float)json_field_number(tree, text_index, "final_logit_softcapping", 0.0);
   form->window_limit = (int)json_field_number(tree, text_index, "max_position_embeddings", 131072);
@@ -2019,7 +2347,23 @@ static app_code config_read(app_model *model, const char *folder_path) {
       form->close_id = (int)json_number(tree, close_index, 1.0);
   }
   if (form->layer_count > MODEL_LAYER_LIMIT) { json_free(tree); return APP_FAIL_SUPPORT; }
-  if (form->moe_flag) { json_free(tree); return APP_FAIL_SUPPORT; }
+  if (form->whole_head_size < 1) {
+    /* `global_head_dim` is a constructor argument upstream, not a stored field:
+     * what `save_pretrained` writes is a `per_layer_config` map of the layers
+     * that override it. Read that, and fall back to the plain head size. */
+    int32_t over_index = json_field(tree, text_index, "per_layer_config");
+    int32_t child_index = over_index >= 0 ? tree->node_list[over_index].head_child : -1;
+    for (; child_index >= 0; child_index = tree->node_list[child_index].next_peer) {
+      int over_size = (int)json_field_number(tree, child_index, "head_dim", 0);
+      if (over_size > form->whole_head_size) form->whole_head_size = over_size;
+    }
+    if (form->whole_head_size < 1) form->whole_head_size = form->head_size;
+  }
+  if (form->moe_flag) {
+    if (form->expert_count < 1) { json_free(tree); return APP_FAIL_SUPPORT; }
+    if (form->expert_top < 1 || form->expert_top > form->expert_count)
+      form->expert_top = form->expert_count;
+  }
 
   {
     int32_t kind_index = json_field(tree, text_index, "layer_types");
@@ -2038,9 +2382,11 @@ static app_code config_read(app_model *model, const char *folder_path) {
     const char *type_text = NULL;
     config_rope_read(tree, text_index, "sliding_attention", &form->rope_list[MODEL_KIND_SLIDE],
                      10000.0, &type_text);
+    text_fill(form->rope_kind[MODEL_KIND_SLIDE], sizeof(form->rope_kind[0]), type_text);
     rope_build(&form->rope_list[MODEL_KIND_SLIDE], form->head_size, type_text);
     config_rope_read(tree, text_index, "full_attention", &form->rope_list[MODEL_KIND_WHOLE],
                      1000000.0, &type_text);
+    text_fill(form->rope_kind[MODEL_KIND_WHOLE], sizeof(form->rope_kind[0]), type_text);
     rope_build(&form->rope_list[MODEL_KIND_WHOLE], form->whole_head_size, type_text);
   }
 
@@ -2215,6 +2561,61 @@ static app_code model_bind(app_model *model) {
       if (!wing->after_ple_norm) return APP_FAIL_MISSING;
     }
 
+    if (form->moe_flag) {
+      int expert_index;
+      int inner_size;
+      snprintf(stem_text, sizeof(stem_text), "%slayers.%d.router.proj", model->prefix_text,
+               layer_index);
+      code = plane_bind(model, stem_text, &wing->route_sheet);
+      if (code != APP_OKAY) return code;
+      /* Every layer must agree on the expert count, because the session rooms
+       * and the free walk are sized once from the form. */
+      if (wing->route_sheet.row_count != form->expert_count) return APP_FAIL_FORMAT;
+
+      snprintf(stem_text, sizeof(stem_text), "%slayers.%d.router.scale", model->prefix_text,
+               layer_index);
+      wing->route_scale = vec_bind(model, stem_text, form->state_size);
+      snprintf(stem_text, sizeof(stem_text), "%slayers.%d.router.per_expert_scale",
+               model->prefix_text, layer_index);
+      wing->route_gain = vec_bind(model, stem_text, form->expert_count);
+      if (!wing->route_scale || !wing->route_gain) return APP_FAIL_MISSING;
+
+      wing->expert_rise_list = (plane *)mem_clear(sizeof(plane) * (size_t)form->expert_count);
+      wing->expert_drop_list = (plane *)mem_clear(sizeof(plane) * (size_t)form->expert_count);
+      if (!wing->expert_rise_list || !wing->expert_drop_list) return APP_FAIL_MEMORY;
+      for (expert_index = 0; expert_index < form->expert_count; ++expert_index) {
+        snprintf(stem_text, sizeof(stem_text), "%slayers.%d.experts.gate_up_proj",
+                 model->prefix_text, layer_index);
+        code = plane_bind_part(model, stem_text, expert_index, form->expert_count,
+                               &wing->expert_rise_list[expert_index]);
+        if (code != APP_OKAY) return code;
+        snprintf(stem_text, sizeof(stem_text), "%slayers.%d.experts.down_proj", model->prefix_text,
+                 layer_index);
+        code = plane_bind_part(model, stem_text, expert_index, form->expert_count,
+                               &wing->expert_drop_list[expert_index]);
+        if (code != APP_OKAY) return code;
+      }
+      /* gate_up_proj stacks the gate rows above the rise rows, so the expert
+       * width is half its row count whatever the configuration claims. It too
+       * has to hold for every layer. */
+      inner_size = wing->expert_rise_list[0].row_count / 2;
+      if (inner_size < 1) return APP_FAIL_FORMAT;
+      if (layer_index == 0) form->expert_inner = inner_size;
+      else if (inner_size != form->expert_inner) return APP_FAIL_FORMAT;
+
+      snprintf(stem_text, sizeof(stem_text), "%slayers.%d.post_feedforward_layernorm_1",
+               model->prefix_text, layer_index);
+      wing->after_mlp_norm = vec_bind(model, stem_text, form->state_size);
+      snprintf(stem_text, sizeof(stem_text), "%slayers.%d.pre_feedforward_layernorm_2",
+               model->prefix_text, layer_index);
+      wing->before_moe_norm = vec_bind(model, stem_text, form->state_size);
+      snprintf(stem_text, sizeof(stem_text), "%slayers.%d.post_feedforward_layernorm_2",
+               model->prefix_text, layer_index);
+      wing->after_moe_norm = vec_bind(model, stem_text, form->state_size);
+      if (!wing->after_mlp_norm || !wing->before_moe_norm || !wing->after_moe_norm)
+        return APP_FAIL_MISSING;
+    }
+
     wing->layer_gain = 1.0f;
     {
       char gain_text[512];
@@ -2225,6 +2626,21 @@ static app_code model_bind(app_model *model) {
       if (gain_span) wing->layer_gain = real_read(gain_span->data_base, gain_span->type_kind, 0);
     }
   }
+
+  /* The rope tables are rebuilt from the head size the tensors imply, because
+   * that is the only source that cannot disagree with the weights. The
+   * configuration is a hint; `q_proj` is the truth. */
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    layer_wing *wing = &model->wing_list[layer_index];
+    rope_form *rope = &form->rope_list[(int)wing->kind_mark];
+    if (wing->head_size < 2 || rope->half_count == wing->head_size / 2) continue;
+    rope_build(rope, wing->head_size, form->rope_kind[(int)wing->kind_mark]);
+    if (!rope->step_list) return APP_FAIL_MEMORY;
+  }
+  form->head_size = model->wing_list[0].head_size;
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index)
+    if (model->wing_list[layer_index].kind_mark == MODEL_KIND_WHOLE)
+      form->whole_head_size = model->wing_list[layer_index].head_size;
 
   /* Cache depth: full length where another layer reads these keys, window otherwise. */
   for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
@@ -2643,6 +3059,61 @@ static int token_decode_book(const token_book *book, int32_t id_value, char *tex
 /* 9. session layer                                                         */
 /* ======================================================================== */
 
+/* Named activation snapshots, for comparing against the reference one tensor
+ * at a time. A disagreement in the logits alone says only that something is
+ * wrong; a disagreement in `layer.3.attn` names the function. The whole
+ * facility compiles away unless APP_TRACE is defined, so a normal build pays
+ * nothing, not even a branch. */
+#if defined(APP_TRACE)
+
+static FILE *trace_file = NULL;
+
+static void trace_open(void) {
+  const char *path_text;
+  if (trace_file) return;
+  path_text = getenv("IGLLM_TRACE");
+  if (!path_text || !path_text[0]) return;
+  trace_file = fopen(path_text, "wb");
+  if (trace_file) fwrite("IGTRACE1", 1, 8, trace_file);
+}
+
+static void trace_save(const char *name_text, const float *value_list, int value_count) {
+  uint32_t name_size, slot_count;
+  trace_open();
+  if (!trace_file || !value_list || value_count < 1) return;
+  name_size = (uint32_t)strlen(name_text);
+  slot_count = (uint32_t)value_count;
+  fwrite(&name_size, sizeof(name_size), 1, trace_file);
+  fwrite(name_text, 1, name_size, trace_file);
+  fwrite(&slot_count, sizeof(slot_count), 1, trace_file);
+  fwrite(value_list, sizeof(float), (size_t)value_count, trace_file);
+}
+
+static void trace_lane(const char *stem_text, int layer_index, int place_index,
+                       const float *value_list, int value_count) {
+  char name_text[128];
+  if (layer_index >= 0)
+    snprintf(name_text, sizeof(name_text), "layer.%d.%s.%d", layer_index, stem_text, place_index);
+  else
+    snprintf(name_text, sizeof(name_text), "%s.%d", stem_text, place_index);
+  trace_save(name_text, value_list, value_count);
+}
+
+static void trace_close(void) {
+  if (!trace_file) return;
+  fclose(trace_file);
+  trace_file = NULL;
+}
+
+#define TRACE_LANE(stem, layer, place, data, count) \
+  trace_lane((stem), (layer), (place), (data), (count))
+#define TRACE_CLOSE() trace_close()
+
+#else
+#define TRACE_LANE(stem, layer, place, data, count) ((void)0)
+#define TRACE_CLOSE() ((void)0)
+#endif
+
 struct app_session {
   app_model *model;
   int        fill_count;
@@ -2651,6 +3122,16 @@ struct app_session {
 
   float **key_store;
   float **value_store;
+
+  /* Every room below the stride block holds KERN_LANE_LIMIT lanes, one per
+   * token of a batched pass, laid out lane by lane with the stride named. */
+  int state_stride;
+  int lift_stride;
+  int quant_stride;
+  int head_stride;
+  int gate_stride;
+  int rise_stride;
+  int ple_stride;
 
   float *state_room;
   float *scrap_room;
@@ -2668,23 +3149,42 @@ struct app_session {
   float *ple_seed;
   float *ple_room;
   float *logit_room;
+  float *route_room;    /* router probabilities, one per expert */
+  float *expert_room;   /* stacked gate and rise activations of one expert */
+  float *expert_drop;   /* one expert's contribution, state width */
+  float *moe_room;      /* the summed mixture branch, state width */
+  float *top_weight;    /* the selected experts' mixing weights */
+  int   *top_slot;      /* the selected experts */
   void  *pick_room;
   int32_t *echo_room;
   int      echo_count;
   int      echo_limit;
 };
 
-/* Applies the activation rule declared by the checkpoint, then multiplies. */
-static void session_lift(app_session *session, const plane *sheet, const float *act_data,
-                         float *out_data) {
+/* Applies the activation rule declared by the checkpoint, then multiplies.
+ * A lane count above one turns the projection into a matrix product. */
+static void session_lift_many(app_session *session, const plane *sheet, const float *act_data,
+                              int act_stride, int lane_count, float *out_data, int out_stride) {
   app_model *model = session->model;
   const float *use_data = act_data;
+  int use_stride = act_stride;
   if (model->book.input_rule.live_flag && sheet->form == PLANE_CODE) {
-    memcpy(session->quant_room, act_data, sizeof(float) * (size_t)sheet->col_count);
-    quant_act(session->quant_room, sheet->col_count, &model->book.input_rule);
+    int lane_index;
+    for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+      float *lane_data = session->quant_room + (size_t)lane_index * (size_t)session->quant_stride;
+      memcpy(lane_data, act_data + (size_t)lane_index * (size_t)act_stride,
+             sizeof(float) * (size_t)sheet->col_count);
+      quant_act(lane_data, sheet->col_count, &model->book.input_rule);
+    }
     use_data = session->quant_room;
+    use_stride = session->quant_stride;
   }
-  model->desk.mat_vec(&model->desk, sheet, use_data, out_data);
+  model->desk.mat_mat(&model->desk, sheet, use_data, use_stride, lane_count, out_data, out_stride);
+}
+
+static void session_lift(app_session *session, const plane *sheet, const float *act_data,
+                         float *out_data) {
+  session_lift_many(session, sheet, act_data, 0, 1, out_data, 0);
 }
 
 static void session_free_rooms(app_session *session) {
@@ -2713,11 +3213,17 @@ static void session_free_rooms(app_session *session) {
   mem_free(session->ple_seed);
   mem_free(session->ple_room);
   mem_free(session->logit_room);
+  mem_free(session->route_room);
+  mem_free(session->expert_room);
+  mem_free(session->expert_drop);
+  mem_free(session->moe_room);
+  mem_free(session->top_weight);
+  mem_free(session->top_slot);
   mem_free(session->pick_room);
   mem_free(session->echo_room);
 }
 
-static void session_attend(app_session *session, int layer_index, int place_index,
+static void session_attend(app_session *session, int layer_index, int place_from, int lane_count,
                            const float *enter_data, float *exit_data) {
   app_model *model = session->model;
   model_form *form = &model->form;
@@ -2725,165 +3231,310 @@ static void session_attend(app_session *session, int layer_index, int place_inde
   layer_wing *owner = wing->share_flag ? &model->wing_list[wing->source_slot] : wing;
   int owner_slot = wing->share_flag ? wing->source_slot : layer_index;
   int head_size = wing->head_size;
-  int half_size = head_size / 2;
   int kv_width = wing->kv_count * head_size;
-  int head_index, place_from, place_upto;
+  int head_stride = session->head_stride;
+  int state_stride = session->state_stride;
+  int head_index, lane_index;
 
-  rope_wave(&form->rope_list[wing->kind_mark], place_index, session->cos_room, session->sin_room);
-
-  session_lift(session, &wing->query_sheet, enter_data, session->query_room);
-  for (head_index = 0; head_index < form->head_count; ++head_index) {
-    float *head_data = session->query_room + (size_t)head_index * head_size;
-    model->desk.norm_rms(&model->desk, head_data, wing->query_norm, head_size, form->norm_eps,
-                         head_data);
-    model->desk.rope_turn(&model->desk, head_data, head_size, session->cos_room, session->sin_room);
-  }
-
+  session_lift_many(session, &wing->query_sheet, enter_data, state_stride, lane_count,
+                    session->query_room, head_stride);
   if (!wing->share_flag) {
-    float *key_slot = session->key_store[layer_index] +
-                      (size_t)(place_index % wing->cache_span) * (size_t)kv_width;
-    float *value_slot = session->value_store[layer_index] +
-                        (size_t)(place_index % wing->cache_span) * (size_t)kv_width;
-    session_lift(session, &wing->key_sheet, enter_data, session->key_room);
+    session_lift_many(session, &wing->key_sheet, enter_data, state_stride, lane_count,
+                      session->key_room, head_stride);
     if (wing->value_sheet.form != PLANE_VOID)
-      session_lift(session, &wing->value_sheet, enter_data, session->value_room);
-    else
-      memcpy(session->value_room, session->key_room, sizeof(float) * (size_t)kv_width);
-
-    for (head_index = 0; head_index < wing->kv_count; ++head_index) {
-      float *key_head = session->key_room + (size_t)head_index * head_size;
-      float *value_head = session->value_room + (size_t)head_index * head_size;
-      model->desk.norm_rms(&model->desk, key_head, wing->key_norm, head_size, form->norm_eps,
-                           key_head);
-      model->desk.rope_turn(&model->desk, key_head, head_size, session->cos_room, session->sin_room);
-      model->desk.norm_rms(&model->desk, value_head, NULL, head_size, form->norm_eps, value_head);
-    }
-    memcpy(key_slot, session->key_room, sizeof(float) * (size_t)kv_width);
-    memcpy(value_slot, session->value_room, sizeof(float) * (size_t)kv_width);
+      session_lift_many(session, &wing->value_sheet, enter_data, state_stride, lane_count,
+                        session->value_room, head_stride);
   }
 
-  place_upto = place_index;
-  place_from = 0;
-  if (wing->kind_mark == MODEL_KIND_SLIDE) {
-    place_from = place_index - form->slide_span + 1;
-    if (place_from < 0) place_from = 0;
-  }
-  (void)half_size;
-
-  for (head_index = 0; head_index < form->head_count; ++head_index) {
-    const float *query_head = session->query_room + (size_t)head_index * head_size;
-    int kv_index = head_index / wing->group_share;
-    float *blend_head = session->blend_room + (size_t)head_index * head_size;
-    int span_count = place_upto - place_from + 1;
-    int span_index, value_index;
-
-    for (span_index = 0; span_index < span_count; ++span_index) {
-      int slot_index = (place_from + span_index) % owner->cache_span;
-      const float *key_head = session->key_store[owner_slot] +
-                              (size_t)slot_index * (size_t)kv_width + (size_t)kv_index * head_size;
-      session->score_room[span_index] =
-          kern_dot_real(key_head, STORE_F32, query_head, head_size);
+  /* Each lane stores its keys and then attends before the next lane runs, so a
+   * ring buffer narrower than the batch still holds every slot a lane reads. */
+  for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+    int place_index = place_from + lane_index;
+    float *query_lane = session->query_room + (size_t)lane_index * (size_t)head_stride;
+    float *blend_lane = session->blend_room + (size_t)lane_index * (size_t)head_stride;
+    int place_start = 0;
+    rope_wave(&form->rope_list[wing->kind_mark], place_index, session->cos_room, session->sin_room);
+    for (head_index = 0; head_index < form->head_count; ++head_index) {
+      float *head_data = query_lane + (size_t)head_index * head_size;
+      model->desk.norm_rms(&model->desk, head_data, wing->query_norm, head_size, form->norm_eps,
+                           head_data);
+      model->desk.rope_turn(&model->desk, head_data, head_size, session->cos_room,
+                            session->sin_room);
     }
-    model->desk.soft_max(&model->desk, session->score_room, span_count);
+    if (!wing->share_flag) {
+      float *key_lane = session->key_room + (size_t)lane_index * (size_t)head_stride;
+      float *value_lane = session->value_room + (size_t)lane_index * (size_t)head_stride;
+      float *key_slot = session->key_store[layer_index] +
+                        (size_t)(place_index % wing->cache_span) * (size_t)kv_width;
+      float *value_slot = session->value_store[layer_index] +
+                          (size_t)(place_index % wing->cache_span) * (size_t)kv_width;
+      if (wing->value_sheet.form == PLANE_VOID)
+        memcpy(value_lane, key_lane, sizeof(float) * (size_t)kv_width);
+      for (head_index = 0; head_index < wing->kv_count; ++head_index) {
+        float *key_head = key_lane + (size_t)head_index * head_size;
+        float *value_head = value_lane + (size_t)head_index * head_size;
+        model->desk.norm_rms(&model->desk, key_head, wing->key_norm, head_size, form->norm_eps,
+                             key_head);
+        model->desk.rope_turn(&model->desk, key_head, head_size, session->cos_room,
+                              session->sin_room);
+        model->desk.norm_rms(&model->desk, value_head, NULL, head_size, form->norm_eps, value_head);
+      }
+      memcpy(key_slot, key_lane, sizeof(float) * (size_t)kv_width);
+      memcpy(value_slot, value_lane, sizeof(float) * (size_t)kv_width);
+    }
 
-    for (value_index = 0; value_index < head_size; ++value_index) blend_head[value_index] = 0.0f;
-    for (span_index = 0; span_index < span_count; ++span_index) {
-      int slot_index = (place_from + span_index) % owner->cache_span;
-      const float *value_head = session->value_store[owner_slot] +
+    if (wing->kind_mark == MODEL_KIND_SLIDE) {
+      place_start = place_index - form->slide_span + 1;
+      if (place_start < 0) place_start = 0;
+    }
+    for (head_index = 0; head_index < form->head_count; ++head_index) {
+      const float *query_head = query_lane + (size_t)head_index * head_size;
+      int kv_index = head_index / wing->group_share;
+      float *blend_head = blend_lane + (size_t)head_index * head_size;
+      int span_count = place_index - place_start + 1;
+      int span_index, value_index;
+
+      for (span_index = 0; span_index < span_count; ++span_index) {
+        int slot_index = (place_start + span_index) % owner->cache_span;
+        const float *key_head = session->key_store[owner_slot] +
                                 (size_t)slot_index * (size_t)kv_width + (size_t)kv_index * head_size;
-      float weight_value = session->score_room[span_index];
-      for (value_index = 0; value_index < head_size; ++value_index)
-        blend_head[value_index] += weight_value * value_head[value_index];
+        session->score_room[span_index] =
+            kern_dot_real(key_head, STORE_F32, query_head, head_size);
+      }
+      model->desk.soft_max(&model->desk, session->score_room, span_count);
+
+      for (value_index = 0; value_index < head_size; ++value_index) blend_head[value_index] = 0.0f;
+      for (span_index = 0; span_index < span_count; ++span_index) {
+        int slot_index = (place_start + span_index) % owner->cache_span;
+        const float *value_head = session->value_store[owner_slot] +
+                                  (size_t)slot_index * (size_t)kv_width +
+                                  (size_t)kv_index * head_size;
+        float weight_value = session->score_room[span_index];
+        for (value_index = 0; value_index < head_size; ++value_index)
+          blend_head[value_index] += weight_value * value_head[value_index];
+      }
     }
   }
-  session_lift(session, &wing->exit_sheet, session->blend_room, exit_data);
+  session_lift_many(session, &wing->exit_sheet, session->blend_room, head_stride, lane_count,
+                    exit_data, session->lift_stride);
 }
 
-static void session_layer(app_session *session, int layer_index, int place_index,
+/* Router: normalizes, projects to one score per expert, and keeps the top few.
+ * Weights are renormalized to sum to one and then scaled per selected expert. */
+static void session_route(app_session *session, layer_wing *wing, const float *state_data) {
+  app_model *model = session->model;
+  model_form *form = &model->form;
+  float root_gain = (float)(1.0 / sqrt((double)form->state_size));
+  float total_value = 0.0f;
+  int value_index, pick_index;
+
+  model->desk.norm_rms(&model->desk, state_data, NULL, form->state_size, form->norm_eps,
+                       session->moe_room);
+  for (value_index = 0; value_index < form->state_size; ++value_index)
+    session->moe_room[value_index] *= wing->route_scale[value_index] * root_gain;
+  session_lift(session, &wing->route_sheet, session->moe_room, session->route_room);
+  model->desk.soft_max(&model->desk, session->route_room, form->expert_count);
+
+  for (pick_index = 0; pick_index < form->expert_top; ++pick_index) {
+    int best_slot = 0;
+    float best_value = -1.0f;
+    for (value_index = 0; value_index < form->expert_count; ++value_index)
+      if (session->route_room[value_index] > best_value) {
+        best_value = session->route_room[value_index];
+        best_slot = value_index;
+      }
+    session->route_room[best_slot] = -1.0f; /* softmax output is never negative */
+    session->top_slot[pick_index] = best_slot;
+    session->top_weight[pick_index] = best_value;
+    total_value += best_value;
+  }
+  if (total_value <= 0.0f) total_value = 1.0f;
+  for (pick_index = 0; pick_index < form->expert_top; ++pick_index)
+    session->top_weight[pick_index] =
+        session->top_weight[pick_index] / total_value * wing->route_gain[session->top_slot[pick_index]];
+}
+
+/* Runs the selected experts and blends their outputs by the router weights. */
+static void session_expert(app_session *session, layer_wing *wing, const float *act_data,
+                           float *out_data) {
+  app_model *model = session->model;
+  model_form *form = &model->form;
+  int inner_size = form->expert_inner;
+  int pick_index, value_index;
+
+  memset(out_data, 0, sizeof(float) * (size_t)form->state_size);
+  for (pick_index = 0; pick_index < form->expert_top; ++pick_index) {
+    int expert_slot = session->top_slot[pick_index];
+    float weight_value = session->top_weight[pick_index];
+    session_lift(session, &wing->expert_rise_list[expert_slot], act_data, session->expert_room);
+    model->desk.gelu_gate(&model->desk, session->expert_room, session->expert_room + inner_size,
+                          inner_size);
+    session_lift(session, &wing->expert_drop_list[expert_slot], session->expert_room,
+                 session->expert_drop);
+    for (value_index = 0; value_index < form->state_size; ++value_index)
+      out_data[value_index] += weight_value * session->expert_drop[value_index];
+  }
+}
+
+static void session_layer(app_session *session, int layer_index, int place_from, int lane_count,
                           const float *ple_data) {
   app_model *model = session->model;
   model_form *form = &model->form;
   layer_wing *wing = &model->wing_list[layer_index];
   int state_size = form->state_size;
-  float *state_data = session->state_room;
-  float *scrap_data = session->scrap_room;
-  float *lift_data = session->lift_room;
+  int state_stride = session->state_stride;
+  int lift_stride = session->lift_stride;
+  int lane_index;
 
-  model->desk.norm_rms(&model->desk, state_data, wing->enter_norm, state_size, form->norm_eps,
-                       scrap_data);
-  session_attend(session, layer_index, place_index, scrap_data, lift_data);
-  model->desk.norm_rms(&model->desk, lift_data, wing->after_attn_norm, state_size, form->norm_eps,
-                       lift_data);
-  kern_add(state_data, lift_data, state_size);
+  for (lane_index = 0; lane_index < lane_count; ++lane_index)
+    model->desk.norm_rms(&model->desk, session->state_room + (size_t)lane_index * state_stride,
+                         wing->enter_norm, state_size, form->norm_eps,
+                         session->scrap_room + (size_t)lane_index * state_stride);
+  session_attend(session, layer_index, place_from, lane_count, session->scrap_room,
+                 session->lift_room);
+  for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+    float *lift_data = session->lift_room + (size_t)lane_index * lift_stride;
+    TRACE_LANE("attn", layer_index, place_from + lane_index, lift_data, state_size);
+    model->desk.norm_rms(&model->desk, lift_data, wing->after_attn_norm, state_size, form->norm_eps,
+                         lift_data);
+    kern_add(session->state_room + (size_t)lane_index * state_stride, lift_data, state_size);
+    model->desk.norm_rms(&model->desk, session->state_room + (size_t)lane_index * state_stride,
+                         wing->before_feed_norm, state_size, form->norm_eps,
+                         session->scrap_room + (size_t)lane_index * state_stride);
+  }
 
-  model->desk.norm_rms(&model->desk, state_data, wing->before_feed_norm, state_size, form->norm_eps,
-                       scrap_data);
-  session_lift(session, &wing->gate_sheet, scrap_data, session->gate_room);
-  session_lift(session, &wing->rise_sheet, scrap_data, session->rise_room);
-  model->desk.gelu_gate(&model->desk, session->gate_room, session->rise_room, wing->inner_size);
-  session_lift(session, &wing->drop_sheet, session->gate_room, lift_data);
-  model->desk.norm_rms(&model->desk, lift_data, wing->after_feed_norm, state_size, form->norm_eps,
-                       lift_data);
-  kern_add(state_data, lift_data, state_size);
+  session_lift_many(session, &wing->gate_sheet, session->scrap_room, state_stride, lane_count,
+                    session->gate_room, session->gate_stride);
+  session_lift_many(session, &wing->rise_sheet, session->scrap_room, state_stride, lane_count,
+                    session->rise_room, session->rise_stride);
+  for (lane_index = 0; lane_index < lane_count; ++lane_index)
+    model->desk.gelu_gate(&model->desk,
+                          session->gate_room + (size_t)lane_index * session->gate_stride,
+                          session->rise_room + (size_t)lane_index * session->rise_stride,
+                          wing->inner_size);
+  session_lift_many(session, &wing->drop_sheet, session->gate_room, session->gate_stride, lane_count,
+                    session->lift_room, lift_stride);
+  for (lane_index = 0; lane_index < lane_count; ++lane_index)
+    TRACE_LANE("mlp", layer_index, place_from + lane_index,
+               session->lift_room + (size_t)lane_index * lift_stride, state_size);
+
+  if (form->moe_flag) {
+    /* The dense mlp above is the shared expert; the mixture reads the residual
+     * from before it, and the two branches are summed under a third norm.
+     * Each lane picks its own experts, so this branch stays one lane wide. */
+    for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+      float *state_data = session->state_room + (size_t)lane_index * state_stride;
+      float *scrap_data = session->scrap_room + (size_t)lane_index * state_stride;
+      float *lift_data = session->lift_room + (size_t)lane_index * lift_stride;
+      model->desk.norm_rms(&model->desk, lift_data, wing->after_mlp_norm, state_size,
+                           form->norm_eps, lift_data);
+      session_route(session, wing, state_data);
+      model->desk.norm_rms(&model->desk, state_data, wing->before_moe_norm, state_size,
+                           form->norm_eps, scrap_data);
+      session_expert(session, wing, scrap_data, session->moe_room);
+      TRACE_LANE("moe", layer_index, place_from + lane_index, session->moe_room, state_size);
+      model->desk.norm_rms(&model->desk, session->moe_room, wing->after_moe_norm, state_size,
+                           form->norm_eps, session->moe_room);
+      kern_add(lift_data, session->moe_room, state_size);
+    }
+  }
+
+  for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+    float *lift_data = session->lift_room + (size_t)lane_index * lift_stride;
+    model->desk.norm_rms(&model->desk, lift_data, wing->after_feed_norm, state_size, form->norm_eps,
+                         lift_data);
+    kern_add(session->state_room + (size_t)lane_index * state_stride, lift_data, state_size);
+  }
 
   if (form->ple_size > 0) {
-    int value_index;
-    session_lift(session, &wing->ple_gate_sheet, state_data, session->gate_room);
-    for (value_index = 0; value_index < form->ple_size; ++value_index)
-      session->gate_room[value_index] =
-          kern_gelu_tanh(session->gate_room[value_index]) * ple_data[value_index];
-    session_lift(session, &wing->ple_lift_sheet, session->gate_room, lift_data);
-    model->desk.norm_rms(&model->desk, lift_data, wing->after_ple_norm, state_size, form->norm_eps,
-                         lift_data);
-    kern_add(state_data, lift_data, state_size);
+    session_lift_many(session, &wing->ple_gate_sheet, session->state_room, state_stride, lane_count,
+                      session->gate_room, session->gate_stride);
+    for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+      float *gate_data = session->gate_room + (size_t)lane_index * session->gate_stride;
+      const float *lane_ple = ple_data + (size_t)lane_index * session->ple_stride;
+      int value_index;
+      for (value_index = 0; value_index < form->ple_size; ++value_index)
+        gate_data[value_index] = kern_gelu_tanh(gate_data[value_index]) * lane_ple[value_index];
+    }
+    session_lift_many(session, &wing->ple_lift_sheet, session->gate_room, session->gate_stride,
+                      lane_count, session->lift_room, lift_stride);
+    for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+      float *lift_data = session->lift_room + (size_t)lane_index * lift_stride;
+      model->desk.norm_rms(&model->desk, lift_data, wing->after_ple_norm, state_size,
+                           form->norm_eps, lift_data);
+      kern_add(session->state_room + (size_t)lane_index * state_stride, lift_data, state_size);
+    }
   }
-  if (wing->layer_gain != 1.0f) kern_scale(state_data, wing->layer_gain, state_size);
+  if (wing->layer_gain != 1.0f)
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      kern_scale(session->state_room + (size_t)lane_index * state_stride, wing->layer_gain,
+                 state_size);
+
+  for (lane_index = 0; lane_index < lane_count; ++lane_index)
+    TRACE_LANE("out", layer_index, place_from + lane_index,
+               session->state_room + (size_t)lane_index * state_stride, state_size);
 }
 
-/* One token through the whole graph.  `want_logits` skips the output head during prefill. */
-static const float *session_pass(app_session *session, int32_t id_value, int want_logits) {
+/* A batch of tokens through the whole graph.  Logits are produced for the last
+ * token only, and skipped entirely when the caller is still filling the prompt. */
+static const float *session_pass(app_session *session, const int32_t *id_list, int lane_count,
+                                 int want_logits) {
   app_model *model = session->model;
   model_form *form = &model->form;
-  int place_index = session->fill_count;
-  int layer_index;
+  int place_from = session->fill_count;
+  int layer_index, lane_index;
 
-  if (id_value < 0 || id_value >= model->embed_sheet.row_count) return NULL;
-  if (place_index >= form->window_limit) return NULL;
+  if (lane_count < 1 || lane_count > KERN_LANE_LIMIT) return NULL;
+  if (place_from + lane_count > form->window_limit) return NULL;
+  for (lane_index = 0; lane_index < lane_count; ++lane_index)
+    if (id_list[lane_index] < 0 || id_list[lane_index] >= model->embed_sheet.row_count) return NULL;
 
-  plane_row(&model->embed_sheet, id_value, session->state_room);
-  kern_scale(session->state_room, (float)sqrt((double)form->state_size), form->state_size);
+  for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+    float *state_data = session->state_room + (size_t)lane_index * session->state_stride;
+    plane_row(&model->embed_sheet, id_list[lane_index], state_data);
+    kern_scale(state_data, (float)sqrt((double)form->state_size), form->state_size);
+    TRACE_LANE("embed", -1, place_from + lane_index, state_data, form->state_size);
+  }
 
   if (form->ple_size > 0) {
-    int chunk_index;
     float blend_gain = (float)(1.0 / sqrt(2.0));
-    plane_row(&model->ple_embed_sheet, id_value % model->ple_embed_sheet.row_count,
-              session->ple_seed);
-    kern_scale(session->ple_seed, (float)sqrt((double)form->ple_size),
-               form->layer_count * form->ple_size);
-    session_lift(session, &model->ple_lift_sheet, session->state_room, session->ple_room);
-    kern_scale(session->ple_room, (float)(1.0 / sqrt((double)form->state_size)),
-               form->layer_count * form->ple_size);
-    for (chunk_index = 0; chunk_index < form->layer_count; ++chunk_index) {
-      float *chunk_data = session->ple_room + (size_t)chunk_index * form->ple_size;
-      const float *seed_data = session->ple_seed + (size_t)chunk_index * form->ple_size;
-      int value_index;
-      model->desk.norm_rms(&model->desk, chunk_data, model->ple_norm, form->ple_size,
-                           form->norm_eps, chunk_data);
-      for (value_index = 0; value_index < form->ple_size; ++value_index)
-        chunk_data[value_index] = (chunk_data[value_index] + seed_data[value_index]) * blend_gain;
+    int chunk_count = form->layer_count * form->ple_size;
+    session_lift_many(session, &model->ple_lift_sheet, session->state_room, session->state_stride,
+                      lane_count, session->ple_room, session->ple_stride);
+    for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+      float *seed_data = session->ple_seed + (size_t)lane_index * session->ple_stride;
+      float *lane_room = session->ple_room + (size_t)lane_index * session->ple_stride;
+      int chunk_index;
+      plane_row(&model->ple_embed_sheet, id_list[lane_index] % model->ple_embed_sheet.row_count,
+                seed_data);
+      kern_scale(seed_data, (float)sqrt((double)form->ple_size), chunk_count);
+      kern_scale(lane_room, (float)(1.0 / sqrt((double)form->state_size)), chunk_count);
+      for (chunk_index = 0; chunk_index < form->layer_count; ++chunk_index) {
+        float *chunk_data = lane_room + (size_t)chunk_index * form->ple_size;
+        const float *chunk_seed = seed_data + (size_t)chunk_index * form->ple_size;
+        int value_index;
+        model->desk.norm_rms(&model->desk, chunk_data, model->ple_norm, form->ple_size,
+                             form->norm_eps, chunk_data);
+        for (value_index = 0; value_index < form->ple_size; ++value_index)
+          chunk_data[value_index] = (chunk_data[value_index] + chunk_seed[value_index]) * blend_gain;
+      }
     }
   }
 
   for (layer_index = 0; layer_index < form->layer_count; ++layer_index)
-    session_layer(session, layer_index, place_index,
+    session_layer(session, layer_index, place_from, lane_count,
                   session->ple_room + (size_t)layer_index * form->ple_size);
 
-  session->fill_count += 1;
-  if (session->echo_count < session->echo_limit) session->echo_room[session->echo_count++] = id_value;
+  session->fill_count += lane_count;
+  for (lane_index = 0; lane_index < lane_count; ++lane_index)
+    if (session->echo_count < session->echo_limit)
+      session->echo_room[session->echo_count++] = id_list[lane_index];
 
   if (!want_logits) return NULL;
-  model->desk.norm_rms(&model->desk, session->state_room, model->final_norm, form->state_size,
-                       form->norm_eps, session->scrap_room);
+  model->desk.norm_rms(&model->desk,
+                       session->state_room + (size_t)(lane_count - 1) * session->state_stride,
+                       model->final_norm, form->state_size, form->norm_eps, session->scrap_room);
+  TRACE_LANE("final", -1, place_from + lane_count - 1, session->scrap_room, form->state_size);
   session_lift(session, &model->head_sheet, session->scrap_room, session->logit_room);
   if (form->logit_cap > 0.0f) {
     int value_index;
@@ -2891,6 +3542,8 @@ static const float *session_pass(app_session *session, int32_t id_value, int wan
       session->logit_room[value_index] =
           tanhf(session->logit_room[value_index] / form->logit_cap) * form->logit_cap;
   }
+  TRACE_LANE("logits", -1, place_from + lane_count - 1, session->logit_room,
+             model->head_sheet.row_count);
   return session->logit_room;
 }
 
@@ -3000,16 +3653,25 @@ app_code model_load(const char *folder_path, const app_setup *setup, app_model *
   if (model->ple_lift_sheet.group_count > group_peak) group_peak = model->ple_lift_sheet.group_count;
   for (layer_index = 0; layer_index < model->form.layer_count; ++layer_index) {
     layer_wing *wing = &model->wing_list[layer_index];
-    const plane *sheet_list[9];
+    const plane *sheet_list[10];
     int sheet_index;
     sheet_list[0] = &wing->query_sheet; sheet_list[1] = &wing->key_sheet;
     sheet_list[2] = &wing->value_sheet; sheet_list[3] = &wing->exit_sheet;
     sheet_list[4] = &wing->gate_sheet;  sheet_list[5] = &wing->rise_sheet;
     sheet_list[6] = &wing->drop_sheet;  sheet_list[7] = &wing->ple_gate_sheet;
-    sheet_list[8] = &wing->ple_lift_sheet;
-    for (sheet_index = 0; sheet_index < 9; ++sheet_index)
+    sheet_list[8] = &wing->ple_lift_sheet; sheet_list[9] = &wing->route_sheet;
+    for (sheet_index = 0; sheet_index < 10; ++sheet_index)
       if (sheet_list[sheet_index]->group_count > group_peak)
         group_peak = sheet_list[sheet_index]->group_count;
+    if (wing->expert_rise_list && wing->expert_drop_list) {
+      int expert_index;
+      for (expert_index = 0; expert_index < model->form.expert_count; ++expert_index) {
+        if (wing->expert_rise_list[expert_index].group_count > group_peak)
+          group_peak = wing->expert_rise_list[expert_index].group_count;
+        if (wing->expert_drop_list[expert_index].group_count > group_peak)
+          group_peak = wing->expert_drop_list[expert_index].group_count;
+      }
+    }
   }
   code = back_open(&model->desk, &model->pool, group_peak);
   if (code != APP_OKAY) { model_free(model); return code; }
@@ -3036,6 +3698,21 @@ void model_free(app_model *model) {
       mem_free(wing->drop_sheet.own_block);
       mem_free(wing->ple_gate_sheet.own_block);
       mem_free(wing->ple_lift_sheet.own_block);
+      mem_free(wing->route_sheet.own_block);
+      mem_free(wing->route_scale);
+      mem_free(wing->route_gain);
+      if (wing->expert_rise_list && wing->expert_drop_list) {
+        int expert_index;
+        for (expert_index = 0; expert_index < model->form.expert_count; ++expert_index) {
+          mem_free(wing->expert_rise_list[expert_index].own_block);
+          mem_free(wing->expert_drop_list[expert_index].own_block);
+        }
+      }
+      mem_free(wing->expert_rise_list);
+      mem_free(wing->expert_drop_list);
+      mem_free(wing->after_mlp_norm);
+      mem_free(wing->before_moe_norm);
+      mem_free(wing->after_moe_norm);
       mem_free(wing->query_norm);
       mem_free(wing->key_norm);
       mem_free(wing->enter_norm);
@@ -3115,6 +3792,8 @@ int token_frame(const app_model *model, const char *user_text, int32_t *id_list,
 }
 
 app_code session_open(app_model *model, app_session **session_out) {
+#define LANE_ROOM(stride) \
+  ((float *)mem_clear(sizeof(float) * (size_t)(stride) * (size_t)KERN_LANE_LIMIT))
   app_session *session;
   model_form *form;
   int layer_index;
@@ -3132,7 +3811,11 @@ app_code session_open(app_model *model, app_session **session_out) {
     if (wing->head_size > head_peak) head_peak = wing->head_size;
     if (wing->inner_size > inner_peak) inner_peak = wing->inner_size;
   }
+  if (form->moe_flag && 2 * form->expert_inner > inner_peak) inner_peak = 2 * form->expert_inner;
   half_peak = head_peak / 2 + 1;
+  for (layer_index = 0; layer_index < MODEL_KIND_COUNT; ++layer_index)
+    if (form->rope_list[layer_index].half_count >= half_peak)
+      half_peak = form->rope_list[layer_index].half_count + 1;
   wide_peak = form->head_count * head_peak;
   if (form->state_size > wide_peak) wide_peak = form->state_size;
 
@@ -3152,24 +3835,43 @@ app_code session_open(app_model *model, app_session **session_out) {
     }
   }
 
-  session->state_room = (float *)mem_clear(sizeof(float) * (size_t)form->state_size);
-  session->scrap_room = (float *)mem_clear(sizeof(float) * (size_t)form->state_size);
-  session->lift_room = (float *)mem_clear(sizeof(float) * (size_t)wide_peak);
-  session->quant_room = (float *)mem_clear(sizeof(float) * (size_t)(wide_peak + inner_peak));
-  session->query_room = (float *)mem_clear(sizeof(float) * (size_t)(form->head_count * head_peak));
-  session->key_room = (float *)mem_clear(sizeof(float) * (size_t)(form->head_count * head_peak));
-  session->value_room = (float *)mem_clear(sizeof(float) * (size_t)(form->head_count * head_peak));
-  session->blend_room = (float *)mem_clear(sizeof(float) * (size_t)(form->head_count * head_peak));
+  session->state_stride = form->state_size;
+  session->lift_stride = wide_peak;
+  session->quant_stride = wide_peak + inner_peak;
+  session->head_stride = form->head_count * head_peak;
+  session->gate_stride = inner_peak + form->ple_size + 1;
+  session->rise_stride = inner_peak + 1;
+  session->ple_stride = form->layer_count * form->ple_size + 1;
+
+  session->state_room = LANE_ROOM(session->state_stride);
+  session->scrap_room = LANE_ROOM(session->state_stride);
+  session->lift_room = LANE_ROOM(session->lift_stride);
+  session->quant_room = LANE_ROOM(session->quant_stride);
+  session->query_room = LANE_ROOM(session->head_stride);
+  session->key_room = LANE_ROOM(session->head_stride);
+  session->value_room = LANE_ROOM(session->head_stride);
+  session->blend_room = LANE_ROOM(session->head_stride);
   session->score_room = (float *)mem_clear(sizeof(float) * (size_t)(form->window_limit + 1));
-  session->gate_room = (float *)mem_clear(sizeof(float) * (size_t)(inner_peak + form->ple_size + 1));
-  session->rise_room = (float *)mem_clear(sizeof(float) * (size_t)(inner_peak + 1));
+  session->gate_room = LANE_ROOM(session->gate_stride);
+  session->rise_room = LANE_ROOM(session->rise_stride);
   session->cos_room = (float *)mem_clear(sizeof(float) * (size_t)half_peak);
   session->sin_room = (float *)mem_clear(sizeof(float) * (size_t)half_peak);
-  session->ple_seed =
-      (float *)mem_clear(sizeof(float) * (size_t)(form->layer_count * form->ple_size + 1));
-  session->ple_room =
-      (float *)mem_clear(sizeof(float) * (size_t)(form->layer_count * form->ple_size + 1));
+  session->ple_seed = LANE_ROOM(session->ple_stride);
+  session->ple_room = LANE_ROOM(session->ple_stride);
   session->logit_room = (float *)mem_clear(sizeof(float) * (size_t)model->head_sheet.row_count);
+  if (form->moe_flag) {
+    session->route_room = (float *)mem_clear(sizeof(float) * (size_t)form->expert_count);
+    session->expert_room = (float *)mem_clear(sizeof(float) * (size_t)(2 * form->expert_inner));
+    session->expert_drop = (float *)mem_clear(sizeof(float) * (size_t)form->state_size);
+    session->moe_room = (float *)mem_clear(sizeof(float) * (size_t)form->state_size);
+    session->top_weight = (float *)mem_clear(sizeof(float) * (size_t)form->expert_top);
+    session->top_slot = (int *)mem_clear(sizeof(int) * (size_t)form->expert_top);
+    if (!session->route_room || !session->expert_room || !session->expert_drop ||
+        !session->moe_room || !session->top_weight || !session->top_slot) {
+      session_close(session);
+      return APP_FAIL_MEMORY;
+    }
+  }
   session->pick_room = mem_clear(sizeof(pick_slot) * (size_t)model->head_sheet.row_count);
   session->echo_limit = form->window_limit;
   session->echo_room = (int32_t *)mem_clear(sizeof(int32_t) * (size_t)session->echo_limit);
@@ -3185,10 +3887,12 @@ app_code session_open(app_model *model, app_session **session_out) {
   }
   *session_out = session;
   return APP_OKAY;
+#undef LANE_ROOM
 }
 
 void session_close(app_session *session) {
   if (!session) return;
+  TRACE_CLOSE();
   session_free_rooms(session);
   mem_free(session);
 }
@@ -3219,8 +3923,12 @@ app_code session_prime(app_session *session, const int32_t *id_list, int id_coun
     if (id_list[id_index] < 0 || id_list[id_index] >= session->model->embed_sheet.row_count)
       return APP_FAIL_ARGUMENT;
   from_time = time_now();
-  for (id_index = 0; id_index + 1 < id_count; ++id_index)
-    session_pass(session, id_list[id_index], 0);
+  for (id_index = 0; id_index + 1 < id_count;) {
+    int lane_count = id_count - 1 - id_index;
+    if (lane_count > KERN_LANE_LIMIT) lane_count = KERN_LANE_LIMIT;
+    session_pass(session, id_list + id_index, lane_count, 0);
+    id_index += lane_count;
+  }
   session->tally.prime_seconds += time_now() - from_time;
   session->tally.prime_tokens += (size_t)(id_count > 0 ? id_count - 1 : 0);
   return APP_OKAY;
@@ -3231,7 +3939,7 @@ const float *session_step(app_session *session, int32_t id_value) {
   double from_time;
   if (!session) return NULL;
   from_time = time_now();
-  logit_list = session_pass(session, id_value, 1);
+  logit_list = session_pass(session, &id_value, 1, 1);
   session->tally.serve_seconds += time_now() - from_time;
   session->tally.serve_tokens += 1;
   session->tally.memory_bytes = app_total_bytes;

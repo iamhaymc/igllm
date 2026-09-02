@@ -8,6 +8,7 @@ compiler invocation. No make, cmake, or third party build tool is involved.
     python3 run.py build            # build the cli and the unit tests
     python3 run.py test             # build, then run the unit tests
     python3 run.py check            # test, plus the reference comparison
+    python3 run.py parity           # build a fake checkpoint and diff every layer
     python3 run.py run -- <args>    # build, then run the cli with <args>
     python3 run.py clean            # remove build products
 """
@@ -51,17 +52,21 @@ def tool_pick():
     raise SystemExit("no C compiler found; set CC to one")
 
 
-def tool_line(kind, program, source, target, tuned, debug):
+def tool_line(kind, program, source, target, tuned, debug, trace=False):
     """Builds the full command line for one translation unit."""
     source_path = os.path.join(ROOT_PATH, source)
     if kind == "msvc":
         line = [program, "/nologo", "/std:c11", "/W3", source_path]
+        if trace:
+            line += ["/DAPP_TRACE"]
         line += ["/Od", "/Zi"] if debug else ["/O2"]
         if tuned:
             line += ["/arch:AVX2"]
         line += ["/Fe:" + target, "/Fo:" + os.path.join(WORK_PATH, "")]
         return line
     line = [program, "-std=c11", "-Wall", "-Wextra", source_path, "-o", target]
+    if trace:
+        line += ["-DAPP_TRACE"]
     line += ["-O0", "-g", "-fsanitize=address,undefined"] if debug else ["-O3"]
     if tuned and platform.machine().lower() in ("x86_64", "amd64", "x86", "i386", "i686"):
         line += ["-mavx2", "-mfma"]
@@ -97,7 +102,8 @@ def work_build(flag):
     if flag.only:
         plan = [item for item in plan if item[1] == flag.only]
     for source, target in plan:
-        line = tool_line(kind, program, source, target_path(target), flag.tuned, flag.debug)
+        line = tool_line(kind, program, source, target_path(target), flag.tuned, flag.debug,
+                         getattr(flag, "trace", False))
         step_show("build", line)
         code = subprocess.call(line, cwd=WORK_PATH)
         if code != 0:
@@ -125,6 +131,19 @@ def work_check(flag):
     return subprocess.call(line)
 
 
+def work_parity(flag):
+    """Builds a synthetic checkpoint and diffs the engine against the reference."""
+    flag.trace = True
+    code = work_build(flag)
+    if code != 0:
+        return code
+    line = [sys.executable, os.path.join(ROOT_PATH, "app_diff.py"), "--sweep"]
+    if flag.model:
+        line += ["--model", flag.model]
+    step_show("parity", line)
+    return subprocess.call(line)
+
+
 def work_run(flag):
     code = work_build(flag)
     if code != 0:
@@ -147,6 +166,7 @@ WORK_TABLE = {
     "build": work_build,
     "test": work_test,
     "check": work_check,
+    "parity": work_parity,
     "run": work_run,
     "clean": work_clean,
 }
@@ -157,12 +177,21 @@ def main():
     parser.add_argument("work", choices=sorted(WORK_TABLE), help="workflow to perform")
     parser.add_argument("--debug", action="store_true", help="unoptimized build with sanitizers")
     parser.add_argument("--tuned", action="store_true", help="allow host specific instructions")
+    parser.add_argument("--trace", action="store_true",
+                        help="compile in the activation dump the layer comparison reads")
     parser.add_argument("--only", help="build a single target")
     parser.add_argument("--model", help="checkpoint folder for the check workflow")
-    parser.add_argument("rest", nargs=argparse.REMAINDER, help="arguments passed to the cli")
-    flag = parser.parse_args()
-    if flag.rest and flag.rest[0] == "--":
-        flag.rest = flag.rest[1:]
+    # Everything after the first bare `--` belongs to the cli, and everything
+    # before it belongs to this script. argparse.REMAINDER cannot express that:
+    # it swallows the script's own flags too, so `build --debug` silently built
+    # a release binary.
+    argv_list = sys.argv[1:]
+    rest_list = []
+    if "--" in argv_list:
+        split_index = argv_list.index("--")
+        argv_list, rest_list = argv_list[:split_index], argv_list[split_index + 1:]
+    flag = parser.parse_args(argv_list)
+    flag.rest = rest_list
     return WORK_TABLE[flag.work](flag)
 
 

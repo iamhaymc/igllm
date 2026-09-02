@@ -14,7 +14,9 @@ and where an accelerator would attach.
 | `app_main.c`  | the command line front end                                   |
 | `app_test.c`  | the unit tests                                               |
 | `app_test.py` | parity and throughput comparison against transformers        |
-| `run.py`      | install, build, test, check, run, clean workflows            |
+| `app_fake.py` | builds a synthetic checkpoint and quantizes it               |
+| `app_diff.py` | layer by layer comparison against transformers               |
+| `run.py`      | install, build, test, check, parity, run, clean workflows    |
 
 `app_core.c` is a single translation unit. `app_main.c` and `app_test.c`
 each `#include "app_core.c"`, so a build is one compiler invocation per
@@ -147,7 +149,10 @@ was selected.
 
 - `kern_dot_real` — dot product against an `f32`, `f16`, or `bf16` row.
 - `kern_dot_code` — dot product against a packed row, specialized for the
-  two, four, and eight bit cases and general otherwise.
+  two, four, and eight bit cases and general otherwise. The two and four bit
+  cases have vector paths on all three targets: a nibble or a quarter byte
+  unpacks with whole-vector shifts and masks. Both require the group to start
+  on a byte boundary and fall back to the bit-stream loop when it does not.
 - `kern_row_code` — one output row of a quantized matrix, formulated as
 
   ```
@@ -157,7 +162,12 @@ was selected.
   The per-group activation sums are computed once per matrix product by
   `kern_group_sum` and shared by every row. This removes one subtraction
   per element from the inner loop and accumulates in a wider range.
+- `kern_row_code_many` — the same row against several activation vectors at
+  once. A group of codes is unpacked into a small float scratch and dotted
+  against every lane, so a batch pays the decode cost of a single vector.
 - `kern_mat_vec_band` — one band of rows, the unit of work given to the pool.
+  It carries a lane count, so the same band function serves a matrix-vector
+  product and a matrix-matrix product.
 - `kern_norm_rms` — `x * rsqrt(mean(x²) + eps) * weight`. Gemma 4 uses the
   weight directly, **not** `1 + weight`.
 - `kern_gelu_tanh`, `kern_gelu_gate` — the tanh approximation, and the gated
@@ -179,6 +189,8 @@ typedef struct back_desk {
   float      *sum_room;
   int         sum_limit;
   void (*mat_vec)(struct back_desk *, const plane *, const float *, float *);
+  void (*mat_mat)(struct back_desk *, const plane *, const float *, int, int,
+                  float *, int);
   void (*norm_rms)(struct back_desk *, const float *, const float *, int, float, float *);
   void (*soft_max)(struct back_desk *, float *, int);
   void (*gelu_gate)(struct back_desk *, float *, const float *, int);
@@ -186,7 +198,8 @@ typedef struct back_desk {
 } back_desk;
 ```
 
-`back_open` binds the CPU implementation. The model and session layers never
+`mat_vec` is `mat_mat` with one lane, so there is a single implementation to
+replace. `back_open` binds the CPU implementation. The model and session layers never
 call a kernel by name — they call `desk->mat_vec` and its siblings. A GPU or
 NPU backend therefore needs three things and touches nothing else:
 
@@ -215,6 +228,8 @@ the arithmetic:
 | `share_count`                  | trailing layers that reuse another cache   |
 | `twin_flag`                    | `attention_k_eq_v`                         |
 | `wide_flag`                    | `use_double_wide_mlp`                      |
+| `moe_flag`, `expert_count`     | `enable_moe_block` and the expert count    |
+| `expert_top`, `expert_inner`   | experts kept per token, and expert width   |
 | `norm_eps`, `logit_cap`        | RMSNorm epsilon, final logit softcapping   |
 | `kind_list`                    | one mark per layer: sliding or full        |
 | `rope_list`                    | one rotary table per layer kind            |
@@ -227,7 +242,8 @@ weight the layer uses.
 
 Two properties are derived from the tensors themselves rather than trusted
 from the configuration — the head size, from the row count of `q_proj`, and
-the key-value head count, from the row count of `k_proj`. A checkpoint whose
+the key-value head count, from the row count of `k_proj`. So is the expert
+width, from half the row count of the stacked `gate_up_proj`. A checkpoint whose
 configuration disagrees with its weights still loads correctly.
 
 Rotary tables. `rope_build` produces one table per layer kind. Sliding
@@ -272,7 +288,11 @@ context length. Layers that share simply read the source layer's cache and
 never write their own. That sizing is what keeps the cache in the tens of
 megabytes rather than the better part of a gigabyte.
 
-`session_pass` runs one token:
+Every scratch buffer holds `KERN_LANE_LIMIT` lanes with a named stride, and
+the whole graph carries a lane count. Decode is a batch of one, so there is
+one code path rather than two.
+
+`session_pass` runs a batch of tokens:
 
 1. embedding lookup, scaled by `sqrt(hidden_size)`
 2. the per-layer embedding block: table lookup scaled by `sqrt(ple_size)`,
@@ -280,10 +300,12 @@ megabytes rather than the better part of a gigabyte.
    with the token identity at `2^-0.5`
 3. for each layer, `session_layer`:
    - `enter_norm` → attention → `after_attn_norm` → residual add
-   - `before_feed_norm` → gated MLP → `after_feed_norm` → residual add
+   - `before_feed_norm` → gated MLP → the mixture branch, if the checkpoint
+     has one → `after_feed_norm` → residual add
    - the per-layer embedding gate → `after_ple_norm` → residual add
    - a scalar layer gain
-4. the final norm, the output head, and optional logit softcapping
+4. the final norm, the output head, and optional logit softcapping, for the
+   last token of the batch only
 
 `session_attend` is the attention itself. Queries and keys are normalized
 with their own RMSNorm weights, rotated, and scored against the cache.
@@ -292,8 +314,25 @@ it, which is what the reference does. Values carry a norm without a scale.
 When `attention_k_eq_v` is set, a full-attention layer has no `v_proj` and
 uses the raw pre-norm key projection as its values.
 
-`session_prime` consumes every prompt token but the last, skipping the
-output head for each, because those logits are never read. The caller feeds
+When `enable_moe_block` is set, the dense MLP above is the shared expert and
+a routed branch runs beside it. `session_route` normalizes the pre-MLP
+residual without a scale, multiplies by `router.scale * hidden_size^-0.5`,
+softmaxes the projection to one score per expert, keeps the top *k*,
+renormalizes the kept weights to sum to one, and scales each by its
+`per_expert_scale`. `session_expert` then runs the selected experts and
+blends them. The two branches carry `post_feedforward_layernorm_1` and
+`post_feedforward_layernorm_2` respectively and are summed before the shared
+`post_feedforward_layernorm`. Expert weights arrive stacked as one
+`[experts, ...]` parameter; `plane_bind_part` slices an expert out as a view
+rather than copying it. The mixture branch stays one lane wide, because each
+token picks its own experts.
+
+`session_prime` consumes every prompt token but the last in batches of
+`KERN_LANE_LIMIT`, skipping the output head for each, because those logits
+are never read. Batching turns each projection into a matrix product: a group
+of packed codes is unpacked once and reused by every lane. The cache write
+and the attention read stay in position order inside the batch, because a
+sliding layer's ring is narrower than the batch. The caller feeds
 the last token to `session_step`, which is the only call that pays for the
 head.
 
@@ -336,7 +375,11 @@ writer, the zero-point layout, `plane_row` against a matrix whose dense form
 is known, the quantized matrix product against that same dense form, RMSNorm,
 GELU, softmax stability and shift invariance, the rotary transform and its
 inverse, both rotary schedules, and a tokenizer round trip over a small
-synthetic vocabulary.
+synthetic vocabulary. `test_expert` checks that an expert slice of a stacked
+parameter lands on the right rows, and `test_wing` writes a complete
+miniature checkpoint — config, tokenizer, and every tensor the loader binds,
+once dense and once with a mixture block — and asserts that a batched prefill
+reaches exactly the logits produced by feeding the same tokens one at a time.
 
 `app_test.py` drives the built binary and the transformers reference over
 the same prompts. It compares the token ids, the rank-one token, the top-k
@@ -344,6 +387,61 @@ overlap, the largest absolute logit gap, and the greedy continuation, then
 reports the decode throughput of each side and their ratio. It skips
 cleanly, exiting zero, when the checkpoint or the python packages are
 absent, so it is safe in a pipeline.
+
+### 6.1 The synthetic oracle
+
+`app_test.py` needs the shipped checkpoint. `app_fake.py` and `app_diff.py`
+need nothing but the python packages, and together they answer the question
+that matters — does this engine compute the same numbers as the reference —
+without any download at all. `python3 run.py parity` runs the whole thing.
+
+**`app_fake.py` builds the checkpoint.** It constructs a `Gemma4Config` at a
+size that fits in a test — 32 hidden, 4 layers, 4 heads — instantiates the
+reference model, reseeds every parameter, and calls `save_pretrained`. The
+reference library writes `config.json` and `model.safetensors` itself, so the
+tensor names, shapes, and layouts come from upstream rather than from a
+reading of upstream. That is the difference between this and `test_wing`,
+which is hand-built and therefore agrees with whatever the loader believes.
+
+Reseeding is not cosmetic. The reference initializer sets every norm weight
+to exactly 1.0, which hides any bug in how a norm is indexed, and leaves
+whole families of tensors identical, which hides any bug in which one is
+picked. `form_seed` gives every parameter its own values, and `form_check`
+refuses to emit a model with a parameter that stayed near zero — a muted
+branch agrees with any implementation at all.
+
+A second mode packs the float checkpoint the way the QAT export is packed:
+symmetric group-wise scales, a bit-packed `weight_packed` as I32 built by
+`compressed_tensors` itself, plus `weight_scale` and `weight_shape`. It then
+dequantizes in python and writes that as a third checkpoint. The engine
+reading the packed files is compared against the reference reading the
+dequantized ones, which isolates the unpacking and the scale convention from
+everything else.
+
+**`app_diff.py` compares.** Final logits tell you that something is wrong,
+never where. A build with `-DAPP_TRACE` — `run.py build --trace` — writes a
+named activation snapshot to the file named by `IGLLM_TRACE`: the embedding,
+then each layer's attention output, mixture or feed-forward output, and
+residual, then the final norm and the logits. The reference side captures the
+same tensors with forward hooks. The harness walks them in order and stops at
+the first one that exceeds tolerance, which names the broken function.
+
+The tolerance is measured, not guessed. `reference_floor` runs the reference
+twice over the same tokens — once over the whole sequence, once one token at
+a time behind its cache — which is the same arithmetic in a different
+summation order, and takes the largest gap as the noise floor. Tolerance is
+eight times that. The dump is compiled out by default, so a normal build
+carries none of it.
+
+The sweep covers the axes that change code paths: dense and mixture blocks,
+sliding and full attention, every packed bit width from two to eight, group
+sizes that do and do not divide the row, the double-wide feed-forward, shared
+key and value projections, and prompt lengths that straddle both the sliding
+window and the prefill chunk.
+
+The oracle itself was checked by breaking the engine on purpose: perturbing
+one expert weight makes it report that layer and stay silent about the ones
+before it. An oracle that never fails has not been shown to work.
 
 ## 7. Extending
 
