@@ -292,3 +292,213 @@ The vision and audio towers are still absent — but they are now buildable
 against something, which is the point of the exercise. The tensor naming of
 the shipped export, the real tokenizer's merges, real vocabulary edge cases,
 and speed at full scale still need the checkpoint.
+
+---
+
+## 0.4.0 — parity on the shipped checkpoint
+
+### Why
+
+0.3.0 established the arithmetic against weights the reference itself wrote,
+and said plainly what that did not cover: the names, the packing, and the
+tokenizer of the real export. The checkpoint is now in hand.
+`google/gemma-4-E2B-it-qat-mobile-transformers` did not load at all, and what
+was wrong with the loader was not a detail.
+
+### What the export actually contains
+
+`quantization_config` carries no `config_groups` and no `format`;
+`quant_method` is `gemma`, and nothing under it matches compressed-tensors:
+
+- the codes sit under the plain `weight` name, as `U8` bytes rather than `I32`
+  words, beside a `weight_scale` with one column per group. The binder saw
+  `weight`, took it for a real tensor, and would have read packed bytes as
+  floats;
+- an embedding table is named apart — `embedding_quantized` and
+  `embedding_scale` — so `model_prefix_pick` probed `embed_tokens.weight` and
+  `embed_tokens.weight_packed`, found neither, and gave up before it reached
+  anything else;
+- two and four bit codes are unsigned with an offset of half the range, and
+  eight bit codes are signed `I8` with no offset at all;
+- nothing records the unpacked width, because the stored shape *is* the packed
+  width. Two bits and four bits are told apart only by what the row was before
+  it was packed;
+- the widths are declared as a map of regular expressions over module names —
+  two bits for `lm_head` and the token embeddings, four for attention and the
+  first fifteen feed-forwards, two for the rest of them, eight for the
+  per-layer gates. None of that map is parsed.
+
+**The widths come from the tensors, not from the map.** A regular expression
+engine to read that map would be a few hundred lines that could only ever
+agree with what the shapes already say. `plane_bind` is told the input width
+its caller expects instead — `q_proj` reads the state, `down_proj` reads what
+`gate_proj` wrote, `o_proj` reads what `q_proj` wrote — and the bit width is
+the one that makes the stored byte count come out right. A hint that no width
+explains is refused rather than decoded, so a wrong expectation is a load
+error and not a wrong answer.
+
+**One xor covers both storage conventions.** A signed byte is the offset code
+with its top bit flipped, so `plane` grew a `code_flip` that is the offset for
+a signed plane and zero for every other, and the decode is otherwise
+unchanged. The vector paths for two and four bits are guarded on the flip
+being zero, which it always is at those widths.
+
+### Static range quantization was the real omission
+
+The larger gap was not a name. Every quantized projection in the export
+carries an `input_activation_scale` and an `output_activation_scale`, and they
+are calibrated, not left at zero: `layers.0.mlp.gate_proj` reads on a grid of
+0.94 and writes on a grid of 0.62. The reference rounds the input to the
+projection and its result onto those grids, at eight bit levels. Without it
+the engine was not approximately right, it was running a different model.
+
+`quant_step` does the rounding, and `session_lift_many` applies it on both
+sides of every code plane, which is the one seam every projection already
+passes through. It is not the dynamic `quant_act` rule beside it: that one
+finds its range from the activation, this one is told it.
+
+**The rounding is to even.** `floor(x + 0.5)` would be indistinguishable from
+`rintf` anywhere else, and is not here. A product of two quantized planes is
+an exact multiple of the two steps, so the value being rounded lands on a half
+step often rather than never, and rounding up instead of to even moved whole
+activations by a whole step. The layer-wise harness named `layer.2.mlp` off by
+5.0118e-02, which is `layers.2.mlp.down_proj.output_activation_scale` to every
+digit it printed.
+
+### The chat frame
+
+Gemma 4 renamed the turn markers. The frame is
+`<bos><|turn>user\nHello!<turn|>\n<|turn>model\n`, and the loader was looking
+for `<start_of_turn>`; finding neither marker it fell through to an unframed
+prompt, which is a different question to ask an instruction-tuned model. Both
+pairs are probed now, the newer first. `logits` frames the turn as well,
+because what it reports is the distribution `chat` samples from and comparing
+it against the reference only means something when the two sides read the same
+prompt. `--raw` opts out, and the layer-wise harness passes it, since what it
+compares is arithmetic and a frame would only move the prompt lengths it picks
+on purpose.
+
+### What parity means on this checkpoint
+
+Static range quantization makes the forward pass discontinuous. Rounding onto
+a grid turns a last-bit disagreement in a sum into a whole step, and one
+flipped step at one layer is a different residual for every layer after it.
+The reference does this to itself. The same graph in double precision agrees
+with single to a part in ten million through the first twenty layers, then
+moves by 5.6622e-02 at `layers.20.mlp` — two steps of that module's grid —
+and by whole units in the logits. Fed its tokens one at a time behind its
+cache rather than all at once, it moves just as far. There is no
+single-precision answer to agree with.
+
+The engine sits inside that. Every attention and feed-forward output is
+identical to the reference through the first several layers, the residual
+apart by one unit in the last place, which is the least a computation can
+differ by without being the same computation. The first divergence is a single
+slot of `layer.7.attn`, off by 2.523848e-02, which is
+`layers.7.self_attn.o_proj.output_activation_scale` exactly. From there it
+compounds the way the reference's own compounds.
+
+So `app_diff.py` stopped asking for per tensor equality on a real checkpoint.
+It reports how deep each side stays exact, requires the embedding and the
+first layer — which nothing can have rounded twice yet — to agree outright,
+and holds the end of the stack to how far the reference moves there. That last
+judgement is made over the whole run rather than prompt by prompt, because
+whether a given perturbation lands on a half step is a lottery: on one of the
+six lengths the reference happened to flip nothing at all and moved by 4e-06,
+which says nothing about what the engine may do. The double-precision run costs
+about twice the memory of the single-precision one, because a forward
+materializes the whole embedding table to read one row of it; where it does not
+fit, the harness says so and leaves that prompt held to the strict bar rather
+than stopping. `app_test.py` measures its
+logit tolerance the same way, and its greedy comparison too — where the two
+continuations part, it asks how far the reference follows itself before
+parting, and requires the engine to do at least as well.
+
+### Results
+
+`run.py parity --model <folder>`, six prompt lengths:
+
+```
+  2 ids        first drift at layer.10.attn.0  the reference at layer.21.attn.0
+                    final  off by 1.753e+00, the reference by 1.656e+00
+                    logits off by 2.317e+00, the reference by 1.944e+00
+  3 ids        first drift at layer.10.attn.0  the reference at layer.21.attn.0
+                    final  off by 1.910e+00, the reference by 3.815e-06
+                    logits off by 2.207e+00, the reference by 4.768e-06
+  11 ids       first drift at layer.10.attn.0  the reference at layer.21.attn.0
+                    final  off by 2.574e+00, the reference by 2.017e+00
+                    logits off by 3.110e+00, the reference by 2.851e+00
+  18 ids       first drift at layer.10.attn.0  the reference at layer.19.mlp.0
+                    final  off by 2.195e+00, the reference by 1.749e+00
+                    logits off by 3.073e+00, the reference by 2.207e+00
+  19 ids       first drift at layer.10.attn.0  the reference at layer.19.mlp.0
+                    final  off by 2.544e+00, the reference by 2.113e+00
+                    logits off by 2.374e+00, the reference by 2.469e+00
+               the double-precision run did not fit in memory
+  44 ids       first drift at layer.10.attn.0  the reference was not measured
+                    final  off by 1.876e+00, the reference by -
+                    logits off by 2.074e+00, the reference by -
+  over the run ok   final  off by at most 2.574e+00, the reference by 2.113e+00, allowed 4.225e+00
+  over the run ok   logits off by at most 3.110e+00, the reference by 2.851e+00, allowed 5.703e+00
+```
+
+The engine drifts first at the same tensor every time, because position zero is
+the sequence marker in every one of those prompts and nothing else reaches it.
+The longest prompt is the one whose double-precision run did not fit in sixteen
+gigabytes beside everything else; it contributes its own gap and no allowance,
+which is the safe direction.
+
+`run.py check --model <folder>`, four prompts: the token ids match the
+reference's framed turn exactly on every one, the leading token matches on
+every one, 81 to 94 per cent of the top sixteen ids are shared, and the
+largest logit gap is between 0.54 and 1.71 against a reference that moves 0.51
+to 1.56 against itself. Decode runs at 5.9 tokens a second against the
+reference's 0.16, on four cores of a 2017 desktop.
+
+### What it found
+
+Three defects, none of them reachable from the synthetic oracle, because the
+synthetic checkpoints are written by the reference in the compressed-tensors
+layout and carry no activation ranges at all.
+
+The eight bit dot product read its bytes directly and so never saw the flip,
+which left the two per-layer gates decoding as unsigned. The engine loaded,
+produced text, and was wrong from the first layer's output.
+
+`floor(x + 0.5)` for the static grid, as above.
+
+`app_test.c` used `_mkdir`, `_rmdir` and `getpid` on Windows without
+`<direct.h>` or `<process.h>`, and `app_test.py` decoded the engine's utf-8
+output with the console's code page. Neither had been run on a Windows host.
+
+### Testing
+
+`test_gemma` builds a safetensors fixture in the export's layout — a four bit
+plane, a signed eight bit plane, and a two bit embedding table with two groups
+to a row — and checks the decode of each, the group size the scale shape
+implies, the bit width the column hint implies, the two activation steps, the
+refusal of a column hint no packing explains, and the eight bit dot product
+that carried the bug. The suite is 199 assertions and builds clean under
+`-Wall -Wextra` on Windows.
+
+The synthetic sweep is unchanged and still passes: eleven configurations by
+six prompt lengths, each judged against the noise floor measured on it.
+
+### Known gaps
+
+The vision and audio towers are still absent. `k_cache_scale` and
+`v_cache_scale` are read by nothing, as they are by the reference. Throughput
+has now been measured but not worked on: 5.9 tokens a second untuned, 10.5
+with AVX2.
+
+The greedy continuation parts from the reference earlier than the reference
+parts from itself on one of the four prompts — 52 characters against 96 —
+which is the same lottery seen everywhere else in this work and is why the
+check allows the engine to follow half as far rather than as far. It is worth
+watching rather than hiding: a real defect would look like this too, only it
+would also move the rank-one token, the top sixteen, and the layer-wise
+comparison, and it moves none of them.
+
+The sanitizers were not run over any of this. The MinGW toolchain on the
+Windows host has no `libasan` or `libubsan`, and there was no POSIX host.
+`TODO.md` has the rest.

@@ -2,16 +2,6 @@
 
 Open development tasks, most consequential first.
 
-- Measure numerical parity against the transformers reference on a real
-  checkpoint. `run.py parity` establishes it on synthetic weights, which
-  covers the arithmetic but not the files: the development sandbox could
-  not reach `huggingface.co`, so every tensor name, group size, and
-  tokenizer setting is still taken from the reference source rather than
-  from the shipped export.
-- Confirm the weight tensor names against the shipped checkpoint and widen
-  `model_prefix_pick` if the export uses a prefix the loader does not expect.
-- Confirm the chat frame against the `chat_template` in the checkpoint rather
-  than the assumed `<start_of_turn>user … <end_of_turn>` shape.
 - Support the vision and audio towers, checking each piece against the
   synthetic oracle as it is written rather than trusting it in bulk. The
   engine is text-only today. The
@@ -22,6 +12,10 @@ Open development tasks, most consequential first.
   a bicubic resize, a WAV reader, and a mel filterbank.
 - Extend `app_fake.py` with vision and audio presets, so the towers have a
   reference to be checked against before any of them is written.
+- Record end-to-end logit fixtures from the shipped checkpoint and assert
+  against them in `app_test.c`, so the parity result survives in a build that
+  has no checkpoint and no python.
+- Profile and speed up decode. Parity is settled; throughput is not.
 - Add an AVX-512 path beside AVX2, selected by the same macro layer.
 - Widen `kern_dot_code` for the odd bit widths. Two and four bits are
   vectorized; three, five, six, and seven still walk the bit stream.
@@ -36,7 +30,13 @@ Open development tasks, most consequential first.
   multi-turn chat loop rather than a single turn.
 - Persist and restore a session cache, so a long prompt need not be primed
   twice.
-- Record end-to-end logit fixtures once a checkpoint is available, and assert
-  against them in `app_test.c`.
-- Verify the Windows build on a real Windows host. The platform shims compile
-  under cross-inspection only.
+- Support the static ranges the export calibrates for the key and value cache.
+  `k_cache_scale` and `v_cache_scale` are read by nothing — the reference
+  ignores them too — but a backend that stores the cache quantized will want
+  them.
+- Build under MSVC. The suite builds clean and passes on a Windows host with
+  MinGW gcc, on the scalar, SSE2 and AVX2 backends; `cl` and its `/arch:AVX2`
+  path have still only been read.
+- Run the sanitizers over the quantization changes. `run.py test --debug` needs
+  a toolchain that ships `libasan` and `libubsan`, which the MinGW build used
+  for the Windows run does not.

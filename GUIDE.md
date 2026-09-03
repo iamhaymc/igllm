@@ -106,8 +106,28 @@ until it is touched.
 
 ### 3.5 Quant layer
 
-Gemma 4 E2B IT QAT ships in the compressed-tensors **pack-quantized**
-format. A quantized linear is four tensors:
+Two layouts are read, told apart by `quant_method` in `quantization_config`.
+
+**The Gemma layout**, which is what the shipped checkpoint uses. A quantized
+linear is its `weight` and a `weight_scale`; a quantized embedding table is an
+`embedding_quantized` and an `embedding_scale`. The codes are ordinary bytes:
+four to a byte at two bits, two at four bits, one at eight. The scale carries
+one column per group — one for a per-channel plane, thirty-five for the
+per-layer embedding table, one to each layer's block. Two and four bit codes
+are unsigned with an offset of half the range; eight bit codes are signed
+`I8` with no offset.
+
+Nothing in such a tensor records how wide the row was, because the stored
+shape *is* the packed width, so `plane_bind` is told the input width its
+caller expects and takes the bit width that makes the byte count come out
+right. `q_proj` reads the state, `down_proj` reads what `gate_proj` wrote,
+`o_proj` reads what `q_proj` wrote. A hint no width explains is refused
+rather than decoded. The alternative, a regular expression engine for the
+`module_quant_configs` map the configuration carries, would be a few hundred
+lines that could only ever agree with the shapes.
+
+**The compressed-tensors pack-quantized layout**, which the synthetic
+checkpoints use. A quantized linear is four tensors:
 
 | tensor              | meaning                                          |
 | ------------------- | ------------------------------------------------ |
@@ -117,28 +137,46 @@ format. A quantized linear is four tensors:
 | `weight_shape`      | the logical `[out, in]` shape                     |
 
 The packing is dense and little-endian: element *i* of a row occupies bits
-`[i*bits, i*bits + bits)`, and rows are padded up to a 32-bit boundary. On
-a little-endian host the mapped bytes are therefore usable **as they are** —
-`pack_read` walks the bit stream directly with no repacking pass and no
-second copy of the weights. Codes are stored with a sign offset folded in,
-so the dequantized value is
+`[i*bits, i*bits + bits)`, and rows are padded up to a 32-bit boundary. On a
+little-endian host the mapped bytes are usable **as they are** in either
+layout — `pack_read` walks the bit stream directly with no repacking pass and
+no second copy of the weights, and a byte-packed row at two, four or eight
+bits is the same stream. Codes carry a sign offset, so the dequantized value
+is
 
 ```
-w = (code - offset - zero_point) * scale
+w = ((code ^ flip) - offset - zero_point) * scale
 ```
 
-`plane` is the storage record for any weight. It is either `PLANE_REAL` —
-a plain `f32`, `f16`, or `bf16` matrix read in place — or `PLANE_CODE` — the
+where `flip` is the offset for a signed byte plane and zero otherwise — a
+signed byte being the offset code with its top bit turned over, one xor puts
+both conventions through the same decode.
+
+`plane` is the storage record for any weight. It is either `PLANE_REAL` — a
+plain `f32`, `f16`, or `bf16` matrix read in place — or `PLANE_CODE` — either
 packed form above. `plane_row` decodes a whole row when a row is what is
 wanted, for example a single embedding lookup. `plane_bits_of` recovers the
 bit width from the shape and the packed word count, so a checkpoint that
 mixes widths across tensors, as this one does, is handled without trusting
 the configuration.
 
+**Activation ranges.** The Gemma export calibrates two more numbers for every
+quantized projection, an `input_activation_scale` and an
+`output_activation_scale`, and the reference rounds what goes into the
+projection and what comes out of it onto those grids at eight bit levels.
+`quant_step` does that, `session_lift_many` applies it on both sides of every
+code plane, and the rounding is to even: a product of two quantized planes is
+an exact multiple of the two steps, so the value being rounded lands on a half
+step often rather than never, and rounding up instead moves whole activations
+by a whole step. A step of zero means the layer was never calibrated and
+nothing happens.
+
 `quant_rule` and `quant_book` carry what `quantization_config` declares:
 bit width, group size, symmetry, strategy, and the ignore list. When the
 configuration declares quantized input activations, `quant_act` reproduces
-the reference fake-quantization per token before the matrix product.
+the reference fake-quantization per token before the matrix product. That is
+the dynamic rule, which finds its range from the activation; `quant_step` is
+the static one, which is told it.
 
 ### 3.6 Kernel layer
 
@@ -256,7 +294,11 @@ which would cost hundreds of megabytes at the model's maximum length.
 
 `model_prefix_pick` detects the weight name prefix — `model.language_model.`,
 `language_model.model.`, `model.`, or none — so checkpoints exported by
-different transformers versions load without a flag.
+different transformers versions load without a flag. It probes each candidate
+for `embed_tokens.weight`, `embed_tokens.weight_packed` and
+`embed_tokens.embedding_quantized` in turn, since the name of the embedding
+table is what distinguishes the quantization layouts as much as the prefix
+distinguishes the exporters.
 
 ### 3.9 Token layer
 
@@ -275,6 +317,10 @@ nothing for control tokens.
 
 `token_frame` applies the Gemma chat frame for instruction-tuned prompts:
 the sequence marker, then a user turn, then the opening of a model turn.
+Gemma 4 writes the turn markers `<|turn>` and `<turn|>`, and the older
+`<start_of_turn>` and `<end_of_turn>` are probed behind them, since nothing
+else in a checkpoint distinguishes the two vocabularies. `chat` and `logits`
+both frame; `--raw` and every other task do not.
 
 ### 3.10 Session layer
 
@@ -381,12 +427,25 @@ miniature checkpoint — config, tokenizer, and every tensor the loader binds,
 once dense and once with a mixture block — and asserts that a batched prefill
 reaches exactly the logits produced by feeding the same tokens one at a time.
 
+`test_gemma` writes a safetensors fixture in the shipped export's layout — a
+four bit plane, a signed eight bit plane, and a two bit embedding table with
+two groups to a row — and checks the decode of each, the group size the scale
+shape implies, the bit width the column hint implies, the two activation
+steps, the refusal of a column hint no packing explains, and the eight bit dot
+product, which reads its bytes directly and so has to take the sign flip that
+the row decode takes.
+
 `app_test.py` drives the built binary and the transformers reference over
 the same prompts. It compares the token ids, the rank-one token, the top-k
 overlap, the largest absolute logit gap, and the greedy continuation, then
-reports the decode throughput of each side and their ratio. It skips
-cleanly, exiting zero, when the checkpoint or the python packages are
-absent, so it is safe in a pipeline.
+reports the decode throughput of each side and their ratio. The last two are
+measured rather than assumed: the reference is run a second time with its
+tokens fed one at a time behind its cache, which is the same arithmetic in
+another summation order, and the engine is held to twice what that moves. On
+a checkpoint that rounds its activations onto a static grid it moves by whole
+units, and a fixed tolerance would report the checkpoint's own rounding as an
+engine fault. It skips cleanly, exiting zero, when the checkpoint or the
+python packages are absent, so it is safe in a pipeline.
 
 ### 6.1 The synthetic oracle
 
@@ -442,6 +501,22 @@ window and the prefill chunk.
 The oracle itself was checked by breaking the engine on purpose: perturbing
 one expert weight makes it report that layer and stay silent about the ones
 before it. An oracle that never fails has not been shown to work.
+
+**`app_diff.py --model <folder>` compares against a real checkpoint**, and
+asks something different of it, because the shipped export rounds every
+activation onto a static grid. A sum that lands on a half step falls one way
+in single precision and the other way in double, so a last-bit difference
+becomes a whole step and then compounds, and the reference does not reproduce
+itself: the same graph in double precision agrees with single to a part in ten
+million through the first layers, moves by whole steps from the middle of the
+stack, and by whole units in the logits. There is no single-precision answer
+to agree with. So the harness reports how deep each side stays exact, requires
+the embedding and the first layer — which nothing can have rounded twice yet —
+to agree outright, and holds the end of the stack to how far the reference
+moves there. That last judgement is made over the whole run rather than prompt
+by prompt: whether a given perturbation lands on a half step is a lottery, and
+a prompt where the reference happens to flip nothing says nothing about what
+the engine may do.
 
 ## 7. Extending
 

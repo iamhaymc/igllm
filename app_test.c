@@ -8,6 +8,12 @@
 
 #include "app_core.c"
 
+#if defined(_WIN32)
+#  include <direct.h>  /* _mkdir, _rmdir */
+#  include <process.h> /* _getpid */
+#  define getpid _getpid
+#endif
+
 /* ======================================================================== */
 /* test harness                                                             */
 /* ======================================================================== */
@@ -409,6 +415,137 @@ static void test_plane(void) {
   }
 }
 
+/* The layout the Gemma quantized export uses: codes as plain bytes under the
+ * name a real weight would have, a scale with one column per group, and the
+ * eight bit case stored signed rather than offset. */
+static void test_gemma(void) {
+  const char header_text[] =
+      "{\"q_proj.weight\":{\"dtype\":\"U8\",\"shape\":[3,4],\"data_offsets\":[0,12]},"
+      "\"q_proj.weight_scale\":{\"dtype\":\"F32\",\"shape\":[3,1],\"data_offsets\":[12,24]},"
+      "\"q_proj.input_activation_scale\":{\"dtype\":\"F32\",\"shape\":[],"
+      "\"data_offsets\":[24,28]},"
+      "\"q_proj.output_activation_scale\":{\"dtype\":\"F32\",\"shape\":[],"
+      "\"data_offsets\":[28,32]},"
+      "\"gate.weight\":{\"dtype\":\"I8\",\"shape\":[2,6],\"data_offsets\":[32,44]},"
+      "\"gate.weight_scale\":{\"dtype\":\"F32\",\"shape\":[2,1],\"data_offsets\":[44,52]},"
+      "\"embed_tokens.embedding_quantized\":{\"dtype\":\"U8\",\"shape\":[2,2],"
+      "\"data_offsets\":[52,56]},"
+      "\"embed_tokens.embedding_scale\":{\"dtype\":\"F32\",\"shape\":[2,2],"
+      "\"data_offsets\":[56,72]}}";
+  /* Four bit codes, low nibble first: 0, 1, 2, 3, -7, -6, 7, -8 in every row. */
+  static const uint8_t four_byte[4] = {0x98u, 0xBAu, 0x21u, 0x0Fu};
+  /* Signed bytes: 0, 1, 127, -1, -128, -56. */
+  static const uint8_t sign_byte[6] = {0x00u, 0x01u, 0x7Fu, 0xFFu, 0x80u, 0xC8u};
+  /* Two bit codes, lowest pair first: 1, 0, -1, -2 then -2, -1, 0, 1. */
+  static const uint8_t pair_byte[2] = {0x1Bu, 0xE4u};
+  static const float four_gain[3] = {0.5f, 1.0f, 2.0f};
+  static const float sign_gain[2] = {0.25f, 0.5f};
+  static const float pair_gain[4] = {1.0f, 4.0f, 0.5f, 2.0f};
+  static const float step_pair[2] = {0.125f, 0.0625f};
+
+  size_t header_size = sizeof(header_text) - 1;
+  size_t pad_count = (8 - (header_size % 8)) % 8;
+  size_t body_size = 72;
+  size_t file_size = 8 + header_size + pad_count + body_size;
+  uint8_t *file_data = (uint8_t *)mem_clear(file_size);
+  uint64_t header_count = (uint64_t)(header_size + pad_count);
+  uint8_t *body_data;
+  app_model *model = (app_model *)mem_clear(sizeof(app_model));
+  int byte_index, row_index;
+
+  test_open("gemma");
+  for (byte_index = 0; byte_index < 8; ++byte_index)
+    file_data[byte_index] = (uint8_t)((header_count >> (8 * byte_index)) & 0xFFu);
+  memcpy(file_data + 8, header_text, header_size);
+  for (byte_index = 0; byte_index < (int)pad_count; ++byte_index)
+    file_data[8 + header_size + byte_index] = ' ';
+  body_data = file_data + 8 + header_count;
+  for (row_index = 0; row_index < 3; ++row_index)
+    memcpy(body_data + row_index * 4, four_byte, sizeof(four_byte));
+  memcpy(body_data + 12, four_gain, sizeof(four_gain));
+  memcpy(body_data + 24, &step_pair[0], sizeof(float));
+  memcpy(body_data + 28, &step_pair[1], sizeof(float));
+  for (row_index = 0; row_index < 2; ++row_index)
+    memcpy(body_data + 32 + row_index * 6, sign_byte, sizeof(sign_byte));
+  memcpy(body_data + 44, sign_gain, sizeof(sign_gain));
+  for (row_index = 0; row_index < 2; ++row_index)
+    memcpy(body_data + 52 + row_index * 2, pair_byte, sizeof(pair_byte));
+  memcpy(body_data + 56, pair_gain, sizeof(pair_gain));
+  test_true(test_file_write("model.safetensors", file_data, file_size), "gemma fixture written");
+  mem_free(file_data);
+
+  test_true(store_open(&model->store, test_yard_path) == APP_OKAY, "gemma fixture opens");
+  {
+    const char *prefix_text = model_prefix_pick(model);
+    test_true(prefix_text && prefix_text[0] == '\0',
+              "the prefix probe finds a quantized embedding table");
+  }
+  {
+    plane sheet;
+    float row_list[8] = {0};
+    test_true(plane_bind(model, "q_proj", 8, &sheet) == APP_OKAY,
+              "a byte packed weight binds as a code plane");
+    test_true(sheet.form == PLANE_CODE && sheet.bit_count == 4 && sheet.col_count == 8,
+              "the column hint fixes the bit width");
+    test_true(sheet.code_flip == 0 && sheet.code_bias == 8, "four bit codes carry an offset");
+    test_true(sheet.group_count == 1 && sheet.group_size == 8, "one scale spans the row");
+    test_near(sheet.enter_gain, 0.125, 0, "the input step is read");
+    test_near(sheet.leave_gain, 0.0625, 0, "the output step is read");
+    plane_row(&sheet, 0, row_list);
+    test_near(row_list[0], 0.0, 0, "four bit decode, first code");
+    test_near(row_list[3], 1.5, 0, "four bit decode, low nibble first");
+    test_near(row_list[4], -3.5, 0, "four bit decode, negative code");
+    test_near(row_list[7], -4.0, 0, "four bit decode, last code");
+    plane_row(&sheet, 2, row_list);
+    test_near(row_list[6], 14.0, 0, "the scale is per row");
+
+    test_true(plane_bind(model, "q_proj", 9, &sheet) == APP_FAIL_FORMAT,
+              "a column hint the packing cannot explain is refused");
+  }
+  {
+    plane sheet;
+    float row_list[6] = {0};
+    float act_list[6];
+    float sum_list[1];
+    int slot;
+    test_true(plane_bind(model, "gate", 6, &sheet) == APP_OKAY, "a signed byte weight binds");
+    test_true(sheet.bit_count == 8 && sheet.code_flip == 128 && sheet.code_bias == 128,
+              "eight bit codes are flipped rather than offset");
+    plane_row(&sheet, 0, row_list);
+    test_near(row_list[2], 31.75, 0, "signed decode, largest positive");
+    test_near(row_list[3], -0.25, 0, "signed decode, minus one");
+    test_near(row_list[4], -32.0, 0, "signed decode, most negative");
+    test_near(row_list[5], -14.0, 0, "signed decode, interior");
+    for (slot = 0, sum_list[0] = 0.0f; slot < 6; ++slot) {
+      act_list[slot] = (float)(slot + 1);
+      sum_list[0] += act_list[slot];
+    }
+    /* The eight bit dot product walks the bytes directly, so it has to take the
+     * flip the row decode takes. */
+    test_near(kern_row_code(&sheet, 0, act_list, sum_list), -149.25, 1e-4,
+              "kern_row_code reads a signed plane");
+    test_near(kern_row_code(&sheet, 1, act_list, sum_list), -298.5, 1e-4,
+              "kern_row_code scales a signed plane per row");
+  }
+  {
+    plane sheet;
+    float row_list[8] = {0};
+    test_true(plane_bind(model, "embed_tokens", 8, &sheet) == APP_OKAY,
+              "a quantized embedding table binds");
+    test_true(sheet.bit_count == 2 && sheet.group_count == 2 && sheet.group_size == 4,
+              "the scale shape gives the group size");
+    plane_row(&sheet, 0, row_list);
+    test_near(row_list[0], 1.0, 0, "two bit decode, lowest pair first");
+    test_near(row_list[3], -2.0, 0, "two bit decode, last of the group");
+    test_near(row_list[4], -8.0, 0, "the second group takes the second scale");
+    test_near(row_list[7], 4.0, 0, "two bit decode, last code");
+    plane_row(&sheet, 1, row_list);
+    test_near(row_list[4], -4.0, 0, "the group scales are per row");
+  }
+  store_close(&model->store);
+  mem_free(model);
+}
+
 /* Binds one slice of a stacked expert tensor and checks the view lands right. */
 static void test_expert(void) {
   const char header_text[] =
@@ -438,13 +575,13 @@ static void test_expert(void) {
   {
     plane sheet;
     float row_list[4];
-    test_true(plane_bind_part(model, "experts.gate_up_proj", 2, 3, &sheet) == APP_OKAY,
+    test_true(plane_bind_part(model, "experts.gate_up_proj", 2, 3, 0, &sheet) == APP_OKAY,
               "plane_bind_part accepts a stacked tensor");
     test_true(sheet.row_count == 2 && sheet.col_count == 4, "the slice drops the expert axis");
     plane_row(&sheet, 1, row_list);
     test_near(row_list[0], 20.0, 0, "the slice lands on the right expert");
     test_near(row_list[3], 23.0, 0, "the slice keeps its row stride");
-    test_true(plane_bind_part(model, "experts.gate_up_proj", 0, 1, &sheet) == APP_FAIL_FORMAT,
+    test_true(plane_bind_part(model, "experts.gate_up_proj", 0, 1, 0, &sheet) == APP_FAIL_FORMAT,
               "plane_bind_part rejects a rank mismatch");
   }
   store_close(&model->store);
@@ -507,7 +644,7 @@ static void test_kernel(void) {
         for (slot = 0; slot < span_count; ++slot)
           want_value += (double)pack_read(code_data, (size_t)(from_index + slot), bit_count) *
                         (double)act_list[from_index + slot];
-        test_near(kern_dot_code(code_data, from_index, span_count, act_list + from_index, bit_count),
+        test_near(kern_dot_code(code_data, from_index, span_count, act_list + from_index, bit_count, 0),
                   want_value, 1e-3, "kern_dot_code matches the bit-stream reference");
       }
       mem_free(code_data);
@@ -1065,6 +1202,7 @@ int main(void) {
   test_pack();
   test_plane();
   test_expert();
+  test_gemma();
   test_kernel();
   test_rope();
   test_token();

@@ -74,8 +74,12 @@ static int main_flags(int argc, char **argv, main_flag *flag_out) {
   return flag_out->task_text ? 1 : 0;
 }
 
+/* `logits` frames the same turn `chat` would, because what it reports is the
+ * distribution the chat task samples from; comparing it against the reference
+ * is only meaningful when both sides read the same prompt. `--raw` opts out. */
 static int main_prompt_ids(app_model *model, const main_flag *flag, int32_t *id_list, int id_limit) {
-  if (strcmp(flag->task_text, "chat") == 0 && !flag->raw_flag)
+  if ((strcmp(flag->task_text, "chat") == 0 || strcmp(flag->task_text, "logits") == 0) &&
+      !flag->raw_flag)
     return token_frame(model, flag->prompt_text, id_list, id_limit);
   {
     int id_count = 0;

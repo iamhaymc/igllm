@@ -17,6 +17,22 @@ The tolerance is not a guess. Before anything is judged, the reference is run
 against itself in two summation orders to find the noise floor, and the floor
 is what the comparison is scaled against. Anything tighter would report float
 addition as a bug; anything looser would let a real one through.
+
+On a checkpoint that carries static activation ranges there is no one answer
+to agree with. Every projection rounds what it reads and what it writes onto a
+grid, so a sum that lands on a half step falls one way in single precision and
+the other way in double, and one flipped step at one layer is a different
+residual for every layer after it. The reference does this to itself: the same
+graph in double precision agrees with single to a part in ten million through
+the first layers, moves by whole steps from the middle of the stack, and by
+whole units in the logits. Nothing that does not reproduce the reference's
+summation order bit for bit can do better. So a real checkpoint is judged
+differently from a synthetic one: how deep each side stays exact is reported,
+the embedding and the first layer have to agree outright, and the end of the
+stack is held to how far the reference moves there — over the whole run rather
+than one prompt at a time, because whether a given perturbation lands on a
+half step is a lottery, and a prompt where the reference happens to flip
+nothing says nothing about the engine.
 """
 
 import argparse
@@ -35,6 +51,10 @@ PROMPT_TEXT = "the sea is wide and the sky is high, one two three four"
 # the sliding window, and the sixteen lane prefill chunk. A prompt of exactly
 # one token is the decode path with no batch at all.
 LENGTH_LIST = (1, 2, 9, 16, 17, 40)
+
+# How much further than the reference's own movement the engine may go at the
+# end of the stack before it is called wrong.
+FLOOR_SHARE = 2.0
 
 # The order the graph runs in. The first name to drift is the one that matters,
 # so the comparison walks this list and stops rather than reporting every later
@@ -83,7 +103,8 @@ def engine_trace(model_path, prompt):
     handle, trace_path = tempfile.mkstemp(suffix=".igtrace")
     os.close(handle)
     room = dict(os.environ, IGLLM_TRACE=trace_path)
-    line = [engine_path(), "logits", "--model", model_path, "--prompt", prompt, "--serve", "1"]
+    line = [engine_path(), "logits", "--model", model_path, "--prompt", prompt, "--serve", "1",
+            "--raw"]
     done = subprocess.run(line, capture_output=True, text=True, env=room)
     if done.returncode != 0:
         raise RuntimeError("engine failed: %s" % done.stderr.strip())
@@ -97,17 +118,35 @@ def engine_trace(model_path, prompt):
 # -- the reference --------------------------------------------------------
 
 
-def reference_run(model_path, id_list):
-    """Runs the reference over the same ids and returns {name: [float]}.
+def reference_note(found, result, place_count):
+    """Records the residual stream of one forward."""
+    # The last entry of `hidden_states` is the final norm already applied, not
+    # the last layer's output, so the residual of the last layer is not exposed
+    # and `final` comes straight from the end of the stack.
+    stack = result.hidden_states
+    for place_index in range(place_count):
+        found["embed.%d" % place_index] = stack[0][0, place_index].float().tolist()
+        for layer_index in range(1, len(stack) - 1):
+            found["layer.%d.out.%d" % (layer_index - 1, place_index)] = \
+                stack[layer_index][0, place_index].float().tolist()
+        found["final.%d" % place_index] = stack[-1][0, place_index].float().tolist()
+    last_index = place_count - 1
+    found["logits.%d" % last_index] = result.logits[0, last_index].float().tolist()
+
+
+def reference_look(model_path, id_list, want_kind):
+    """Runs the reference once in one precision and returns {name: [float]}.
 
     Hooks are placed on the attention and feedforward modules so that the two
     sides can be compared before the residual folds them together, where an
     error is still local to one function.
     """
+    import gc
+
     import torch
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=want_kind)
     model.eval()
     found = {}
     handle_list = []
@@ -137,20 +176,39 @@ def reference_run(model_path, id_list):
         result = model(id_data, output_hidden_states=True)
     for handle in handle_list:
         handle.remove()
-
-    # The last entry of `hidden_states` is the final norm already applied, not
-    # the last layer's output, so the residual of the last layer is not exposed
-    # and `final` comes straight from the end of the stack.
-    stack = result.hidden_states
-    for place_index in range(len(id_list)):
-        found["embed.%d" % place_index] = stack[0][0, place_index].float().tolist()
-        for layer_index in range(1, len(stack) - 1):
-            found["layer.%d.out.%d" % (layer_index - 1, place_index)] = \
-                stack[layer_index][0, place_index].float().tolist()
-        found["final.%d" % place_index] = stack[-1][0, place_index].float().tolist()
-    last_index = len(id_list) - 1
-    found["logits.%d" % last_index] = result.logits[0, last_index].float().tolist()
+    reference_note(found, result, len(id_list))
+    # The caller runs this twice over, so the first model has to be gone before
+    # the second is built: a forward materializes the whole embedding table to
+    # read one row of it, which is 1.6 GiB single and 3.2 double.
+    del model, result, handle_list
+    gc.collect()
     return found
+
+
+def reference_run(model_path, id_list, want_floor=False):
+    """Runs the reference over the same ids and returns {name: [float]}.
+
+    With `want_floor`, the same graph is run a second time in double precision
+    and that second dictionary is returned beside the first. Wherever the two
+    disagree, the tensor turns on the last bits of a float sum, and neither
+    single-precision answer is more correct than the other.
+
+    The second run wants about twice the memory of the first. Where there is
+    not enough of it the floor comes back as `None`, which leaves the engine
+    held to the strict bar for that prompt rather than stopping the sweep.
+    """
+    import torch
+
+    found = reference_look(model_path, id_list, torch.float32)
+    if not want_floor:
+        return found
+    try:
+        return found, reference_look(model_path, id_list, torch.float64)
+    except (MemoryError, RuntimeError) as trouble:
+        if "memory" not in str(trouble).lower():
+            raise
+        print("  %-12s the double-precision run did not fit in memory" % "")
+        return found, None
 
 
 def reference_floor(model_path, id_list):
@@ -190,6 +248,33 @@ def drift_of(mine, theirs):
     peak = max((abs(value) for value in theirs), default=0.0)
     gap = max((abs(a - b) for a, b in zip(mine, theirs)), default=0.0)
     return gap, peak
+
+
+def graph_walk(theirs, id_count):
+    """Yields the traced names in the order the graph computes them."""
+    for place_index in range(id_count):
+        for stem in STEP_ORDER:
+            for name in sorted(theirs):
+                if not name.endswith(".%d" % place_index):
+                    continue
+                head = name[: name.rindex(".")]
+                if head.split(".")[-1] != stem:
+                    continue
+                # Deeper tensors inherit the error of everything before them,
+                # so the bar loosens with depth rather than staying flat.
+                depth = 1.0 + (head.count(".") and int(head.split(".")[1]) or 0)
+                yield name, depth
+
+
+def first_drift(mine, theirs, id_count, slack):
+    """The first tensor in graph order that the two sides do not share."""
+    for name, depth in graph_walk(theirs, id_count):
+        if name not in mine:
+            continue
+        gap, peak = drift_of(mine[name], theirs[name])
+        if gap > slack * depth * max(1.0, peak):
+            return name, gap
+    return None
 
 
 def compare(mine, theirs, id_count, slack):
@@ -248,6 +333,76 @@ def diff_one(title, model_path, ref_path, slack, length_list=None):
     return fail_count
 
 
+def diff_real(model_path, ref_path, slack, length_list):
+    """Diffs a checkpoint whose activations are rounded onto a static grid.
+
+    Such a checkpoint does not have one answer in single precision. Every
+    projection rounds what it reads and what it writes, so a sum that lands on
+    a half step falls one way at one precision and the other way at another,
+    and one flipped step at one layer becomes a different residual for every
+    layer after it. The reference does this to itself, and no engine that does
+    not reproduce its summation order bit for bit can avoid it.
+
+    So two things are asked instead of per tensor equality. Where the graph is
+    still determined the engine must be exact, and the depth it reaches is
+    reported beside the depth the reference reaches against its own
+    double-precision self; the embedding and the first layer, which nothing can
+    have rounded twice yet, must agree outright. Where the graph is no longer
+    determined, only the end of the stack is judged, against how far the
+    reference moves there rather than against a constant, and over the whole
+    run at once rather than prompt by prompt.
+    """
+    fail_count = 0
+    my_peak = {"final": 0.0, "logits": 0.0}
+    their_peak = {"final": 0.0, "logits": 0.0}
+    size_peak = {"final": 1.0, "logits": 1.0}
+    for id_count in length_list:
+        mine, id_list = engine_trace(model_path, prompt_of(id_count))
+        theirs, wide = reference_run(ref_path, id_list, want_floor=True)
+        if not [name for name in theirs if name in mine]:
+            print("  %-12s FAIL  the two sides share no tensor names" % ("%d ids" % len(id_list)))
+            fail_count += 1
+            continue
+        my_edge = first_drift(mine, theirs, len(id_list), slack)
+        their_edge = first_drift(wide, theirs, len(id_list), slack) if wide else None
+        print("  %-12s first drift at %-16s %s"
+              % ("%d ids" % len(id_list),
+                 my_edge[0] if my_edge else "nowhere",
+                 "the reference at %s" % (their_edge[0] if their_edge else "nowhere")
+                 if wide else "the reference was not measured"))
+        # The embedding and the first layer are computed from the weights and
+        # the token alone, before anything has had a chance to be rounded twice.
+        # A difference there is a defect, not a rounding choice.
+        if my_edge and (my_edge[0].startswith("embed.") or my_edge[0].startswith("layer.0.")):
+            print("  %-12s FAIL  %s is off by %.3e before the graph can drift"
+                  % ("", my_edge[0], my_edge[1]))
+            fail_count += 1
+        for stem in ("final", "logits"):
+            name = "%s.%d" % (stem, len(id_list) - 1)
+            if name not in mine or name not in theirs:
+                continue
+            gap, peak = drift_of(mine[name], theirs[name])
+            move = drift_of(wide[name], theirs[name])[0] if wide else 0.0
+            my_peak[stem] = max(my_peak[stem], gap)
+            their_peak[stem] = max(their_peak[stem], move)
+            size_peak[stem] = max(size_peak[stem], peak)
+            print("  %-12s      %-6s off by %.3e, the reference by %s"
+                  % ("", stem, gap, "%.3e" % move if wide else "-"))
+    # Judged once over the whole run rather than length by length. Whether a
+    # given perturbation lands on a half step is a lottery, so a prompt where
+    # the reference happens to flip nothing says nothing about the engine. What
+    # the reference does across the run is the size of the movement the grid
+    # allows, and the engine is held to twice it.
+    for stem in ("final", "logits"):
+        limit = max(slack * size_peak[stem], their_peak[stem] * FLOOR_SHARE)
+        good_flag = my_peak[stem] <= limit
+        fail_count += 0 if good_flag else 1
+        print("  %-12s %-4s %-6s off by at most %.3e, the reference by %.3e, allowed %.3e"
+              % ("over the run", "ok" if good_flag else "FAIL", stem,
+                 my_peak[stem], their_peak[stem], limit))
+    return fail_count
+
+
 # The axes that change which code path runs. Prompt lengths are chosen to
 # straddle the batch chunk and the sliding window rather than to be round.
 SWEEP_PLAN = (
@@ -292,8 +447,8 @@ def main():
         if slack <= 0:
             slack = 1e-4
         print("checkpoint %s" % flag.model)
-        fail_count += diff_one("as given", flag.model, flag.reference or flag.model, slack,
-                               LENGTH_LIST if flag.sweep else None)
+        fail_count += diff_real(flag.model, flag.reference or flag.model, slack,
+                                LENGTH_LIST if flag.sweep else (len(PROMPT_TEXT.split()),))
         print("\n%d checks failed" % fail_count)
         return 0 if fail_count == 0 else 1
 

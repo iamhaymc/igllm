@@ -1264,8 +1264,11 @@ typedef struct plane {
   const int8_t  *bias_data;  /* zero points, owned, NULL when symmetric */
   int            bit_count;
   int            code_bias;  /* offset folded into the stored codes */
+  int            code_flip;  /* xor taken before the offset, for signed byte codes */
   int            group_size;
   int            group_count;
+  float          enter_gain; /* static activation step taken before the product */
+  float          leave_gain; /* and after it; zero where the export left it uncalibrated */
 
   void *own_block; /* owned auxiliary allocation, freed with the model */
 } plane;
@@ -1299,7 +1302,8 @@ static void plane_row(const plane *sheet, int row_index, float *row_out) {
       int upto_index = from_index + sheet->group_size;
       if (upto_index > sheet->col_count) upto_index = sheet->col_count;
       for (col_index = from_index; col_index < upto_index; ++col_index) {
-        int code_value = (int)pack_read(code_row, (size_t)col_index, sheet->bit_count);
+        int code_value = (int)(pack_read(code_row, (size_t)col_index, sheet->bit_count) ^
+                               (uint32_t)sheet->code_flip);
         row_out[col_index] = (float)(code_value - sheet->code_bias - bias_value) * gain_value;
       }
     }
@@ -1343,6 +1347,27 @@ static void quant_rule_read(const json_tree *tree, int32_t node_index, quant_rul
   rule_out->plan_kind = quant_plan_of(json_field_text(tree, node_index, "strategy"));
   if (rule_out->plan_kind == QUANT_NONE)
     rule_out->plan_kind = rule_out->group_size > 0 ? QUANT_GROUP : QUANT_CHANNEL;
+}
+
+/* Rounds to the static grid the export calibrated, on eight bit levels.
+ *
+ * This is not the dynamic rule below: the step is a single number stored beside
+ * the weights, one for what goes into a projection and one for what comes out.
+ * A step of zero means the layer was never calibrated, and nothing happens.
+ *
+ * The rounding is to even on a tie, which is what the reference does, and the
+ * ties are not rare here: a product of two quantized planes is an exact
+ * multiple of the two steps, so landing on a half is common enough that
+ * rounding up instead moved whole activations by a step. */
+static void quant_step(float *value_list, int value_count, float step_value) {
+  int value_index;
+  if (!(step_value > 0.0f)) return;
+  for (value_index = 0; value_index < value_count; ++value_index) {
+    float level = rintf(value_list[value_index] / step_value);
+    if (level < -128.0f) level = -128.0f;
+    if (level > 127.0f) level = 127.0f;
+    value_list[value_index] = level * step_value;
+  }
 }
 
 /* Fake-quantizes activations the way the reference forward does. */
@@ -1463,11 +1488,14 @@ static float kern_wide_total(float32x4_t wide_total) {
  * multiple of the codes per byte; when it is not, the general bit-stream loop
  * at the bottom still produces the right answer. */
 static float kern_dot_code(const uint8_t *code_row, int from_index, int span_count,
-                           const float *act_data, int bit_count) {
+                           const float *act_data, int bit_count, int code_flip) {
   float total = 0.0f;
   int slot = 0;
 
-  if (bit_count == 4 && (from_index & 1) == 0) {
+  /* The vector paths read the packed bytes as they lie, so they are taken only
+   * when the codes need no flip. A signed plane is eight bits wide and walks
+   * the stream below instead. */
+  if (bit_count == 4 && code_flip == 0 && (from_index & 1) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 2;
 #if defined(APP_SIMD_AVX2)
     {
@@ -1543,11 +1571,13 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
 
   if (bit_count == 8) {
     const uint8_t *byte_head = code_row + (size_t)from_index;
-    for (; slot < span_count; ++slot) total += (float)byte_head[slot] * act_data[slot];
+    uint8_t flip_byte = (uint8_t)code_flip;
+    for (; slot < span_count; ++slot)
+      total += (float)(uint8_t)(byte_head[slot] ^ flip_byte) * act_data[slot];
     return total;
   }
 
-  if (bit_count == 2 && (from_index & 3) == 0) {
+  if (bit_count == 2 && code_flip == 0 && (from_index & 3) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 4;
 #if defined(APP_SIMD_AVX2)
     {
@@ -1655,7 +1685,8 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
   }
 
   for (; slot < span_count; ++slot)
-    total += (float)pack_read(code_row, (size_t)(from_index + slot), bit_count) * act_data[slot];
+    total += (float)(pack_read(code_row, (size_t)(from_index + slot), bit_count) ^
+                     (uint32_t)code_flip) * act_data[slot];
   return total;
 }
 
@@ -1674,7 +1705,7 @@ static float kern_row_code(const plane *sheet, int row_index, const float *act_d
     float part_value;
     if (span_count > sheet->group_size) span_count = sheet->group_size;
     part_value = kern_dot_code(code_row, from_index, span_count, act_data + from_index,
-                               sheet->bit_count);
+                               sheet->bit_count, sheet->code_flip);
     total += gain_value * (part_value - bias_value * sum_data[group_index]);
   }
   return total;
@@ -1715,8 +1746,8 @@ static void kern_row_code_many(const plane *sheet, int row_index, const kern_job
       int slot;
       if (chunk_count > KERN_SPREAD_LIMIT) chunk_count = KERN_SPREAD_LIMIT;
       for (slot = 0; slot < chunk_count; ++slot)
-        code_room[slot] = (float)pack_read(code_row, (size_t)(from_index + done_count + slot),
-                                           sheet->bit_count);
+        code_room[slot] = (float)(pack_read(code_row, (size_t)(from_index + done_count + slot),
+                                            sheet->bit_count) ^ (uint32_t)sheet->code_flip);
       for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
         part_list[lane_index] += kern_dot_real(
             code_room, STORE_F32,
@@ -2094,17 +2125,109 @@ static const store_span *plane_find(app_model *model, const char *stem, const ch
   return store_find(&model->store, stem);
 }
 
+/* Reads a plane in the layout the Gemma quantized export uses: the codes are
+ * ordinary bytes rather than packed words, the scale carries one column per
+ * group, and the eight bit case is stored signed rather than offset.
+ *
+ * Nothing in the tensor says how many codes share a byte, because the packed
+ * width is all the shape records, so `col_hint` is what fixes the bit width. */
+static app_code plane_bind_gemma(app_model *model, const char *stem, const store_span *span,
+                                 const store_span *gain_span, int part_index, int part_count,
+                                 int col_hint, plane *sheet_out) {
+  static const int width_list[] = {8, 4, 2, 1};
+  int row_count, byte_count, group_count, col_count, bit_count = 0;
+  size_t width_index;
+  char step_text[512];
+  const store_span *step_span;
+
+  if (span->rank_count != (part_count > 1 ? 3 : 2)) return APP_FAIL_FORMAT;
+  if (part_count > 1 && (int)span->size_list[0] != part_count) return APP_FAIL_FORMAT;
+  row_count = (int)span->size_list[span->rank_count - 2];
+  byte_count = (int)span->size_list[span->rank_count - 1];
+  group_count =
+      gain_span->rank_count >= 2 ? (int)gain_span->size_list[gain_span->rank_count - 1] : 1;
+  if (group_count < 1) group_count = 1;
+
+  if (span->type_kind == STORE_I8) {
+    bit_count = 8;
+    col_count = byte_count;
+  } else if (span->type_kind == STORE_U8) {
+    col_count = col_hint;
+    if (col_count < 1) return APP_FAIL_SUPPORT;
+    for (width_index = 0; width_index < sizeof(width_list) / sizeof(width_list[0]); ++width_index)
+      if (((int64_t)col_count * width_list[width_index] + 7) / 8 == (int64_t)byte_count) {
+        bit_count = width_list[width_index];
+        break;
+      }
+    if (bit_count == 0) return APP_FAIL_FORMAT;
+  } else {
+    return APP_FAIL_SUPPORT;
+  }
+  if (col_hint > 0 && col_count != col_hint) return APP_FAIL_FORMAT;
+  if (col_count % group_count) return APP_FAIL_FORMAT;
+
+  sheet_out->form = PLANE_CODE;
+  sheet_out->row_count = row_count;
+  sheet_out->col_count = col_count;
+  sheet_out->code_data = (const uint8_t *)span->data_base +
+                         (size_t)part_index * (size_t)row_count * (size_t)byte_count;
+  sheet_out->row_stride = (size_t)byte_count;
+  sheet_out->gain_data = (const uint8_t *)gain_span->data_base +
+                         (size_t)part_index * (size_t)row_count * (size_t)group_count *
+                             store_type_bytes(gain_span->type_kind);
+  sheet_out->gain_type = gain_span->type_kind;
+  sheet_out->bit_count = bit_count;
+  sheet_out->code_bias = 1 << (bit_count - 1);
+  /* A signed byte is the offset code with its top bit flipped, so one xor puts
+   * both storage conventions through the same decode. */
+  sheet_out->code_flip = span->type_kind == STORE_I8 ? sheet_out->code_bias : 0;
+  sheet_out->group_count = group_count;
+  sheet_out->group_size = col_count / group_count;
+  if (part_index == 0) model->weight_bytes += span->data_bytes + gain_span->data_bytes;
+
+  snprintf(step_text, sizeof(step_text), "%s.input_activation_scale", stem);
+  step_span = store_find(&model->store, step_text);
+  if (step_span) sheet_out->enter_gain = real_read(step_span->data_base, step_span->type_kind, 0);
+  snprintf(step_text, sizeof(step_text), "%s.output_activation_scale", stem);
+  step_span = store_find(&model->store, step_text);
+  if (step_span) sheet_out->leave_gain = real_read(step_span->data_base, step_span->type_kind, 0);
+  return APP_OKAY;
+}
+
 /* Resolves `prefix.name` to either a real or a code plane.
  *
  * `part_count` above one selects one slice of a tensor that carries a leading
- * expert axis; the slice is a view, so no payload is copied. */
+ * expert axis; the slice is a view, so no payload is copied. `col_hint` is the
+ * input width the caller expects, and is used, and checked, only where the
+ * stored shape cannot supply it. */
 static app_code plane_bind_part(app_model *model, const char *stem, int part_index, int part_count,
-                                plane *sheet_out) {
+                                int col_hint, plane *sheet_out) {
   const store_span *span;
+  const store_span *gain_span;
+  char other_text[512];
   memset(sheet_out, 0, sizeof(*sheet_out));
   if (part_count < 1 || part_index < 0 || part_index >= part_count) return APP_FAIL_ARGUMENT;
 
+  /* The Gemma export names a quantized embedding table apart, but stores a
+   * quantized projection under the plain `weight`. What tells that apart from a
+   * real weight is the companion scale, since the codes are ordinary bytes. */
+  span = plane_find(model, stem, "embedding_quantized");
+  if (span) {
+    snprintf(other_text, sizeof(other_text), "%s.embedding_scale", stem);
+    gain_span = store_find(&model->store, other_text);
+    if (!gain_span) return APP_FAIL_MISSING;
+    return plane_bind_gemma(model, stem, span, gain_span, part_index, part_count, col_hint,
+                            sheet_out);
+  }
+
   span = plane_find(model, stem, "weight");
+  if (span && (span->type_kind == STORE_U8 || span->type_kind == STORE_I8)) {
+    snprintf(other_text, sizeof(other_text), "%s.weight_scale", stem);
+    gain_span = store_find(&model->store, other_text);
+    if (gain_span)
+      return plane_bind_gemma(model, stem, span, gain_span, part_index, part_count, col_hint,
+                              sheet_out);
+  }
   if (span) {
     size_t part_slots;
     if (span->rank_count != (part_count > 1 ? 3 : 2)) return APP_FAIL_FORMAT;
@@ -2123,11 +2246,9 @@ static app_code plane_bind_part(app_model *model, const char *stem, int part_ind
   span = plane_find(model, stem, "weight_packed");
   if (!span) return APP_FAIL_MISSING;
   {
-    const store_span *gain_span;
     const store_span *zero_span;
     const store_span *shape_span;
     int row_count, col_count, word_count, group_count, bit_count;
-    char other_text[512];
 
     if (span->rank_count != (part_count > 1 ? 3 : 2) || span->type_kind != STORE_I32)
       return APP_FAIL_SUPPORT;
@@ -2190,15 +2311,15 @@ static app_code plane_bind_part(app_model *model, const char *stem, int part_ind
   return APP_OKAY;
 }
 
-static app_code plane_bind(app_model *model, const char *stem, plane *sheet_out) {
-  return plane_bind_part(model, stem, 0, 1, sheet_out);
+static app_code plane_bind(app_model *model, const char *stem, int col_hint, plane *sheet_out) {
+  return plane_bind_part(model, stem, 0, 1, col_hint, sheet_out);
 }
 
 static app_code plane_bind_at(app_model *model, const char *shape_text, int layer_index,
-                              const char *leaf, plane *sheet_out) {
+                              const char *leaf, int col_hint, plane *sheet_out) {
   char stem_text[512];
   snprintf(stem_text, sizeof(stem_text), shape_text, model->prefix_text, layer_index, leaf);
-  return plane_bind(model, stem_text, sheet_out);
+  return plane_bind(model, stem_text, col_hint, sheet_out);
 }
 
 /* Materializes a one dimensional weight, such as a norm gain, into f32. */
@@ -2392,8 +2513,20 @@ static app_code config_read(app_model *model, const char *folder_path) {
 
   {
     int32_t quant_index = json_field(tree, 0, "quantization_config");
+    const char *method_text =
+        quant_index >= 0 ? json_field_text(tree, quant_index, "quant_method") : NULL;
     memset(&model->book, 0, sizeof(model->book));
-    if (quant_index >= 0) {
+    if (method_text && strcmp(method_text, "gemma") == 0) {
+      /* The Gemma export declares its widths as a map of module name patterns
+       * onto bit counts. Every one of them is recoverable from the shape of the
+       * tensor it describes, and the tensor is the side that cannot disagree
+       * with the payload, so only the default is taken from here. */
+      model->book.pack_flag = 1;
+      model->book.weight_rule.live_flag = 1;
+      model->book.weight_rule.symmetric_flag = 1;
+      model->book.weight_rule.plan_kind = QUANT_CHANNEL;
+      model->book.weight_rule.bit_count = (int)json_field_number(tree, quant_index, "num_bits", 4);
+    } else if (quant_index >= 0) {
       int32_t group_index = json_field(tree, quant_index, "config_groups");
       int32_t first_index = json_item(tree, group_index, 0);
       const char *form_text = json_field_text(tree, quant_index, "format");
@@ -2427,6 +2560,9 @@ static const char *model_prefix_pick(app_model *model) {
     snprintf(name_text, sizeof(name_text), "%sembed_tokens.weight_packed",
              candidate_list[candidate_index]);
     if (store_find(&model->store, name_text)) return candidate_list[candidate_index];
+    snprintf(name_text, sizeof(name_text), "%sembed_tokens.embedding_quantized",
+             candidate_list[candidate_index]);
+    if (store_find(&model->store, name_text)) return candidate_list[candidate_index];
   }
   return NULL;
 }
@@ -2439,18 +2575,19 @@ static app_code model_bind(app_model *model) {
   app_code code;
 
   snprintf(stem_text, sizeof(stem_text), "%sembed_tokens", model->prefix_text);
-  code = plane_bind(model, stem_text, &model->embed_sheet);
+  code = plane_bind(model, stem_text, form->state_size, &model->embed_sheet);
   if (code != APP_OKAY) return code;
   if (model->embed_sheet.row_count > 0) form->vocab_count = model->embed_sheet.row_count;
   if (model->embed_sheet.col_count > 0) form->state_size = model->embed_sheet.col_count;
 
   snprintf(stem_text, sizeof(stem_text), "%sembed_tokens_per_layer", model->prefix_text);
-  code = plane_bind(model, stem_text, &model->ple_embed_sheet);
+  code = plane_bind(model, stem_text, form->ple_size * form->layer_count,
+                    &model->ple_embed_sheet);
   if (code != APP_OKAY) return code;
   form->ple_size = model->ple_embed_sheet.col_count / form->layer_count;
 
   snprintf(stem_text, sizeof(stem_text), "%sper_layer_model_projection", model->prefix_text);
-  code = plane_bind(model, stem_text, &model->ple_lift_sheet);
+  code = plane_bind(model, stem_text, form->state_size, &model->ple_lift_sheet);
   if (code != APP_OKAY) return code;
 
   snprintf(stem_text, sizeof(stem_text), "%sper_layer_projection_norm", model->prefix_text);
@@ -2464,7 +2601,8 @@ static app_code model_bind(app_model *model) {
     size_t head_index;
     model->head_own_flag = 0;
     for (head_index = 0; head_index < sizeof(head_list) / sizeof(head_list[0]); ++head_index) {
-      if (plane_bind(model, head_list[head_index], &model->head_sheet) == APP_OKAY) {
+      if (plane_bind(model, head_list[head_index], form->state_size,
+                     &model->head_sheet) == APP_OKAY) {
         model->head_own_flag = 1;
         break;
       }
@@ -2497,26 +2635,32 @@ static app_code model_bind(app_model *model) {
       wing->keep_flag = form->share_count > 0 && last_slot == layer_index;
     }
 
-    code = plane_bind_at(model, "%slayers.%d.self_attn.%s", layer_index, "q_proj", &wing->query_sheet);
+    code = plane_bind_at(model, "%slayers.%d.self_attn.%s", layer_index, "q_proj",
+                         form->state_size, &wing->query_sheet);
     if (code != APP_OKAY) return code;
-    code = plane_bind_at(model, "%slayers.%d.%s", layer_index, "mlp.gate_proj", &wing->gate_sheet);
+    code = plane_bind_at(model, "%slayers.%d.%s", layer_index, "mlp.gate_proj",
+                         form->state_size, &wing->gate_sheet);
     if (code != APP_OKAY) return code;
-    code = plane_bind_at(model, "%slayers.%d.%s", layer_index, "mlp.up_proj", &wing->rise_sheet);
+    code = plane_bind_at(model, "%slayers.%d.%s", layer_index, "mlp.up_proj",
+                         form->state_size, &wing->rise_sheet);
     if (code != APP_OKAY) return code;
-    code = plane_bind_at(model, "%slayers.%d.%s", layer_index, "mlp.down_proj", &wing->drop_sheet);
+    code = plane_bind_at(model, "%slayers.%d.%s", layer_index, "mlp.down_proj",
+                         wing->gate_sheet.row_count, &wing->drop_sheet);
     if (code != APP_OKAY) return code;
-    code = plane_bind_at(model, "%slayers.%d.self_attn.%s", layer_index, "o_proj", &wing->exit_sheet);
+    code = plane_bind_at(model, "%slayers.%d.self_attn.%s", layer_index, "o_proj",
+                         wing->query_sheet.row_count, &wing->exit_sheet);
     if (code != APP_OKAY) return code;
 
     wing->head_size = wing->query_sheet.row_count / form->head_count;
     wing->inner_size = wing->gate_sheet.row_count;
 
     if (!wing->share_flag) {
-      code = plane_bind_at(model, "%slayers.%d.self_attn.%s", layer_index, "k_proj", &wing->key_sheet);
+      code = plane_bind_at(model, "%slayers.%d.self_attn.%s", layer_index, "k_proj",
+                           form->state_size, &wing->key_sheet);
       if (code != APP_OKAY) return code;
       wing->kv_count = wing->key_sheet.row_count / wing->head_size;
       if (plane_bind_at(model, "%slayers.%d.self_attn.%s", layer_index, "v_proj",
-                        &wing->value_sheet) != APP_OKAY)
+                        form->state_size, &wing->value_sheet) != APP_OKAY)
         memset(&wing->value_sheet, 0, sizeof(wing->value_sheet)); /* keys double as values */
       snprintf(stem_text, sizeof(stem_text), "%slayers.%d.self_attn.k_norm", model->prefix_text,
                layer_index);
@@ -2550,10 +2694,10 @@ static app_code model_bind(app_model *model) {
 
     if (form->ple_size > 0) {
       code = plane_bind_at(model, "%slayers.%d.%s", layer_index, "per_layer_input_gate",
-                           &wing->ple_gate_sheet);
+                           form->state_size, &wing->ple_gate_sheet);
       if (code != APP_OKAY) return code;
       code = plane_bind_at(model, "%slayers.%d.%s", layer_index, "per_layer_projection",
-                           &wing->ple_lift_sheet);
+                           form->ple_size, &wing->ple_lift_sheet);
       if (code != APP_OKAY) return code;
       snprintf(stem_text, sizeof(stem_text), "%slayers.%d.post_per_layer_input_norm",
                model->prefix_text, layer_index);
@@ -2566,7 +2710,7 @@ static app_code model_bind(app_model *model) {
       int inner_size;
       snprintf(stem_text, sizeof(stem_text), "%slayers.%d.router.proj", model->prefix_text,
                layer_index);
-      code = plane_bind(model, stem_text, &wing->route_sheet);
+      code = plane_bind(model, stem_text, form->state_size, &wing->route_sheet);
       if (code != APP_OKAY) return code;
       /* Every layer must agree on the expert count, because the session rooms
        * and the free walk are sized once from the form. */
@@ -2587,11 +2731,12 @@ static app_code model_bind(app_model *model) {
         snprintf(stem_text, sizeof(stem_text), "%slayers.%d.experts.gate_up_proj",
                  model->prefix_text, layer_index);
         code = plane_bind_part(model, stem_text, expert_index, form->expert_count,
-                               &wing->expert_rise_list[expert_index]);
+                               form->state_size, &wing->expert_rise_list[expert_index]);
         if (code != APP_OKAY) return code;
         snprintf(stem_text, sizeof(stem_text), "%slayers.%d.experts.down_proj", model->prefix_text,
                  layer_index);
         code = plane_bind_part(model, stem_text, expert_index, form->expert_count,
+                               wing->expert_rise_list[expert_index].row_count / 2,
                                &wing->expert_drop_list[expert_index]);
         if (code != APP_OKAY) return code;
       }
@@ -2907,8 +3052,15 @@ static app_code token_load(const char *folder_path, int vocab_hint, token_book *
   book->close_id = token_find(book, "<eos>");
   book->pad_id = token_find(book, "<pad>");
   book->unk_id = token_find(book, "<unk>");
-  book->turn_open_id = token_find(book, "<start_of_turn>");
-  book->turn_shut_id = token_find(book, "<end_of_turn>");
+  /* Gemma 4 renamed the turn markers. The older pair is kept behind it so that
+   * a Gemma 2 or 3 checkpoint still frames, since nothing else distinguishes
+   * the two vocabularies. */
+  book->turn_open_id = token_find(book, "<|turn>");
+  book->turn_shut_id = token_find(book, "<turn|>");
+  if (book->turn_open_id < 0 || book->turn_shut_id < 0) {
+    book->turn_open_id = token_find(book, "<start_of_turn>");
+    book->turn_shut_id = token_find(book, "<end_of_turn>");
+  }
   book->start_flag = 1;
 
   *book_out = book;
@@ -3161,25 +3313,33 @@ struct app_session {
   int      echo_limit;
 };
 
-/* Applies the activation rule declared by the checkpoint, then multiplies.
- * A lane count above one turns the projection into a matrix product. */
+/* Rounds the activation onto whatever grid the checkpoint declares, multiplies,
+ * and rounds the result onto its own grid. Every projection passes through
+ * here, so this is the one place either rule has to be applied. A lane count
+ * above one turns the projection into a matrix product. */
 static void session_lift_many(app_session *session, const plane *sheet, const float *act_data,
                               int act_stride, int lane_count, float *out_data, int out_stride) {
   app_model *model = session->model;
   const float *use_data = act_data;
   int use_stride = act_stride;
-  if (model->book.input_rule.live_flag && sheet->form == PLANE_CODE) {
-    int lane_index;
+  int rule_flag = model->book.input_rule.live_flag && sheet->form == PLANE_CODE;
+  int lane_index;
+  if (rule_flag || sheet->enter_gain > 0.0f) {
     for (lane_index = 0; lane_index < lane_count; ++lane_index) {
       float *lane_data = session->quant_room + (size_t)lane_index * (size_t)session->quant_stride;
       memcpy(lane_data, act_data + (size_t)lane_index * (size_t)act_stride,
              sizeof(float) * (size_t)sheet->col_count);
-      quant_act(lane_data, sheet->col_count, &model->book.input_rule);
+      if (rule_flag) quant_act(lane_data, sheet->col_count, &model->book.input_rule);
+      quant_step(lane_data, sheet->col_count, sheet->enter_gain);
     }
     use_data = session->quant_room;
     use_stride = session->quant_stride;
   }
   model->desk.mat_mat(&model->desk, sheet, use_data, use_stride, lane_count, out_data, out_stride);
+  if (sheet->leave_gain > 0.0f)
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      quant_step(out_data + (size_t)lane_index * (size_t)out_stride, sheet->row_count,
+                 sheet->leave_gain);
 }
 
 static void session_lift(app_session *session, const plane *sheet, const float *act_data,
