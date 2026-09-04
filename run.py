@@ -9,6 +9,7 @@ compiler invocation. No make, cmake, or third party build tool is involved.
     python3 run.py test             # build, then run the unit tests
     python3 run.py check            # test, plus the reference comparison
     python3 run.py parity           # build a fake checkpoint and diff every layer
+    python3 run.py parity --media   # the same for the vision and audio towers
     python3 run.py run -- <args>    # build, then run the cli with <args>
     python3 run.py clean            # remove build products
 """
@@ -140,6 +141,12 @@ def work_parity(flag):
     line = [sys.executable, os.path.join(ROOT_PATH, "app_diff.py"), "--sweep"]
     if flag.model:
         line += ["--model", flag.model]
+    if flag.media:
+        line += ["--media"]
+        if flag.image:
+            line += ["--image", flag.image]
+        if flag.audio:
+            line += ["--audio", flag.audio]
     step_show("parity", line)
     return subprocess.call(line)
 
@@ -181,6 +188,10 @@ def main():
                         help="compile in the activation dump the layer comparison reads")
     parser.add_argument("--only", help="build a single target")
     parser.add_argument("--model", help="checkpoint folder for the check workflow")
+    parser.add_argument("--media", action="store_true",
+                        help="diff the vision and audio towers rather than the text stack")
+    parser.add_argument("--image", help="the picture to show a vision tower")
+    parser.add_argument("--audio", help="the clip to play an audio tower")
     # Everything after the first bare `--` belongs to the cli, and everything
     # before it belongs to this script. argparse.REMAINDER cannot express that:
     # it swallows the script's own flags too, so `build --debug` silently built

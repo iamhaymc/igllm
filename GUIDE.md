@@ -10,7 +10,7 @@ and where an accelerator would attach.
 
 | file          | role                                                         |
 | ------------- | ------------------------------------------------------------ |
-| `app_core.c`  | the engine: a public interface followed by ten layers        |
+| `app_core.c`  | the engine: a public interface followed by eleven layers     |
 | `app_main.c`  | the command line front end                                   |
 | `app_test.c`  | the unit tests                                               |
 | `app_test.py` | parity and throughput comparison against transformers        |
@@ -47,6 +47,7 @@ Six types and twenty-odd functions:
 - `app_setup` — thread count, context length, verbosity.
 - `app_taste` — temperature, top-k, top-p, repetition penalty, seed.
 - `app_tally` — prefill and decode timings, token counts, memory.
+- `app_media` — the embedding rows one picture or one clip turned into.
 - `app_model` — an opaque loaded checkpoint, shared and read-only.
 - `app_session` — an opaque conversation, one per concurrent stream.
 
@@ -250,7 +251,42 @@ NPU backend therefore needs three things and touches nothing else:
 The loader deliberately keeps "the bytes of a weight" separate from "the
 handle to a weight", which is what makes that substitution local.
 
-### 3.8 Model layer
+### 3.8 Media layer
+
+Everything a picture or a sound passes through before a tower sees it. The
+layer knows nothing about models: it turns bytes on disk into a rectangle of
+floats or a run of samples.
+
+- `flat_grid` — a band-interleaved raster. A mel spectrogram is one of these
+  too, with one band, the frame as the row and the filter as the column, which
+  is what lets the tower layer treat a picture and a sound the same way.
+- `puff_run` — an inflate reader: stored, fixed and dynamic Huffman blocks,
+  with the zlib wrapper skipped when one is present. It is here because a PNG
+  cannot be read without one and a third party decoder is not an option.
+- `png_read` — eight and sixteen bit grey, RGB, palette, and the two alpha
+  forms, non-interlaced. All five line filters are undone. Alpha is dropped
+  rather than composited: inventing a background is a preprocessing choice
+  this layer has no business making.
+- `pnm_read`, `bmp_read` — binary `P5`/`P6`, and uncompressed 24 or 32 bit
+  bitmaps. `image_read` picks between the three from the leading bytes rather
+  than the file name.
+- `grid_scale` — a separable bicubic, the `a = -0.5` member of the family.
+  The support widens with the reduction factor, so shrinking an image averages
+  over everything it passes rather than sampling sixteen pixels out of a
+  thousand; centres are half-pixel, so the two images cover the same area.
+  `grid_bands` folds three bands onto one by the luma weights, or spreads one
+  over three.
+- `wave_read` — RIFF wave: 8, 16, 24 and 32 bit integer and 32 bit float,
+  `WAVE_FORMAT_EXTENSIBLE` included, with channels averaged rather than
+  dropped. `wave_rate` resamples linearly, which is below what a filterbank
+  can see.
+- `wave_spin` — an in-place radix-2 transform. `mel_bank` builds triangular
+  filters spaced evenly on the HTK mel scale at fractional bin positions, and
+  `mel_make` produces the log mel spectrogram: a periodic Hann window, the
+  next power of two at or above the frame, and a floor under the logarithm so
+  a silent band cannot reach negative infinity.
+
+### 3.9 Model layer
 
 `config_read` fills `model_form`, the description of everything that affects
 the arithmetic:
@@ -300,7 +336,130 @@ for `embed_tokens.weight`, `embed_tokens.weight_packed` and
 table is what distinguishes the quantization layouts as much as the prefix
 distinguishes the exporters.
 
-### 3.9 Token layer
+### 3.10 The vision and audio towers
+
+Two encoders sit beside the text stack, each ending in a projection into the
+text hidden width. They are bound only when `config.json` carries a
+`vision_config` or an `audio_config` **and** the weights carry the matching
+tower; a configuration that describes one the export left out is a text-only
+checkpoint, not a broken one, and loads as such.
+
+`tower_prefix_pick` finds the names the exporter used, probing both shapes the
+reference writes — vision layers under an `encoder` module, audio layers
+directly under the tower — and `tower_bind_line` looks one level deeper than the
+name of a projection suggests, because the reference wraps every tower linear in
+a module that can clip its input and its output. As everywhere else in the
+loader, the weights decide the shape: the hidden width comes from `q_proj`'s
+column count, the head size from its row count over the configured head count,
+the feed-forward width from `gate_proj` or `ffw_layer_1`. Only what a tensor
+cannot record is read from the configuration — the patch size, the pooling
+factor, the analysis window, the attention span.
+
+Both towers' projections go through `plane_lift_many`, the same function the
+text stack's projections go through, so the checkpoint's packed weights and its
+calibrated activation ranges are handled without a second code path. The shipped
+export quantizes the vision tower to eight bits and the audio tower to two, and
+`plane_bind_gemma` recovers each width from the stored shape rather than from
+the configuration's regular expressions.
+
+**The vision tower** is the text layer with the causal mask taken off:
+`input_layernorm` → attention → `post_attention_layernorm` → residual, then
+`pre_feedforward_layernorm` → gated MLP → `post_feedforward_layernorm` →
+residual. That is `session_layer` without the per-layer embedding gate and
+without the mixture branch, which is why `tower_feed` is one function.
+
+It takes a **variable resolution** rather than a fixed square. `vision_grid_pick`
+preserves the aspect ratio, caps the area by the patch budget the soft-token
+limit implies, and rounds both sides down to a multiple of `pool_size *
+patch_size` so the pooler's windows divide exactly. `vision_patch_cut` then cuts
+the picture into patches; inside one patch the samples run row, then column,
+then band — the band is the fastest axis, which is what the reference's flatten
+produces. Pixels arrive in `[0,1]` and are scaled to `[-1,1]`, a step the
+reference does in the model rather than in the preprocessor.
+
+Positions are two dimensional and enter twice. A learned table holds one row per
+column index and one per row index — `position_embedding_table` is the two
+stacked — and the patch's two rows are summed into its embedding. Then
+`rope_grid_wave` and `rope_grid_turn` give the first half of every head the
+patch's column and the second half its row, **rotating each half within itself**:
+channel *j* of a half pairs with channel *j + half/2* of the same half. That is
+not the text stack's rotate-half, which pairs across the whole head, so the
+vision tower has its own turn. It needs a head size divisible by four, and a
+tower whose head does not divide is refused rather than guessed at. Attention is
+bidirectional and scaled by **one**: the query and key norms absorb the usual
+`1/sqrt(d)`, exactly as they do in the text stack. Values carry a norm without a
+scale.
+
+After the stack, `vision_pool` averages over `pool_size` squared windows and
+scales by the square root of the hidden width.
+
+**The audio tower is a conformer**, not a transformer, and the difference is
+worth stating because the two look alike from a distance. A layer is
+
+```
+feed-forward (folded back at half weight)
+norm, chunked local attention, norm, residual
+a gated depthwise convolution over time
+feed-forward (folded back at half weight)
+norm
+```
+
+so it carries two feed-forwards rather than one and a convolution module the
+text stack has no equivalent of. `sound_wing` and `sound_bind` are separate from
+the vision tower's for that reason.
+
+The clip is read, resampled to the tower's rate, and turned into a log mel
+spectrogram whose every convention comes from the checkpoint's
+`preprocessor_config.json`: a periodic Hann window, a stated transform length
+rather than a derived one, half a window of silence prepended so the first frame
+is centred on the first sample, a frame cut one sample longer than the window
+before the last sample is dropped, a **magnitude** spectrum rather than a power
+one, and a floor added under the logarithm rather than a clamp inside it.
+Squaring instead of taking the magnitude is the easy mistake here: it survives
+every sanity check and only a comparison against the reference finds it.
+
+`sound_stage` then runs the subsampler — two convolutions over (frame, filter),
+each followed by a mean-subtracting `kern_norm_layer` across the channels it
+produced and a rectifier — and the map is folded into the hidden width with the
+filter axis outside the channel axis, which is the order the reference's permute
+leaves behind.
+
+`sound_attend` writes the attention as the causal window that the reference's
+chunking and its sliding mask agree on. The reference cuts the sequence into
+chunks, gives each a context window, and masks that window down with a rule of
+`(attention_context_left - 1, attention_context_right)` — and that rule is a
+**strict** inequality, so a query reaches `attention_context_left - 1` keys at or
+before itself. Getting that bound wrong by one is invisible in every shape and
+changes every number; it is the one thing in this tower that a shape check
+cannot catch. What survives both the chunking and the mask is exactly the
+sliding window, so the block machinery is an efficiency device rather than part
+of the arithmetic, and the relative shift it needs collapses into indexing the
+position row by the lag. The score is a content term plus a term against a
+projection of the sinusoid of that lag, the query is scaled per head channel
+through a softplus and the key by a constant, and the sum is softcapped with a
+tanh before the softmax.
+
+**The projector.** Each tower ends in one norm and one linear into the text
+hidden width. The norm carries no scale in the reference, so a missing weight
+means "normalize without one" rather than "do not normalize". The audio tower
+widens through its own `output_proj` first. `plane_bind_turn` accepts the
+projection stored either way round, because a multi-modal projection is
+conventionally `[in, out]` while every other weight in the checkpoint is
+`[out, in]`.
+
+**Where the rows go.** `media_image` and `media_audio` return an `app_media` —
+one embedding row per placeholder token. The caller lays those rows against the
+ids and hands both to `session_prime_media`, which substitutes a row for the
+embedding lookup of the lanes it is given. The substitution happens *after* the
+token path's `sqrt(hidden_size)` scale, not before it, so a projector's output
+is already in the units the residual stream carries. The id stays the
+placeholder's, because the per-layer embedding block reads the id and the
+reference feeds it the placeholder too.
+
+A tower allocates its own scratch per call rather than per session: it runs once
+for a prompt and never inside the token loop.
+
+### 3.11 Token layer
 
 `token_load` reads `tokenizer.json`: the vocabulary, the merge list, the
 added tokens with their special marks, and the metaspace behaviour from the
@@ -322,7 +481,7 @@ Gemma 4 writes the turn markers `<|turn>` and `<turn|>`, and the older
 else in a checkpoint distinguishes the two vocabularies. `chat` and `logits`
 both frame; `--raw` and every other task do not.
 
-### 3.10 Session layer
+### 3.12 Session layer
 
 A session owns the caches and the scratch. `session_open` allocates once,
 sized from the model, and nothing in the token loop allocates again.
@@ -389,27 +548,35 @@ temperature of zero short-circuits to the maximum.
 ## 4. Data flow
 
 ```
-folder ──► config.json ──► model_form ──► layer_wing[]
+folder ──► config.json ──► model_form ──► layer_wing[], tower_gear[]
        │
        ├─► model.safetensors ──► store_span[] ──► plane[]
        │                          (mmap, zero copy)
        │
        └─► tokenizer.json ──► token_book
 
-text ──► token_encode ──► ids ──► session_prime ──► session_step ──► logits
-                                       │                 │
-                                  key/value cache   session_pick ──► id ──► token_decode ──► text
+text  ──► token_encode ──► ids ───┐
+                                  ├─► session_prime_media ──► session_step ──► logits
+image ──► image_read ──► resize ──┤          │                     │
+              └► vision_run ──► rows         │                session_pick ──► id ──► text
+sound ──► wave_read ──► mel ──────┤     key/value cache
+              └► audio_run  ──► rows
 ```
+
+An image or a clip enters as a run of placeholder ids with one embedding row
+laid against each of them; everything after that is the text path.
 
 ## 5. Formats read
 
 | file                      | needed for                                     |
 | ------------------------- | ---------------------------------------------- |
-| `config.json`             | architecture, layer types, rotary, quantization |
+| `config.json`             | architecture, layer types, rotary, quantization, the tower blocks |
 | `generation_config.json`  | default sampling and stop ids, when present     |
 | `model.safetensors`       | the weights                                     |
 | `model.safetensors.index.json` | shard map, when the checkpoint is split   |
 | `tokenizer.json`          | vocabulary, merges, special tokens              |
+| `.png`, `.pnm`, `.bmp`    | a picture for the vision tower                  |
+| `.wav`                    | a clip for the audio tower                      |
 
 ## 6. Testing
 
@@ -426,6 +593,43 @@ parameter lands on the right rows, and `test_wing` writes a complete
 miniature checkpoint — config, tokenizer, and every tensor the loader binds,
 once dense and once with a mixture block — and asserts that a batched prefill
 reaches exactly the logits produced by feeding the same tokens one at a time.
+
+`test_puff`, `test_image`, `test_scale`, `test_wave` and `test_mel` cover the
+media layer. The inflate reader is held against a stored block assembled in the
+test and against a dynamic Huffman block produced by an independent compressor
+over four hundred bytes the test can regenerate from a formula; a truncated
+stream and one that would overrun its room are both required to be refused. The
+png fixture is a twelve by eight picture written by an independent encoder with
+the five line filters used in turn, and the same picture is written again as a
+pnm and as a bottom-up bitmap, so the three readers are held to one answer. The
+resize is checked four ways: a constant survives in both directions, a ramp
+stays a straight line where the taps fit, the separable implementation matches a
+direct two dimensional gather, and folding three bands onto one takes the luma
+weights. The wave reader has to step over an unknown chunk, average its channels
+rather than drop one, and halve its sample count when the rate halves. The fast
+transform is held against the discrete one it is a fast way of computing, the
+filters against the shape the mel scale implies, and a pure tone against the
+filter that covers it.
+
+`test_tower` writes a miniature multi-modal checkpoint in the shipped export's
+arrangement — the reference's module names, its wrapper around every projection,
+its two axis position tables, its conformer — and runs the vision tower against
+a definition of it written out separately in the test file. The two sides share
+the weights and the decoded picture and nothing else, so agreement says the
+arrangement is right rather than merely self-consistent.
+
+The audio tower is not reproduced a second time in C. It is a conformer with a
+dozen interacting parts and a second transcription here would mostly be a copy
+of the first; what it gets instead is a check on each piece peculiar to it — the
+mean-subtracting norm, the silu, the softplus — plus the end-to-end run, the
+causal property that a longer clip repeats a shorter one's first row, and the
+requirement that a clip which sounds different reaches a different answer. The
+tower as a whole is held against the real reference by `app_diff.py --media`,
+which is a stronger test than anything written here could be.
+
+Both cases then check that a substituted embedding actually reaches the stack:
+the same ids primed with and without the tower's rows have to land on different
+logits.
 
 `test_gemma` writes a safetensors fixture in the shipped export's layout — a
 four bit plane, a signed eight bit plane, and a two bit embedding table with
@@ -518,6 +722,32 @@ by prompt: whether a given perturbation lands on a half step is a lottery, and
 a prompt where the reference happens to flip nothing says nothing about what
 the engine may do.
 
+**`app_diff.py --media` walks the two towers against the reference itself.**
+Each tower is built from the reference's own module and loaded with the
+checkpoint's own weights, its packed tensors decoded by the reference's own
+`QuantizedLinear`. That works even on the shipped export, whose language model
+dequantizes to about nineteen gigabytes and will not fit on an ordinary machine:
+a tower is a couple of hundred megabytes, and the reference gives each one a
+`base_model_prefix` so it can be built alone. So the towers are held to the same
+standard as the text stack — upstream, on the real weights — rather than to a
+second reading of the same description.
+
+Both sides start from the rows the engine says it read — the normalized patches,
+or the mel frames — because the png reader, the resize and the filterbank each
+have an independent definition in `app_test.c` already, and what is in question
+here is the tower above them. The filterbank is separately held against the
+reference's own `Gemma4AudioFeatureExtractor`.
+
+The bar is measured rather than picked. On a checkpoint that rounds every
+activation onto a static grid there is no single answer to agree with, so the
+reference's own input is nudged by a part in a million and how far that carries
+is the size of a difference that means nothing. On the shipped export the vision
+tower's rows differ by 2.08 where that nudge moves the reference by 2.62, and
+the audio tower's by 2.38 where the nudge moves it by 5.36 — in both cases the
+engine is closer to the reference than the reference is to itself under a change
+that should not matter. On synthetic float weights, where there is no grid, the
+vision tower agrees to 1.2e-07 and the audio tower to 2.2e-05.
+
 ## 7. Extending
 
 **A new backend.** Write a `back_open` variant that fills `back_desk` with
@@ -531,3 +761,11 @@ only `plane`.
 **A new architecture.** Extend `model_form` and `layer_wing`, and add the
 matching branch in `session_layer`. The loader, tokenizer, kernels, and
 sampler are all architecture-neutral.
+
+**A new modality.** Add a reader to the media layer, a `tower_form` and a
+`tower_gear` beside the two that exist, and one `*_run` that fills embedding
+rows. `tower_feed` already carries the residual arrangement; what a new tower
+has to supply is how a position enters the score and how its input becomes a
+row. Nothing in the session or the sampler changes: a tower's output is
+substituted for a placeholder token's embedding and the text path takes it from
+there.

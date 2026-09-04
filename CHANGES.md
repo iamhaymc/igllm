@@ -502,3 +502,324 @@ comparison, and it moves none of them.
 The sanitizers were not run over any of this. The MinGW toolchain on the
 Windows host has no `libasan` or `libubsan`, and there was no POSIX host.
 `TODO.md` has the rest.
+
+---
+
+## 0.5.0 — the vision and audio towers
+
+### Why
+
+The engine was text-only, and the two encoders were the largest thing missing
+from an architecture that has them. They also bring in work the engine had
+never done before: reading a picture, resizing it, reading a sound, and turning
+it into a spectrogram — none of which can be borrowed in a project with no
+dependencies.
+
+### Both towers are the text layer with the mask taken off
+
+`tower_feed` runs `input_layernorm` → attention → `post_attention_layernorm` →
+residual, then `pre_feedforward_layernorm` → gated MLP →
+`post_feedforward_layernorm` → residual. That is `session_layer` without the
+per-layer embedding gate and without the mixture branch, so the two towers
+share one copy of it, and what differs between them is exactly what should:
+where a position enters the score, and how the input becomes a row.
+
+Every tower projection goes through `plane_lift_many`, which is the function
+the text stack's projections go through. That was a refactor rather than an
+addition — `session_lift_many` used to hold the activation-grid rule and the
+session's staging room together, and the towers needed the rule without the
+session. Splitting them left the rule in one place, which is what the guide
+already claimed, and it means a packed tower with calibrated activation ranges
+needs no second code path. The staging room is chunked to `KERN_LANE_LIMIT`
+lanes inside the function, so a tower running two hundred patches at once needs
+no larger buffer than the token loop does.
+
+### Positions
+
+**Vision is two dimensional.** The first half of a head turns with the patch's
+row and the second half with its column, which lets the rotate-half kernel the
+text stack uses apply unchanged. It needs a head size divisible by four — each
+axis takes half a head and is rotated as a pair — and a tower whose head does
+not divide is refused rather than guessed at.
+
+**Audio is relative.** The score is a content term against the key plus a term
+against a projection of the distance between the two frames, each with its own
+learned bias, which is what lets one query serve both. The relative rows do not
+depend on the query, so they are projected once for the whole layer rather than
+once for every pair of frames. Without `pos_proj` the tower is an ordinary
+bidirectional encoder, which is what a checkpoint that left it out is asking
+for.
+
+### Where the rows go
+
+A tower's output is substituted for the embedding of a placeholder token
+**after** the token path has applied its `sqrt(hidden_size)` scale, not before
+it, so a projector emits values already in the units the residual stream
+carries. The id stays the placeholder's, because the per-layer embedding block
+reads the id and the reference feeds it the placeholder too. `session_prime`
+gained `session_prime_media`, which takes one embedding row per id and a mark
+saying which of them a tower filled; the old entry points forward to it with
+nulls, so nothing text-only changed.
+
+### The media layer
+
+**The deflate reader is here because a png cannot be read without one.** It
+handles stored, fixed and dynamic blocks, skips a zlib wrapper when it finds
+one, and refuses a truncated stream rather than returning what it managed —
+the caller sizes its buffer from the header and would read the rest as image
+data. The png reader undoes all five line filters and takes eight and sixteen
+bit grey, RGB, palette and the two alpha forms; interlaced files and sub-byte
+depths are refused. A pnm and a bmp reader come almost free beside it, and
+`image_read` picks between the three from the leading bytes rather than the
+file name, because a checkpoint's own sample images are as likely to be
+misnamed as anything.
+
+**The resize widens its filter when it shrinks.** A plain four-tap bicubic
+sampling sixteen pixels out of a thousand aliases badly, and it is visible as
+speckle in any downscaled photograph. The support is scaled by the reduction
+factor, which is what PIL and torchvision do when antialiasing is on. Centres
+are half-pixel, so the two images cover the same area rather than sharing a
+corner.
+
+**The filterbank is HTK mel.** Triangles at fractional bin positions, so two
+neighbours hand over cleanly across the band they share; a periodic Hann
+window; the transform taken over the next power of two at or above the frame;
+and a floor under the logarithm, without which a silent band reaches negative
+infinity and takes the tower with it.
+
+### Testing
+
+`test_puff`, `test_image`, `test_scale`, `test_wave` and `test_mel` hold every
+piece of the media layer against something written independently of it. Two
+fixtures were produced by a foreign encoder over content a formula describes —
+four hundred bytes deflated into a dynamic Huffman block, and a twelve by eight
+png with the five line filters used in turn — which is stronger than a recorded
+output: a recording only shows that nothing has changed. The transform is
+checked against the discrete sum it is a fast way of computing, and the
+separable resize against a direct two dimensional gather.
+
+`test_tower` writes a miniature multi-modal checkpoint and runs both towers
+against a definition of them written out separately in the test file. The two
+sides share the weights and the decoded media and nothing else. Finding the
+audio reference wrong on its first run was the point of writing it: the fixture
+carries query and key norms, the tower applies them, and the reference had left
+them out.
+
+`app_diff.py --media` does the same at a larger size and in another language,
+against `tower_forward` in `app_fake.py`. Both oracles were then checked by
+breaking the engine on purpose. Swapping the row and the column in
+`rope_grid_wave` makes the harness report `vision.0.attn.0`, stay silent about
+the patches and the embedding before it, and leave the audio tower passing;
+reading the relative row for the opposite offset makes it report
+`audio.0.attn.0` and leaves the vision tower passing.
+
+The suite is 267 assertions and builds clean under `-Wall -Wextra`.
+
+### What the tower oracle is worth
+
+Less than the text one, and the difference is worth stating rather than
+glossing. The text stack is compared against the reference library: the
+checkpoint is written by `save_pretrained` and read by `AutoModelForCausalLM`,
+so the names, the shapes and the arithmetic all come from upstream rather than
+from a reading of upstream. No released `transformers` carries these towers, so
+there is nothing upstream to compare against, and `app_fake.py` has to build
+the tower weights itself.
+
+What is left is two transcriptions of one description — the engine in C and
+`tower_forward` in torch, plus a third in `app_test.c` — walked tensor by
+tensor. That catches a transcription error, an index the wrong way round, a
+norm in the wrong place, an offset read backwards; all of those are what the
+deliberate perturbations above are. It cannot catch a misunderstanding the
+sides share. `TODO.md` carries the item to replace it when upstream ships.
+
+### Fixed on the way through
+
+`token_decode_book` left its output slot untouched when it returned zero for a
+control token, so a caller that reads the text without checking the count
+printed uninitialized stack. Every media prompt starts with a run of
+placeholder ids, which made it show up immediately. The slot is now terminated
+before anything else happens.
+
+### Known gaps
+
+The towers have not been run against a real multi-modal checkpoint, because
+none exists to run them against. Nothing in them has been optimized: attention
+is a plain triple loop over the whole grid, the audio tower materializes a
+relative row for every reachable offset whether or not the context spans reach
+it, and the subsampler projects one frame at a time. None of that is in the
+token loop.
+
+The command line takes one picture and one clip and puts both in front of the
+prompt. The engine substitutes any set of positions, so interleaving them with
+the text is a front-end change rather than an engine one.
+
+The png reader refuses interlaced files and bit depths under eight, and there
+is no jpeg reader. The sanitizers were not run over any of this, for the same
+reason as last time: the MinGW toolchain on the Windows host has no `libasan`
+or `libubsan`, and there was no POSIX host. `TODO.md` has the rest.
+
+---
+
+## 0.6.0 — the towers against the reference
+
+### Why
+
+Version 0.5.0 shipped two towers that had never been compared to anything but
+themselves. The reasoning given at the time was that no released `transformers`
+carried the vision and audio encoders, so there was nothing upstream to compare
+against, and that three transcriptions of one description agreeing with each
+other was the best available evidence. That reasoning was correct about the
+evidence and wrong about the premise: `transformers` **does** carry them, and
+the shipped checkpoint is not gated. Installing the library from source and
+downloading the export took twenty minutes.
+
+The comparison then said what a comparison of that kind usually says when it is
+run for the first time: almost everything was wrong.
+
+### What the reference actually says
+
+The architecture in 0.5.0 was in the right family and wrong in most specifics.
+
+| | what 0.5.0 did | what the reference does |
+| --- | --- | --- |
+| vision rope | flat `rope_theta`, default 10000 | `rope_parameters.rope_theta`, **100** |
+| vision rope pairing | rotate-half across the whole head | each half rotated **within itself** |
+| vision axes | row first | **column** first |
+| vision attention | scaled by `1/sqrt(d)` | scaled by **one**; the norms absorb it |
+| vision values | no norm | a norm **without a scale** |
+| vision positions | none, or one flat table | **two** tables, one per axis, summed |
+| vision input | fixed square `image_size` | **variable resolution**, capped by a soft-token budget |
+| patch layout | band, row, column | row, column, **band** |
+| pooling | ragged windows, no scale | exact windows, scaled by `sqrt(hidden)` |
+| audio layer | a transformer layer | a **conformer**: two half-weight feed-forwards and a gated depthwise convolution |
+| audio activation | gelu | **silu** |
+| audio attention | full or simple span | **chunked local**, with a tanh softcap and a per-channel query scale |
+| mel spectrum | power, clamped log, derived transform length | **magnitude**, floor added under the log, stated length, semicausal padding |
+
+Every one of those is now the reference's. The vision encoder layer's residual
+arrangement was the one thing that had been right, which is why `tower_feed`
+survived unchanged.
+
+### The towers can be weighed even when the model cannot be loaded
+
+The obvious way to check a tower is to load the model and compare. That was not
+available: the shipped export's language model dequantizes to roughly nineteen
+gigabytes, against eight free on the development host, and no amount of care
+about dtypes closes that gap.
+
+What made the comparison possible is that the reference gives each tower its own
+`base_model_prefix`. A tower can be constructed on its own, handed the subset of
+the checkpoint that belongs to it, and run — a couple of hundred megabytes
+instead of nineteen gigabytes. `replace_with_quant_layers` then decodes the
+packed weights, so the unpacking, the per-row scales and the activation rounding
+on the reference side are all the reference's rather than a second reading of
+them.
+
+That is worth keeping in mind more generally: when a model is too large to hold,
+the piece under suspicion often is not.
+
+### What the comparison found
+
+**The vision tower was right after one correction.** The rope pairing, the axis
+order, the attention scale, the value norm and the position tables were all
+fixed together, and the embedding then matched to 4e-05 on a peak of 70 —
+which is float noise on bfloat16 weights.
+
+**The audio tower needed an off-by-one that no shape could catch.** The
+reference masks its chunked attention with `dist < left_window_size`, a strict
+inequality, so a query reaches `attention_context_left - 1` keys at or before
+itself — twelve, not thirteen. Every tensor had the right shape either way, and
+every intermediate looked plausible. A Python replica of the corrected window
+reproduced the reference exactly, which is how the bound was settled before the
+C was touched.
+
+**The subsampler was right the first time**, matching to 5e-05 on a peak of
+112 — the two convolutions, the mean-subtracting norm, the rectifier, the
+flatten order and the join projection.
+
+### Reading a difference on a checkpoint that rounds
+
+The residual differences are the same phenomenon 0.4.0 documented for the text
+stack, and it is worth showing that they are, because "0.8% off" and "one
+quantization step" look identical until they are measured.
+
+On the vision tower's first attention the largest difference was 0.167013
+against a calibrated `o_proj` output step of 0.167012 — one step exactly. Of
+1.8 million values, 523 differed at all, and **not one** by more than a single
+step. On the audio tower's first feed-forward the largest difference was one
+step of `ffw_layer_1`'s output, and the 61% of values that then appeared to
+differ were the RMSNorm behind it spreading a single flipped step across the
+row it normalizes.
+
+So the towers are judged the way the text stack is: against how far the
+reference moves when something that should not matter changes. Nudging the
+reference's own input by a part in a million moves the vision tower's rows by
+2.62 where the engine differs by 2.08, and the audio tower's by 5.36 where the
+engine differs by 2.38. In both cases the engine is closer to the reference than
+the reference is to itself. On synthetic float weights, which carry no
+activation grid, the vision tower agrees to 1.2e-07 and the audio tower to
+2.2e-05 — float32 noise.
+
+### The harness
+
+`app_fake.py` no longer builds tower weights by hand. `tower_open` loads one
+tower of any checkpoint — shipped or synthetic — from the reference's own
+module, and `tower_build` writes a synthetic one using the reference's classes,
+so both paths compare against upstream. The torch transcription that 0.5.0 used
+as a stand-in is gone; it was a reasonable thing to write when there was nothing
+to compare against, and keeping it now would only offer a second opinion that
+carries no weight.
+
+`app_diff.py --media` walks either. `--media --model <folder>` is what holds the
+engine to the shipped export.
+
+The filterbank is checked separately against the reference's own
+`Gemma4AudioFeatureExtractor`, and agrees to 1.4e-03 on a peak of 6.9 with a
+mean of 6.6e-05.
+
+### Testing
+
+`test_tower` was rewritten around the reference's names and arrangement, and its
+in-test definition of the vision tower with it. The audio tower is no longer
+transcribed a second time in C: a conformer written out twice would mostly be a
+copy, and the real reference is now available to do better. What it keeps are
+checks on the pieces peculiar to it, the end-to-end run, the causal property
+that a longer clip repeats a shorter one's first row, and the requirement that a
+clip which sounds different reaches a different answer.
+
+Two of those tests failed when first written, both because the test was wrong
+rather than the engine: the frame count no longer follows the old formula now
+that a frame is cut one sample longer than its window, and a longer clip *must*
+repeat a shorter one's first row, because the conformer's attention only reaches
+backwards. Both are now asserted in the direction that says something.
+
+The suite is 285 assertions and builds clean under `-Wall -Wextra`.
+
+### Also true now
+
+The text stack runs on the shipped checkpoint and produces sensible prose. That
+had been recorded as verified in 0.4.0 but could not be re-run here, for the
+memory reason above; what can be said from this host is that the engine loads
+the real export — 35 layers, a vocabulary of 262144, 2.3 GiB of weights — and
+answers a question about gravity correctly at 5.5 tokens a second.
+
+`token_decode_book` left its output slot untouched when it returned zero for a
+control token, so a caller reading the text without checking the count printed
+uninitialized stack. Every media prompt begins with a run of placeholder ids,
+which made it show up immediately.
+
+### Known gaps
+
+The whole multi-modal graph has not been run against the reference end to end,
+only each tower separately, because `Gemma4ForConditionalGeneration` does not
+fit in memory here. The seam between them — the placeholder run the processor
+lays down, and the ids around it — is the part that remains unchecked.
+
+The engine emits whatever soft tokens a clip yields; the reference's processor
+pads or trims to a fixed count, and its feature extractor produces one more
+frame than the engine on a clip that does not divide evenly. Nothing in the
+towers has been optimized: an image at the full patch budget spends its time in
+a triple loop over 2340 patches.
+
+The sanitizers were not run over any of this, for the same reason as before.
+`TODO.md` has the rest.
