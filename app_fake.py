@@ -357,6 +357,26 @@ def tower_form(model_path, kind):
     return config_class(**field), whole
 
 
+def tower_hold(model_path):
+    """Every tensor of a checkpoint, whether it is one file or a set of shards.
+
+    A vendored checkpoint is sharded to stay under the host's per-object limit,
+    so a reader that only knows `model.safetensors` finds nothing.
+    """
+    from safetensors.torch import load_file
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as source:
+            leaf_list = sorted(set(json.load(source)["weight_map"].values()))
+    else:
+        leaf_list = ["model.safetensors"]
+    held = {}
+    for leaf in leaf_list:
+        held.update(load_file(os.path.join(model_path, leaf)))
+    return held
+
+
 def tower_open(model_path, kind, want_kind=None):
     """Builds one tower on its own and loads the checkpoint's weights into it.
 
@@ -367,7 +387,6 @@ def tower_open(model_path, kind, want_kind=None):
     import gc
 
     import torch
-    from safetensors.torch import load_file
     from transformers.integrations.gemma_quant import replace_with_quant_layers
     from transformers.utils.quantization_config import GemmaQuantizationConfig
 
@@ -384,7 +403,7 @@ def tower_open(model_path, kind, want_kind=None):
                                     module_quant_configs=plan["bits"], quantize_embeddings=False),
             plan["keep"])
 
-    held = load_file(os.path.join(model_path, "model.safetensors"))
+    held = tower_hold(model_path)
     piece = {name[len(plan["stem"]):]: value.clone() for name, value in held.items()
              if name.startswith(plan["stem"]) and not name.endswith("_cache_scale")}
     del held
@@ -404,7 +423,6 @@ def tower_lift(model_path, kind, config, want_kind=None):
     """The projector that follows a tower into the text hidden width."""
     import gc
 
-    from safetensors.torch import load_file
     from transformers.models.gemma4 import configuration_gemma4 as C, modeling_gemma4 as M
 
     plan = TOWER_PLAN[kind]
@@ -414,7 +432,7 @@ def tower_lift(model_path, kind, config, want_kind=None):
                                  whole.get("text_config", whole).items()
                                  if not name.startswith("_")})
     lift = M.Gemma4MultimodalEmbedder(config, text)
-    held = load_file(os.path.join(model_path, "model.safetensors"))
+    held = tower_hold(model_path)
     piece = {name[len(plan["lift"]):]: value.clone() for name, value in held.items()
              if name.startswith(plan["lift"])}
     del held
