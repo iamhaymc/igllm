@@ -80,6 +80,7 @@ typedef struct app_media {
   float *state_data; /* [row_count][state_size], owned */
   int    row_count;
   int    state_size;
+  int    cut_flag;   /* set when the source ran past what the budget allows */
 } app_media;
 
 /* Where one image's or one clip's soft tokens sit in a prompt.  The caller says
@@ -145,6 +146,11 @@ int      model_audio_token(const app_model *model);
 int      model_image_wrap(const app_model *model, int *open_out, int *shut_out);
 int      model_audio_wrap(const app_model *model, int *open_out, int *shut_out);
 int      model_image_rows(const app_model *model);   /* rows one image produces */
+/* The processor gives a clip a budget rather than reading all of it: so many
+ * soft tokens, each standing for so many milliseconds.  A longer clip is cut to
+ * fit, so these two are the ceiling on what one clip can contribute. */
+int      model_audio_rows(const app_model *model);    /* rows one clip may produce */
+int      model_audio_span_ms(const app_model *model); /* milliseconds one row stands for */
 app_code media_image(app_model *model, const char *path_text, app_media *media_out);
 app_code media_audio(app_model *model, const char *path_text, app_media *media_out);
 void     media_free(app_media *media);
@@ -1581,6 +1587,36 @@ static float kern_wide_total(float32x4_t wide_total) {
 }
 #endif
 
+/* Four codes to four floats, indexed by the byte that holds them.
+ *
+ * Two bits a code means a byte is exactly four codes, so a decode that costs a
+ * shift, a mask and a convert per code becomes one sixteen byte read of a table
+ * that is four kilobytes and stays in the first level cache.  The values are
+ * the codes themselves — zero to three — so a path that reads the table reaches
+ * the same float in the same lane as the path that unpacks, and the two are
+ * interchangeable to the last bit rather than merely close.
+ *
+ * It is built by the preprocessor rather than filled at startup, which keeps it
+ * in read-only memory and keeps the kernels free of an initialization order to
+ * get wrong.  It is read unaligned: C11 has no way to state the alignment of a
+ * static array that every compiler this file targets agrees on, and on any part
+ * that runs this path an unaligned load of an aligned address costs nothing. */
+#define KERN_CODE_TWO_ROW(byte)                                                                  \
+  {(float)((byte) & 3), (float)(((byte) >> 2) & 3), (float)(((byte) >> 4) & 3),                  \
+   (float)(((byte) >> 6) & 3)}
+#define KERN_CODE_TWO_4(byte)                                                                    \
+  KERN_CODE_TWO_ROW(byte), KERN_CODE_TWO_ROW((byte) + 1),                                        \
+      KERN_CODE_TWO_ROW((byte) + 2), KERN_CODE_TWO_ROW((byte) + 3)
+#define KERN_CODE_TWO_16(byte)                                                                   \
+  KERN_CODE_TWO_4(byte), KERN_CODE_TWO_4((byte) + 4), KERN_CODE_TWO_4((byte) + 8),               \
+      KERN_CODE_TWO_4((byte) + 12)
+#define KERN_CODE_TWO_64(byte)                                                                   \
+  KERN_CODE_TWO_16(byte), KERN_CODE_TWO_16((byte) + 16),                                         \
+      KERN_CODE_TWO_16((byte) + 32), KERN_CODE_TWO_16((byte) + 48)
+
+static const float kern_code_two[256][4] = {KERN_CODE_TWO_64(0), KERN_CODE_TWO_64(64),
+                                            KERN_CODE_TWO_64(128), KERN_CODE_TWO_64(192)};
+
 /* Sum of activation times code over one quantization group.
  *
  * Two, four and eight bits are the widths the checkpoint leans on, and each has
@@ -1767,45 +1803,27 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
     }
 #elif defined(APP_SIMD_SSE2)
     {
-      /* Each packed byte is spread across a 32 bit lane, then the four codes
-       * are lifted into their own byte by four whole-vector shifts and a
-       * select.  Masking to two bits removes the bits a 16 bit lane shift
-       * drags in from its neighbour. */
-      const __m128i zero_data = _mm_setzero_si128();
-      const __m128i code_mask = _mm_set1_epi8(3);
-      const __m128i pick_zero = _mm_set1_epi32(0x000000FF);
-      const __m128i pick_one = _mm_set1_epi32(0x0000FF00);
-      const __m128i pick_two = _mm_set1_epi32(0x00FF0000);
-      const __m128i pick_three = _mm_set1_epi32((int)0xFF000000u);
+      /* One table read a byte, multiplied into the same accumulator the
+       * unpacking path put that lane in, so the sum is the same to the last
+       * bit and only the way the codes were reached has changed.  Measured on
+       * the export's widest row, 12288 by 1536 in one thread: 0.0039 s
+       * unpacking, 0.0023 s reading the table.
+       *
+       * The wide path above keeps its shifts.  The same table there costs two
+       * narrow loads and an insert to fill one 256 bit vector, against one
+       * broadcast, one variable shift and one mask, and it measures slower —
+       * 0.0018 s against 0.0016 s on the same row. */
       __m128 part_a = _mm_setzero_ps(), part_b = _mm_setzero_ps();
       for (; slot + 16 <= span_count; slot += 16) {
-        uint32_t word_value;
-        __m128i pack_data, spread_data, code_byte, word_low, word_high;
-        memcpy(&word_value, byte_head + slot / 4, 4);
-        pack_data = _mm_cvtsi32_si128((int)word_value);
-        spread_data = _mm_unpacklo_epi8(pack_data, pack_data);
-        spread_data = _mm_unpacklo_epi16(spread_data, spread_data);
-        code_byte = _mm_and_si128(
-            _mm_or_si128(
-                _mm_or_si128(_mm_and_si128(spread_data, pick_zero),
-                             _mm_and_si128(_mm_srli_epi16(spread_data, 2), pick_one)),
-                _mm_or_si128(_mm_and_si128(_mm_srli_epi16(spread_data, 4), pick_two),
-                             _mm_and_si128(_mm_srli_epi16(spread_data, 6), pick_three))),
-            code_mask);
-        word_low = _mm_unpacklo_epi8(code_byte, zero_data);
-        word_high = _mm_unpackhi_epi8(code_byte, zero_data);
-        part_a = _mm_add_ps(
-            part_a, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)),
-                               _mm_loadu_ps(act_data + slot)));
-        part_b = _mm_add_ps(
-            part_b, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)),
-                               _mm_loadu_ps(act_data + slot + 4)));
-        part_a = _mm_add_ps(
-            part_a, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)),
-                               _mm_loadu_ps(act_data + slot + 8)));
-        part_b = _mm_add_ps(
-            part_b, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)),
-                               _mm_loadu_ps(act_data + slot + 12)));
+        const uint8_t *quad_head = byte_head + slot / 4;
+        part_a = _mm_add_ps(part_a, _mm_mul_ps(_mm_loadu_ps(kern_code_two[quad_head[0]]),
+                                               _mm_loadu_ps(act_data + slot)));
+        part_b = _mm_add_ps(part_b, _mm_mul_ps(_mm_loadu_ps(kern_code_two[quad_head[1]]),
+                                               _mm_loadu_ps(act_data + slot + 4)));
+        part_a = _mm_add_ps(part_a, _mm_mul_ps(_mm_loadu_ps(kern_code_two[quad_head[2]]),
+                                               _mm_loadu_ps(act_data + slot + 8)));
+        part_b = _mm_add_ps(part_b, _mm_mul_ps(_mm_loadu_ps(kern_code_two[quad_head[3]]),
+                                               _mm_loadu_ps(act_data + slot + 12)));
       }
       total = kern_wide_total(_mm_add_ps(part_a, part_b));
     }
@@ -1959,35 +1977,15 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
     }
 #elif defined(APP_SIMD_SSE2)
     {
-      const __m128i zero_data = _mm_setzero_si128();
-      const __m128i code_mask = _mm_set1_epi8(3);
-      const __m128i pick_zero = _mm_set1_epi32(0x000000FF);
-      const __m128i pick_one = _mm_set1_epi32(0x0000FF00);
-      const __m128i pick_two = _mm_set1_epi32(0x00FF0000);
-      const __m128i pick_three = _mm_set1_epi32((int)0xFF000000u);
+      /* Written out, a byte of codes is a row of the table and nothing else,
+       * so the whole decode is a sixteen byte copy: 0.0031 s unpacking against
+       * 0.0023 s reading the table, on the row measured above. */
       for (; slot + 16 <= span_count; slot += 16) {
-        uint32_t word_value;
-        __m128i pack_data, spread_data, code_byte, word_low, word_high;
-        memcpy(&word_value, byte_head + slot / 4, 4);
-        pack_data = _mm_cvtsi32_si128((int)word_value);
-        spread_data = _mm_unpacklo_epi8(pack_data, pack_data);
-        spread_data = _mm_unpacklo_epi16(spread_data, spread_data);
-        code_byte = _mm_and_si128(
-            _mm_or_si128(
-                _mm_or_si128(_mm_and_si128(spread_data, pick_zero),
-                             _mm_and_si128(_mm_srli_epi16(spread_data, 2), pick_one)),
-                _mm_or_si128(_mm_and_si128(_mm_srli_epi16(spread_data, 4), pick_two),
-                             _mm_and_si128(_mm_srli_epi16(spread_data, 6), pick_three))),
-            code_mask);
-        word_low = _mm_unpacklo_epi8(code_byte, zero_data);
-        word_high = _mm_unpackhi_epi8(code_byte, zero_data);
-        _mm_storeu_ps(out_data + slot, _mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)));
-        _mm_storeu_ps(out_data + slot + 4,
-                      _mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)));
-        _mm_storeu_ps(out_data + slot + 8,
-                      _mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)));
-        _mm_storeu_ps(out_data + slot + 12,
-                      _mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)));
+        const uint8_t *quad_head = byte_head + slot / 4;
+        _mm_storeu_ps(out_data + slot, _mm_loadu_ps(kern_code_two[quad_head[0]]));
+        _mm_storeu_ps(out_data + slot + 4, _mm_loadu_ps(kern_code_two[quad_head[1]]));
+        _mm_storeu_ps(out_data + slot + 8, _mm_loadu_ps(kern_code_two[quad_head[2]]));
+        _mm_storeu_ps(out_data + slot + 12, _mm_loadu_ps(kern_code_two[quad_head[3]]));
       }
     }
 #elif defined(APP_SIMD_NEON)
@@ -2016,13 +2014,14 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
       }
     }
 #endif
-    for (; slot + 4 <= span_count; slot += 4) {
-      uint8_t quad = byte_head[slot / 4];
-      out_data[slot] = (float)(quad & 3u);
-      out_data[slot + 1] = (float)((quad >> 2) & 3u);
-      out_data[slot + 2] = (float)((quad >> 4) & 3u);
-      out_data[slot + 3] = (float)((quad >> 6) & 3u);
-    }
+    /* The remainder, and every host without a vector path, reads the table
+     * too: written out, four codes are a row of it and nothing else.  On the
+     * row measured above that loop alone goes from 0.0092 s to 0.0023 s.  The
+     * fused dot's remainder is left unpacking, because there the cost is the
+     * chain of dependent adds rather than the decode and the same swap moves
+     * it by nothing. */
+    for (; slot + 4 <= span_count; slot += 4)
+      memcpy(out_data + slot, kern_code_two[byte_head[slot / 4]], 4 * sizeof(float));
     for (; slot < span_count; ++slot)
       out_data[slot] = (float)((byte_head[slot / 4] >> (2 * (slot & 3))) & 3u);
     return;
@@ -3585,17 +3584,18 @@ typedef struct tower_form {
   int   token_id;     /* placeholder id in the text vocabulary */
   int   open_id;      /* the id the processor writes before the run */
   int   shut_id;      /* and after it */
+  int   soft_limit;   /* soft tokens one image or one clip may produce */
 
   /* vision */
   int patch_size, band_count, pool_size;
   int grid_wide, grid_high;   /* patches across and down, decided per image */
   int place_size;             /* rows in each axis of the position table */
-  int soft_limit;             /* soft tokens one image may produce */
   int standard_flag;
   rope_form rope; /* built over half a head, because each axis takes a half */
 
   /* audio */
   int   mel_count, rate_value, frame_size, frame_step, turn_size, lead_pad;
+  int   token_ms; /* milliseconds of clip one soft token stands for */
   float mel_floor;
   int   conv_count, conv_step, conv_pad, conv_side;
   int   chunk_size, left_span, right_span; /* the local attention window */
@@ -4134,13 +4134,18 @@ static void config_tower_read(const json_tree *tree, const char *node_text, int 
     form_out->share_gain = (float)json_field_number(tree, node_index, "residual_weight", 1.0);
     form_out->lift_size = (int)json_field_number(tree, node_index, "output_proj_dims", 0);
     /* The analysis window belongs to the feature extractor rather than the
-     * model, and is read from `preprocessor_config.json` beside it. */
+     * model, and is read from `preprocessor_config.json` beside it; the token
+     * budget belongs to the processor, in `processor_config.json`.  Both are
+     * defaulted to the shipped export's, which is the only thing a checkpoint
+     * that writes neither file can be read as meaning. */
     form_out->mel_count = 128;
     form_out->rate_value = 16000;
     form_out->frame_size = 320;
     form_out->frame_step = 160;
     form_out->turn_size = 0;
     form_out->mel_floor = 1e-3f;
+    form_out->soft_limit = 750;
+    form_out->token_ms = 40;
   }
 }
 
@@ -4169,6 +4174,50 @@ static void config_sound_read(const char *folder_path, tower_form *form) {
    * semicausal padding: half a window of silence in front of the clip. */
   form->lead_pad = form->frame_size / 2;
   json_free(tree);
+}
+
+/* The clip's token budget, which belongs to the processor rather than to the
+ * model or to the feature extractor, and is written in a third file beside
+ * them.  `audio_seq_length` soft tokens of `audio_ms_per_token` milliseconds
+ * each is the most one clip is worth, and the processor pads or trims a clip to
+ * fit before it ever reaches the tower.
+ *
+ * Only the trim is visible here.  The padding is marked in
+ * `input_features_mask`, zeroed between the convolution stages and dropped from
+ * the rows the tower returns, so a short clip is worth its live frames on both
+ * sides and the engine already agrees; a clip past the ceiling is one the
+ * reference stops reading and the engine would otherwise keep going through. */
+static void config_budget_read(const char *folder_path, tower_form *form) {
+  char path_text[1024];
+  size_t text_size = 0;
+  char *text_data;
+  json_tree *tree;
+  if (!form->live_flag) return;
+  path_join(path_text, sizeof(path_text), folder_path, "processor_config.json");
+  text_data = file_slurp(path_text, &text_size);
+  if (!text_data) return;
+  tree = json_read(text_data, text_size);
+  mem_free(text_data);
+  if (!tree) return;
+  form->soft_limit = (int)json_field_number(tree, 0, "audio_seq_length", form->soft_limit);
+  form->token_ms = (int)json_field_number(tree, 0, "audio_ms_per_token", form->token_ms);
+  json_free(tree);
+}
+
+/* The samples the budget allows, which is where the trim falls: the reference
+ * cuts the waveform and then frames what is left, so the engine has to cut in
+ * the same place rather than capping the rows afterwards.  A cap would agree on
+ * the count and disagree on the last row, whose frames would have been drawn
+ * from audio the reference never read.
+ *
+ * Zero means no ceiling, for a checkpoint that records neither field. */
+static long sound_budget_samples(const tower_form *form) {
+  double sample_limit;
+  if (form->soft_limit < 1 || form->token_ms < 1 || form->rate_value < 1) return 0;
+  sample_limit = (double)form->soft_limit * (double)form->token_ms *
+                 ((double)form->rate_value / 1000.0);
+  if (sample_limit >= (double)INT32_MAX) return 0;
+  return (long)sample_limit;
 }
 
 static app_code config_read(app_model *model, const char *folder_path) {
@@ -4296,6 +4345,7 @@ static app_code config_read(app_model *model, const char *folder_path) {
   config_tower_read(tree, "vision_config", TOWER_VISION, &model->tower_list[TOWER_VISION].form);
   config_tower_read(tree, "audio_config", TOWER_AUDIO, &model->tower_list[TOWER_AUDIO].form);
   config_sound_read(folder_path, &model->tower_list[TOWER_AUDIO].form);
+  config_budget_read(folder_path, &model->tower_list[TOWER_AUDIO].form);
   model->tower_list[TOWER_VISION].form.token_id =
       (int)json_field_number(tree, 0, "image_token_id", -1);
   model->tower_list[TOWER_AUDIO].form.token_id =
@@ -7337,6 +7387,19 @@ int model_image_rows(const app_model *model) {
   return model->tower_list[TOWER_VISION].form.soft_limit;
 }
 
+/* The most rows one clip can produce, and what one of them is worth.  A clip
+ * shorter than the budget is worth what its own frames come to; a longer one is
+ * cut to the budget, so this is a ceiling rather than a count. */
+int model_audio_rows(const app_model *model) {
+  if (!model_audio_ready(model)) return 0;
+  return model->tower_list[TOWER_AUDIO].form.soft_limit;
+}
+
+int model_audio_span_ms(const app_model *model) {
+  if (!model_audio_ready(model)) return 0;
+  return model->tower_list[TOWER_AUDIO].form.token_ms;
+}
+
 app_code media_image(app_model *model, const char *path_text, app_media *media_out) {
   flat_grid grid;
   app_code code;
@@ -7364,6 +7427,15 @@ app_code media_audio(app_model *model, const char *path_text, app_media *media_o
   memset(&mel_grid, 0, sizeof(mel_grid));
   code = wave_read(path_text, &clip);
   if (code == APP_OKAY) code = wave_rate(&clip, form->rate_value);
+  if (code == APP_OKAY) {
+    /* The budget is spent in the processor's units, so it is applied here, on
+     * the resampled clip, and before a frame is taken from it. */
+    long sample_limit = sound_budget_samples(form);
+    if (sample_limit > 0 && (long)clip.value_count > sample_limit) {
+      clip.value_count = (int)sample_limit;
+      media_out->cut_flag = 1;
+    }
+  }
   if (code == APP_OKAY)
     code = mel_make(&clip, form->mel_count, form->frame_size, form->frame_step, form->turn_size,
                     form->mel_floor, form->lead_pad, &mel_grid);

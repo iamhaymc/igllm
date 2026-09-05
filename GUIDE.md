@@ -190,15 +190,30 @@ was selected.
   `f32` case has a vector path on all three targets.
 - `kern_dot_code` — dot product against a packed row, specialized for the
   two, four, and eight bit cases and general otherwise. All three have vector
-  paths on all three targets: a nibble or a quarter byte unpacks with
-  whole-vector shifts and masks, and a whole byte needs only the flip. The two
-  narrow widths require the group to start on a byte boundary and fall back to
-  the bit-stream loop when it does not.
+  paths on all three targets: a nibble unpacks with whole-vector shifts and
+  masks, a quarter byte with those or with the table below, and a whole byte
+  needs only the flip. The two narrow widths require the group to start on a
+  byte boundary and fall back to the bit-stream loop when it does not.
 
   Every vector path carries two accumulators rather than one. The arithmetic is
   cheap enough that a single chain waits on the latency of its own add rather
   than on the work: splitting it took a four bit row 1.6 times quicker on SSE2
   and 1.4 on AVX2, for nothing but a second register.
+
+  At two bits the unpacking is read out of `kern_code_two` instead, a four
+  kilobyte table of four floats indexed by the byte that holds them, built by
+  the preprocessor so it costs no startup and lives in read-only memory. A byte
+  is exactly four codes at that width, so a shift, a mask and a convert per code
+  become one sixteen byte read, and the values are the codes themselves, in the
+  lanes the unpacking put them in — the two paths agree to the last bit rather
+  than to a tolerance. On the export's widest row it takes the fused dot from
+  0.0039 s to 0.0023 s on SSE2.
+
+  The wide path keeps its shifts, and the reason is worth recording because the
+  table looks like it should win everywhere. Filling one 256 bit vector from the
+  table costs two narrow loads and an insert, against one broadcast, one
+  variable shift and one mask, and it measures slower: 0.0018 s against 0.0016 s
+  on the same row.
 - `kern_row_code` — one output row of a quantized matrix, formulated as
 
   ```
@@ -211,6 +226,10 @@ was selected.
 - `kern_code_spread` — a run of codes unpacked into floats, with the same
   vector paths `kern_dot_code` fuses into its own loop. It exists because a
   batch has someone to share the decode with and a single vector does not.
+  Written out rather than summed, a byte of two bit codes *is* a row of
+  `kern_code_two`, so that width is a sixteen byte copy: 0.0031 s against
+  0.0023 s on SSE2, and 0.0092 s against 0.0023 s in the plain loop the
+  remainder and a host without a vector path both run.
 - `kern_row_code_many` — the same row against several activation vectors at
   once. A group of codes is spread into a small float scratch and dotted
   against every lane, so a batch pays the decode cost of a single vector. When
@@ -464,6 +483,31 @@ marks on every one of them, and `ceil(live / 4)` is what the processor's own
 `_get_num_multimodal_tokens` asks for on every one of them. The padding is a
 detail of how the extractor batches, not of what the model reads.
 
+What the engine does do is stop where the processor stops. The framing above is
+the feature extractor's; the **budget** is the processor's, and it is written in
+a third file beside the other two, `processor_config.json`: `audio_seq_length`
+soft tokens of `audio_ms_per_token` milliseconds each, 750 and 40 on the shipped
+export, which is half a minute of audio. A clip inside that is worth its own
+live frames on both sides, which is why the two agreed for as long as every clip
+tested was a short one. A longer clip the processor pads or trims to fit, and
+the trim is the half that shows: past the ceiling the reference stops reading,
+and the engine left to itself would keep going and hand the prompt soft tokens
+the reference never asked for — a thirty-five second clip is 875 rows framed and
+750 rows budgeted.
+
+`config_budget_read` reads the pair, `sound_budget_samples` turns it into a
+sample count, and `media_audio` applies that to the resampled clip *before* a
+frame is taken from it. Cutting the samples rather than capping the rows is the
+whole point: a cap would agree on the count and disagree on the last row, whose
+frames would have been drawn from audio the reference never read. The two halves
+of the processor's configuration agree that this is the right place to cut —
+750 tokens of 40 milliseconds is 480 000 samples, which frames to 2999 live
+frames, which is `ceil(2999 / 4) = 750` rows, the budget exactly and not a row
+over. The suite holds a clip four times the budget to the clip that ends at it,
+row for row rather than merely the same length, and `app_media` carries a
+`cut_flag` so the command line can say the tail was dropped rather than answer
+about half a clip without saying so.
+
 `sound_stage` then runs the subsampler — two convolutions over (frame, filter),
 each followed by a mean-subtracting `kern_norm_layer` across the channels it
 produced and a rectifier — and the map is folded into the hidden width with the
@@ -646,6 +690,8 @@ path.
 | `model.safetensors`       | the weights                                     |
 | `model.safetensors.index.json` | shard map, when the checkpoint is split   |
 | `tokenizer.json`          | vocabulary, merges, special tokens              |
+| `preprocessor_config.json` | the audio analysis window, when present        |
+| `processor_config.json`   | the clip's soft token budget, when present      |
 | `.png`, `.pnm`, `.bmp`    | a picture for the vision tower                  |
 | `.wav`                    | a clip for the audio tower                      |
 
@@ -855,7 +901,10 @@ worth, which is the aspect-preserving resize against the patch budget, and what
 it says the clip is worth. The second is the feature extractor's framing, which
 was an open question and is now settled — the engine's frame count is the live
 count `input_features_mask` marks, on every clip length it has been measured
-against — so it is checked like the rest.
+against — so it is checked like the rest. Above `audio_seq_length` tokens the
+answer is the budget rather than the framing, on both sides; no clip that long
+has been put through this harness, because the reference's forward on one is a
+larger thing than the count it is being asked for.
 
 The *graph* half runs `Gemma4ForConditionalGeneration` over those same ids and
 compares the distribution. That wants the whole model in memory, which the

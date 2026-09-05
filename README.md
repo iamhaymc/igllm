@@ -58,7 +58,10 @@ Common flags: `--model`, `--prompt`, `--image`, `--audio`, `--serve`,
 `--image` takes a png, pnm or bmp and `--audio` a riff wave. Each is run
 through its tower and put in front of the prompt, bracketed by the ids the
 reference's processor brackets it with, in the place a multi-modal chat template
-puts it:
+puts it. A clip is worth a soft token every forty milliseconds up to the
+processor's budget of 750 of them, and one longer than the half minute that
+comes to is cut to it, which is what the reference does with one; the run says
+so rather than quietly answering about the first half of a clip:
 
 ```sh
 python3 run.py run -- chat --model model \
@@ -151,6 +154,6 @@ is absent, the vision tower agrees to a part in ten million.
 | `run.py parity --seam --model model`     | the same join on the shipped export: every id, every soft token count, and every distribution, each case in a process of its own |
 
 On four cores of a 2017 desktop, against the reference's 0.16 tokens a second:
-decode runs at about 7.3 and prefill at about 12.3, and a build tuned for the
-host — `--tuned`, which selects the AVX2 path — reaches 13.5 and 21.3. The
-kernels have had one pass over them; `TODO.md` says what is left.
+decode runs at about 9.5 and prefill at about 12.4, and a build tuned for the
+host — `--tuned`, which selects the AVX2 path — reaches 13.2 and 21.2. The
+kernels have had two passes over them; `TODO.md` says what is left.

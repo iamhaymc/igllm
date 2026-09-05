@@ -77,7 +77,8 @@ static void test_yard_close(void) {
   static const char *leaf_list[] = {"config.json", "tokenizer.json", "model.safetensors",
                                     "shape.json", "image.png",  "image.pnm",
                                     "image.bmp",  "image.bad",  "clip.wav",
-                                    "preprocessor_config.json", NULL};
+                                    "preprocessor_config.json",
+                                    "processor_config.json", NULL};
   int leaf_index;
   char path_text[1024];
   for (leaf_index = 0; leaf_list[leaf_index]; ++leaf_index) {
@@ -625,6 +626,22 @@ static void test_kernel(void) {
     mem_free(act_list);
     mem_free(row_list);
     mem_free(half_list);
+  }
+
+  { /* The two bit table against the bit stream it stands in for.  It is built
+     * by a nest of macros at compile time, which is the sort of thing that is
+     * either right or catastrophically wrong, and every kernel that reads it
+     * would agree with itself either way.  `pack_read` is the independent
+     * account of what a byte of two bit codes holds. */
+    int byte_index, code_index, okay_flag = 1;
+    for (byte_index = 0; byte_index < 256; ++byte_index) {
+      uint8_t byte_value = (uint8_t)byte_index;
+      for (code_index = 0; code_index < 4; ++code_index)
+        if (kern_code_two[byte_index][code_index] !=
+            (float)pack_read(&byte_value, (size_t)code_index, 2))
+          okay_flag = 0;
+    }
+    test_true(okay_flag, "the two bit table is the bit stream it stands in for");
   }
 
   { /* Packed dot against a plain bit-stream loop, over every widened width. */
@@ -1744,11 +1761,17 @@ static int test_wing_config(int moe_flag, int media_flag) {
   config_text[fill_count++] = '}';
   config_text[fill_count] = '\0';
   if (media_flag) {
-    /* The analysis window lives beside the model, as the export writes it. */
+    /* The analysis window lives beside the model, as the export writes it, and
+     * the clip's token budget beside that, in the processor's own file.  Four
+     * frames of four samples at eight kilohertz is one soft token, so a token
+     * here is two milliseconds and sixty-four of them are a budget a fixture
+     * can be written past without the tower costing anything. */
     static const char sound_text[] =
         "{\"feature_size\":8,\"sampling_rate\":8000,\"frame_length\":8,"
         "\"hop_length\":4,\"fft_length\":16,\"mel_floor\":0.001}";
+    static const char budget_text[] = "{\"audio_seq_length\":64,\"audio_ms_per_token\":2}";
     if (!test_file_write("preprocessor_config.json", sound_text, sizeof(sound_text) - 1)) return 0;
+    if (!test_file_write("processor_config.json", budget_text, sizeof(budget_text) - 1)) return 0;
   }
   return test_file_write("config.json", config_text, (size_t)fill_count);
 }
@@ -1850,6 +1873,8 @@ static void test_wing(void) {
 #define SOUND_DEEP   3
 #define SOUND_CHUNK  4
 #define SOUND_LEFT   3
+#define SOUND_BUDGET 64 /* soft tokens one clip may spend, from the processor */
+#define SOUND_SPAN   2  /* milliseconds one of them stands for */
 
 static void test_tower_add(test_kit *pack) {
   char name_text[160];
@@ -2244,6 +2269,8 @@ static void test_tower(void) {
   test_true(model_audio_ready(model), "the audio tower is bound");
   test_true(model_image_token(model) == 5, "the image placeholder id comes from the configuration");
   test_true(model_image_rows(model) == TOWER_SOFT, "the soft token cap comes from the configuration");
+  test_true(model_audio_rows(model) == SOUND_BUDGET && model_audio_span_ms(model) == SOUND_SPAN,
+            "the clip's token budget comes from the processor configuration");
 
   /* -- vision -------------------------------------------------------- */
   path_join(path_text, sizeof(path_text), test_yard_path, "image.png");
@@ -2314,6 +2341,37 @@ static void test_tower(void) {
           same_flag = 0;
       test_true(!same_flag, "a clip that sounds different reaches a different answer");
       media_free(&other);
+    }
+
+    /* The processor does not read a clip past its budget: so many soft tokens
+     * of so many milliseconds each, and a longer clip cut to fit before a frame
+     * is taken from it.  The cut is of the samples rather than of the rows,
+     * which is a distinction with a difference — capping the rows would agree
+     * on the count and disagree on the last one, whose frames would have been
+     * drawn from audio the reference never read.  So a clip that ends at the
+     * budget and a clip four times as long have to come out the same, row for
+     * row, and not merely the same length. */
+    {
+      app_media brim, over;
+      int same_flag = 1;
+      test_true(test_wave_write("clip.wav", 8000, SOUND_BUDGET * SOUND_SPAN * 8),
+                "a clip exactly at the budget is written");
+      test_true(media_audio(model, path_text, &brim) == APP_OKAY, "the clip at the budget runs");
+      test_true(brim.row_count == SOUND_BUDGET && !brim.cut_flag,
+                "a clip at the budget spends all of it and is not cut");
+      test_true(test_wave_write("clip.wav", 8000, 4 * SOUND_BUDGET * SOUND_SPAN * 8),
+                "a clip four times the budget is written");
+      test_true(media_audio(model, path_text, &over) == APP_OKAY, "the clip past the budget runs");
+      test_true(over.row_count == SOUND_BUDGET && over.cut_flag,
+                "a clip past the budget is worth the budget and says it was cut");
+      for (row_index = 0; row_index < over.row_count && row_index < brim.row_count; ++row_index)
+        for (value_index = 0; value_index < TOWER_TEXT; ++value_index)
+          if (fabs((double)over.state_data[row_index * TOWER_TEXT + value_index] -
+                   (double)brim.state_data[row_index * TOWER_TEXT + value_index]) > 1e-6)
+            same_flag = 0;
+      test_true(same_flag, "the clip past the budget is the clip that ends at it");
+      media_free(&brim);
+      media_free(&over);
     }
     media_free(&sound);
   }
@@ -2590,6 +2648,10 @@ static void test_shot(void) {
     model_free(model);
     return;
   }
+  /* The clip budget the export's processor records, which is the ceiling a
+   * longer clip is cut to: 750 soft tokens of 40 milliseconds, half a minute. */
+  test_true(model_audio_rows(model) == 750 && model_audio_span_ms(model) == 40,
+            "the shipped export allows a clip of thirty seconds");
 
   for (case_index = 0; case_index < 3; ++case_index) {
     const test_shot_case *shot = &shot_case_list[case_index];

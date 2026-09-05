@@ -1412,3 +1412,231 @@ fused decode inside `kern_dot_code`, which is now dependency-free but still
 spends about two instructions a weight on the narrow widths. A byte-indexed
 table of unpacked floats would spend less; it is not written. `TODO.md` has the
 rest.
+
+---
+
+## 0.7.5 — the clip stops where the processor stops
+
+### Why
+
+The framing was settled in 0.7.2: the engine's frame count is the live count
+`input_features_mask` marks, checked against the extractor on twenty-two clip
+lengths, and the rows it makes are `ceil(live / 4)` on all of them. What was not
+settled was the ceiling.
+
+A clip is not only framed, it is budgeted, and the budget was in a file the
+engine had never opened. `processor_config.json` records an `audio_seq_length`
+of 750 and an `audio_ms_per_token` of 40 — 750 soft tokens of forty milliseconds
+each, half a minute of audio — and the processor pads or trims a clip to that
+before the tower is handed anything.
+
+Nothing had parted the two, because every clip that had been tested was inside
+the ceiling. Past it they part, and not by a little: thirty-five seconds frames
+to 3499 live frames and 875 rows, where the processor writes 750 placeholders.
+The engine would have laid a hundred and twenty-five rows on ids that were never
+there.
+
+### Only the trim is visible
+
+The other half of what the processor does — padding a short clip out to the
+budget — is invisible here, and it is worth saying why rather than matching it.
+The padding is marked in `input_features_mask`, zeroed between the subsampler's
+two convolution stages, excluded from the conformer's attention, and dropped
+from the rows the tower returns. A short clip is therefore worth its live frames
+on both sides, which is exactly what the engine already computed. Matching the
+padded shape would change nothing except the arithmetic that decides how many
+soft tokens to ask for, and 0.7.2 established that counting padded frames there
+is what gets that wrong.
+
+The trim is the half that reaches the model, so the trim is the half that is
+implemented.
+
+### Where it cuts
+
+`config_budget_read` reads the pair beside `config_sound_read`, which already
+reads the analysis window out of `preprocessor_config.json`; both default to the
+shipped export's values, which is the only thing a checkpoint that writes
+neither file can be read as meaning. `sound_budget_samples` turns the pair into
+a sample count, and `media_audio` applies it to the resampled clip **before** a
+frame is taken from it.
+
+Cutting the samples rather than capping the rows is the whole of the design. A
+cap would agree with the reference on the count and disagree on the last row,
+whose frames would have been drawn from audio the reference stopped reading. The
+suite states it that way round: a clip four times the budget has to come out
+equal to the clip that ends at the budget, row for row, not merely the same
+length.
+
+The two halves of the processor's configuration agree that this is the right
+place to cut. Seven hundred and fifty tokens of forty milliseconds is 480,000
+samples at sixteen kilohertz; those frame to 2999 live frames at a 320 sample
+window and a 160 sample hop; and `ceil(2999 / 4)` is 750 — the budget exactly,
+and not a row over. The framing and the budget are written by different parts of
+the export and they meet on the same number.
+
+### Saying so
+
+A clip that is cut is a clip whose tail the answer will not be about, so
+`app_media` carries a `cut_flag` and the command line prints one line when it is
+set. `model_audio_rows` and `model_audio_span_ms` expose the ceiling beside
+`model_image_rows`, and `probe` reports it:
+
+```
+audio    yes
+  rows   750 at 40 ms, 30.0 s of clip, placeholder id 258881
+```
+
+### What it comes to
+
+A thirty-five second clip through the shipped export, `tokens` task:
+
+| | soft tokens | prompt ids |
+| --- | --- | --- |
+| before | 875 | 883 |
+| after | **750** | 758 |
+
+and the run says `audio: the clip runs past the budget of 30 s and is cut to it`.
+
+### Testing
+
+The fixture grew a third configuration file. Four frames of four samples at
+eight kilohertz is one soft token there, which makes a token two milliseconds,
+and a budget of sixty-four of them is one a fixture can be written past without
+the tower costing anything: a clip at the budget and a clip four times as long
+are compared row for row, and the shorter of the two is checked to have spent
+the whole budget without being cut. The shipped export's own ceiling — 750 at
+40 — is asserted where the recorded prompts are.
+
+Nine new assertions. The suite is 341 when the checkpoint is beside it and 318
+when it is not, clean under `-Wall -Wextra` and passing on the SSE2 and AVX2
+backends.
+
+### Known gaps
+
+The reference has not re-judged this. `run.py parity --seam` wants a
+`transformers` carrying `Gemma4Processor`, which is not installed on the host
+this was written on, so what is checked here is the export's own recorded budget
+and the engine's arithmetic against it — not a fresh answer from
+`_get_num_multimodal_tokens` on a clip past the ceiling. That is the check to
+run when the reference is next to hand, and it is a cheap one: it is the layout
+half of the seam, which needs no weights.
+
+Nothing else about audio moved. Every clip inside the budget frames and counts
+exactly as it did in 0.7.4, so the recorded distributions are untouched.
+`TODO.md` has the rest.
+
+---
+
+## 0.7.6 — the two bit decode becomes a table read
+
+### Why
+
+0.7.4 left decode a third quicker and said where the rest of it was: the
+engine runs one lane in the token loop, so it cannot share a decode with
+anybody, and the decode fused inside `kern_dot_code` still spent about two
+instructions a weight on the narrow widths. The note in `TODO.md` proposed the
+fix — a byte-indexed table of unpacked floats — and this is it.
+
+### What the measurement said first
+
+The proposal is only worth taking if two bits really is the expensive width, so
+it was timed before it was written, on the export's widest row and one thread:
+
+| 12288 x 1536, one thread | two bit | four bit | eight bit |
+| --- | --- | --- | --- |
+| SSE2 | **0.0039 s** | 0.0027 s | 0.0025 s |
+| AVX2 | 0.0016 s | 0.0016 s | 0.0014 s |
+
+Two bits is the slowest width on SSE2 while reading a *quarter* of the bytes
+eight bits reads. That is an unpacking cost and nothing else, and it is the
+width the export leans on hardest.
+
+### The table
+
+`kern_code_two` is 256 rows of four floats — four kilobytes, first level cache
+resident — built by a nest of preprocessor macros so it lands in read-only
+memory and no kernel has to remember to fill it. Two bits a code means a byte is
+exactly four codes, so the unpacking becomes one sixteen byte read.
+
+The values are the codes themselves, in the lanes the shift-and-mask sequence
+put them in, and the accumulator each lane is multiplied into is unchanged. So
+this is not a close approximation of the old path, it is the same sum in the
+same order.
+
+That is the sort of claim worth checking rather than reasoning about, because
+every other change to these kernels has moved a logit by whole steps of the
+checkpoint's activation grid and needed an allowance written for it. This one
+does not: `logits` on the shipped export, whose json is the whole head of the
+distribution to six decimal places, is **byte for byte identical** between the
+build before this change and the build after it, on both the SSE2 and the AVX2
+backend. There is no allowance to spend and nothing to re-judge.
+
+| 12288 x 1536, one thread | unpacking | table |
+| --- | --- | --- |
+| SSE2, fused dot | 0.0039 s | **0.0023 s** |
+| SSE2, spread | 0.0031 s | **0.0023 s** |
+| plain loop, spread | 0.0092 s | **0.0023 s** |
+| AVX2, fused dot | 0.0016 s | 0.0018 s |
+| AVX2, spread | 0.0015 s | 0.0023 s |
+
+### Where it is not used, and why
+
+The wide path keeps its shifts. Filling one 256 bit vector from the table costs
+two narrow loads and an insert, against one broadcast, one variable shift and
+one mask; it measures slower, so it is not taken. Writing it down rather than
+quietly leaving the AVX2 path alone is the point of the row above — the table
+looks like it should win everywhere and it does not.
+
+The fused dot's remainder loop keeps its shifts too, for a different reason:
+there the cost is a chain of four dependent adds per byte rather than the
+decode, and swapping in the table moves it by nothing (0.0179 s against
+0.0178 s). The spread's remainder does take the table, where the same swap is
+four times quicker, and that is the loop a host with no vector path at all
+runs for the whole width.
+
+NEON is left as it was. Its unpacking is already a table instruction — `vtbl1_u8`
+across a register — and there is no ARM host here to measure a change on.
+
+### What it comes to
+
+Thirty-two tokens of prompt, a hundred and twenty-eight decoded, four cores of a
+2017 desktop:
+
+| | prefill before | after | decode before | after |
+| --- | --- | --- | --- | --- |
+| SSE2 | 11.86 tok/s | 12.43 | 7.06 tok/s | **9.48** |
+| AVX2 | 20.56 tok/s | 21.19 | 13.07 tok/s | 13.24 |
+
+Decode is a third quicker on the default build and unmoved on the tuned one,
+which is what the kernel timings predict. Prefill barely moves on either, and
+that is also what they predict: a batch pays the spread once and then runs
+sixteen lanes over what it left, so a third off one sixteenth of the work is
+not visible.
+
+### Testing
+
+The table is checked against `pack_read`, byte by byte and code by code, which
+is the suite's usual rule — an independent account of the same thing rather than
+a recording of this one. It earns its own assertion because a nest of macros
+that builds 256 rows is either right or catastrophically wrong, and every kernel
+that reads it would agree with itself either way.
+
+One new assertion. The suite is 342 with the checkpoint beside it and 319
+without, clean under `-Wall -Wextra` and passing on the SSE2 and AVX2 backends.
+
+### Known gaps
+
+Three, five, six and seven bits still walk the bit stream in both functions, and
+the same table trick does not reach them — those widths do not divide a byte, so
+a byte is not a whole number of codes and the index is not a byte. Four bits
+does divide, but a byte is two codes there and the table would be read twice as
+often for half as much; it was not tried, because four bits already measures
+within a tenth of eight bits, which is the floor.
+
+And the floor may be the memory rather than the arithmetic. This export carries
+no mixture-of-experts block, so decode reads close to the whole two and a third
+gigabytes of weights for every token it produces; 13.24 tokens a second is about
+thirty-two gigabytes a second, which is near what a desktop of this age will
+hand over. If that is where the tuned build now sits, the next gain is in
+reading fewer bytes rather than in spending fewer instructions on them. Nothing
+here has measured that either way. `TODO.md` has the rest.

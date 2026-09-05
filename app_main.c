@@ -157,6 +157,12 @@ static int main_media_load(app_model *model, const main_flag *flag, app_media *i
       media_free(image_out);
       return 0;
     }
+    /* A clip past the processor's budget is cut to it, which is what the
+     * reference does with one.  Saying so is the difference between an answer
+     * about the whole clip and an answer about its first half. */
+    if (audio_out->cut_flag)
+      fprintf(stderr, "audio: the clip runs past the budget of %d s and is cut to it\n",
+              (model_audio_rows(model) * model_audio_span_ms(model) + 999) / 1000);
   }
   return 1;
 }
@@ -391,7 +397,15 @@ static int main_probe(app_model *model) {
   if (model_vision_ready(model))
     printf("  rows   %d, placeholder id %d\n", model_image_rows(model), model_image_token(model));
   printf("audio    %s\n", model_audio_ready(model) ? "yes" : "no");
-  if (model_audio_ready(model)) printf("  placeholder id %d\n", model_audio_token(model));
+  /* A checkpoint that records no budget is not one that allows no clip: it
+   * is one the engine reads all of, so say that rather than print a zero. */
+  if (model_audio_ready(model) && model_audio_rows(model) > 0)
+    printf("  rows   %d at %d ms, %.1f s of clip, placeholder id %d\n", model_audio_rows(model),
+           model_audio_span_ms(model),
+           (double)model_audio_rows(model) * (double)model_audio_span_ms(model) / 1000.0,
+           model_audio_token(model));
+  else if (model_audio_ready(model))
+    printf("  rows   no budget recorded, placeholder id %d\n", model_audio_token(model));
   printf("weights  %.1f MiB\n", (double)model_memory_bytes(model) / (1024.0 * 1024.0));
   return 0;
 }

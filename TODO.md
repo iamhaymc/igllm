@@ -8,22 +8,27 @@ Open development tasks, most consequential first.
   enough that the reference's forward stops fitting even alone — the cost is the
   reference's rather than the engine's, and the answer when it comes is probably
   to compare against a cached forward rather than a live one.
-- Match the processor's audio token budget. The framing itself is settled: the
-  engine's frame count is the live count `input_features_mask` marks, checked
-  against the extractor on twenty-two clip lengths, and the rows it makes are
-  `ceil(live / 4)` on all of them. What is not settled is the ceiling.
-  `processor_config.json` records an `audio_seq_length` of 750 and an
-  `audio_ms_per_token` of 40, which the reference pads or trims a clip to; the
-  engine emits whatever the clip yields. Nothing has parted them yet, because
-  every clip tested is inside the ceiling, but one past thirty seconds would.
-- Speed up decode further. The batched path was the defect and is fixed —
-  prefill is six times quicker on the default build and now beats decode per
-  token — but decode itself gained only a third, because it runs one lane and
-  its cost is the decode fused inside `kern_dot_code`. That loop no longer
-  stalls on its own accumulator, and it still spends about two instructions a
-  weight on the narrow widths. A byte-indexed table of unpacked floats would
-  spend less: at two bits a byte is four codes, so a 256-entry table of four
-  floats turns the unpacking into one aligned load.
+- Re-judge the clip budget against the reference. The engine now stops where
+  `processor_config.json` says the processor stops: 750 soft tokens of forty
+  milliseconds, cut out of the samples rather than off the rows, and the two
+  halves of the export's own configuration agree that the cut lands on the
+  budget exactly. What has not happened is the reference answering for itself.
+  `_get_num_multimodal_tokens` on a clip past thirty seconds is the layout half
+  of the seam — it needs no weights and costs seconds — and it was not runnable
+  on the host this was written on.
+- Find what decode spends its time on now. The two bit unpack was the last
+  cost anyone had named, and since 0.7.6 it is a table read: decode went from
+  7.06 to 9.48 tokens a second on the default build, and did not move on the
+  tuned one, where the two, four and eight bit paths already measured within a
+  tenth of each other. So on AVX2 the fused decode is not the pace-setter and
+  nothing has been measured to say what is. The per-group gain conversion below
+  is one candidate. The other is that there is nothing left to win: this export
+  carries no mixture-of-experts block, so decode reads close to the whole two
+  and a third gigabytes of weights for every token, and 13.24 tokens a second is
+  about thirty-two gigabytes a second — which is near what a 2017 desktop's
+  memory will hand over. If that is the wall, the next gain is in reading fewer
+  bytes rather than in spending fewer instructions on them. Neither has been
+  measured.
 - Speed up the towers further. Vision attention runs a head at a time over the
   pool, with each head's keys and values gathered into a run that stays in
   cache, and the eight bit projections the tower is quantized to now have a
