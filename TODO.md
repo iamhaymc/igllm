@@ -43,11 +43,19 @@ weights or on none. Most consequential first within each group.
   conformer's convolution module still walks its kernel per channel per frame.
   None of it runs in the token loop, and a prompt may now carry several of
   them, which makes it the cost of the first answer rather than of the run.
-- Support the static ranges the export calibrates for the key and value cache.
-  `k_cache_scale` and `v_cache_scale` are read by nothing — the reference
-  ignores them too — but a backend that stores the cache quantized will want
-  them. The export ships seventy of them, one pair a layer, so both what they
-  hold and what a quantized cache costs in accuracy have to be looked at here.
+- Store the key and value cache on the grid the export calibrates for. The
+  scales are read now and 0.8.2 says what they hold: an eight bit float grid,
+  not a byte's, with the ranges comfortably over what a prompt puts in them.
+  `--cache 8` makes the round trip in float and costs the next token nothing —
+  the top id agrees on every prompt tried — while greedy decoding diverges at
+  the first close call, around eighty characters in. What is left is the part
+  that collects the win: `key_store` and `value_store` are still float arrays,
+  and holding them as bytes is 1803.0 MiB of cache down to 450.8 at the default
+  window. That is a backend change rather than a session one.
+- Measure what a quantized cache costs at length. The divergence above is five
+  text prompts at short context, where the sliding window has not begun to turn
+  over. The case that decides whether the footprint is worth taking is the long
+  one, and it is untested.
 - Cache dequantized scales for the hottest planes. Gains are converted from
   their stored dtype on every group; a per-plane float mirror trades memory for
   a shorter inner loop. 0.8.0 struck this from the tuned build on the reading

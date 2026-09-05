@@ -2037,3 +2037,111 @@ The sanitizer build could not be run this session: the MinGW gcc on this host
 ships no `libasan` or `libubsan`, so `run.py test --debug` fails at the link.
 That is the host's gap rather than the suite's, and it is unrelated to
 everything above.
+
+---
+
+## 0.8.2 — the cache scales the export ships
+
+### Scope
+
+The seventy calibration scalars under `self_attn.k_cache_scale` and
+`self_attn.v_cache_scale` are read for the first time. They were shipped by the
+export, ignored by the reference, and ignored here since 0.4.0. This release
+says what they hold, what grid they describe, and what a cache stored on that
+grid costs — the last of which is measured on the shipped export rather than
+argued.
+
+### What they are
+
+Seventy rank-zero `f32` tensors, all of them in the first shard, one pair a
+layer. They are per tensor and static: one magnitude for every channel and
+every position of a layer's key or value cache.
+
+Only thirty are bound. Twenty of the thirty-five layers read another layer's
+keys and values and allocate no cache of their own, so there is nothing for
+their scales to describe. The forty that go unread are not junk, and this is
+worth stating because it would otherwise look like a gap: each is bit-exact with
+the scale of the layer it reads from — layer 13 for the sliding layers, layer 14
+for the whole-attention ones, which is the layer `source_slot` resolves to.
+Skipping them is safe, and reading them would be reading the same number twice.
+
+### The grid is eight bit float, not eight bit integer
+
+The scales are a magnitude divided by the largest the grid reaches, so the
+denominator has to be known before a scale means anything. A byte's 127 is the
+obvious guess and it is wrong. Two things say so.
+
+Layer four's value scale is `0.2857142984867096`, which is the float32 nearest
+128/448 **to the bit** — a calibration clamped at a round magnitude, over the
+largest normal e4m3 carries. Under 127 it would be 36.2857, which is round in
+nothing.
+
+And under 127 the ranges are too small for what a plain prompt already puts in
+the cache. Eighteen ids of an ordinary question fill layer 13's value range to
+229% of a byte's reach, and six other layers overflow it too. Under 448 the same
+run fills it to 65% and nothing clips:
+
+```
+layer       k range     k peak   fill        v range     v peak   fill
+    0      2.686925     0.8841  32.9%      21.165359     8.3354  39.4%
+    4      8.288697     0.3142   3.8%     128.000000     7.1995   5.6%
+   13      2.667951     0.8484  31.8%      21.165359    13.7411  64.9%
+   14      7.821923     0.3747   4.8%     128.000000     7.5050   5.9%
+```
+
+The whole-attention layers sit an order of magnitude wider than the sliding ones
+and use almost none of it, which is the export's calibration being cautious
+where the cache is longest rather than anything the engine can improve on.
+
+### What it costs
+
+`--cache 8` makes the round trip through the grid in float, at the one point a
+row enters the cache. Nothing is stored smaller yet: the cost of quantizing is
+paid where it can be measured against the same run without it, which is what a
+backend that stored bytes would inherit.
+
+On the shipped export, over five prompts, the next token is never in doubt — the
+top id agrees every time and the top probability moves by under 1.5 points. What
+does not survive is token-exact reproduction: under greedy decoding four of the
+five diverge, at 78 to 102 characters in, at the first genuinely close call. All
+four stay correct and on topic afterwards; they say the same thing in different
+words.
+
+That is the shape of the trade rather than a verdict on it. The reason to want
+it is the footprint, and at the default window it is not small: 1803.0 MiB of
+cache becomes 450.8 MiB, a saving larger than the whole checkpoint's mapped
+weights.
+
+### Surfaces
+
+A `cache` task prints the table above for a prompt of your choosing, the peaks
+beside the ranges they have to fit in, and what the cache costs at full span
+both ways. The peaks are tracked whether or not quantizing is on, because what
+the range has to cover is a question only a real prompt answers.
+
+`model_cache_scale`, `session_cache_peak` and `session_cache_room` expose the
+three numbers to a caller.
+
+### Tests
+
+Nine more, on the grid itself rather than the export: every value it carries
+survives the round trip, in the normal range and the subnormal one; a magnitude
+over 448 saturates rather than running off into an infinity e4m3 has no room
+for; the midpoint between two neighbours rounds to the even significand, as the
+hardware conversion does. The rounder was also checked against a grid built
+from scratch over 200000 values, and agrees on every one.
+
+The suite is **380** with the export beside it, clean under `-Wall -Wextra` and
+under the sanitizers.
+
+### Known gaps
+
+Nothing stores the cache smaller yet. The scales are read, the grid is
+implemented and the error is measured, but `key_store` and `value_store` are
+still float arrays — a backend that holds bytes is the change that collects the
+1352 MiB, and it is a backend change rather than this one.
+
+The divergence measurement is five prompts on one export, text only, at short
+context. What quantizing costs when the cache is long enough for the sliding
+window to be turning over is the case that matters most for a small host, and it
+is untested here.

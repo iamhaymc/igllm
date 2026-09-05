@@ -36,6 +36,7 @@ typedef struct main_flag {
   int         thread_count;
   int         window_limit;
   int         verbose_level;
+  int         cache_bits;   /* 0 keeps the key and value cache in float, 8 quantizes it */
   int         raw_flag;
   app_taste   taste;
 } main_flag;
@@ -94,7 +95,8 @@ static void main_usage(void) {
   printf("  bench      timed prefill and decode report\n");
   printf("  tokens     print the token ids of the prompt\n");
   printf("  logits     print the next token distribution as json\n");
-  printf("  probe      print the resolved model shape\n\n");
+  printf("  probe      print the resolved model shape\n");
+  printf("  cache      print the calibrated cache ranges against a prompt\n\n");
   printf("options:\n");
   printf("  --model <folder>    checkpoint folder in huggingface layout\n");
   printf("  --prompt <text>     prompt text, defaults to a short greeting\n");
@@ -104,6 +106,7 @@ static void main_usage(void) {
   printf("  --serve <count>     tokens to produce, default 128\n");
   printf("  --threads <count>   worker threads, default host count\n");
   printf("  --window <count>    context length cap\n");
+  printf("  --cache <bits>      key and value cache storage, 0 float or 8 quantized\n");
   printf("  --heat <value>      temperature, 0 for greedy\n");
   printf("  --top-k <count>     top-k cutoff, 0 disables\n");
   printf("  --top-p <value>     top-p cutoff\n");
@@ -146,6 +149,7 @@ static int main_flags(int argc, char **argv, main_flag *flag_out) {
     else if (strcmp(name_text, "--serve") == 0 && value_text) flag_out->serve_limit = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--threads") == 0 && value_text) flag_out->thread_count = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--window") == 0 && value_text) flag_out->window_limit = atoi(argv[++argument_index]);
+    else if (strcmp(name_text, "--cache") == 0 && value_text) flag_out->cache_bits = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--heat") == 0 && value_text) flag_out->taste.heat_value = (float)atof(argv[++argument_index]);
     else if (strcmp(name_text, "--top-k") == 0 && value_text) flag_out->taste.top_count = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--top-p") == 0 && value_text) flag_out->taste.top_portion = (float)atof(argv[++argument_index]);
@@ -449,6 +453,69 @@ static int main_tokens(app_model *model, const main_flag *flag) {
   return 0;
 }
 
+/* What the export's calibrated cache ranges hold, judged against a prompt.
+ *
+ * The scales are per tensor and static, so the only question that decides
+ * whether a quantized cache is safe is how the range compares with what the
+ * cache is actually asked to carry: a peak above the range clips, and a peak
+ * far below it spends levels on room nothing uses.  Both are printed a layer,
+ * with the fill the ratio comes to. */
+static int main_cache(app_model *model, const main_flag *flag) {
+  app_session *session = NULL;
+  main_reel reel;
+  int layer_count = model_layer_count(model);
+  int layer_index;
+  app_code code = session_open(model, &session);
+
+  if (code != APP_OKAY) {
+    fprintf(stderr, "session: %s\n", app_code_text(code));
+    return 1;
+  }
+  if (!main_reel_build(model, flag, &reel)) {
+    session_close(session);
+    return 1;
+  }
+  if (session_prime_media(session, reel.id_list, reel.id_count, reel.state_list, reel.state_flag) !=
+      APP_OKAY) {
+    fprintf(stderr, "prime failed\n");
+    main_reel_free(&reel);
+    session_close(session);
+    return 1;
+  }
+  session_step_state(session, reel.id_list[reel.id_count - 1],
+                     reel.state_flag[reel.id_count - 1]
+                         ? reel.state_list +
+                               (size_t)(reel.id_count - 1) * (size_t)reel.state_size
+                         : NULL);
+
+  {
+    double room = (double)session_cache_room(session) / (1024.0 * 1024.0);
+    printf("prompt   %d ids\n", reel.id_count);
+    printf("room     %.1f MiB of cache at full span, %.1f MiB quantized\n", room, room / 4.0);
+  }
+  printf("cache    %s\n\n", flag->cache_bits == 8 ? "quantized through the scales" : "float");
+  printf("%5s  %12s %10s %6s   %12s %10s %6s\n", "layer", "k range", "k peak", "fill",
+         "v range", "v peak", "fill");
+  for (layer_index = 0; layer_index < layer_count; ++layer_index) {
+    float key_scale = model_cache_scale(model, layer_index, 0);
+    float value_scale = model_cache_scale(model, layer_index, 1);
+    float key_peak = session_cache_peak(session, layer_index, 0);
+    float value_peak = session_cache_peak(session, layer_index, 1);
+    float key_span = key_scale * CACHE_FP8_TOP;
+    float value_span = value_scale * CACHE_FP8_TOP;
+    printf("%5d  %12.6f %10.4f ", layer_index, (double)key_span, (double)key_peak);
+    if (key_span > 0.0f) printf("%5.1f%%", (double)(100.0f * key_peak / key_span));
+    else printf("%6s", "-");
+    printf("   %12.6f %10.4f ", (double)value_span, (double)value_peak);
+    if (value_span > 0.0f) printf("%5.1f%%", (double)(100.0f * value_peak / value_span));
+    else printf("%6s", "-");
+    printf("\n");
+  }
+  main_reel_free(&reel);
+  session_close(session);
+  return 0;
+}
+
 static int main_probe(app_model *model) {
   const char *name_text = model_name(model);
   printf("model    %s\n", name_text ? name_text : "");
@@ -497,6 +564,7 @@ int main(int argc, char **argv) {
   setup.thread_count = flag.thread_count;
   setup.window_limit = flag.window_limit;
   setup.verbose_level = flag.verbose_level;
+  setup.cache_bits = flag.cache_bits;
 
   code = model_load(flag.model_path, &setup, &model);
   if (code != APP_OKAY) {
@@ -514,6 +582,8 @@ int main(int argc, char **argv) {
     result_code = main_tokens(model, &flag);
   else if (strcmp(flag.task_text, "probe") == 0)
     result_code = main_probe(model);
+  else if (strcmp(flag.task_text, "cache") == 0)
+    result_code = main_cache(model, &flag);
   else {
     main_usage();
     result_code = 1;

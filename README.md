@@ -50,10 +50,18 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 | `tokens`   | print the token ids of the prompt             |
 | `logits`   | print the next token distribution as json     |
 | `probe`    | print the resolved model shape                |
+| `cache`    | print the export's calibrated cache ranges    |
 
 Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
-`--threads`, `--window`, `--heat`, `--top-k`, `--top-p`, `--echo-penalty`,
-`--seed`, `--raw`, `--verbose`. Run `igllm --help` for the full list.
+`--threads`, `--window`, `--cache`, `--heat`, `--top-k`, `--top-p`,
+`--echo-penalty`, `--seed`, `--raw`, `--verbose`. Run `igllm --help` for the
+full list.
+
+`--cache 8` rounds the key and value cache through the eight bit float grid the
+export calibrates static ranges for — the error a backend that stored the cache
+as bytes would carry, paid where it can be measured. It is off by default. The
+`cache` task prints those ranges against the peaks a prompt actually reaches,
+and what the cache costs at full span either way.
 
 `--image` takes a png, pnm or bmp and `--audio` a riff wave. Each is run
 through its tower and put in front of the prompt, bracketed by the ids the

@@ -53,6 +53,7 @@ typedef struct app_setup {
   int   thread_count;  /* worker threads, 0 selects the host default */
   int   window_limit;  /* context length, 0 selects the model default */
   int   verbose_level; /* 0 quiet, 1 progress, 2 detail */
+  int   cache_bits;    /* key and value cache storage: 0 keeps float, 8 quantizes */
 } app_setup;
 
 /* Tunables applied when a token is drawn from a logit row. */
@@ -191,6 +192,17 @@ const float *session_step(app_session *session, int32_t id_value);
 const float *session_step_state(app_session *session, int32_t id_value, const float *state_data);
 int32_t      session_pick(app_session *session, const float *logit_list, const app_taste *taste);
 int          session_fill(const app_session *session); /* tokens held in cache */
+
+/* The static range the export calibrates for a layer's key or value cache, and
+ * the largest magnitude a session has actually put there.  `value_side` picks
+ * the value cache over the key cache.  A scale of zero means the checkpoint
+ * ships none for that layer. */
+float        model_cache_scale(const app_model *model, int layer_index, int value_side);
+float        session_cache_peak(const app_session *session, int layer_index, int value_side);
+
+/* Bytes the key and value cache occupies at full span, as it is stored now.  A
+ * backend that held it at `cache_bits` would pay a quarter of this. */
+size_t       session_cache_room(const app_session *session);
 app_tally    session_tally(const app_session *session);
 
 /* helper layer ------------------------------------------------------------*/
@@ -3524,6 +3536,20 @@ static void trace_close(void) {
 #endif
 
 #define MODEL_LAYER_LIMIT 128
+
+/* A quantized key and value cache stores the eight bit floats the export
+ * calibrates for: one sign bit, four exponent bits, three mantissa bits, and
+ * no infinity, so 448 is the largest magnitude the grid reaches and anything
+ * over it saturates there.  Below 2^-6 the grid turns subnormal and its step
+ * settles at 2^-9.
+ *
+ * That the denominator is 448 rather than a byte's 127 is not a guess: layer
+ * four's value scale is the float32 nearest 128/448 to the bit, a calibration
+ * clamped at a round magnitude, and under 127 the ranges would be too small to
+ * hold what a plain prompt already puts in the cache. */
+#define CACHE_FP8_TOP     448.0f
+#define CACHE_FP8_NORM    (1.0f / 64.0f)  /* 2^-6, the smallest normal */
+#define CACHE_FP8_STEP    (1.0f / 512.0f) /* 2^-9, the subnormal step */
 #define MODEL_KIND_SLIDE  0
 #define MODEL_KIND_WHOLE  1
 #define MODEL_KIND_COUNT  2
@@ -3596,6 +3622,11 @@ typedef struct layer_wing {
   float *query_norm, *key_norm;
   float *enter_norm, *after_attn_norm, *before_feed_norm, *after_feed_norm, *after_ple_norm;
   float  layer_gain;
+
+  /* Static ranges the export calibrates for a quantized key and value cache,
+   * one scalar each per layer.  Zero where the checkpoint ships none, which is
+   * the signal to keep that layer's cache in float. */
+  float  key_cache_scale, value_cache_scale;
 } layer_wing;
 
 /* -- towers -------------------------------------------------------------- */
@@ -4059,6 +4090,20 @@ static float *vec_bind(app_model *model, const char *stem, int span_hint) {
     value_list[value_index] = real_read(span->data_base, span->type_kind, (size_t)value_index);
   model->weight_bytes += span->data_bytes;
   return value_list;
+}
+
+/* A calibration scalar, read straight out of the checkpoint.  These are rank
+ * zero tensors, so `vec_bind` would allocate a one element array to hold what
+ * fits in a register; read the single value and hand it back by value. */
+static float scale_bind(app_model *model, const char *stem) {
+  const store_span *span = store_find(&model->store, stem);
+  int value_index, value_count = 1;
+  if (!span) return 0.0f;
+  for (value_index = 0; value_index < span->rank_count; ++value_index)
+    value_count *= (int)span->size_list[value_index];
+  if (value_count != 1) return 0.0f;
+  model->weight_bytes += span->data_bytes;
+  return real_read(span->data_base, span->type_kind, 0);
 }
 
 /* -- configuration ------------------------------------------------------- */
@@ -4538,6 +4583,12 @@ static app_code model_bind(app_model *model) {
                layer_index);
       wing->key_norm = vec_bind(model, stem_text, wing->head_size);
       if (!wing->key_norm) return APP_FAIL_MISSING;
+      snprintf(stem_text, sizeof(stem_text), "%slayers.%d.self_attn.k_cache_scale",
+               model->prefix_text, layer_index);
+      wing->key_cache_scale = scale_bind(model, stem_text);
+      snprintf(stem_text, sizeof(stem_text), "%slayers.%d.self_attn.v_cache_scale",
+               model->prefix_text, layer_index);
+      wing->value_cache_scale = scale_bind(model, stem_text);
     } else {
       wing->kv_count = model->wing_list[wing->source_slot].kv_count;
       wing->head_size = model->wing_list[wing->source_slot].head_size;
@@ -6686,6 +6737,12 @@ struct app_session {
   float **key_store;
   float **value_store;
 
+  /* The largest magnitude this session has put in each layer's cache, tracked
+   * so the static ranges the export calibrates can be judged against what the
+   * cache is actually asked to hold.  One entry a layer, keys and values apart. */
+  float  *key_peak;
+  float  *value_peak;
+
   /* Every room below the stride block holds KERN_LANE_LIMIT lanes, one per
    * token of a batched pass, laid out lane by lane with the stride named. */
   int state_stride;
@@ -6747,6 +6804,8 @@ static void session_free_rooms(app_session *session) {
     mem_free(session->key_store);
     mem_free(session->value_store);
   }
+  mem_free(session->key_peak);
+  mem_free(session->value_peak);
   mem_free(session->state_room);
   mem_free(session->scrap_room);
   mem_free(session->lift_room);
@@ -6771,6 +6830,53 @@ static void session_free_rooms(app_session *session) {
   mem_free(session->top_slot);
   mem_free(session->pick_room);
   mem_free(session->echo_room);
+}
+
+/* Round to the nearest eight bit float the cache grid carries.
+ *
+ * The value arrives already divided by its layer's scale, so the grid is the
+ * plain e4m3 one.  `rintf` rounds half to even under the default mode, which is
+ * what the hardware form of this conversion does. */
+static float cache_pack8(float value) {
+  float sign = value < 0.0f ? -1.0f : 1.0f;
+  float size = value < 0.0f ? -value : value;
+  float step;
+  int power;
+  if (!(size < CACHE_FP8_TOP)) return sign * CACHE_FP8_TOP; /* saturates, and catches NaN */
+  if (size < CACHE_FP8_NORM) return sign * rintf(size / CACHE_FP8_STEP) * CACHE_FP8_STEP;
+  frexpf(size, &power);        /* size is in [2^(power-1), 2^power) */
+  step = ldexpf(1.0f, power - 4); /* four bits of significand, one of them implied */
+  size = rintf(size / step) * step;
+  return sign * (size > CACHE_FP8_TOP ? CACHE_FP8_TOP : size);
+}
+
+/* Lay one row into the key or value cache.
+ *
+ * The export calibrates a static range a layer for each of them — a single
+ * scalar, the same for every channel and every position — and ships seventy of
+ * them the reference never reads.  They describe the eight bit float grid
+ * above: a backend that holds the cache quantized stores `value / scale`
+ * rounded to that grid, and reads back what it rounded to times the scale.
+ * With `cache_bits` at zero the row is stored as it arrives and the scales cost
+ * nothing; at eight it makes that round trip here, in float, so the error a
+ * quantized cache would carry is paid where it can be measured against the same
+ * run without it.
+ *
+ * The peak is tracked either way.  What the range has to cover is the question
+ * the scalars answer, and it can only be asked of a real prompt. */
+static void cache_lay(app_session *session, int layer_index, float *slot, const float *row,
+                      int width, float scale, int value_side) {
+  float *peak = (value_side ? session->value_peak : session->key_peak) + layer_index;
+  int index;
+  for (index = 0; index < width; ++index) {
+    float size = row[index] < 0.0f ? -row[index] : row[index];
+    if (size > *peak) *peak = size;
+  }
+  if (session->model->setup.cache_bits != 8 || !(scale > 0.0f)) {
+    memcpy(slot, row, sizeof(float) * (size_t)width);
+    return;
+  }
+  for (index = 0; index < width; ++index) slot[index] = cache_pack8(row[index] / scale) * scale;
 }
 
 static void session_attend(app_session *session, int layer_index, int place_from, int lane_count,
@@ -6829,8 +6935,8 @@ static void session_attend(app_session *session, int layer_index, int place_from
                               session->sin_room);
         model->desk.norm_rms(&model->desk, value_head, NULL, head_size, form->norm_eps, value_head);
       }
-      memcpy(key_slot, key_lane, sizeof(float) * (size_t)kv_width);
-      memcpy(value_slot, value_lane, sizeof(float) * (size_t)kv_width);
+      cache_lay(session, layer_index, key_slot, key_lane, kv_width, wing->key_cache_scale, 0);
+      cache_lay(session, layer_index, value_slot, value_lane, kv_width, wing->value_cache_scale, 1);
     }
 
     if (wing->kind_mark == MODEL_KIND_SLIDE) {
@@ -7162,6 +7268,7 @@ app_setup app_setup_plain(void) {
   setup.thread_count = 0;
   setup.window_limit = 0;
   setup.verbose_level = 0;
+  setup.cache_bits = 0;
   return setup;
 }
 
@@ -7748,7 +7855,12 @@ app_code session_open(app_model *model, app_session **session_out) {
 
   session->key_store = (float **)mem_clear(sizeof(float *) * (size_t)form->layer_count);
   session->value_store = (float **)mem_clear(sizeof(float *) * (size_t)form->layer_count);
-  if (!session->key_store || !session->value_store) { session_close(session); return APP_FAIL_MEMORY; }
+  session->key_peak = (float *)mem_clear(sizeof(float) * (size_t)form->layer_count);
+  session->value_peak = (float *)mem_clear(sizeof(float) * (size_t)form->layer_count);
+  if (!session->key_store || !session->value_store || !session->key_peak || !session->value_peak) {
+    session_close(session);
+    return APP_FAIL_MEMORY;
+  }
   for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
     layer_wing *wing = &model->wing_list[layer_index];
     size_t slot_count;
@@ -7830,6 +7942,8 @@ void session_reset(app_session *session) {
   session->fill_count = 0;
   session->echo_count = 0;
   memset(&session->tally, 0, sizeof(session->tally));
+  memset(session->key_peak, 0, sizeof(float) * (size_t)session->model->form.layer_count);
+  memset(session->value_peak, 0, sizeof(float) * (size_t)session->model->form.layer_count);
   for (layer_index = 0; layer_index < session->model->form.layer_count; ++layer_index) {
     layer_wing *wing = &session->model->wing_list[layer_index];
     size_t slot_count;
@@ -7917,6 +8031,31 @@ const float *session_step(app_session *session, int32_t id_value) {
 }
 
 int session_fill(const app_session *session) { return session ? session->fill_count : 0; }
+
+float model_cache_scale(const app_model *model, int layer_index, int value_side) {
+  const layer_wing *wing;
+  if (!model || layer_index < 0 || layer_index >= model->form.layer_count) return 0.0f;
+  wing = &model->wing_list[layer_index];
+  return value_side ? wing->value_cache_scale : wing->key_cache_scale;
+}
+
+size_t session_cache_room(const app_session *session) {
+  size_t total = 0;
+  int layer_index;
+  if (!session) return 0;
+  for (layer_index = 0; layer_index < session->model->form.layer_count; ++layer_index) {
+    const layer_wing *wing = &session->model->wing_list[layer_index];
+    if (wing->share_flag) continue; /* reads another layer's cache, allocates none */
+    total += (size_t)wing->cache_span * (size_t)wing->kv_count * (size_t)wing->head_size *
+             sizeof(float) * 2u;
+  }
+  return total;
+}
+
+float session_cache_peak(const app_session *session, int layer_index, int value_side) {
+  if (!session || layer_index < 0 || layer_index >= session->model->form.layer_count) return 0.0f;
+  return (value_side ? session->value_peak : session->key_peak)[layer_index];
+}
 
 app_tally session_tally(const app_session *session) {
   app_tally tally;

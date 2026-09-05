@@ -1256,6 +1256,47 @@ static float test_scale_axis(const float *from_list, int from_count, int into_in
   return total_value != 0.0f ? sum_value / total_value : 0.0f;
 }
 
+/* The eight bit float grid a quantized key and value cache stores on.
+ *
+ * Every value the grid carries has to come back unchanged, everything between
+ * two of them has to land on the nearer, and a magnitude over the top has to
+ * saturate rather than run off into an infinity the format has no room for. */
+static void test_cache(void) {
+  int okay_flag = 1;
+  int power_index, step_index;
+  test_open("cache");
+
+  /* The normal range: significands of four bits, one of them implied. */
+  for (power_index = -6; power_index <= 8; ++power_index)
+    for (step_index = 0; step_index < 8; ++step_index) {
+      float exact = ldexpf(1.0f + (float)step_index / 8.0f, power_index);
+      if (exact > 448.0f) continue;
+      if (cache_pack8(exact) != exact || cache_pack8(-exact) != -exact) okay_flag = 0;
+    }
+  test_true(okay_flag, "every normal the grid carries survives the round trip");
+
+  okay_flag = 1;
+  for (step_index = 0; step_index < 8; ++step_index) {
+    float exact = (float)step_index / 512.0f;
+    if (cache_pack8(exact) != exact) okay_flag = 0;
+  }
+  test_true(okay_flag, "the subnormal steps survive the round trip");
+
+  test_true(cache_pack8(448.0f) == 448.0f, "the largest magnitude is held");
+  test_true(cache_pack8(1e9f) == 448.0f && cache_pack8(-1e9f) == -448.0f,
+            "a magnitude over the top saturates rather than overflowing");
+  test_true(cache_pack8(0.0f) == 0.0f, "zero stays zero");
+
+  /* Between 1.0 and 1.125 the step is 0.125, so the halfway point is 1.0625
+   * and either side of it has a nearer neighbour. */
+  test_true(cache_pack8(1.03f) == 1.0f, "a value below the midpoint rounds down");
+  test_true(cache_pack8(1.10f) == 1.125f, "a value above the midpoint rounds up");
+  test_true(cache_pack8(1.0625f) == 1.0f, "a midpoint rounds to the even significand");
+
+  /* Anything under half the subnormal step has no neighbour but zero. */
+  test_true(cache_pack8(1.0f / 4096.0f) == 0.0f, "a magnitude under the smallest step falls to zero");
+}
+
 static void test_scale(void) {
   flat_grid from_grid, into_grid;
   int wide_index, high_index, okay_flag = 1;
@@ -2810,7 +2851,11 @@ static void test_shot(void) {
    * a step reads one row of it.  A build that swept it would land above that
    * figure on its own, so the bound below fails long before the exact totals
    * would need to be re-recorded for an export of another shape. */
-  test_true(model_memory_bytes(model) == 2448245376u, "the shipped export is the size recorded");
+  /* The 120 bytes over the figure this held before the cache scales were read
+   * are those scales: thirty of the seventy the export ships, four bytes each.
+   * The other forty belong to layers that read another layer's cache and own
+   * none of their own, so the loader never binds them. */
+  test_true(model_memory_bytes(model) == 2448245496u, "the shipped export is the size recorded");
   test_true(model_decode_bytes(model) == 796326800u, "a token reads what was recorded");
   test_true(model_decode_bytes(model) < 1120u * 1024u * 1024u,
             "a token reads less than the per-layer embedding table alone");
@@ -2891,6 +2936,7 @@ int main(void) {
   test_puff();
   test_image();
   test_scale();
+  test_cache();
   test_wave();
   test_mel();
   test_wing();
