@@ -489,9 +489,12 @@ static int main_cache(app_model *model, const main_flag *flag) {
                          : NULL);
 
   {
+    int byte_flag = flag->cache_bits == 8;
     double room = (double)session_cache_room(session) / (1024.0 * 1024.0);
+    double other = (double)session_cache_room_at(session, byte_flag ? 0 : 8) / (1024.0 * 1024.0);
     printf("prompt   %d ids\n", reel.id_count);
-    printf("room     %.1f MiB of cache at full span, %.1f MiB quantized\n", room, room / 4.0);
+    printf("room     %.1f MiB of cache at full span, held as %s (%.1f MiB as %s)\n", room,
+           byte_flag ? "bytes" : "floats", other, byte_flag ? "floats" : "bytes");
   }
   printf("cache    %s\n\n", flag->cache_bits == 8 ? "quantized through the scales" : "float");
   printf("%5s  %12s %10s %6s   %12s %10s %6s\n", "layer", "k range", "k peak", "fill",

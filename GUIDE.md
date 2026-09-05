@@ -700,10 +700,32 @@ layer's keys and values — one magnitude per tensor, held in
 grid: four exponent bits, three mantissa bits, and 448 as the largest
 magnitude, over which a value saturates rather than becoming an infinity the
 format has no room for. With `setup.cache_bits` at zero the row is stored as
-it arrives. At eight it makes the round trip through that grid in float via
-`cache_pack8`, so the error a backend holding bytes would carry is paid where
-it can be measured against the same run without it. Nothing is stored smaller
-yet.
+it arrives. At eight the row is stored as bytes on that grid: `cache_code8`
+names the byte, and the cache is a quarter of the size it was.
+
+Which of the two a layer uses is settled once, in `session_open`, and is
+carried by `key_grid` and `value_grid` — a 256 entry table a side a layer,
+filled by `cache_grid_fill` with the grid times that layer's scale, and null
+where the layer holds floats. A null table is the flag; it also decides what
+one stored value costs, which is `cache_slot_bytes`. A layer the export ships
+no scale for keeps floats, so a checkpoint that calibrates nothing costs
+nothing for asking, and a byte of zero decodes to a float of zero, which is
+what lets one `memset` clear either store.
+
+Folding the scale into the table is what makes the two storages agree rather
+than merely come close: an entry is exactly `cache_pack8(value / scale) *
+scale`, which is the float a round trip through the grid stored, so a layer
+holding bytes reaches the same score as one holding floats, bit for bit.
+`cache_dot` and `cache_add` read a byte row and mirror the packed dot kernel's
+blocking and accumulators term for term to keep it that way; on AVX2 the table
+read is a gather, on SSE2 and NEON four scalar reads of a table that stays in
+the first level cache. A layer holding floats never reaches them — it keeps
+`kern_dot_real` and the blend loop it always had, so `--cache 8` off is the
+arithmetic it was before any of this existed.
+
+`session_cache_room_at` says what the cache costs at either storage, and
+`session_cache_bytes` asks the layer rather than assuming a float, so what
+`bench` reports a token reads falls with the storage.
 
 The largest magnitude a session has put in each cache is tracked either way,
 in `key_peak` and `value_peak`. What the calibrated range has to cover is a
