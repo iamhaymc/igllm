@@ -186,12 +186,19 @@ path chosen at compile time behind one macro layer: `APP_SIMD_AVX2`,
 `APP_SIMD_SSE2`, `APP_SIMD_NEON`, or none. `back_flavor` names the path that
 was selected.
 
-- `kern_dot_real` — dot product against an `f32`, `f16`, or `bf16` row.
+- `kern_dot_real` — dot product against an `f32`, `f16`, or `bf16` row. The
+  `f32` case has a vector path on all three targets.
 - `kern_dot_code` — dot product against a packed row, specialized for the
-  two, four, and eight bit cases and general otherwise. The two and four bit
-  cases have vector paths on all three targets: a nibble or a quarter byte
-  unpacks with whole-vector shifts and masks. Both require the group to start
-  on a byte boundary and fall back to the bit-stream loop when it does not.
+  two, four, and eight bit cases and general otherwise. All three have vector
+  paths on all three targets: a nibble or a quarter byte unpacks with
+  whole-vector shifts and masks, and a whole byte needs only the flip. The two
+  narrow widths require the group to start on a byte boundary and fall back to
+  the bit-stream loop when it does not.
+
+  Every vector path carries two accumulators rather than one. The arithmetic is
+  cheap enough that a single chain waits on the latency of its own add rather
+  than on the work: splitting it took a four bit row 1.6 times quicker on SSE2
+  and 1.4 on AVX2, for nothing but a second register.
 - `kern_row_code` — one output row of a quantized matrix, formulated as
 
   ```
@@ -201,9 +208,15 @@ was selected.
   The per-group activation sums are computed once per matrix product by
   `kern_group_sum` and shared by every row. This removes one subtraction
   per element from the inner loop and accumulates in a wider range.
+- `kern_code_spread` — a run of codes unpacked into floats, with the same
+  vector paths `kern_dot_code` fuses into its own loop. It exists because a
+  batch has someone to share the decode with and a single vector does not.
 - `kern_row_code_many` — the same row against several activation vectors at
-  once. A group of codes is unpacked into a small float scratch and dotted
-  against every lane, so a batch pays the decode cost of a single vector.
+  once. A group of codes is spread into a small float scratch and dotted
+  against every lane, so a batch pays the decode cost of a single vector. When
+  that spread was a scalar walk of the bit stream, a sixteen lane batch cost
+  three and a half times what the same sixteen lanes cost one at a time, and
+  batching lost to the thing it exists to beat.
 - `kern_mat_vec_band` — one band of rows, the unit of work given to the pool.
   It carries a lane count, so the same band function serves a matrix-vector
   product and a matrix-matrix product.
@@ -282,9 +295,9 @@ floats or a run of samples.
   can see.
 - `wave_spin` — an in-place radix-2 transform. `mel_bank` builds triangular
   filters spaced evenly on the HTK mel scale at fractional bin positions, and
-  `mel_make` produces the log mel spectrogram: a periodic Hann window, the
-  next power of two at or above the frame, and a floor under the logarithm so
-  a silent band cannot reach negative infinity.
+  `mel_make` produces the log mel spectrogram: a periodic Hann window, a stated
+  transform length, a floor under the logarithm so a silent band cannot reach
+  negative infinity, and a frame count that stops where the audio does.
 
 ### 3.9 Model layer
 
@@ -393,6 +406,16 @@ scale.
 After the stack, `vision_pool` averages over `pool_size` squared windows and
 scales by the square root of the hidden width.
 
+That attention is the whole cost of an image: at the shipped export's patch
+budget a picture is two thousand three hundred and forty patches scored against
+themselves, sixteen layers over. It is also the one loop in either tower that
+divides cleanly, so it is the one that goes to the pool — and it goes a head at
+a time, because a head's keys are sixty-four floats in every seven hundred and
+sixty-eight where they lie. Gathering one head into a run of its own turns a
+seven megabyte walk per query into six hundred kilobytes that stays in cache.
+The two together took an image from four minutes thirty-seven to one minute
+fifty-two on four cores, without moving a single number.
+
 **The audio tower is a conformer**, not a transformer, and the difference is
 worth stating because the two look alike from a distance. A layer is
 
@@ -417,6 +440,29 @@ before the last sample is dropped, a **magnitude** spectrum rather than a power
 one, and a floor added under the logarithm rather than a clamp inside it.
 Squaring instead of taking the magnitude is the easy mistake here: it survives
 every sanity check and only a comparison against the reference finds it.
+
+What the engine does **not** do is pad the clip out to a whole block of a
+hundred and twenty-eight samples, which the extractor does before it frames
+anything. That is deliberate, and it is worth saying why, because the extractor
+plainly hands those extra frames back and matching its output shape looks like
+the faithful thing to do.
+
+The extra frames are masked. `input_features_mask` marks them, the subsampler
+zeros them between its two convolution stages, the conformer's attention is
+built to exclude them, and `Gemma4Model` keeps only the rows the tower's output
+mask leaves — `audio_features[audio_mask_from_encoder]`. So they reach nothing.
+What they would change, if the engine counted them, is the number of rows it
+thinks the clip is worth, because a row survives the two stride-two stages only
+if the frame four times its index is real. Counting the padding puts a soft
+token there that the reference never asks for: four thousand samples reach
+twenty-four frames and pad to twenty-five, and twenty-four frames are six soft
+tokens where twenty-five would be seven.
+
+Measured against the extractor over clip lengths from a twentieth of a second to
+ten seconds, the frame count the engine computes is the live count the mask
+marks on every one of them, and `ceil(live / 4)` is what the processor's own
+`_get_num_multimodal_tokens` asks for on every one of them. The padding is a
+detail of how the extractor batches, not of what the model reads.
 
 `sound_stage` then runs the subsampler — two convolutions over (frame, filter),
 each followed by a mean-subtracting `kern_norm_layer` across the channels it
@@ -664,6 +710,24 @@ steps, the refusal of a column hint no packing explains, and the eight bit dot
 product, which reads its bytes directly and so has to take the sign flip that
 the row decode takes.
 
+One section is the exception, and it is the last one. `test_shot` wants the
+checkpoint: it looks in `IGLLM_MODEL`, then beside the tree, and when it finds
+the shipped export it runs three prompts through the whole stack — frame,
+prefill, one step — and holds each to numbers recorded from the build the seam
+comparison judged against the reference. The ids of the frame have to be exact,
+the leading id has to be exact, the top eight logits have to come back within
+2.0, and none of those eight may fall out of the top sixteen. The slack is
+measured rather than guessed: between this host's SSE2 and AVX2 builds, over
+five prompts, rank one never moved, no id in a top eight fell below rank eleven
+in the other build, and the logits moved by at most 1.30. The bar sits above
+that and well inside the 2.30 to 5.33 the reference moves against itself when
+its own input is nudged by a millionth, so what it catches is a layer wired
+wrong rather than a last-bit difference. What it buys is that the parity result
+outlives the host it was measured on: a tree that has the checkpoint but no
+python still fails if the stack stops reaching the same answer. It costs about
+twenty seconds. A folder holding some other checkpoint is passed over rather
+than failed, and `IGLLM_MODEL=none` turns the section off.
+
 `app_test.py` drives the built binary and the transformers reference over
 the same prompts. It compares the token ids, the rank-one token, the top-k
 overlap, the largest absolute logit gap, and the greedy continuation, then
@@ -750,12 +814,12 @@ the engine may do.
 **`app_diff.py --media` walks the two towers against the reference itself.**
 Each tower is built from the reference's own module and loaded with the
 checkpoint's own weights, its packed tensors decoded by the reference's own
-`QuantizedLinear`. That works even on the shipped export, whose language model
-dequantizes to about nineteen gigabytes and will not fit on an ordinary machine:
-a tower is a couple of hundred megabytes, and the reference gives each one a
-`base_model_prefix` so it can be built alone. So the towers are held to the same
-standard as the text stack — upstream, on the real weights — rather than to a
-second reading of the same description.
+`QuantizedLinear`. A tower is a couple of hundred megabytes and the reference
+gives each one a `base_model_prefix`, so it can be built alone rather than
+standing the whole model up to look at one encoder — quicker, lighter, and it
+keeps a tower's arithmetic isolated from everything around it. So the towers are
+held to the same standard as the text stack — upstream, on the real weights —
+rather than to a second reading of the same description.
 
 Both sides start from the rows the engine says it read — the normalized patches,
 or the mel frames — because the png reader, the resize and the filterbank each
@@ -789,20 +853,60 @@ the ids that come out have to be the engine's, id for id. Two counts are checked
 beside them: what the processor's own arithmetic says a picture of that size is
 worth, which is the aspect-preserving resize against the patch budget, and what
 it says the clip is worth. The second is the feature extractor's framing, which
-is an open question tracked in `TODO.md`, so it is reported rather than judged.
+was an open question and is now settled — the engine's frame count is the live
+count `input_features_mask` marks, on every clip length it has been measured
+against — so it is checked like the rest.
 
 The *graph* half runs `Gemma4ForConditionalGeneration` over those same ids and
 compares the distribution. That wants the whole model in memory, which the
-shipped export does not give; `app_fake.whole_build` writes a synthetic one that
-does — the reference's own model class, both towers, both projectors, a tokenizer
-carrying the media tokens, and the processor files beside them. The towers are
-fed the rows the engine says it read, as `--media` feeds them, so what is
+shipped export does give: its weights stay packed and are decoded per forward,
+so it loads in about two and a third gigabytes. `app_fake.whole_build` writes a
+synthetic one as well — the reference's own model class, both towers, both
+projectors, a tokenizer carrying the media tokens, and the processor files
+beside them — which runs in seconds where the real one takes minutes. The towers
+are fed the rows the engine says it read, as `--media` feeds them, so what is
 measured is the seam rather than the png reader or the filterbank.
 
-Two engine faults came out of writing it, neither of which any single-tower
-comparison could have reached: the run was laid down without the ids the
-processor brackets it with, and the per-layer embedding at a filled lane read the
-placeholder where the reference reads the pad id.
+The bar is the reference's own movement, and how that is measured depends on
+what was attached. With a picture or a clip the input is nudged by a millionth
+and what reaches the logits is the answer. With nothing attached there is
+nothing to nudge, and it is tempting to call the floor zero because the ids are
+exact on both sides — but that does not follow on a checkpoint that rounds every
+activation onto a static grid, where a sum landing on a half step falls one way
+here and the other way there. So the same tokens are fed again in two chunks
+behind the cache, which is the same arithmetic in another summation order and
+the measure `reference_floor` already uses on the text stack. A floor of zero
+was not a measurement but the absence of one, and it called the shipped
+checkpoint wrong until it was replaced.
+
+A forward on a quantized checkpoint costs about a gigabyte and a half above the
+weights, because reading one row of an embedding dequantizes the whole table,
+and the case with both a picture and a clip attached wants two of them. Held in
+one process across four cases that does not fit, and — worse than not fitting —
+which case fits depends on what ran before it: the same case passed alone and
+skipped after `--media` had run in the same shell.
+
+So each case is judged in a process of its own. `--seam` spawns itself with
+`--seam-case`, and the child loads the model, runs the graph half and exits,
+handing its memory back. The engine's work is not repeated: the child is given
+the path to the trace the parent already wrote and reads it directly, so the
+cost is one model load per case rather than one engine run. The parent releases
+that trace before the child starts, because one picture leaves half a gigabyte
+of rows behind and the parent needs three numbers out of it.
+
+The child's exit code is the report, and it is deliberately not 1 for a
+disagreement: 1 is what python returns for an unhandled traceback, and a parent
+that cannot tell the two apart counts a crashed case as a fault and prints
+nothing to say so. It answers 0 or 2. Anything else is a child that died, and
+the parent prints its last lines and sorts it into the host running out of
+memory, which is a skip, or anything else, which is the harness's own fault and
+is labelled as such.
+
+Three engine faults came out of writing it and running it, none of which any
+single-tower comparison could have reached: the run was laid down without the
+ids the processor brackets it with, the per-layer embedding at a filled lane
+read the placeholder where the reference reads the pad id, and the floor that
+was supposed to judge all of it measured nothing at all.
 
 ## 7. Extending
 

@@ -29,11 +29,9 @@ the reference's own tower modules, the same way the text stack's come from its
 own model class, so `app_diff.py --media` compares against upstream rather than
 against a second reading of upstream.
 
-`tower_open` also builds one tower of a *shipped* checkpoint on its own. That
-matters because the language model of the released export dequantizes to about
-nineteen gigabytes and will not fit on an ordinary machine, while a tower is a
-couple of hundred megabytes: the towers can be held to the real weights even
-where the whole model cannot be loaded.
+`tower_open` also builds one tower of a *shipped* checkpoint on its own, which
+is quicker and lighter than standing the whole model up to look at one encoder,
+and keeps a tower's own arithmetic isolated from everything around it.
 
 `whole_build` goes the other way: a checkpoint small enough to be loaded whole,
 carrying both towers, a tokenizer with the media tokens, and the processor files
@@ -637,11 +635,11 @@ def tower_media(out_path, kind):
 
 # One tower at a time leaves the seam unchecked: what the processor lays down
 # around a run of soft tokens, and what the model makes of the ids either side
-# of it, exists only when the whole graph runs. The shipped export cannot be
-# loaded whole — its language model dequantizes to about nineteen gigabytes —
-# but a synthetic one can, and `Gemma4ForConditionalGeneration` writes the
+# of it, exists only when the whole graph runs. A synthetic checkpoint gives one
+# that runs in seconds, and `Gemma4ForConditionalGeneration` writes the
 # arrangement and the names itself, so the seam is compared against upstream
-# rather than against a second reading of it.
+# rather than against a second reading of it. The shipped export is walked the
+# same way by `--seam --model`; it is only slower.
 #
 # The processor files are written beside the weights because the ids under
 # examination are the processor's: it is `Gemma4Processor` that decides a run is

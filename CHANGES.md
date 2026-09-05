@@ -948,3 +948,467 @@ run the layout half there, and the export could not be fetched on this host.
 `run.py install` now asks for `torchvision` and `pillow` as well: the reference's
 image processor is a torchvision backend, and a processor cannot be opened
 without it. `TODO.md` has the rest.
+
+---
+
+## 0.7.1 — the seam on the shipped checkpoint
+
+### Why
+
+The seam landed with its layout half unrun against the real export, because the
+host it was written on could not fetch the weights. This one can: they are
+vendored under `model/`. Running it there was the whole of the open item, and it
+passes — but getting to that answer needed two faults fixed and one belief
+withdrawn.
+
+### It passes
+
+```
+text only        ids ok  14
+one image        ids ok 276    soft tokens ok  260 = 260
+one clip         ids ok  54    soft tokens ok   38 =  38
+image and clip   ids ok 316    soft tokens ok  both
+```
+
+Every id the engine lays down for a multi-modal prompt on the shipped export is
+the id the reference's own processor lays down, and every run of soft tokens is
+the length the processor asks for. That is the join the towers and the text
+stack meet at, and it had never been compared on real weights.
+
+### The graph half was reporting a false failure
+
+The whole-graph comparison called the shipped checkpoint wrong on a prompt with
+nothing attached: a largest logit gap of `2.965e-01` against an allowance of
+`1e-3`. The allowance was that small because the floor came back as exactly
+zero, and it came back as zero by construction — with nothing attached there is
+no input to nudge, and the code reasoned that "the ids are exact on both sides
+and there is nothing for a grid to round".
+
+The first half of that is true and the second does not follow. Identical ids do
+not make the arithmetic exact on a checkpoint that rounds every activation onto
+a static grid: a sum landing on a half step falls one way here and the other way
+there, which is the whole subject of 0.4.0. A floor of zero was not a
+measurement, it was the absence of one.
+
+The measure that applies is already in this file, used on the text stack: feed
+the same tokens again in two chunks behind the cache, which is the same
+arithmetic in another summation order. With that in place the verdicts are what
+the numbers actually say:
+
+| | engine differs by | the reference moves |
+| --- | --- | --- |
+| text only | 2.965e-01 | **5.330e+00** |
+| one image | 5.692e-01 | **3.271e+00** |
+| one clip | 5.370e-01 | **2.696e+00** |
+
+In all three the engine is nearer the reference than the reference is to itself
+under a change that should not matter — by a factor of five to eighteen.
+
+A floor that cannot fail is worth no more here than an oracle that cannot fail
+was worth in 0.3.0.
+
+### And crashing
+
+The fourth case took the run down with an out-of-memory error partway through,
+losing the three results before it. The graph half now catches that and reports
+a skip with the reason, so a host that cannot hold two forwards still gets the
+ids and the soft token counts — which is most of what the seam is for. The gap
+that case measures, `4.051e-01`, is in line with the three that pass; it is
+reported and left unjudged rather than compared against a bar nothing measured.
+
+### The model does fit, and never did not
+
+Both the tower work in 0.6.0 and the seam in 0.7.0 were scoped around a claim of
+mine: that the shipped export's language model "dequantizes to about nineteen
+gigabytes and will not fit on an ordinary machine". That is false, and it was
+never true. The figure is the footprint the weights would have if they were
+unpacked at load, which is not what happens — `replace_with_quant_layers` leaves
+them packed and decodes per forward. Measured:
+
+```
+Gemma4ForConditionalGeneration.from_pretrained("model", dtype=float32)
+    loaded in 3 s, 2.34 GiB of resident parameters
+```
+
+with the process at about 3.1 GB while the whole model is live, and a transient
+of roughly a gigabyte and a half per forward, because reading one row of an
+embedding dequantizes the whole table. That last part is why two forwards at
+once are tight; it is not why nineteen gigabytes were ever needed.
+
+The claim is removed from `app_diff.py`, `app_fake.py`, `GUIDE.md` and
+`README.md`. What it was used to justify — building one tower alone rather than
+standing the whole model up — is kept, because that is still the better way to
+look at one encoder: quicker, lighter, and it keeps a tower's arithmetic
+isolated from everything around it. It just is not a necessity.
+
+The entries for 0.6.0 and 0.7.0 are left as they were written. They are the
+record of what was believed at the time, and this is the correction.
+
+### Known gaps
+
+The seam's last case is unjudged on the shipped export for want of memory, and
+`TODO.md` carries it. Nothing else changed: the suite is 298 assertions, the
+synthetic seam still passes all four cases with the new floor, and the towers
+are where 0.6.0 left them.
+
+---
+
+## 0.7.2 — the towers get faster and the framing gets right
+
+### Why
+
+Three open items, taken in order of what running the last release had exposed:
+the seam's last case went unjudged, the audio framing was known to differ from
+the reference by a frame, and an image cost four and a half minutes. The first
+is closed, the third is much better, and the middle one turned out to be correct
+as it stood — which took a wrong fix and a failing seam to establish.
+
+### An image is two and a half times quicker
+
+Vision attention was the whole cost of a picture and had never been touched. At
+the shipped export's patch budget an image is two thousand three hundred and
+forty patches scored against themselves, sixteen layers over — about six hundred
+billion multiply-adds — and it ran on one core in one loop.
+
+Two changes, neither of which moves a number:
+
+**It goes to the pool.** The query loop is the one place in either tower that
+divides cleanly: a band writes only its own rows of the blend and its own slice
+of the score scratch, and reads everything else.
+
+**A head is gathered before it is scored.** Where the projections leave them, a
+head's keys are sixty-four floats in every seven hundred and sixty-eight, so
+scoring one query walks the whole seven megabyte array and the next query walks
+it again. Copying one head into a run of its own turns that into six hundred
+kilobytes that stays in cache across every query in the band. The copy costs a
+few hundred megabytes of memory traffic per image and saves a great deal more.
+
+Together: four minutes thirty-seven to one minute fifty-two on four cores, with
+the tower's output identical to the last digit — `2.078e+00` against the
+reference before and after.
+
+The first attempt was wrong in a way worth recording. `pool_run` hands out
+`worker_count + 1` slices, because the thread that calls it takes one rather
+than waiting idle; the scratch was sized at `worker_count` and the last band
+wrote off the end of it. It survived a run and a timing, and only fell over
+under the trace build. The rule now lives in `pool_bands`, which both `pool_run`
+and its caller use, so there is nothing left to get wrong twice.
+
+### The audio framing, and a padding that must not be copied
+
+This one was implemented backwards first, and the seam caught it, so it is
+written down the way it happened.
+
+`Gemma4AudioFeatureExtractor` pads a clip out to a multiple of a hundred and
+twenty-eight samples before it frames anything — a default of its `__call__`
+rather than a field any configuration writes down, which is why it had been
+missed. The engine made a hundred and forty-nine frames on a clip where the
+extractor made a hundred and fifty. That reads as a plain omission, and it was
+fixed as one: round the clip up, hand the extra frames on as zeros.
+
+The synthetic checkpoint's seam case then went from agreeing with the processor
+at sixty-three soft tokens to claiming sixty-four.
+
+The padded frames are masked, and masked all the way down. `input_features_mask`
+marks them; `Gemma4AudioSubSampleConvProjection` zeros them at the input of each
+of its two stride-two stages; the conformer's attention mask excludes them; and
+`Gemma4Model` keeps only the rows the tower's own output mask leaves, in one
+line — `audio_features[audio_mask_from_encoder]`. Nothing downstream can see
+them. What counting them does change is the number of rows the clip is worth,
+because the mask is subsampled as `mask[:, ::2]` twice, so a row survives only
+if the frame at four times its index is real. Padding therefore cannot alter a
+single value the model reads, and can only add soft tokens the reference never
+asks for.
+
+So the measurement was redone against the thing that decides it, over
+twenty-two clip lengths from a twentieth of a second to ten seconds:
+
+| | agrees with the extractor |
+| --- | --- |
+| the engine's frame count against the live count the mask marks | 22 of 22 |
+| `ceil(live / 4)` against `_get_num_multimodal_tokens` | 22 of 22 |
+| the **padded** frame count against the same token budget | 19 of 22 |
+
+The three it parts on are 800, 4000 and 100000 samples — four thousand samples
+reach twenty-four frames and pad to twenty-five, and twenty-four frames are six
+soft tokens where twenty-five would be seven.
+
+The engine's original framing was right, and the change has been taken back out.
+What the release adds is the reason it is right, in `GUIDE.md` and in the tests,
+so that the next reader who notices the extractor emitting one more frame than
+the engine does not fix it again.
+
+### Every seam case is judged now
+
+The case with both a picture and a clip in it had never once been judged. Three
+of the four ran whole and it reported its gap and stopped, because the
+reference's second forward — the one that measures how far it moves against
+itself — would not fit beside the first.
+
+Two changes, and the second is the one that mattered.
+
+**A floor that can be measured either way.** The nudge moves the input by a
+millionth, which means running the towers a second time. Reordering the sums
+instead does not, and measures a change that matters just as little, so the
+graph half tries the nudge and falls back to the reordering.
+
+**A process per case.** Which case fitted depended on what had run before it,
+which is no way to judge anything: `one image` passed alone and skipped after
+`--media` had run in the same shell. So `--seam` now spawns itself once per
+case. The engine's work is not repeated — the child reads the trace the parent
+already wrote — so the cost is one model load, about three seconds, per case.
+The parent also lets go of that trace before the child starts: it is half a
+gigabyte behind a single picture, it was being held parsed while the child read
+the same file again, and three numbers out of it are all the parent needs.
+
+That was worth doing carefully, because the first attempt hid a failure. A child
+that dies returns 1, and 1 was also what the parent read as "one check
+disagreed", so a case that crashed was counted as a fault and printed nothing at
+all — a silent `1 checks failed`. The child now answers 0 or 2 and never 1, and
+a child that dies has its last lines printed, sorted into the host running out
+of memory and anything else, which is this harness's fault and says so.
+
+### What the seam says on the shipped export
+
+All four cases, every check, on the real weights:
+
+| | engine differs by | the reference moves | |
+| --- | --- | --- | --- |
+| text only | 2.965e-01 | 5.330e+00 | 14 ids |
+| one image | 5.692e-01 | 3.271e+00 | 276 ids, 260 soft tokens |
+| one clip | 5.370e-01 | 2.696e+00 | 54 ids, 38 soft tokens |
+| image and clip | 4.051e-01 | 2.296e+00 | 316 ids, 260 and 38 soft tokens |
+
+Every id agrees, every soft token count agrees with what the processor asks for,
+rank one agrees in all four, the whole top eight is shared in all four, and in
+each case the engine sits five to eighteen times nearer the reference than the
+reference sits to itself under a change that should not matter.
+
+### Testing
+
+Twelve new assertions pin the frame count at the shipped export's framing — a
+320 sample window, a 160 sample hop, half a window of lead — against six clip
+lengths the extractor was measured on, including the two that straddle a block
+boundary and the one where padding would buy a seventh soft token. The suite is
+310 assertions, clean under `-Wall -Wextra` on the SSE2 and AVX2 backends.
+
+### Known gaps
+
+The longest prompt the seam judges is 316 ids; a prompt long enough that the
+reference's forward will not fit even alone has not been tried. Nothing in the
+conformer has been made faster; its convolution module still walks its kernel
+per channel per frame. `TODO.md` has the rest.
+
+---
+
+## 0.7.3 — the parity result, written down
+
+### Why
+
+Everything the suite knew about the engine it knew from weights it had made
+itself. The comparison against the real ones lives in `app_diff.py` and
+`app_test.py`, and both want python, torch, and a transformers that knows the
+architecture. This host is the case that makes the gap plain: it has the
+export vendored under `model/`, a compiler, and a transformers with no `gemma4`
+in it. Every claim in this file about the shipped checkpoint was, on a tree like
+that, unverifiable — not because the checkpoint was missing, but because the
+thing that had checked it was.
+
+So what the comparison settled is now recorded in `app_test.c`, where a C
+compiler is the only thing needed to read it back.
+
+### What is recorded
+
+Three prompts, run through the whole stack — frame, prefill, one step — and for
+each of them the ids of the frame and the head of the distribution:
+
+| prompt | ids | rank one | its lead |
+| --- | --- | --- | --- |
+| The capital of France is | 14 | 818 | 3.27 |
+| Say hello. | 12 | 9259 | 4.36 |
+| List the first three prime numbers. | 16 | 818 | 4.31 |
+
+The frame has to come back exactly, rank one has to come back exactly, the
+eight highest logits have to come back within 2.0, and none of those eight may
+fall out of the top sixteen.
+
+### The slack is a measurement
+
+A fixture that demands the last bit would be a fixture for one compiler on one
+host. The checkpoint rounds every activation onto a static grid, which is the
+subject of 0.4.0: a sum landing on a half step falls one way in one build and
+the other way in another, and the difference is a whole step rather than an
+ulp. So the bar had to be measured before it could be set.
+
+Between this host's SSE2 build and its AVX2 one, over five prompts:
+
+| | |
+| --- | --- |
+| rank one moved | never |
+| the top eight logits moved by at most | 1.30 |
+| the lowest rank an id in a top eight fell to | 11 of 16 |
+
+The bar is 2.0 and sixteen ranks — above what a backend change did, and inside
+the 2.30 to 5.33 the reference moves against itself when its own input is
+nudged by a millionth (0.7.2). What that catches is a layer wired wrong, not a
+last-bit difference; per-tensor equality is not the criterion here for the same
+reason it was not the criterion in 0.4.0.
+
+Held to it, the AVX2 build reproduces the SSE2 recording with room to spare —
+the worst of the three prompts moves a logit by 1.107 and drops an id to rank
+twelve.
+
+The prompts were picked for the same reason the bar was measured. Of eight
+candidates, the three kept lead their runners-up by 3.27, 4.36 and 4.31, all
+more than twice the widest move a backend change was seen to make. Two that
+read as well were dropped for leads of 1.01 and 1.03, and one measured earlier
+led by 0.28. A lead inside the noise is a coin toss dressed as an assertion,
+and both backends happening to call it the same way is not a reason to write
+it down.
+
+### What it costs, and what is not in it
+
+About twenty seconds at `-O3`, a minute unoptimized, on top of a suite that ran
+in a seventh of a second. That is three forwards of a two-and-a-third gigabyte
+model and there is no way around it. The section is skipped, with the reason
+printed, when there is no checkpoint beside the tree; `IGLLM_MODEL` names one
+elsewhere, and naming a folder that holds no `config.json` — `IGLLM_MODEL=none`
+— turns the section off. A folder holding some other checkpoint is passed over
+rather than failed: the shape is checked against the export's own first, and
+all a failure there would report is that these numbers are not about it.
+
+No picture is in it. The processor lifts even a thirty-two pixel image to the
+export's full patch budget — 260 soft tokens, four and a half minutes on this
+host — so the cheapest media shot would cost more than the whole of the rest of
+the suite by three orders of magnitude. That join is judged by
+`run.py parity --seam --model model`, which is where it belongs.
+
+### Testing
+
+Twenty-two new assertions, and the suite is 332 when the checkpoint is beside
+it and 310 when it is not. Clean under `-Wall -Wextra` on the SSE2 and AVX2
+backends, and passing on both from one recording.
+
+### Known gaps
+
+The recording is of the engine, not of the reference: it says the stack still
+reaches what it reached when the reference last judged it, not that the
+reference would say so today. Re-judging still wants python. `TODO.md` has the
+rest.
+
+---
+
+## 0.7.4 — the batch stops losing to the thing it exists to beat
+
+### Why
+
+Throughput had never been looked at. The first thing looking at it found was
+not a slow kernel but an inverted one: `bench` reports prefill and decode side
+by side, and prefill — thirty-seven tokens run in lanes, which is the whole
+point of the batched path — came in at 2.05 tokens a second against decode's
+5.65, one token at a time. Batching was costing nearly three times what not
+batching cost.
+
+### Where it went
+
+Two kernels, both single-lane against many, timed on this host at the shipped
+export's own shapes:
+
+| 12288 x 1536, one thread | one lane at a time | sixteen lanes batched |
+| --- | --- | --- |
+| SSE2, four bit | 0.075 s | **0.266 s** |
+| SSE2, two bit | 0.075 s | **0.266 s** |
+| AVX2, four bit | 0.039 s | 0.051 s |
+| SSE2, eight bit | 0.006 s | 0.006 s |
+
+`kern_dot_code` decodes packed weights inside its own vector loop: a nibble
+unpacks with a shift and a mask, never becoming a float in memory.
+`kern_row_code_many` did the opposite — it called `pack_read` once per weight,
+scalar, to build a float scratch every lane could then read. The comment above
+it said a batch "pays the decode cost of a single vector", and in count that was
+true; in cost it was not, because the decode it paid was the slow one. Sixteen
+lanes bought one decode and gave back sixteen vector loops.
+
+The four bit AVX2 row shows the same thing in the small: the batch is nearly as
+quick as the single lane, which for sixteen times the work means the spread is
+all of it.
+
+### `kern_code_spread`
+
+The fix is to write the decode out once, properly: the same shift-and-mask
+sequences `kern_dot_code` fuses into its loop, storing floats instead of
+accumulating. Two, four and eight bits, on AVX2, SSE2 and NEON, behind the same
+macro layer as everything else.
+
+| 12288 x 1536, sixteen lanes | before | after |
+| --- | --- | --- |
+| SSE2, four bit | 0.266 s | 0.061 s |
+| AVX2, four bit | 0.051 s | 0.032 s |
+
+Batching now wins where it should: 1.24 times a single lane on SSE2 rather than
+0.28.
+
+### The accumulator was the pace-setter
+
+With the spread fixed, the kernels were still slower than their instruction
+counts implied. Every vector path in this file accumulated into one register.
+A four bit SSE2 row is four multiply-adds per sixteen codes, chained: each waits
+on the last, so the loop ran at the latency of an add rather than at its
+throughput. The arithmetic was cheap enough that the dependency was the cost.
+
+Two accumulators, summed at the end — one extra register, no change of method:
+
+| 12288 x 1536, one thread | one chain | two chains |
+| --- | --- | --- |
+| SSE2, four bit, one lane | 0.075 s | 0.047 s |
+| AVX2, four bit, one lane | 0.039 s | 0.027 s |
+| SSE2, four bit, sixteen lanes | 0.061 s | 0.039 s |
+| AVX2, four bit, sixteen lanes | 0.032 s | 0.018 s |
+
+This is the only change here that touches decode, which runs one lane and so
+never went near the spread.
+
+### Eight bits had no vector path at all
+
+Two and four bits had one. Eight did not — it was a scalar byte loop, six times
+slower per weight than the four bit vector path beside it. It is the width the
+vision tower is quantized to, and the width of the two per-layer projections the
+text stack runs every layer. Vectorizing it is the same sequence as the others
+with the unpacking removed: load sixteen bytes, apply the flip a vector at a
+time, widen, multiply. A 256 x 1536 row went from 0.006 s to 0.001 s.
+
+### What it comes to
+
+Thirty-seven tokens of prompt, sixteen decoded, four cores of a 2017 desktop:
+
+| | prefill before | after | decode before | after |
+| --- | --- | --- | --- | --- |
+| SSE2 | 2.05 tok/s | **12.34** | 5.65 tok/s | **7.28** |
+| AVX2 | 7.37 tok/s | **21.26** | 10.40 tok/s | **13.45** |
+
+Prefill is six times quicker on the default build and prefill now beats decode
+per token, which is what a batch is for. Decode is a little under a third
+quicker on both. And an image — thirty-two pixels square, which the processor
+lifts to the full patch budget of 260 soft tokens, then 316 ids of prefill
+behind it — went from 4 m 28 s to 1 m 02 s on the SSE2 build, because the tower
+is eight bit and runs its projections in lanes.
+
+### Nothing moved that should not have
+
+Every change here alters the order of a floating point sum, which on this
+checkpoint moves a logit by whole steps of the activation grid. That is what
+0.7.3 recorded the shipped export's answers for, and the recording was left
+where it was rather than taken again from the faster build: re-recording would
+launder an unjudged change into the record. Held to the numbers the judged build
+produced, the optimized build moves a top-eight logit by at most 1.176 against
+an allowance of 2.0, and drops no recorded id below rank nine of sixteen —
+which is where an AVX2 build already sat, at 1.107. The suite is 332 assertions
+on both backends.
+
+### Known gaps
+
+Decode gained a third and no more, because it runs one lane and its cost is the
+fused decode inside `kern_dot_code`, which is now dependency-free but still
+spends about two instructions a weight on the narrow widths. A byte-indexed
+table of unpacked floats would spend less; it is not written. `TODO.md` has the
+rest.

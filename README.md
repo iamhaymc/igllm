@@ -119,6 +119,12 @@ a whole step, so the reference does not reproduce itself either, and both sides
 move by whole steps of it. `CHANGES.md` sets out what that means and why per
 tensor equality is not the criterion on a checkpoint like this one.
 
+That result is recorded in the suite. With the export beside it, `run.py test`
+runs three prompts through the whole stack and holds the ids and the head of
+the distribution to what the judged build produced, so a tree that has the
+checkpoint but no python still fails if a layer is wired wrong. Without a
+checkpoint the section says so and passes over.
+
 The whole multi-modal graph is verified end to end. The ids are held to the
 reference's own `Gemma4Processor` — the run of soft tokens, the pair of ids
 around it, and the frame either side — which needs no weights and so runs
@@ -127,14 +133,13 @@ against the shipped export; the distribution over them is held to
 where the engine agrees with the reference to a part in ten million.
 
 The vision and audio towers are verified the same way, against the reference's
-own tower modules on the same shipped weights. The language model of that
-export dequantizes to about nineteen gigabytes and will not fit on an ordinary
-machine, but each tower is a couple of hundred megabytes and the reference lets
-one be built alone, so the towers are held to upstream rather than to a second
-reading of it. On the shipped checkpoint the engine is closer to the reference
-than the reference is to itself under a one-part-per-million change to its own
-input; on synthetic float weights, where the activation grid is absent, the
-vision tower agrees to a part in ten million.
+own tower modules on the same shipped weights. Each tower is a couple of hundred
+megabytes and the reference lets one be built alone, which keeps its arithmetic
+isolated from everything around it, so the towers are held to upstream rather
+than to a second reading of it. On the shipped checkpoint the engine is closer
+to the reference than the reference is to itself under a one-part-per-million
+change to its own input; on synthetic float weights, where the activation grid
+is absent, the vision tower agrees to a part in ten million.
 
 | command                                  | what it measures                     |
 | ---------------------------------------- | ------------------------------------ |
@@ -143,6 +148,9 @@ vision tower agrees to a part in ten million.
 | `run.py check --model <folder>`          | the next token distribution, the greedy continuation, and the speed of both sides |
 | `run.py parity --media`                  | both towers against the reference's own tower modules, on the same weights |
 | `run.py parity --seam`                   | the join between them: the ids the reference's processor lays down around a run of soft tokens, and the distribution the whole graph reaches over them |
+| `run.py parity --seam --model model`     | the same join on the shipped export: every id, every soft token count, and every distribution, each case in a process of its own |
 
-Decode runs at about six tokens a second on four cores of a 2017 desktop,
-against the reference's 0.16. It has not been optimized. See `TODO.md`.
+On four cores of a 2017 desktop, against the reference's 0.16 tokens a second:
+decode runs at about 7.3 and prefill at about 12.3, and a build tuned for the
+host — `--tuned`, which selects the AVX2 path — reaches 13.5 and 21.3. The
+kernels have had one pass over them; `TODO.md` says what is left.

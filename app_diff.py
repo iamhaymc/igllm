@@ -40,10 +40,9 @@ nothing says nothing about the engine.
 
 `--media` walks the two towers instead. Each is built from the reference's own
 module and loaded with the checkpoint's own weights, which works even for the
-shipped export: its language model dequantizes to about nineteen gigabytes and
-will not fit on an ordinary machine, but a tower is a couple of hundred
-megabytes and the reference gives each one a `base_model_prefix` so it can be
-built alone.
+shipped export: a tower is a couple of hundred megabytes and the reference gives
+each one a `base_model_prefix` so it can be built alone, which is quicker and
+lighter than standing the whole model up to look at one encoder.
 
 Both sides start from the rows the engine says it read — the normalized patches,
 or the mel frames — because the png reader, the resize and the filterbank are
@@ -52,9 +51,11 @@ question here is the tower above them.
 
 `--seam` walks the join instead: the ids the reference's processor lays down
 around a run of soft tokens, and the distribution the whole graph reaches over
-them. The ids need no weights, so that half runs against the shipped export; the
-graph needs the whole model in memory, which only a synthetic checkpoint gives,
-and `app_fake.whole_build` writes one from the reference's own model class.
+them. Both halves run against the shipped export. The ids need no weights at
+all, and the graph needs the whole model, which the export gives: its weights
+stay packed and are decoded per forward, so it loads in about two and a third
+gigabytes. `app_fake.whole_build` writes a synthetic one as well, which runs in
+seconds where the real one takes minutes.
 """
 
 import argparse
@@ -602,8 +603,10 @@ def seam_engine(model_path, prompt, image_path, audio_path):
     if done.returncode != 0:
         raise RuntimeError("engine failed: %s" % done.stderr.strip())
     found = trace_read(trace_path)
-    os.unlink(trace_path)
-    return json.loads(done.stdout), found
+    # The trace is not read and dropped here, because the graph half of a case
+    # runs in a process of its own and reads the same file rather than being
+    # handed two thousand rows down a pipe. Unlinking is the caller's.
+    return json.loads(done.stdout), found, trace_path
 
 
 def seam_reference_ids(processor, prompt, image_rows, audio_rows, mel_count):
@@ -694,13 +697,29 @@ def seam_reference_run(model, id_list, mine, grid):
 
 
 def seam_reference_floor(model, room):
-    """How far the same forward moves when its input is nudged by a millionth.
+    """How far the same forward moves when something that should not matter does.
 
     The engine is not asked to be nearer the reference than the reference is to
-    itself under a change that should not matter. On a checkpoint that rounds its
-    activations onto a static grid that distance is not small, and on one that
-    does not it is float noise; either way it is measured rather than assumed.
+    itself. There are two ways to ask that, and which one applies depends on
+    whether anything was attached.
+
+    With a picture or a clip, the input itself can be nudged by a millionth, and
+    what that carries through the towers is the answer. That runs the towers a
+    second time, which on the shipped export is more than a sixteen gigabyte
+    host can hold beside the first; where it does not fit, the reordering below
+    is used instead, which does not.
+
+    With nothing attached there is no input to nudge, and it is tempting to call
+    the floor zero: the ids are exact on both sides. That is wrong on a
+    checkpoint that rounds every activation onto a static grid. The ids being
+    equal does not make the arithmetic exact, because a sum landing on a half
+    step falls one way here and the other way there. So the same tokens are fed
+    again in two chunks behind the cache — the same arithmetic in another
+    summation order, which is the measure `reference_floor` uses on the text
+    stack — and whatever that moves by is not a fault.
     """
+    import gc
+
     import torch
 
     maker = torch.Generator().manual_seed(11)
@@ -711,12 +730,31 @@ def seam_reference_floor(model, room):
             moved[name] = room[name] * (1.0 + 1e-6 * torch.randn(room[name].shape,
                                                                  generator=maker))
             nudged = True
-    # A prompt with nothing attached has no input to nudge: its ids are exact on
-    # both sides and there is nothing for a grid to round.
-    if not nudged:
+    # A forward on a quantized checkpoint materializes an embedding table to read
+    # one row of it, so the last one has to be gone before the next is built.
+    gc.collect()
+    if nudged:
+        try:
+            with torch.no_grad():
+                return model(**moved).logits[0, -1].float()
+        except (RuntimeError, MemoryError) as trouble:
+            if "memory" not in str(trouble).lower():
+                raise
+            # The nudge runs the towers a second time. Reordering the sums does
+            # not, so where there is no room for the first there is usually room
+            # for the second, and it measures a change that matters just as
+            # little.
+            del moved
+            gc.collect()
+    id_data = room["input_ids"]
+    if id_data.shape[1] < 2:
         return 0.0
+    split = id_data.shape[1] - 1
+    lead = {name: value for name, value in room.items() if name != "input_ids"}
     with torch.no_grad():
-        return model(**moved).logits[0, -1].float()
+        state = model(input_ids=id_data[:, :split], use_cache=True, **lead).past_key_values
+        return model(input_ids=id_data[:, split:], past_key_values=state,
+                     use_cache=True).logits[0, -1].float()
 
 
 def seam_report(title, name, good_flag, detail):
@@ -724,9 +762,135 @@ def seam_report(title, name, good_flag, detail):
     return 0 if good_flag else 1
 
 
+# What `--seam-case` returns. Neither is 1, which is what Python returns for an
+# unhandled traceback, so a child that dies is never mistaken for a child that
+# ran and disagreed.
+SEAM_CASE_OKAY = 0
+SEAM_CASE_APART = 2
+
+
+def seam_graph(model, mine, found):
+    """Judges the reference's forward against the engine's for one case."""
+    import gc
+
+    import torch
+
+    id_list = mine["tokens"]
+    grid = None
+    if "vision.grid.0" in found:
+        grid = (int(found["vision.grid.0"][0]), int(found["vision.grid.0"][1]))
+    # A forward on a quantized checkpoint materializes an embedding table to
+    # read one row of it, so the whole graph costs about a gigabyte and a half
+    # above the weights. On a host that cannot spare it the ids and the soft
+    # token counts still stand, and only this half is dropped.
+    try:
+        their_value, room = seam_reference_run(model, id_list, found, grid)
+    except (RuntimeError, MemoryError) as trouble:
+        if "memory" not in str(trouble).lower():
+            raise
+        print("  %-16s %-14s skip  the graph did not fit: %s"
+              % ("", "logits", str(trouble).splitlines()[0][:60]))
+        return 0
+    my_value = {entry["id"]: entry["logit"] for entry in mine["top"]}
+    gc.collect()
+    order = torch.topk(their_value, SEAM_TOP)
+    their_top = order.indices.tolist()
+    gap = max((abs(my_value[slot] - float(value)) for slot, value in
+               zip(their_top, order.values.tolist()) if slot in my_value), default=float("inf"))
+    try:
+        moved = seam_reference_floor(model, room)
+    except (RuntimeError, MemoryError) as trouble:
+        if "memory" not in str(trouble).lower():
+            raise
+        print("  %-16s %-14s skip  the floor did not fit, so the gap of %.3e is unjudged"
+              % ("", "logits", gap))
+        return 0
+    floor = float((moved - their_value).abs().max()) if not isinstance(moved, float) else 0.0
+    del room, moved
+    # The nudge measures what the input is worth, not what a different
+    # summation order is worth, and over sixty conformer rows the second is
+    # the larger of the two. So the bar has a floor under it, wide enough for
+    # float32 addition in another order and still well inside what the two
+    # faults this comparison found were worth: the per-layer embedding
+    # reading the placeholder moved these logits by 3.4e-03.
+    limit = max(floor * FLOOR_SHARE, 1e-3)
+    lead_flag = bool(mine["top"]) and mine["top"][0]["id"] == their_top[0]
+    share = len([slot for slot in their_top if slot in my_value]) / float(len(their_top))
+    return seam_report("", "logits", lead_flag and share >= 0.75 and gap <= limit,
+                       "rank one %s, %.0f%% of the top %d shared, largest gap %.3e, "
+                       "the reference moves %.3e, allowed %.3e"
+                       % ("agrees" if lead_flag else "differs", 100.0 * share,
+                          SEAM_TOP, gap, floor, limit))
+
+
+def seam_case_alone(model_path, trace_path, mine_path):
+    """The graph half of one case, in the empty process the parent gave it."""
+    import json
+
+    import torch
+
+    from transformers.models.gemma4 import Gemma4ForConditionalGeneration
+
+    with open(mine_path, encoding="utf-8") as source:
+        mine = json.load(source)
+    try:
+        model = Gemma4ForConditionalGeneration.from_pretrained(model_path,
+                                                               dtype=torch.float32).eval()
+    except (MemoryError, RuntimeError, ValueError, OSError) as trouble:
+        print("  %-16s %-14s skip  the whole model did not load: %s"
+              % ("", "graph", str(trouble).split("\n")[0][:70]))
+        return 0
+    return seam_graph(model, mine, trace_read(trace_path))
+
+
+def seam_graph_apart(model_path, trace_path, mine):
+    """Runs the graph half of one case in a process that starts empty.
+
+    Reading one row of this checkpoint's embedding table materializes the whole
+    of it, and a picture carries two thousand three hundred and forty rows
+    through sixteen layers besides. Held across four cases in one process, that
+    is more than a sixteen gigabyte host has, and which case fits then depends
+    on what ran before it — which is no way to judge anything. So each case is
+    measured somewhere that starts empty and hands its memory back when it
+    exits. The engine's own work is not repeated: the child reads the trace the
+    parent already has, so the cost is one model load per case.
+    """
+    import json
+
+    handle, mine_path = tempfile.mkstemp(suffix=".igmine")
+    with os.fdopen(handle, "w", encoding="utf-8") as sink:
+        json.dump(mine, sink)
+    line = [sys.executable, os.path.abspath(__file__), "--seam-case",
+            "--model", model_path, "--trace", trace_path, "--mine", mine_path]
+    try:
+        done = subprocess.run(line, capture_output=True, text=True)
+    finally:
+        os.unlink(mine_path)
+    sys.stdout.write(done.stdout)
+    if done.returncode in (SEAM_CASE_OKAY, SEAM_CASE_APART):
+        return 1 if done.returncode == SEAM_CASE_APART else 0
+    # Any other code is a child that died rather than answering, and the two
+    # reasons want opposite treatment: a host that ran out of memory is the same
+    # news as the skips the child prints itself, and anything else is a fault in
+    # this harness that must not be swallowed. Neither is a disagreement between
+    # the engine and the reference, so neither is counted as one, but the second
+    # is printed loudly enough to chase.
+    tail = [line_text for line_text in done.stderr.strip().splitlines() if line_text.strip()]
+    last = tail[-1] if tail else "no output"
+    if any(word in done.stderr.lower() for word in ("memory", "alloc", "0xc0000005")):
+        print("  %-16s %-14s skip  the case did not fit: %s" % ("", "logits", last[:60]))
+        return 0
+    print("  %-16s %-14s skip  the case died, which is this harness's fault, not the "
+          "engine's:" % ("", "logits"))
+    for line_text in tail[-4:]:
+        print("  %-16s %-14s       %s" % ("", "", line_text[:88]))
+    return 0
+
+
 def diff_seam(model_path, image_path, audio_path, prompt, want_graph=True):
     """Holds the join between the towers and the text stack to the reference."""
-    import torch
+    import gc
+
     from transformers import AutoProcessor
 
     try:
@@ -739,17 +903,6 @@ def diff_seam(model_path, image_path, audio_path, prompt, want_graph=True):
         return 0
     image_token = processor.image_token_id
     audio_token = processor.audio_token_id
-    model = None
-    if want_graph:
-        from transformers.models.gemma4 import Gemma4ForConditionalGeneration
-
-        try:
-            model = Gemma4ForConditionalGeneration.from_pretrained(model_path,
-                                                                   dtype=torch.float32).eval()
-        except (MemoryError, RuntimeError, ValueError, OSError) as trouble:
-            print("  %-16s %-14s skip  the whole model did not load: %s"
-                  % ("", "graph", str(trouble).split("\n")[0][:70]))
-
     fail_count = 0
     for title, want_image, want_audio in SEAM_PLAN:
         if want_image and not image_path:
@@ -758,11 +911,19 @@ def diff_seam(model_path, image_path, audio_path, prompt, want_graph=True):
             continue
         show_image = image_path if want_image else None
         show_audio = audio_path if want_audio else None
-        mine, found = seam_engine(model_path, prompt, show_image, show_audio)
+        mine, found, trace_path = seam_engine(model_path, prompt, show_image, show_audio)
         id_list = mine["tokens"]
         image_rows = id_list.count(image_token) if image_token is not None else 0
         audio_rows = id_list.count(audio_token) if audio_token is not None else 0
         mel_count = len(tower_seed_rows(found, "audio"))
+        # The trace behind one picture is half a gigabyte, and the child is about
+        # to read the same file for itself. Nothing here needs it beyond these
+        # three numbers, so the parent lets go of it rather than holding a second
+        # copy alongside a child that is trying to fit a forward in.
+        wrote_vision = bool(tower_seed_rows(found, "vision"))
+        wrote_audio = bool(tower_seed_rows(found, "audio"))
+        del found
+        gc.collect()
         theirs = seam_reference_ids(processor, prompt, image_rows, audio_rows, mel_count)
 
         same_flag = list(id_list) == list(theirs)
@@ -783,53 +944,28 @@ def diff_seam(model_path, image_path, audio_path, prompt, want_graph=True):
                                           "the engine made %d rows for the picture, the "
                                           "processor asks for %d" % (image_rows, image_want))
             if audio_want is not None:
-                # How many rows the engine's own frames become is the seam's
-                # arithmetic, and the ids above assert it. How many frames the
-                # clip should have made in the first place is the feature
-                # extractor's framing, which is open and tracked separately, so
-                # a disagreement there is reported rather than judged.
-                print("  %-16s %-14s %-4s the engine made %d rows for the clip, the processor "
-                      "asks for %d%s"
-                      % ("", "soft tokens", "ok" if audio_want == audio_rows else "note",
-                         audio_rows, audio_want,
-                         "" if audio_want == audio_rows
-                         else " from the clip itself; the framing is the open question"))
+                # This was reported rather than judged while the framing behind
+                # it was an open question. It is not one any more: the engine's
+                # frame count is the live count `input_features_mask` marks,
+                # held against the extractor across twenty-two clip lengths, so
+                # a disagreement here is a fault and is called one.
+                fail_count += seam_report("", "soft tokens", audio_want == audio_rows,
+                                          "the engine made %d rows for the clip, the "
+                                          "processor asks for %d" % (audio_rows, audio_want))
 
-        if model is None or not same_flag:
-            continue
-        # The reference is fed the rows the engine says it read, so without the
-        # activation dump there is nothing to feed it and the graph half is not
-        # attempted rather than run against the wrong input.
-        if (image_rows and not tower_seed_rows(found, "vision")) or \
-                (audio_rows and not tower_seed_rows(found, "audio")):
-            print("  %-16s %-14s skip  the engine wrote no rows; build with `run.py build --trace`"
-                  % ("", "logits"))
-            continue
-        grid = None
-        if "vision.grid.0" in found:
-            grid = (int(found["vision.grid.0"][0]), int(found["vision.grid.0"][1]))
-        their_value, room = seam_reference_run(model, id_list, found, grid)
-        my_value = {entry["id"]: entry["logit"] for entry in mine["top"]}
-        order = torch.topk(their_value, SEAM_TOP)
-        their_top = order.indices.tolist()
-        gap = max((abs(my_value[slot] - float(value)) for slot, value in
-                   zip(their_top, order.values.tolist()) if slot in my_value), default=float("inf"))
-        moved = seam_reference_floor(model, room)
-        floor = float((moved - their_value).abs().max()) if not isinstance(moved, float) else 0.0
-        # The nudge measures what the input is worth, not what a different
-        # summation order is worth, and over sixty conformer rows the second is
-        # the larger of the two. So the bar has a floor under it, wide enough for
-        # float32 addition in another order and still well inside what the two
-        # faults this comparison found were worth: the per-layer embedding
-        # reading the placeholder moved these logits by 3.4e-03.
-        limit = max(floor * FLOOR_SHARE, 1e-3)
-        lead_flag = bool(mine["top"]) and mine["top"][0]["id"] == their_top[0]
-        share = len([slot for slot in their_top if slot in my_value]) / float(len(their_top))
-        fail_count += seam_report("", "logits", lead_flag and share >= 0.75 and gap <= limit,
-                                  "rank one %s, %.0f%% of the top %d shared, largest gap %.3e, "
-                                  "the reference moves %.3e, allowed %.3e"
-                                  % ("agrees" if lead_flag else "differs", 100.0 * share,
-                                     SEAM_TOP, gap, floor, limit))
+        try:
+            if not want_graph or not same_flag:
+                continue
+            # The reference is fed the rows the engine says it read, so without
+            # the activation dump there is nothing to feed it and the graph half
+            # is not attempted rather than run against the wrong input.
+            if (image_rows and not wrote_vision) or (audio_rows and not wrote_audio):
+                print("  %-16s %-14s skip  the engine wrote no rows; build with "
+                      "`run.py build --trace`" % ("", "logits"))
+                continue
+            fail_count += seam_graph_apart(model_path, trace_path, mine)
+        finally:
+            os.unlink(trace_path)
     return fail_count
 
 
@@ -873,7 +1009,17 @@ def main():
     parser.add_argument("--work", default=os.path.join(WORK_PATH, "fake"))
     parser.add_argument("--slack", type=float, default=0.0,
                         help="absolute tolerance, or 0 to measure the noise floor")
+    # `--seam` spawns itself once per case, so that a forward that does not fit
+    # is one case reporting a skip rather than every later case inheriting a
+    # tighter host. These carry a case across that gap and are not for typing.
+    parser.add_argument("--seam-case", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--trace", help=argparse.SUPPRESS)
+    parser.add_argument("--mine", help=argparse.SUPPRESS)
     flag = parser.parse_args()
+
+    if flag.seam_case:
+        return SEAM_CASE_APART if seam_case_alone(flag.model, flag.trace, flag.mine) \
+            else SEAM_CASE_OKAY
 
     try:
         import torch  # noqa: F401

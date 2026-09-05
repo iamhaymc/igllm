@@ -514,8 +514,16 @@ static app_code pool_open(pool_group *group, int thread_count) {
   return APP_OKAY;
 }
 
+/* How many slices `pool_run` will hand out: the workers, and the thread that
+ * called it, which takes one itself rather than waiting idle. Scratch indexed
+ * by slice has to be this long, so the rule lives here rather than at each
+ * caller that has to guess it. */
+static int pool_bands(const pool_group *group) {
+  return group->worker_count > 0 ? group->worker_count + 1 : 1;
+}
+
 static void pool_run(pool_group *group, pool_task task_call, void *task_state) {
-  int slice_count = group->worker_count + 1;
+  int slice_count = pool_bands(group);
   if (group->worker_count <= 0) {
     task_call(task_state, 0, 1);
     return;
@@ -1477,10 +1485,21 @@ static float kern_dot_real(const void *row_data, store_type row_type, const floa
   if (row_type == STORE_F32) {
     const float *row_real = (const float *)row_data;
 #if defined(APP_SIMD_AVX2)
-    __m256 wide_total = _mm256_setzero_ps();
-    for (slot = 0; slot + 8 <= span_count; slot += 8)
-      wide_total = _mm256_fmadd_ps(_mm256_loadu_ps(row_real + slot),
-                                   _mm256_loadu_ps(act_data + slot), wide_total);
+    /* Two accumulators rather than one: a single chain makes the loop wait a
+     * whole multiply-add latency per iteration, where two let the pipeline keep
+     * one in flight while the other lands. */
+    __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
+    __m256 wide_total;
+    for (slot = 0; slot + 16 <= span_count; slot += 16) {
+      part_a = _mm256_fmadd_ps(_mm256_loadu_ps(row_real + slot),
+                               _mm256_loadu_ps(act_data + slot), part_a);
+      part_b = _mm256_fmadd_ps(_mm256_loadu_ps(row_real + slot + 8),
+                               _mm256_loadu_ps(act_data + slot + 8), part_b);
+    }
+    for (; slot + 8 <= span_count; slot += 8)
+      part_a = _mm256_fmadd_ps(_mm256_loadu_ps(row_real + slot),
+                               _mm256_loadu_ps(act_data + slot), part_a);
+    wide_total = _mm256_add_ps(part_a, part_b);
     {
       __m128 half_total = _mm_add_ps(_mm256_castps256_ps128(wide_total),
                                      _mm256_extractf128_ps(wide_total, 1));
@@ -1488,10 +1507,34 @@ static float kern_dot_real(const void *row_data, store_type row_type, const floa
       half_total = _mm_hadd_ps(half_total, half_total);
       total = _mm_cvtss_f32(half_total);
     }
+#elif defined(APP_SIMD_SSE2)
+    __m128 part_a = _mm_setzero_ps(), part_b = _mm_setzero_ps();
+    __m128 wide_total;
+    for (slot = 0; slot + 8 <= span_count; slot += 8) {
+      part_a = _mm_add_ps(
+          part_a, _mm_mul_ps(_mm_loadu_ps(row_real + slot), _mm_loadu_ps(act_data + slot)));
+      part_b = _mm_add_ps(part_b, _mm_mul_ps(_mm_loadu_ps(row_real + slot + 4),
+                                             _mm_loadu_ps(act_data + slot + 4)));
+    }
+    for (; slot + 4 <= span_count; slot += 4)
+      part_a = _mm_add_ps(
+          part_a, _mm_mul_ps(_mm_loadu_ps(row_real + slot), _mm_loadu_ps(act_data + slot)));
+    wide_total = _mm_add_ps(part_a, part_b);
+    {
+      __m128 half_total = _mm_add_ps(wide_total, _mm_movehl_ps(wide_total, wide_total));
+      half_total = _mm_add_ss(half_total, _mm_shuffle_ps(half_total, half_total, 0x55));
+      total = _mm_cvtss_f32(half_total);
+    }
 #elif defined(APP_SIMD_NEON)
-    float32x4_t wide_total = vdupq_n_f32(0.0f);
-    for (slot = 0; slot + 4 <= span_count; slot += 4)
-      wide_total = vmlaq_f32(wide_total, vld1q_f32(row_real + slot), vld1q_f32(act_data + slot));
+    float32x4_t part_a = vdupq_n_f32(0.0f), part_b = vdupq_n_f32(0.0f);
+    float32x4_t wide_total;
+    for (slot = 0; slot + 8 <= span_count; slot += 8) {
+      part_a = vmlaq_f32(part_a, vld1q_f32(row_real + slot), vld1q_f32(act_data + slot));
+      part_b = vmlaq_f32(part_b, vld1q_f32(row_real + slot + 4), vld1q_f32(act_data + slot + 4));
+    }
+    for (; slot + 4 <= span_count; slot += 4)
+      part_a = vmlaq_f32(part_a, vld1q_f32(row_real + slot), vld1q_f32(act_data + slot));
+    wide_total = vaddq_f32(part_a, part_b);
     total = vgetq_lane_f32(wide_total, 0) + vgetq_lane_f32(wide_total, 1) +
             vgetq_lane_f32(wide_total, 2) + vgetq_lane_f32(wide_total, 3);
 #else
@@ -1540,43 +1583,47 @@ static float kern_wide_total(float32x4_t wide_total) {
 
 /* Sum of activation times code over one quantization group.
  *
- * The two and four bit cases are the ones the checkpoint leans on, so each has
+ * Two, four and eight bits are the widths the checkpoint leans on, and each has
  * a vector path behind the same macro layer the dense kernels use.  A group
- * starts on a byte boundary in both of those widths whenever `from_index` is a
+ * starts on a byte boundary in the two narrow widths whenever `from_index` is a
  * multiple of the codes per byte; when it is not, the general bit-stream loop
- * at the bottom still produces the right answer. */
+ * at the bottom still produces the right answer.
+ *
+ * Every path carries two accumulators rather than one.  A single chain stalls
+ * on the latency of its own add: the arithmetic here is cheap enough that the
+ * dependency, not the work, was setting the pace. */
 static float kern_dot_code(const uint8_t *code_row, int from_index, int span_count,
                            const float *act_data, int bit_count, int code_flip) {
   float total = 0.0f;
   int slot = 0;
 
-  /* The vector paths read the packed bytes as they lie, so they are taken only
-   * when the codes need no flip. A signed plane is eight bits wide and walks
-   * the stream below instead. */
+  /* The two narrow paths read the packed bytes as they lie, so they are taken
+   * only when the codes need no flip.  A signed plane is eight bits wide, and
+   * that path applies the flip a whole vector at a time. */
   if (bit_count == 4 && code_flip == 0 && (from_index & 1) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 2;
 #if defined(APP_SIMD_AVX2)
     {
       const __m128i low_mask = _mm_set1_epi8(0x0F);
-      __m256 wide_total = _mm256_setzero_ps();
+      __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
       for (; slot + 16 <= span_count; slot += 16) {
         __m128i pack_data = _mm_loadl_epi64((const __m128i *)(const void *)(byte_head + slot / 2));
         __m128i low_part = _mm_and_si128(pack_data, low_mask);
         __m128i high_part = _mm_and_si128(_mm_srli_epi16(pack_data, 4), low_mask);
         __m128i code_byte = _mm_unpacklo_epi8(low_part, high_part);
-        wide_total = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(code_byte)),
-                                     _mm256_loadu_ps(act_data + slot), wide_total);
-        wide_total = _mm256_fmadd_ps(
+        part_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(code_byte)),
+                                 _mm256_loadu_ps(act_data + slot), part_a);
+        part_b = _mm256_fmadd_ps(
             _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(code_byte, 8))),
-            _mm256_loadu_ps(act_data + slot + 8), wide_total);
+            _mm256_loadu_ps(act_data + slot + 8), part_b);
       }
-      total = kern_wide_total(wide_total);
+      total = kern_wide_total(_mm256_add_ps(part_a, part_b));
     }
 #elif defined(APP_SIMD_SSE2)
     {
       const __m128i low_mask = _mm_set1_epi8(0x0F);
       const __m128i zero_data = _mm_setzero_si128();
-      __m128 wide_total = _mm_setzero_ps();
+      __m128 part_a = _mm_setzero_ps(), part_b = _mm_setzero_ps();
       for (; slot + 16 <= span_count; slot += 16) {
         __m128i pack_data = _mm_loadl_epi64((const __m128i *)(const void *)(byte_head + slot / 2));
         __m128i low_part = _mm_and_si128(pack_data, low_mask);
@@ -1584,24 +1631,24 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
         __m128i code_byte = _mm_unpacklo_epi8(low_part, high_part);
         __m128i word_low = _mm_unpacklo_epi8(code_byte, zero_data);
         __m128i word_high = _mm_unpackhi_epi8(code_byte, zero_data);
-        wide_total = _mm_add_ps(
-            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)),
-                                   _mm_loadu_ps(act_data + slot)));
-        wide_total = _mm_add_ps(
-            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)),
-                                   _mm_loadu_ps(act_data + slot + 4)));
-        wide_total = _mm_add_ps(
-            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)),
-                                   _mm_loadu_ps(act_data + slot + 8)));
-        wide_total = _mm_add_ps(
-            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)),
-                                   _mm_loadu_ps(act_data + slot + 12)));
+        part_a = _mm_add_ps(
+            part_a, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)),
+                               _mm_loadu_ps(act_data + slot)));
+        part_b = _mm_add_ps(
+            part_b, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)),
+                               _mm_loadu_ps(act_data + slot + 4)));
+        part_a = _mm_add_ps(
+            part_a, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)),
+                               _mm_loadu_ps(act_data + slot + 8)));
+        part_b = _mm_add_ps(
+            part_b, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)),
+                               _mm_loadu_ps(act_data + slot + 12)));
       }
-      total = kern_wide_total(wide_total);
+      total = kern_wide_total(_mm_add_ps(part_a, part_b));
     }
 #elif defined(APP_SIMD_NEON)
     {
-      float32x4_t wide_total = vdupq_n_f32(0.0f);
+      float32x4_t part_a = vdupq_n_f32(0.0f), part_b = vdupq_n_f32(0.0f);
       for (; slot + 16 <= span_count; slot += 16) {
         uint8x8_t pack_data = vld1_u8(byte_head + slot / 2);
         uint8x8x2_t code_byte =
@@ -1609,13 +1656,13 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
         int part_index;
         for (part_index = 0; part_index < 2; ++part_index) {
           uint16x8_t code_word = vmovl_u8(code_byte.val[part_index]);
-          wide_total = vmlaq_f32(wide_total, vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_word))),
-                                 vld1q_f32(act_data + slot + part_index * 8));
-          wide_total = vmlaq_f32(wide_total, vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_word))),
-                                 vld1q_f32(act_data + slot + part_index * 8 + 4));
+          part_a = vmlaq_f32(part_a, vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_word))),
+                             vld1q_f32(act_data + slot + part_index * 8));
+          part_b = vmlaq_f32(part_b, vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_word))),
+                             vld1q_f32(act_data + slot + part_index * 8 + 4));
         }
       }
-      total = kern_wide_total(wide_total);
+      total = kern_wide_total(vaddq_f32(part_a, part_b));
     }
 #endif
     for (; slot + 2 <= span_count; slot += 2) {
@@ -1630,6 +1677,66 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
   if (bit_count == 8) {
     const uint8_t *byte_head = code_row + (size_t)from_index;
     uint8_t flip_byte = (uint8_t)code_flip;
+#if defined(APP_SIMD_AVX2)
+    {
+      const __m128i flip_data = _mm_set1_epi8((char)flip_byte);
+      __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
+      for (; slot + 16 <= span_count; slot += 16) {
+        __m128i code_byte = _mm_xor_si128(
+            _mm_loadu_si128((const __m128i *)(const void *)(byte_head + slot)), flip_data);
+        part_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(code_byte)),
+                                 _mm256_loadu_ps(act_data + slot), part_a);
+        part_b = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(code_byte, 8))),
+            _mm256_loadu_ps(act_data + slot + 8), part_b);
+      }
+      total = kern_wide_total(_mm256_add_ps(part_a, part_b));
+    }
+#elif defined(APP_SIMD_SSE2)
+    {
+      const __m128i flip_data = _mm_set1_epi8((char)flip_byte);
+      const __m128i zero_data = _mm_setzero_si128();
+      __m128 part_a = _mm_setzero_ps(), part_b = _mm_setzero_ps();
+      for (; slot + 16 <= span_count; slot += 16) {
+        __m128i code_byte = _mm_xor_si128(
+            _mm_loadu_si128((const __m128i *)(const void *)(byte_head + slot)), flip_data);
+        __m128i word_low = _mm_unpacklo_epi8(code_byte, zero_data);
+        __m128i word_high = _mm_unpackhi_epi8(code_byte, zero_data);
+        part_a = _mm_add_ps(
+            part_a, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)),
+                               _mm_loadu_ps(act_data + slot)));
+        part_b = _mm_add_ps(
+            part_b, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)),
+                               _mm_loadu_ps(act_data + slot + 4)));
+        part_a = _mm_add_ps(
+            part_a, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)),
+                               _mm_loadu_ps(act_data + slot + 8)));
+        part_b = _mm_add_ps(
+            part_b, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)),
+                               _mm_loadu_ps(act_data + slot + 12)));
+      }
+      total = kern_wide_total(_mm_add_ps(part_a, part_b));
+    }
+#elif defined(APP_SIMD_NEON)
+    {
+      const uint8x16_t flip_data = vdupq_n_u8(flip_byte);
+      float32x4_t part_a = vdupq_n_f32(0.0f), part_b = vdupq_n_f32(0.0f);
+      for (; slot + 16 <= span_count; slot += 16) {
+        uint8x16_t code_byte = veorq_u8(vld1q_u8(byte_head + slot), flip_data);
+        uint16x8_t word_low = vmovl_u8(vget_low_u8(code_byte));
+        uint16x8_t word_high = vmovl_u8(vget_high_u8(code_byte));
+        part_a = vmlaq_f32(part_a, vcvtq_f32_u32(vmovl_u16(vget_low_u16(word_low))),
+                           vld1q_f32(act_data + slot));
+        part_b = vmlaq_f32(part_b, vcvtq_f32_u32(vmovl_u16(vget_high_u16(word_low))),
+                           vld1q_f32(act_data + slot + 4));
+        part_a = vmlaq_f32(part_a, vcvtq_f32_u32(vmovl_u16(vget_low_u16(word_high))),
+                           vld1q_f32(act_data + slot + 8));
+        part_b = vmlaq_f32(part_b, vcvtq_f32_u32(vmovl_u16(vget_high_u16(word_high))),
+                           vld1q_f32(act_data + slot + 12));
+      }
+      total = kern_wide_total(vaddq_f32(part_a, part_b));
+    }
+#endif
     for (; slot < span_count; ++slot)
       total += (float)(uint8_t)(byte_head[slot] ^ flip_byte) * act_data[slot];
     return total;
@@ -1641,22 +1748,22 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
     {
       const __m256i step_data = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
       const __m256i code_mask = _mm256_set1_epi32(3);
-      __m256 wide_total = _mm256_setzero_ps();
+      __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
       for (; slot + 16 <= span_count; slot += 16) {
         uint32_t word_value;
         memcpy(&word_value, byte_head + slot / 4, 4);
-        wide_total = _mm256_fmadd_ps(
+        part_a = _mm256_fmadd_ps(
             _mm256_cvtepi32_ps(_mm256_and_si256(
                 _mm256_srlv_epi32(_mm256_set1_epi32((int)(word_value & 0xFFFFu)), step_data),
                 code_mask)),
-            _mm256_loadu_ps(act_data + slot), wide_total);
-        wide_total = _mm256_fmadd_ps(
+            _mm256_loadu_ps(act_data + slot), part_a);
+        part_b = _mm256_fmadd_ps(
             _mm256_cvtepi32_ps(_mm256_and_si256(
                 _mm256_srlv_epi32(_mm256_set1_epi32((int)(word_value >> 16)), step_data),
                 code_mask)),
-            _mm256_loadu_ps(act_data + slot + 8), wide_total);
+            _mm256_loadu_ps(act_data + slot + 8), part_b);
       }
-      total = kern_wide_total(wide_total);
+      total = kern_wide_total(_mm256_add_ps(part_a, part_b));
     }
 #elif defined(APP_SIMD_SSE2)
     {
@@ -1670,7 +1777,7 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
       const __m128i pick_one = _mm_set1_epi32(0x0000FF00);
       const __m128i pick_two = _mm_set1_epi32(0x00FF0000);
       const __m128i pick_three = _mm_set1_epi32((int)0xFF000000u);
-      __m128 wide_total = _mm_setzero_ps();
+      __m128 part_a = _mm_setzero_ps(), part_b = _mm_setzero_ps();
       for (; slot + 16 <= span_count; slot += 16) {
         uint32_t word_value;
         __m128i pack_data, spread_data, code_byte, word_low, word_high;
@@ -1687,20 +1794,20 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
             code_mask);
         word_low = _mm_unpacklo_epi8(code_byte, zero_data);
         word_high = _mm_unpackhi_epi8(code_byte, zero_data);
-        wide_total = _mm_add_ps(
-            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)),
-                                   _mm_loadu_ps(act_data + slot)));
-        wide_total = _mm_add_ps(
-            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)),
-                                   _mm_loadu_ps(act_data + slot + 4)));
-        wide_total = _mm_add_ps(
-            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)),
-                                   _mm_loadu_ps(act_data + slot + 8)));
-        wide_total = _mm_add_ps(
-            wide_total, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)),
-                                   _mm_loadu_ps(act_data + slot + 12)));
+        part_a = _mm_add_ps(
+            part_a, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)),
+                               _mm_loadu_ps(act_data + slot)));
+        part_b = _mm_add_ps(
+            part_b, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)),
+                               _mm_loadu_ps(act_data + slot + 4)));
+        part_a = _mm_add_ps(
+            part_a, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)),
+                               _mm_loadu_ps(act_data + slot + 8)));
+        part_b = _mm_add_ps(
+            part_b, _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)),
+                               _mm_loadu_ps(act_data + slot + 12)));
       }
-      total = kern_wide_total(wide_total);
+      total = kern_wide_total(_mm_add_ps(part_a, part_b));
     }
 #elif defined(APP_SIMD_NEON)
     {
@@ -1708,7 +1815,7 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
       static const uint8_t high_pick[8] = {2, 2, 2, 2, 3, 3, 3, 3};
       static const int8_t step_list[8] = {0, -2, -4, -6, 0, -2, -4, -6};
       const int8x8_t step_data = vld1_s8(step_list);
-      float32x4_t wide_total = vdupq_n_f32(0.0f);
+      float32x4_t part_a = vdupq_n_f32(0.0f), part_b = vdupq_n_f32(0.0f);
       for (; slot + 16 <= span_count; slot += 16) {
         uint32_t word_value;
         uint8x8_t pack_data;
@@ -1721,13 +1828,13 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
         for (part_index = 0; part_index < 2; ++part_index) {
           uint16x8_t code_word = vmovl_u8(
               vand_u8(vshl_u8(part_list[part_index], step_data), vdup_n_u8(3)));
-          wide_total = vmlaq_f32(wide_total, vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_word))),
-                                 vld1q_f32(act_data + slot + part_index * 8));
-          wide_total = vmlaq_f32(wide_total, vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_word))),
-                                 vld1q_f32(act_data + slot + part_index * 8 + 4));
+          part_a = vmlaq_f32(part_a, vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_word))),
+                             vld1q_f32(act_data + slot + part_index * 8));
+          part_b = vmlaq_f32(part_b, vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_word))),
+                             vld1q_f32(act_data + slot + part_index * 8 + 4));
         }
       }
-      total = kern_wide_total(wide_total);
+      total = kern_wide_total(vaddq_f32(part_a, part_b));
     }
 #endif
     for (; slot + 4 <= span_count; slot += 4) {
@@ -1746,6 +1853,184 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
     total += (float)(pack_read(code_row, (size_t)(from_index + slot), bit_count) ^
                      (uint32_t)code_flip) * act_data[slot];
   return total;
+}
+
+/* The same decode `kern_dot_code` performs, written out into floats instead of
+ * summed against one activation vector.  A batch pays it once and every lane
+ * reads what it leaves, so the two widths the checkpoint leans on get the same
+ * vector paths here that they get there.  Anything else walks the bit stream,
+ * which is what the whole of this did before there was a reason to hurry it:
+ * with the decode scalar, a sixteen lane batch cost three and a half times what
+ * the same sixteen lanes cost one at a time, and batching lost to the thing it
+ * exists to beat. */
+static void kern_code_spread(const uint8_t *code_row, int from_index, int span_count,
+                             int bit_count, int code_flip, float *out_data) {
+  int slot = 0;
+
+  if (bit_count == 8) {
+    const uint8_t *byte_head = code_row + (size_t)from_index;
+    uint8_t flip_byte = (uint8_t)code_flip;
+    for (; slot < span_count; ++slot)
+      out_data[slot] = (float)(uint8_t)(byte_head[slot] ^ flip_byte);
+    return;
+  }
+
+  if (bit_count == 4 && code_flip == 0 && (from_index & 1) == 0) {
+    const uint8_t *byte_head = code_row + (size_t)from_index / 2;
+#if defined(APP_SIMD_AVX2)
+    {
+      const __m128i low_mask = _mm_set1_epi8(0x0F);
+      for (; slot + 16 <= span_count; slot += 16) {
+        __m128i pack_data = _mm_loadl_epi64((const __m128i *)(const void *)(byte_head + slot / 2));
+        __m128i low_part = _mm_and_si128(pack_data, low_mask);
+        __m128i high_part = _mm_and_si128(_mm_srli_epi16(pack_data, 4), low_mask);
+        __m128i code_byte = _mm_unpacklo_epi8(low_part, high_part);
+        _mm256_storeu_ps(out_data + slot, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(code_byte)));
+        _mm256_storeu_ps(out_data + slot + 8,
+                         _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(code_byte, 8))));
+      }
+    }
+#elif defined(APP_SIMD_SSE2)
+    {
+      const __m128i low_mask = _mm_set1_epi8(0x0F);
+      const __m128i zero_data = _mm_setzero_si128();
+      for (; slot + 16 <= span_count; slot += 16) {
+        __m128i pack_data = _mm_loadl_epi64((const __m128i *)(const void *)(byte_head + slot / 2));
+        __m128i low_part = _mm_and_si128(pack_data, low_mask);
+        __m128i high_part = _mm_and_si128(_mm_srli_epi16(pack_data, 4), low_mask);
+        __m128i code_byte = _mm_unpacklo_epi8(low_part, high_part);
+        __m128i word_low = _mm_unpacklo_epi8(code_byte, zero_data);
+        __m128i word_high = _mm_unpackhi_epi8(code_byte, zero_data);
+        _mm_storeu_ps(out_data + slot, _mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)));
+        _mm_storeu_ps(out_data + slot + 4,
+                      _mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)));
+        _mm_storeu_ps(out_data + slot + 8,
+                      _mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)));
+        _mm_storeu_ps(out_data + slot + 12,
+                      _mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)));
+      }
+    }
+#elif defined(APP_SIMD_NEON)
+    {
+      for (; slot + 16 <= span_count; slot += 16) {
+        uint8x8_t pack_data = vld1_u8(byte_head + slot / 2);
+        uint8x8x2_t code_byte =
+            vzip_u8(vand_u8(pack_data, vdup_n_u8(0x0F)), vshr_n_u8(pack_data, 4));
+        int part_index;
+        for (part_index = 0; part_index < 2; ++part_index) {
+          uint16x8_t code_word = vmovl_u8(code_byte.val[part_index]);
+          vst1q_f32(out_data + slot + part_index * 8,
+                    vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_word))));
+          vst1q_f32(out_data + slot + part_index * 8 + 4,
+                    vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_word))));
+        }
+      }
+    }
+#endif
+    for (; slot + 2 <= span_count; slot += 2) {
+      uint8_t pair = byte_head[slot / 2];
+      out_data[slot] = (float)(pair & 0x0Fu);
+      out_data[slot + 1] = (float)(pair >> 4);
+    }
+    if (slot < span_count) out_data[slot] = (float)(byte_head[slot / 2] & 0x0Fu);
+    return;
+  }
+
+  if (bit_count == 2 && code_flip == 0 && (from_index & 3) == 0) {
+    const uint8_t *byte_head = code_row + (size_t)from_index / 4;
+#if defined(APP_SIMD_AVX2)
+    {
+      const __m256i step_data = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+      const __m256i code_mask = _mm256_set1_epi32(3);
+      for (; slot + 16 <= span_count; slot += 16) {
+        uint32_t word_value;
+        memcpy(&word_value, byte_head + slot / 4, 4);
+        _mm256_storeu_ps(
+            out_data + slot,
+            _mm256_cvtepi32_ps(_mm256_and_si256(
+                _mm256_srlv_epi32(_mm256_set1_epi32((int)(word_value & 0xFFFFu)), step_data),
+                code_mask)));
+        _mm256_storeu_ps(out_data + slot + 8,
+                         _mm256_cvtepi32_ps(_mm256_and_si256(
+                             _mm256_srlv_epi32(_mm256_set1_epi32((int)(word_value >> 16)),
+                                               step_data),
+                             code_mask)));
+      }
+    }
+#elif defined(APP_SIMD_SSE2)
+    {
+      const __m128i zero_data = _mm_setzero_si128();
+      const __m128i code_mask = _mm_set1_epi8(3);
+      const __m128i pick_zero = _mm_set1_epi32(0x000000FF);
+      const __m128i pick_one = _mm_set1_epi32(0x0000FF00);
+      const __m128i pick_two = _mm_set1_epi32(0x00FF0000);
+      const __m128i pick_three = _mm_set1_epi32((int)0xFF000000u);
+      for (; slot + 16 <= span_count; slot += 16) {
+        uint32_t word_value;
+        __m128i pack_data, spread_data, code_byte, word_low, word_high;
+        memcpy(&word_value, byte_head + slot / 4, 4);
+        pack_data = _mm_cvtsi32_si128((int)word_value);
+        spread_data = _mm_unpacklo_epi8(pack_data, pack_data);
+        spread_data = _mm_unpacklo_epi16(spread_data, spread_data);
+        code_byte = _mm_and_si128(
+            _mm_or_si128(
+                _mm_or_si128(_mm_and_si128(spread_data, pick_zero),
+                             _mm_and_si128(_mm_srli_epi16(spread_data, 2), pick_one)),
+                _mm_or_si128(_mm_and_si128(_mm_srli_epi16(spread_data, 4), pick_two),
+                             _mm_and_si128(_mm_srli_epi16(spread_data, 6), pick_three))),
+            code_mask);
+        word_low = _mm_unpacklo_epi8(code_byte, zero_data);
+        word_high = _mm_unpackhi_epi8(code_byte, zero_data);
+        _mm_storeu_ps(out_data + slot, _mm_cvtepi32_ps(_mm_unpacklo_epi16(word_low, zero_data)));
+        _mm_storeu_ps(out_data + slot + 4,
+                      _mm_cvtepi32_ps(_mm_unpackhi_epi16(word_low, zero_data)));
+        _mm_storeu_ps(out_data + slot + 8,
+                      _mm_cvtepi32_ps(_mm_unpacklo_epi16(word_high, zero_data)));
+        _mm_storeu_ps(out_data + slot + 12,
+                      _mm_cvtepi32_ps(_mm_unpackhi_epi16(word_high, zero_data)));
+      }
+    }
+#elif defined(APP_SIMD_NEON)
+    {
+      static const uint8_t low_pick[8] = {0, 0, 0, 0, 1, 1, 1, 1};
+      static const uint8_t high_pick[8] = {2, 2, 2, 2, 3, 3, 3, 3};
+      static const int8_t step_list[8] = {0, -2, -4, -6, 0, -2, -4, -6};
+      const int8x8_t step_data = vld1_s8(step_list);
+      for (; slot + 16 <= span_count; slot += 16) {
+        uint32_t word_value;
+        uint8x8_t pack_data;
+        uint8x8_t part_list[2];
+        int part_index;
+        memcpy(&word_value, byte_head + slot / 4, 4);
+        pack_data = vreinterpret_u8_u32(vdup_n_u32(word_value));
+        part_list[0] = vtbl1_u8(pack_data, vld1_u8(low_pick));
+        part_list[1] = vtbl1_u8(pack_data, vld1_u8(high_pick));
+        for (part_index = 0; part_index < 2; ++part_index) {
+          uint16x8_t code_word =
+              vmovl_u8(vand_u8(vshl_u8(part_list[part_index], step_data), vdup_n_u8(3)));
+          vst1q_f32(out_data + slot + part_index * 8,
+                    vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_word))));
+          vst1q_f32(out_data + slot + part_index * 8 + 4,
+                    vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_word))));
+        }
+      }
+    }
+#endif
+    for (; slot + 4 <= span_count; slot += 4) {
+      uint8_t quad = byte_head[slot / 4];
+      out_data[slot] = (float)(quad & 3u);
+      out_data[slot + 1] = (float)((quad >> 2) & 3u);
+      out_data[slot + 2] = (float)((quad >> 4) & 3u);
+      out_data[slot + 3] = (float)((quad >> 6) & 3u);
+    }
+    for (; slot < span_count; ++slot)
+      out_data[slot] = (float)((byte_head[slot / 4] >> (2 * (slot & 3))) & 3u);
+    return;
+  }
+
+  for (; slot < span_count; ++slot)
+    out_data[slot] = (float)(pack_read(code_row, (size_t)(from_index + slot), bit_count) ^
+                             (uint32_t)code_flip);
 }
 
 static float kern_row_code(const plane *sheet, int row_index, const float *act_data,
@@ -1801,11 +2086,9 @@ static void kern_row_code_many(const plane *sheet, int row_index, const kern_job
     for (lane_index = 0; lane_index < job->lane_count; ++lane_index) part_list[lane_index] = 0.0f;
     while (done_count < span_count) {
       int chunk_count = span_count - done_count;
-      int slot;
       if (chunk_count > KERN_SPREAD_LIMIT) chunk_count = KERN_SPREAD_LIMIT;
-      for (slot = 0; slot < chunk_count; ++slot)
-        code_room[slot] = (float)(pack_read(code_row, (size_t)(from_index + done_count + slot),
-                                            sheet->bit_count) ^ (uint32_t)sheet->code_flip);
+      kern_code_spread(code_row, from_index + done_count, chunk_count, sheet->bit_count,
+                       sheet->code_flip, code_room);
       for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
         part_list[lane_index] += kern_dot_real(
             code_room, STORE_F32,
@@ -3058,7 +3341,15 @@ static app_code mel_make(const wave_clip *clip, int mel_count, int frame_size, i
   if (lead_pad < 0) lead_pad = 0;
   bin_count = turn_size / 2 + 1;
   /* One sample longer than the window, because the reference cuts the frame
-   * that way and then drops the last sample. */
+   * that way and then drops the last sample.
+   *
+   * The frames counted here are the ones the audio actually reaches. The
+   * extractor does pad a clip out to a whole block of a hundred and twenty
+   * eight samples first, and it does hand back the extra frames, but it marks
+   * them in `input_features_mask`; the tower zeros them between its convolution
+   * stages and drops their rows from what it returns, so nothing downstream can
+   * see them. Counting them here instead would add a soft token the reference
+   * never asks for, which the seam catches on about one clip length in seven. */
   reach_count = clip->value_count + lead_pad;
   frame_count = reach_count > frame_size ? 1 + (reach_count - (frame_size + 1)) / frame_step : 1;
   if (frame_count < 1) frame_count = 1;
@@ -4848,6 +5139,8 @@ typedef struct tower_room {
   float *score_data;
   float *cos_data;
   float *sin_data;
+  float *key_pack;  /* one head's keys and values, gathered into a run */
+  float *value_pack;
   float *turn_data; /* the projected relative rows, one per reachable offset */
   float *wave_data;
   float *quant_data;
@@ -4867,6 +5160,8 @@ static void tower_room_free(tower_room *room) {
   mem_free(room->score_data);
   mem_free(room->cos_data);
   mem_free(room->sin_data);
+  mem_free(room->key_pack);
+  mem_free(room->value_pack);
   mem_free(room->turn_data);
   mem_free(room->wave_data);
   mem_free(room->quant_data);
@@ -4889,6 +5184,7 @@ static int tower_wide_peak(const tower_gear *gear) {
 }
 
 static app_code tower_room_open(tower_room *room, const tower_gear *gear, int lane_count,
+                                int band_count,
                                 int turn_flag) {
   const tower_form *form = &gear->form;
   int wide_peak = tower_wide_peak(gear);
@@ -4909,7 +5205,14 @@ static app_code tower_room_open(tower_room *room, const tower_gear *gear, int la
   room->blend_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)room->head_wide);
   room->gate_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)form->inner_size);
   room->rise_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)form->inner_size);
-  room->score_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count);
+  room->key_pack =
+      (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)form->head_size);
+  room->value_pack =
+      (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)form->head_size);
+  /* One slice of scores per band, because the bands run at the same time. */
+  if (band_count < 1) band_count = 1;
+  room->score_data =
+      (float *)mem_clear(sizeof(float) * (size_t)band_count * (size_t)lane_count);
   room->cos_data = (float *)mem_clear(sizeof(float) * (size_t)(form->head_size / 2 + 1));
   room->sin_data = (float *)mem_clear(sizeof(float) * (size_t)(form->head_size / 2 + 1));
   room->quant_data = (float *)mem_clear(sizeof(float) * (size_t)KERN_LANE_LIMIT * (size_t)wide_peak);
@@ -4922,7 +5225,7 @@ static app_code tower_room_open(tower_room *room, const tower_gear *gear, int la
   if (!room->state_data || !room->scrap_data || !room->lift_data || !room->query_data ||
       !room->key_data || !room->value_data || !room->blend_data || !room->gate_data ||
       !room->rise_data || !room->score_data || !room->cos_data || !room->sin_data ||
-      !room->quant_data || (turn_flag && (!room->turn_data || !room->wave_data))) {
+      !room->key_pack || !room->value_pack || !room->quant_data || (turn_flag && (!room->turn_data || !room->wave_data))) {
     tower_room_free(room);
     return APP_FAIL_MEMORY;
   }
@@ -4953,21 +5256,55 @@ static void tower_lift(app_model *model, tower_room *room, const plane *sheet, c
 /* Softmaxes one head's scores and blends the values behind them.  Both towers
  * end up here; what differs is the score, which the caller has already written
  * into `score_data`. */
-static void tower_blend(app_model *model, tower_room *room, int head_index, int lane_index,
-                        int from_lane, int upto_lane, int head_size) {
-  float *blend_head = room->blend_data + (size_t)lane_index * (size_t)room->head_wide +
-                      (size_t)head_index * head_size;
-  int span_count = upto_lane - from_lane;
-  int span_index, value_index;
-  model->desk.soft_max(&model->desk, room->score_data, span_count);
-  for (value_index = 0; value_index < head_size; ++value_index) blend_head[value_index] = 0.0f;
-  for (span_index = 0; span_index < span_count; ++span_index) {
-    const float *value_head = room->value_data +
-                              (size_t)(from_lane + span_index) * (size_t)room->head_wide +
-                              (size_t)head_index * head_size;
-    float weight_value = room->score_data[span_index];
-    for (value_index = 0; value_index < head_size; ++value_index)
-      blend_head[value_index] += weight_value * value_head[value_index];
+/* One band of the patch grid, for one head: every query in the band scored
+ * against every key, then blended.
+ *
+ * That head's keys and values have already been gathered into a run of their
+ * own, which is what makes this worth threading. Left where they lie, a head's
+ * keys are sixty-four floats in every seven hundred and sixty-eight, so scoring
+ * one query walks the whole seven megabyte array and the next query walks it
+ * again. Gathered, a head is six hundred kilobytes that stays in cache across
+ * every query in the band.
+ *
+ * A band writes only its own rows of the blend and its own slice of the score
+ * scratch, so nothing is shared but the reads. */
+typedef struct grid_job {
+  app_model   *model;
+  tower_room  *room;
+  const float *key_pack;
+  const float *value_pack;
+  int          head_index;
+  int          head_size;
+  int          lane_count;
+  float        head_gain;
+} grid_job;
+
+static void tower_attend_band(void *state, int slice_index, int slice_count) {
+  grid_job *job = (grid_job *)state;
+  tower_room *room = job->room;
+  int head_size = job->head_size;
+  int head_wide = room->head_wide;
+  float *score_data = room->score_data + (size_t)slice_index * (size_t)job->lane_count;
+  int from_lane, upto_lane, lane_index, span_index, value_index;
+  slice_span(job->lane_count, slice_index, slice_count, &from_lane, &upto_lane);
+  for (lane_index = from_lane; lane_index < upto_lane; ++lane_index) {
+    const float *query_head = room->query_data + (size_t)lane_index * (size_t)head_wide +
+                              (size_t)job->head_index * head_size;
+    float *blend_head = room->blend_data + (size_t)lane_index * (size_t)head_wide +
+                        (size_t)job->head_index * head_size;
+    for (span_index = 0; span_index < job->lane_count; ++span_index)
+      score_data[span_index] =
+          kern_dot_real(job->key_pack + (size_t)span_index * (size_t)head_size, STORE_F32,
+                        query_head, head_size) *
+          job->head_gain;
+    job->model->desk.soft_max(&job->model->desk, score_data, job->lane_count);
+    for (value_index = 0; value_index < head_size; ++value_index) blend_head[value_index] = 0.0f;
+    for (span_index = 0; span_index < job->lane_count; ++span_index) {
+      const float *value_head = job->value_pack + (size_t)span_index * (size_t)head_size;
+      float weight_value = score_data[span_index];
+      for (value_index = 0; value_index < head_size; ++value_index)
+        blend_head[value_index] += weight_value * value_head[value_index];
+    }
   }
 }
 
@@ -5010,19 +5347,37 @@ static void tower_attend_grid(app_model *model, tower_gear *gear, tower_wing *wi
     }
   }
 
-  for (lane_index = 0; lane_index < lane_count; ++lane_index)
+  /* This is the whole cost of an image: a grid of two thousand patches scored
+   * against itself, sixteen times over. One head at a time, so its keys and
+   * values can be gathered into a run that stays in cache, and the queries
+   * divided across the pool. */
+  {
+    grid_job job;
+    job.model = model;
+    job.room = room;
+    job.head_size = head_size;
+    job.lane_count = lane_count;
+    job.head_gain = form->head_gain;
     for (head_index = 0; head_index < form->head_count; ++head_index) {
-      const float *query_head = room->query_data + (size_t)lane_index * (size_t)head_wide +
-                                (size_t)head_index * head_size;
-      int span_index;
-      for (span_index = 0; span_index < lane_count; ++span_index) {
-        const float *key_head = room->key_data + (size_t)span_index * (size_t)head_wide +
-                                (size_t)head_index * head_size;
-        room->score_data[span_index] =
-            kern_dot_real(key_head, STORE_F32, query_head, head_size) * form->head_gain;
+      for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+        memcpy(room->key_pack + (size_t)lane_index * (size_t)head_size,
+               room->key_data + (size_t)lane_index * (size_t)head_wide +
+                   (size_t)head_index * head_size,
+               sizeof(float) * (size_t)head_size);
+        memcpy(room->value_pack + (size_t)lane_index * (size_t)head_size,
+               room->value_data + (size_t)lane_index * (size_t)head_wide +
+                   (size_t)head_index * head_size,
+               sizeof(float) * (size_t)head_size);
       }
-      tower_blend(model, room, head_index, lane_index, 0, lane_count, head_size);
+      job.key_pack = room->key_pack;
+      job.value_pack = room->value_pack;
+      job.head_index = head_index;
+      if (model->pool.worker_count > 0 && lane_count >= 64)
+        pool_run(&model->pool, tower_attend_band, &job);
+      else
+        tower_attend_band(&job, 0, 1);
     }
+  }
 
   tower_lift(model, room, &wing->exit_sheet, room->blend_data, head_wide, lane_count,
              room->lift_data, form->state_size, wing->exit_bias);
@@ -5234,7 +5589,8 @@ static app_code vision_run(app_model *model, flat_grid *grid_in, float **row_out
   if (lane_count < 1 || pool_count < 1) return APP_FAIL_SUPPORT;
 
   code = grid_scale(grid_in, want_wide, want_high, &work_grid);
-  if (code == APP_OKAY) code = tower_room_open(&room, gear, lane_count, 0);
+  if (code == APP_OKAY)
+    code = tower_room_open(&room, gear, lane_count, pool_bands(&model->pool), 0);
   if (code != APP_OKAY) goto vision_done;
 
   patch_data =

@@ -4,7 +4,12 @@
  * checkpoint: the platform shims, the JSON reader, the safetensors store, the
  * packed-quantization decode, the kernels against plain references, the rotary
  * tables, and the tokenizer. Fixtures are written into a scratch folder and
- * removed on exit. */
+ * removed on exit.
+ *
+ * The last section is the exception. When the shipped export is beside the
+ * suite it runs three prompts through the whole stack and holds the result to
+ * numbers recorded from the build the reference comparison judged, which takes
+ * about twenty seconds; without a checkpoint it says so and passes over. */
 
 #include "app_core.c"
 
@@ -1469,6 +1474,45 @@ static void test_mel(void) {
   }
   grid_free(&mel_grid);
   wave_free(&clip);
+
+  /* How many frames a clip makes is how many soft tokens it becomes, so the
+   * count is held against the reference's own at the shipped export's framing:
+   * a 320 sample window, a 160 sample hop, and half a window of lead. The
+   * lengths below are ones `Gemma4AudioFeatureExtractor` was measured on, and
+   * the frame counts are the ones it marks live in `input_features_mask`.
+   *
+   * The trap here is that the extractor also pads a clip out to a whole block
+   * of a hundred and twenty eight samples and hands back the extra frames. They
+   * are masked, zeroed between the convolution stages and dropped from the rows
+   * the tower returns, so counting them would add a soft token the reference
+   * never asks for: 4000 samples make 24 live frames and 25 padded, and 24
+   * frames are six tokens where 25 would be seven. */
+  {
+    static const struct {
+      int sample_count;
+      int frame_count;
+    } reach_list[] = {{800, 4}, {2000, 12}, {4000, 24}, {24000, 149}, {24065, 150}, {40000, 249}};
+    size_t reach_index;
+    for (reach_index = 0; reach_index < sizeof(reach_list) / sizeof(reach_list[0]); ++reach_index) {
+      wave_clip reach_clip;
+      flat_grid reach_grid;
+      int slot;
+      memset(&reach_clip, 0, sizeof(reach_clip));
+      reach_clip.rate_value = 16000;
+      reach_clip.value_count = reach_list[reach_index].sample_count;
+      reach_clip.value_data =
+          (float *)mem_clear(sizeof(float) * (size_t)reach_clip.value_count);
+      if (!reach_clip.value_data) { test_true(0, "the clip is allocated"); return; }
+      for (slot = 0; slot < reach_clip.value_count; ++slot)
+        reach_clip.value_data[slot] = (float)sin((double)slot * 0.05);
+      test_true(mel_make(&reach_clip, 8, 320, 160, 512, 1e-3f, 160, &reach_grid) == APP_OKAY,
+                "a spectrogram is taken at the shipped framing");
+      test_true(reach_grid.high_count == reach_list[reach_index].frame_count,
+                "the frame count is the one the extractor marks live");
+      grid_free(&reach_grid);
+      wave_free(&reach_clip);
+    }
+  }
 }
 
 /* ======================================================================== */
@@ -2391,6 +2435,215 @@ static void test_face(void) {
 }
 
 /* ======================================================================== */
+/* 11. the shipped checkpoint                                               */
+/* ======================================================================== */
+
+/* Everything above this line is held against a definition written out beside
+ * it, or against a synthetic checkpoint built here for the purpose.  Neither
+ * touches the weights the engine is actually for.  The comparison that does —
+ * `app_diff.py` against the reference — wants python, torch, and a transformers
+ * that knows the architecture, and a host can easily have the checkpoint and
+ * none of those.  So what that comparison settled is written down here: the
+ * frame the tokenizer lays down for a prompt, and the head of the distribution
+ * the whole stack reaches over it.
+ *
+ * The numbers are the engine's own, read off the SSE2 build the seam comparison
+ * judged against the reference (`CHANGES.md`, 0.7.2).  They are held to a slack
+ * rather than to the last bit, because the checkpoint rounds every activation
+ * onto a static grid and a build that sums in another order lands on a
+ * neighbouring step.  Measured on this export, an SSE2 build against an AVX2
+ * one over five prompts: rank one never moved, no id in a top eight fell below
+ * rank eleven in the other build, and the top eight logits moved by at most
+ * 1.30.  The slack is 2.0 — clear of what a backend change did, and well inside
+ * the 2.30 to 5.33 the reference moves against itself when its own input is
+ * nudged by a millionth.  What that catches is a layer wired wrong, not a
+ * last-bit difference.
+ *
+ * The prompts are chosen for a wide rank one: the least of the three leads the
+ * next id by 3.27, which is more than twice the widest move a backend change
+ * was seen to make.
+ *
+ * No picture is in here.  The processor lifts even a thirty-two pixel image to
+ * the export's full patch budget — 260 soft tokens, four and a half minutes on
+ * this host — so the cheapest media shot would cost more than the whole of the
+ * rest of the suite by three orders of magnitude.  `run.py parity --seam
+ * --model model` is where that join is judged. */
+
+#define TEST_SHOT_TOP   8   /* recorded ids per prompt */
+#define TEST_SHOT_ROOM  16  /* ranks they are allowed to move within */
+#define TEST_SHOT_SLACK 2.0 /* how far a recorded logit may move */
+
+typedef struct test_shot_case {
+  const char    *prompt_text;
+  int            id_count;
+  const int32_t *id_list;    /* the frame `token_frame` lays down */
+  const int32_t *rank_list;  /* the highest scoring ids, in order */
+  const float   *logit_list; /* and what they scored */
+} test_shot_case;
+
+static const int32_t shot_paris_id[14] = {2,    105, 2364, 107, 818, 5279, 529,
+                                          7001, 563, 106,  107, 105, 4368, 107};
+static const int32_t shot_paris_rank[TEST_SHOT_TOP] = {818,   50429, 1018,   236777,
+                                                       10450, 48,    236798, 9366};
+static const float shot_paris_logit[TEST_SHOT_TOP] = {27.329222f, 24.059254f, 21.418470f,
+                                                      19.322742f, 18.975519f, 18.860050f,
+                                                      18.603403f, 18.475531f};
+
+static const int32_t shot_hello_id[12] = {2,      105, 2364, 107, 37889, 29104,
+                                          236761, 106, 107,  105, 4368,  107};
+static const int32_t shot_hello_rank[TEST_SHOT_TOP] = {9259,   10979, 236777, 1018,
+                                                       174886, 21529, 17531,  23391};
+static const float shot_hello_logit[TEST_SHOT_TOP] = {28.229704f, 23.872934f, 22.081196f,
+                                                      21.774128f, 21.530983f, 21.086210f,
+                                                      20.350374f, 20.348656f};
+
+static const int32_t shot_prime_id[16] = {2,    105, 2364, 107, 1613, 506,  1171, 1806,
+                                          8355, 4945, 236761, 106, 107, 105, 4368, 107};
+static const int32_t shot_prime_rank[TEST_SHOT_TOP] = {818,  236770, 236777, 8291,
+                                                       1018, 49190,  236800, 236829};
+static const float shot_prime_logit[TEST_SHOT_TOP] = {28.001677f, 23.693737f, 21.795601f,
+                                                      20.744570f, 20.577866f, 20.443802f,
+                                                      20.155479f, 19.610378f};
+
+static const test_shot_case shot_case_list[3] = {
+    {"The capital of France is", 14, shot_paris_id, shot_paris_rank, shot_paris_logit},
+    {"Say hello.", 12, shot_hello_id, shot_hello_rank, shot_hello_logit},
+    {"List the first three prime numbers.", 16, shot_prime_id, shot_prime_rank,
+     shot_prime_logit},
+};
+
+/* Where the checkpoint is: `IGLLM_MODEL` when it is set, and otherwise the
+ * vendored export, as seen from the tree root and from the build folder.  The
+ * variable is the only place looked at once it is set, so naming a folder that
+ * holds no `config.json` — `IGLLM_MODEL=none` — is how a host that does not
+ * want to spend the twenty seconds turns this section off. */
+static const char *test_shot_folder(void) {
+  static const char *look_list[2] = {"model", "../model"};
+  const char *named_text = getenv("IGLLM_MODEL");
+  char path_text[1024];
+  file_map map;
+  size_t look_index, look_count = sizeof(look_list) / sizeof(look_list[0]);
+  for (look_index = 0; look_index < look_count; ++look_index) {
+    const char *folder_text = named_text ? named_text : look_list[look_index];
+    path_join(path_text, sizeof(path_text), folder_text, "config.json");
+    if (file_open(path_text, &map) == APP_OKAY) {
+      file_close(&map);
+      return folder_text;
+    }
+    if (named_text) break;
+  }
+  return NULL;
+}
+
+/* The shape these were taken from.  A folder holding some other checkpoint is
+ * skipped rather than failed: all a failure would report is that the numbers
+ * below are not about it. */
+static int test_shot_shape(const app_model *model) {
+  return model_vocab_count(model) == 262144 && model_layer_count(model) == 35 &&
+         model_state_size(model) == 1536 && model_window_limit(model) == 131072 &&
+         model_vision_ready(model) && model_audio_ready(model) &&
+         model_image_token(model) == 258880 && model_audio_token(model) == 258881 &&
+         model_image_rows(model) == 280;
+}
+
+/* The highest scoring ids, in order, without sorting the vocabulary. */
+static void test_shot_rank(const float *logit_list, int vocab_count, int *rank_list,
+                           int rank_room) {
+  int rank_count = 0, rank_index, vocab_index;
+  for (vocab_index = 0; vocab_index < vocab_count; ++vocab_index) {
+    float value = logit_list[vocab_index];
+    if (rank_count < rank_room) {
+      rank_list[rank_count++] = vocab_index;
+    } else if (value > logit_list[rank_list[rank_count - 1]]) {
+      rank_list[rank_count - 1] = vocab_index;
+    } else {
+      continue;
+    }
+    for (rank_index = rank_count - 1; rank_index > 0; --rank_index) {
+      int keep_value;
+      if (logit_list[rank_list[rank_index]] <= logit_list[rank_list[rank_index - 1]]) break;
+      keep_value = rank_list[rank_index];
+      rank_list[rank_index] = rank_list[rank_index - 1];
+      rank_list[rank_index - 1] = keep_value;
+    }
+  }
+}
+
+static void test_shot(void) {
+  const char *folder_text = test_shot_folder();
+  app_setup setup = app_setup_plain();
+  app_model *model = NULL;
+  int case_index;
+  test_open("shot");
+  if (!folder_text) {
+    printf("   skipped: no checkpoint; set IGLLM_MODEL or run beside model/\n");
+    return;
+  }
+  if (model_load(folder_text, &setup, &model) != APP_OKAY || !model) {
+    test_true(0, "the shipped checkpoint loads");
+    model_free(model);
+    return;
+  }
+  test_true(1, "the shipped checkpoint loads");
+  if (!test_shot_shape(model)) {
+    printf("   skipped: %s is not the export these were recorded from\n", folder_text);
+    model_free(model);
+    return;
+  }
+
+  for (case_index = 0; case_index < 3; ++case_index) {
+    const test_shot_case *shot = &shot_case_list[case_index];
+    app_session *session = NULL;
+    int32_t id_room[64];
+    int rank_room[TEST_SHOT_ROOM];
+    const float *logit_list;
+    int id_count, slot_index, worst_place = 1;
+    double worst_gap = 0.0;
+
+    id_count = token_frame(model, shot->prompt_text, id_room,
+                           (int)(sizeof(id_room) / sizeof(id_room[0])));
+    test_near((double)id_count, (double)shot->id_count, 0.0, "the frame is the length recorded");
+    if (id_count != shot->id_count) continue;
+    test_true(memcmp(id_room, shot->id_list, sizeof(int32_t) * (size_t)id_count) == 0,
+              "the frame is the one recorded");
+
+    if (session_open(model, &session) != APP_OKAY || !session) {
+      test_true(0, "a session opens on the shipped checkpoint");
+      continue;
+    }
+    test_true(session_prime(session, id_room, id_count) == APP_OKAY, "the prompt primes");
+    logit_list = session_step(session, id_room[id_count - 1]);
+    test_true(logit_list != NULL, "the stack reaches the vocabulary");
+    if (!logit_list) {
+      session_close(session);
+      continue;
+    }
+    test_shot_rank(logit_list, model_vocab_count(model), rank_room, TEST_SHOT_ROOM);
+    test_true(rank_room[0] == shot->rank_list[0], "rank one is the id recorded");
+    /* Where each recorded id landed this time, and how far its score moved.
+     * Both go through `test_near`, so a failure says by how much. */
+    for (slot_index = 0; slot_index < TEST_SHOT_TOP; ++slot_index) {
+      int32_t want_id = shot->rank_list[slot_index];
+      int place_index, place_found = TEST_SHOT_ROOM + 1;
+      double gap = (double)logit_list[want_id] - (double)shot->logit_list[slot_index];
+      for (place_index = 0; place_index < TEST_SHOT_ROOM; ++place_index)
+        if (rank_room[place_index] == want_id) {
+          place_found = place_index + 1;
+          break;
+        }
+      if (place_found > worst_place) worst_place = place_found;
+      if (gap < 0.0) gap = -gap;
+      if (gap > worst_gap) worst_gap = gap;
+    }
+    test_near((double)worst_place, 1.0, (double)(TEST_SHOT_ROOM - 1),
+              "every recorded id is still in the top sixteen");
+    test_near(worst_gap, 0.0, TEST_SHOT_SLACK, "every recorded logit is within the slack");
+    session_close(session);
+  }
+  model_free(model);
+}
+
+/* ======================================================================== */
 /* entry point                                                              */
 /* ======================================================================== */
 
@@ -2417,6 +2670,7 @@ int main(void) {
   test_wing();
   test_tower();
   test_face();
+  test_shot();
 
   test_yard_close();
   printf("\n%d passed, %d failed\n", test_pass_count, test_fail_count);
