@@ -1640,3 +1640,400 @@ thirty-two gigabytes a second, which is near what a desktop of this age will
 hand over. If that is where the tuned build now sits, the next gain is in
 reading fewer bytes rather than in spending fewer instructions on them. Nothing
 here has measured that either way. `TODO.md` has the rest.
+
+---
+
+## 0.8.0 — attachments where the words are, and the wall decode is against
+
+### Why
+
+Three of the open tasks could only be settled where the shipped export is, and
+this is a pass over those. Two of them were waiting on a reference that would
+run at all: the `transformers` on the host 0.7.5 and 0.7.6 were written on
+carried no `gemma4`, so the clip budget and the ids around a run were held to
+the export's own configuration rather than to the reference's answer about it.
+A `transformers` that carries one is installed now, in an environment of its own
+so that nothing else on the host had to move to make room for it, and it
+answers.
+
+### The clip budget, answered by the reference
+
+0.7.5 cut a clip at the processor's budget — 750 soft tokens of forty
+milliseconds, cut out of the samples rather than off the rows — and said in its
+own known gaps that the reference had not re-judged it.
+`_get_num_multimodal_tokens` is the processor's answer to the same question, the
+one a serving stack asks before it allocates, and it agrees on every length put
+to it:
+
+| clip | the processor asks for | the engine makes |
+| --- | --- | --- |
+| 5 s | 125 | 125 |
+| 30 s, which is the budget exactly | 750 | 750 |
+| 35 s | 750 | 750 |
+| 61 s | 750 | 750 |
+
+A picture is the same story on the other tower: a 320 by 240 png is 266 soft
+tokens to the processor's aspect-preserving resize and 266 rows to the engine.
+
+Nothing was changed to make that true. It is the arithmetic 0.7.5 wrote, put
+against the code it was written from, and the gap is closed rather than fixed.
+
+### More than one picture or clip
+
+The engine never cared how many runs a prompt carried. `token_media_run` walks a
+list of spans, and the substitution takes any set of positions. The command line
+cared: `--image` and `--audio` held one path each, and the picture always led
+because there could only be one of each.
+
+Both flags are repeatable now, up to eight attachments in a prompt, and the
+order they are laid down in is the order they were given in — which is what a
+content list means by order, and what a reversed pair has to mean if the flags
+are to mean anything at all. So `--audio clip.wav --image photo.png` puts the
+clip first, where before it would have put the picture there.
+
+What settles it is the reference's own layout rather than a reading of it. The
+seam comparison walks seven cases now instead of four, and on the shipped export
+every id of every one of them is the reference's:
+
+| case | ids | runs of soft tokens |
+| --- | --- | --- |
+| one image | 282 | 266 |
+| one clip | 141 | 125 |
+| image and clip | 409 | 266, 125 |
+| clip and image | 409 | 125, 266 |
+| two images | 537 | 266, 253 |
+| two images, a clip | 664 | 266, 253, 125 |
+
+The two pictures are deliberately different shapes, 320 by 240 and 224 by 448,
+so the second run is 253 rows where the first is 266. A harness that measured
+one run and used its length twice would agree with itself on two copies of one
+picture and be wrong here, and so would an engine that laid the first tower's
+rows down on both runs.
+
+The count of a placeholder id is no longer the length of a run, so the harness
+walks the ids, cuts them into runs, and asks the processor about each attachment
+separately. A prompt that put the right number of rows in the wrong run would
+still have the right total.
+
+The graph half of the two new cases is not run, and says so rather than being
+run against the wrong input: the activation dump holds one set of rows per tower
+and cannot say which attachment they came from. The reversed pair is not a new
+case for it, and there it does run — on the synthetic checkpoint a clip before a
+picture reaches the reference's distribution, inside the reference's own
+movement, which is the end to end form of the ordering claim.
+
+### Where the words go
+
+Putting every attachment in front of the words is one arrangement of a content
+list and not the only one, and the reference's template has always laid down
+whatever order it was given. `token_frame_media` could not: it took a block of
+spans and a block of text. `token_frame_parts` takes the list itself — an
+`app_part` is a stretch of words or one of the spans — and walks it in order, so
+a picture can sit in the middle of a sentence. The older call is the newer one
+with every span first and the words last, and both go through the same body, so
+there is one arrangement of the frame rather than two that can drift apart. The
+suite writes a prompt both ways and holds the ids to each other.
+
+The one thing that body has to carry across the pieces is whether the next one
+begins a chunk. A media run ends in a closing special id and a stretch of words
+does not, so the words after a picture take the tokenizer's lead mark and the
+first words of a turn — which follow only the role marker — do not. It is a
+one-token difference, in a place no test of the runs themselves would look.
+
+On the command line that is `--text`, which takes its place in the order the
+flags were typed. `--prompt` keeps its older meaning, the words after everything
+else wherever on the line it is written, so every invocation that predates this
+lays down exactly what it did before:
+
+| turn | ids |
+| --- | --- |
+| words, picture, words | 284 |
+| words, picture | 280 |
+| picture, words, picture | 533 |
+| words, clip, words, picture | 409 |
+
+Every id of those is the reference's too, on the shipped export, against the
+same template and the same processor as the rest.
+
+### What decode spends its time on
+
+> This subsection is wrong and 0.8.1 replaces it. The tokens a second and
+> the sweep below are right; the byte count they are divided by is the key
+> and value cache, not the weights. It is left as written because the
+> mistake is instructive and because the numbers around it are still good.
+
+0.7.6 named two candidates and measured neither: converting the per-group gains
+once instead of per group, or nothing at all — this export carrying no
+mixture-of-experts block, so that decode reads close to the whole two and a
+third gigabytes of weights for every token it produces.
+
+It is the second. Two measurements say so, both on four cores of the 2017
+desktop every other number here was taken on.
+
+The first is what the host's memory will hand over: a read only sweep of a 2.4
+gigabyte buffer, three passes, the best of them kept. It has nothing to do with
+the engine; it is the shape the engine reads in.
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| sequential read | 19.73 GB/s | 24.77 | 27.08 | **27.96** |
+
+The second is decode against it. The engine reports 2067.9 MiB resident for this
+export and reads all of it for every token, so a token a second is a little over
+two gigabytes a second:
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| decode, tuned | 4.45 tok/s | 8.33 | 11.36 | **13.49** |
+| which is | 8.98 GB/s | 16.82 | 22.93 | **27.24** |
+| of what the memory gives | 46% | 68% | 85% | **97%** |
+
+At one thread the engine is nowhere near the memory's limit and the arithmetic
+is the cost. At four it is against the wall: 27.24 against 27.96 is inside the
+spread of the sweep itself.
+
+The default build is the control. It runs the same reads through a narrower
+kernel, and it is not at the wall:
+
+| default, SSE2 | 1 thread | 4 threads |
+| --- | --- | --- |
+| decode | 3.06 tok/s | 9.96 |
+| which is | 6.18 GB/s | 20.11 |
+| of the memory | 31% | **72%** |
+
+That is the whole shape of it. On SSE2 there is a quarter of the machine still
+to win by spending fewer instructions, which is why the two bit table read in
+0.7.6 moved that build by a third and moved the tuned one by nothing. On AVX2
+there is nothing left to win that way, and the per-group gain mirror that
+`TODO.md` offered as the other candidate is worse than nothing there: it trades
+memory for instructions on a build whose whole cost is already memory. It stays
+in `TODO.md` scoped to the default build, where the trade is still open and the
+bytes it adds are what would have to be weighed against the instructions it
+saves.
+
+What replaces it as the next thing to try is reading fewer bytes rather than
+converting them faster. The loader chooses between a packed plane and a real one
+by size, and every plane it unpacks is bytes added to a read that is now the
+whole cost. What residency per tensor is worth is the difference between the
+2067.9 MiB this export sits at and what it would sit at packed, and that is one
+measurement this release did not take.
+
+The gigabytes here are powers of two, as the engine's own report is.
+
+### Testing
+
+The suite grew two cases for what the front end now depends on. The first is
+ordering: four spans in a caller's order rather than a picture and then a clip,
+one of them empty, held to the ids each run is bracketed with and to where each
+run says its rows go. The second is the parts list: the same turn written both
+ways, once through the older call and once as a list with the span first, held
+to each other id for id, and then the same span with words on both sides of it,
+where the words in front have to stand exactly where the opener stood and the
+run has to begin that much further in. Neither needs a checkpoint, because none
+of it is the checkpoint's.
+
+Nine new assertions. The suite is **351** with the export beside it and **328**
+without, clean under `-Wall -Wextra` on the SSE2 and AVX2 backends.
+
+Three comparisons against the reference were run, all of them clean:
+
+| run | what it covered |
+| --- | --- |
+| `parity --seam` | nine cases on a synthetic checkpoint: every id, every count, and the distribution for the six with at most one of a kind |
+| `parity --seam --model model`, two pictures and a clip | the same nine on the shipped export: every id and every count, and the distribution for the four whose forward, and its floor, both fit |
+| the processor's own arithmetic | four clip lengths and a picture, against `_get_num_multimodal_tokens` |
+
+### Known gaps
+
+On the shipped export two of the nine get no distribution for want of memory,
+and they fail differently: the case with a picture and then a clip cannot
+allocate the forward at all, and the case with the clip first allocates it and
+then has no room for the floor beside it — the reference moving its own input by
+a millionth and running again. The second reports the gap it measured and leaves
+it unjudged. Sixteen gigabytes is the constraint rather than the engine, and it
+is the same one 0.7.1 wrote down.
+
+A case with two of a kind is judged on its ids alone, here and on synthetic
+weights both. The activation dump holds one set of rows per tower and cannot say
+which attachment they came from, so the reference would be fed the wrong input
+rather than a hard one, and the graph half says so and stands down.
+
+The gain mirror and the residency measurement are both still open, in the
+narrower forms above. `TODO.md` has the rest.
+
+---
+
+## 0.8.1 — what a token actually reads
+
+### Scope
+
+The measurement 0.8.0 left open, taken. It says 0.8.0's conclusion was wrong:
+decode is not against the memory wall, and it is not close to it.
+
+Nothing about the arithmetic in that release is affected. The tokens a second
+are what they were, the sweep is what it was, and every parity result stands.
+What was wrong was the byte count the seconds were divided by.
+
+### The number that was not the weights
+
+`memory 2067.9 MiB` in the bench report is `app_total_bytes`, a running total of
+what the engine's allocator has handed out since the process began. The weights
+are not in it and never were: they are mapped, not allocated, and `mem_alloc` is
+the only thing that counter counts. What is in it is the key and value cache,
+which is sized from the window and not from the prompt:
+
+| `--window` | 4096 | 32768 | 131072 |
+| --- | --- | --- | --- |
+| `memory` | 330.9 MiB | 723.1 MiB | **2067.9 MiB** |
+
+The run that reported 2067.9 asked for the default window of 131072 and then
+filled seven slots of it. So the figure 0.8.0 divided the seconds by was the
+cache the run did not use, and the resemblance to the size of the checkpoint —
+2334.8 MiB of tensors, close enough to pass — was a coincidence.
+
+The report now says which is which, and the model layer answers the question
+directly rather than leaving it to be inferred from an allocator counter:
+
+```
+reads   762.6 MiB a token, 10.55 GiB/s
+weights 2334.8 MiB mapped
+memory  2067.9 MiB allocated
+```
+
+### What a step reads
+
+`model_decode_bytes` walks the planes the token loop reads and counts what a
+product against each of them streams: the payload, and for a quantized plane the
+gains and the zero points beside it. `plane_bytes` and `plane_row_bytes` under
+it are the same sum for a whole plane and for one row of it.
+
+Three things separate that from what the export weighs, and all three are large:
+
+- **The embedding tables are indexed, not swept.** This export's per-layer
+  embedding table is 262144 by 8960 at four bits — 1120 MiB, 48% of the file —
+  and a step reads one row of it. The token table is another 96 MiB read a row
+  at a time, and it is not the output head here: this export ships `lm_head`
+  untied, so the head is a separate 96 MiB that *is* swept.
+- **The towers are not in the token loop.** Vision is 180.3 MiB of the
+  checkpoint and audio 143.6, and both are read when a picture or a clip is put
+  in front of a prompt rather than once a token.
+- **A sharing layer binds no keys or values.** Twenty of the thirty-five layers
+  read another layer's cache, so of the 15.8 MiB of `k_proj` and `v_proj` the
+  checkpoint ships across the stack a token reads 6.8.
+
+What is left is 759.4 MiB — 796,326,800 bytes — against 2334.8 MiB mapped:
+
+| what | MiB a token |
+| --- | --- |
+| mlp gate, up, down | 475.3 |
+| output head | 97.0 |
+| attention q | 63.3 |
+| attention o | 63.2 |
+| per-layer input gate and projection | 26.5 |
+| per-layer model projection | 26.2 |
+| attention k and v | 6.8 |
+| norms | 1.1 |
+| embedding rows | 0.005 |
+| **a decode step** | **759.4** |
+
+The engine adds the cache to that as the prompt grows, so the figure the bench
+reports climbs a little over a run: 762.6 MiB a token averaged over 64 tokens,
+against the 759.4 a step costs at the start of one.
+
+### Decode against the memory, again
+
+Same host, same sweep, same build flags, measured this session rather than
+0.8.0's:
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| sequential read | 16.17 GiB/s | 24.29 | 24.40 | **24.87** |
+
+That is a little under what 0.8.0 measured — 19.73 to 27.96 — on a host with
+more running on it, and the difference does not matter to what follows. Decode
+against it, tuned, over 64 tokens:
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| decode | 4.49 tok/s | 8.41 | 11.80 | **14.17** |
+| which is | 3.35 GiB/s | 6.26 | 8.79 | **10.55** |
+| of what the memory gives | 21% | 26% | 36% | **42%** |
+
+And the default build, which 0.8.0 used as its control:
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| decode | 3.07 tok/s | 5.82 | 8.26 | **10.17** |
+| which is | 2.29 GiB/s | 4.34 | 6.15 | **7.57** |
+| of what the memory gives | 14% | 18% | 25% | **30%** |
+
+Against 0.8.0's own ceiling of 27.96 the tuned build is at 38% rather than 42%,
+which is the direction that makes the point more strongly, not less.
+
+The scaling says the same thing without any byte count at all, and it was
+sitting in 0.8.0's own tables. From one thread to four the memory hands over
+1.54 times as much; decode produces 3.16 times as many tokens on the tuned build
+and 3.31 on the default. A run against the memory wall cannot scale more than
+twice as well as the memory does. That check needs no measurement of what is
+read, and it is the one that should have caught this.
+
+### What it changes
+
+0.8.0 concluded that on AVX2 there was nothing left to win by spending fewer
+instructions, and scoped two open items around that. All of it is withdrawn:
+
+- **The per-group gain mirror is open on both builds again.** 0.8.0 called it
+  worse than nothing on the tuned build, on the grounds that the whole cost
+  there was already memory. It is not, so the trade is what it always was —
+  memory against instructions — on a build with 58% of the machine unused.
+- **Residency per tensor is a footprint question, not a decode one.** What a
+  packed residency saves is in the two thirds of the mapped total the token loop
+  never touches, and that is worth having on a small host. What it does for
+  decode is smaller than it looked, because the planes it would pack are not the
+  planes a token reads.
+- **There is one unquantized plane in the token loop, and it is meant to be.**
+  The per-layer model projection is bf16 at 26.2 MiB, 3.4% of what a token reads
+  and the only real plane of any size the decode path touches. The export names
+  it in `modules_to_not_convert` beside the patch embedder and the two
+  projectors, and ships no packed form of it, so the loader is reading the only
+  thing there is to read. That is worth having written down: it looked like a
+  gap in the loader and it is a decision of the export's.
+
+The gigabytes here are powers of two, as the engine's own report is, and the
+report now says GiB rather than GB so that it says so itself.
+
+### Testing
+
+Sixteen assertions that need no checkpoint. `plane_bytes` and `plane_row_bytes`
+are held to what the plane fixture allocated — codes, gains, and zero points,
+counted from the test's own arithmetic rather than from the function under
+test — over the three bit widths the fixture covers, plus a real plane and an
+unbound one.
+
+The mixture case gets an exact identity rather than a bound. A step reads the
+`expert_top` experts the router picks, so raising `expert_top` to the whole bank
+has to move the figure by precisely the experts that were being left out, and
+the test computes that difference itself from the expert planes. Counting the
+bank whole and counting none of it both fail it.
+
+Four more with the export beside it: the mapped total and the per-token read,
+both recorded exactly, and two bounds that survive a re-recording — a token
+reads less than the per-layer embedding table alone, and under a third of what
+the export holds. A build that swept either table would fail the bounds long
+before the exact totals needed touching.
+
+The suite is **371** with the export beside it and **344** without, clean under
+`-Wall -Wextra` on the SSE2 and AVX2 backends.
+
+### Known gaps
+
+The cache figure counts the distinct bytes of a layer's span. The heads of one
+group re-read the same key head, so a run of `group_share` heads asks for those
+bytes more than once; a group's span is tens of kilobytes at the prompt lengths
+here and stays in cache, but at a long context that assumption is worth
+revisiting rather than trusting.
+
+The sanitizer build could not be run this session: the MinGW gcc on this host
+ships no `libasan` or `libubsan`, so `run.py test --debug` fails at the link.
+That is the host's gap rather than the suite's, and it is unrelated to
+everything above.

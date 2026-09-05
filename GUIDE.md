@@ -46,7 +46,8 @@ Six types and twenty-odd functions:
 - `app_code` — the single result enum; zero is success.
 - `app_setup` — thread count, context length, verbosity.
 - `app_taste` — temperature, top-k, top-p, repetition penalty, seed.
-- `app_tally` — prefill and decode timings, token counts, memory.
+- `app_tally` — prefill and decode timings, token counts, allocated bytes,
+  and the weights and cache the decode steps counted actually read.
 - `app_media` — the embedding rows one picture or one clip turned into.
 - `app_model` — an opaque loaded checkpoint, shared and read-only.
 - `app_session` — an opaque conversation, one per concurrent stream.
@@ -160,6 +161,17 @@ wanted, for example a single embedding lookup. `plane_bits_of` recovers the
 bit width from the shape and the packed word count, so a checkpoint that
 mixes widths across tensors, as this one does, is handled without trusting
 the configuration.
+
+`plane_bytes` says what a product against a plane reads — the payload, and for
+a code plane the gains and zero points beside it — and `plane_row_bytes` says
+what one row of that costs. `model_decode_bytes` above them sums the planes one
+decode step touches, which is a different quantity from `model_memory_bytes`
+and much smaller: an embedding table is indexed rather than swept, the towers
+are not in the token loop, a sharing layer binds no keys or values of its own,
+and a mixture block reads the experts the router picked rather than the bank.
+On the shipped export the two are 759.4 MiB and 2334.8 MiB. Dividing a token
+rate by the second names a bandwidth the run never asked for, which is a
+mistake `CHANGES.md` 0.8.1 documents having made.
 
 **Activation ranges.** The Gemma export calibrates two more numbers for every
 quantized projection, an `input_activation_scale` and an
@@ -560,6 +572,32 @@ its placeholders begin, and `token_frame_media` splices that between the role
 marker and the user's words, which is where a multi-modal template puts it. The
 caller lays its rows against the reported index rather than against the opener.
 
+The span list holds as many as the caller has, in the caller's order, and that
+order is what reaches the ids: a clip given before a picture is laid down before
+it. A span whose tower produced no rows keeps its place and is skipped rather
+than dropped, so an index into the spans stays an index into the attachments
+they came from — which is what lets the front end fill the list straight from
+its flags and lay each tower's rows back on its own run.
+
+**Where the words go.** `token_frame_media` puts every span in front of the
+user's text, which is one arrangement of a content list rather than the only
+one. `token_frame_parts` takes the list itself: an `app_part` is a stretch of
+text or one of the spans, and the frame builder walks them in order, so a
+picture can sit in the middle of a sentence. Both call the same body, and the
+older call is the newer one with every span first and the words last — which the
+suite asserts by writing a prompt both ways and comparing the ids.
+
+The one thing the body carries across pieces is whether the next one begins a
+chunk. A media run ends in a closing special id and a stretch of words does not,
+so words after a picture take the tokenizer's lead mark and the first words of a
+turn, which only follow the role marker, do not. Getting that wrong is a
+one-token difference that no test of the runs themselves would catch.
+
+The command line spells this as `--text`, which takes its place in the order the
+flags were typed, beside `--image` and `--audio`. `--prompt` keeps its older
+meaning — the words after everything else, wherever it is written — so every
+invocation that predates the change lays down exactly what it did.
+
 An export that records neither bracket is read as having none; half a bracket is
 treated as none at all, because half of one is a prompt nothing lays down.
 
@@ -895,8 +933,12 @@ placeholders go. A processor is a tokenizer and three small configurations, so
 this needs no weights at all and runs against the shipped export as easily as
 against a synthetic one. The chat template frames the turn, `replace_image_token`
 and `replace_audio_token` substitute a bracketed run for the marker it wrote, and
-the ids that come out have to be the engine's, id for id. Two counts are checked
-beside them: what the processor's own arithmetic says a picture of that size is
+the ids that come out have to be the engine's, id for id. A prompt may carry
+several attachments, so the count of a placeholder id is not the length of a
+run: the harness walks the ids and cuts them into runs, hands the reference one
+replacement string per run, and asks about each attachment separately. A prompt
+that laid the right number of rows down in the wrong run would have the right
+total. Two counts are checked beside them: what the processor's own arithmetic says a picture of that size is
 worth, which is the aspect-preserving resize against the patch budget, and what
 it says the clip is worth. The second is the feature extractor's framing, which
 was an open question and is now settled — the engine's frame count is the live
@@ -931,7 +973,7 @@ checkpoint wrong until it was replaced.
 A forward on a quantized checkpoint costs about a gigabyte and a half above the
 weights, because reading one row of an embedding dequantizes the whole table,
 and the case with both a picture and a clip attached wants two of them. Held in
-one process across four cases that does not fit, and — worse than not fitting —
+one process across every case that does not fit, and — worse than not fitting —
 which case fits depends on what ran before it: the same case passed alone and
 skipped after `--media` had run in the same shell.
 

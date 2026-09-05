@@ -147,10 +147,10 @@ def work_parity(flag):
         line += ["--model", flag.model]
     if flag.media or flag.seam:
         line += ["--media" if flag.media else "--seam"]
-        if flag.image:
-            line += ["--image", flag.image]
-        if flag.audio:
-            line += ["--audio", flag.audio]
+        for path_text in flag.image or []:
+            line += ["--image", path_text]
+        for path_text in flag.audio or []:
+            line += ["--audio", path_text]
     step_show("parity", line)
     return subprocess.call(line)
 
@@ -196,8 +196,10 @@ def main():
                         help="diff the vision and audio towers rather than the text stack")
     parser.add_argument("--seam", action="store_true",
                         help="diff the join between the towers and the text stack")
-    parser.add_argument("--image", help="the picture to show a vision tower")
-    parser.add_argument("--audio", help="the clip to play an audio tower")
+    parser.add_argument("--image", action="append",
+                        help="a picture to show a vision tower, repeatable")
+    parser.add_argument("--audio", action="append",
+                        help="a clip to play an audio tower, repeatable")
     # Everything after the first bare `--` belongs to the cli, and everything
     # before it belongs to this script. argparse.REMAINDER cannot express that:
     # it swallows the script's own flags too, so `build --debug` silently built

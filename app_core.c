@@ -71,7 +71,8 @@ typedef struct app_tally {
   double serve_seconds;
   size_t prime_tokens;
   size_t serve_tokens;
-  size_t memory_bytes;
+  size_t memory_bytes; /* bytes handed out by the engine's allocator */
+  size_t serve_bytes;  /* weights and cache read by the decode steps counted */
 } app_tally;
 
 /* One image or one clip, after a tower has turned it into embedding rows.  Each
@@ -108,6 +109,9 @@ int         model_vocab_count(const app_model *model);
 int         model_window_limit(const app_model *model);
 int         model_state_size(const app_model *model);
 size_t      model_memory_bytes(const app_model *model);
+/* Weight bytes one decode step reads, which on an export with large embedding
+ * tables is a fraction of the mapped total `model_memory_bytes` reports. */
+size_t      model_decode_bytes(const app_model *model);
 
 /* token layer -------------------------------------------------------------*/
 /* `lead_marker` says this text begins a chunk rather than continuing one.  A
@@ -131,6 +135,26 @@ int  token_frame_media(const app_model *model, const char *user_text,
  * each span's `place_from`. */
 int  token_media_run(const app_model *model, app_media_span *span_list, int span_count,
                      int place_base, int32_t *id_list, int id_limit);
+
+/* One piece of a turn, for a prompt whose attachments do not all sit in front
+ * of the words: either a stretch of the user's text or one of the spans above.
+ * A content list is exactly this — a picture, some words, another picture — and
+ * the reference's template lays one down in the order it is given. */
+#define APP_PART_TEXT  0
+#define APP_PART_MEDIA 1
+
+typedef struct app_part {
+  int         kind_mark;  /* APP_PART_TEXT or APP_PART_MEDIA */
+  const char *text_ref;   /* the words, when this is a text part */
+  int         span_index; /* which of the caller's spans, when it is a media part */
+} app_part;
+
+/* The same chat frame around an ordered list of parts.  `token_frame_media` is
+ * this with every span first and the words last, which is the common case and
+ * the only one the command line could express before. */
+int  token_frame_parts(const app_model *model, const app_part *part_list, int part_count,
+                       app_media_span *span_list, int span_count,
+                       int32_t *id_list, int id_limit);
 int  token_start_id(const app_model *model);
 int  token_close_id(const app_model *model);
 int  token_is_close(const app_model *model, int32_t id_value);
@@ -1380,6 +1404,29 @@ static void plane_row(const plane *sheet, int row_index, float *row_out) {
       }
     }
   }
+}
+
+/* Bytes a product against this plane reads: the payload, and for a code plane
+ * the gains and zero points it is decoded with.  This is what the kernel
+ * streams, not what the tensor occupies on disk — a plane bound as a view of a
+ * stacked tensor counts only its own slice. */
+static size_t plane_bytes(const plane *sheet) {
+  size_t total;
+  if (!sheet || sheet->form == PLANE_VOID) return 0;
+  if (sheet->form == PLANE_REAL)
+    return (size_t)sheet->row_count * (size_t)sheet->col_count *
+           store_type_bytes(sheet->real_type);
+  total = (size_t)sheet->row_count * sheet->row_stride;
+  total += (size_t)sheet->row_count * (size_t)sheet->group_count *
+           store_type_bytes(sheet->gain_type);
+  if (sheet->bias_data) total += (size_t)sheet->row_count * (size_t)sheet->group_count;
+  return total;
+}
+
+/* And what one row of it costs, which is what a table read by index reads. */
+static size_t plane_row_bytes(const plane *sheet) {
+  if (!sheet || sheet->form == PLANE_VOID || sheet->row_count < 1) return 0;
+  return plane_bytes(sheet) / (size_t)sheet->row_count;
 }
 
 /* Rules recovered from `quantization_config` in config.json. */
@@ -7348,6 +7395,71 @@ int model_window_limit(const app_model *model) { return model ? model->form.wind
 int model_state_size(const app_model *model) { return model ? model->form.state_size : 0; }
 size_t model_memory_bytes(const app_model *model) { return model ? model->weight_bytes : 0; }
 
+/* Weight bytes one decode step reads.
+ *
+ * This is deliberately not `model_memory_bytes`.  What is mapped and what is
+ * read a token are different quantities on this family of export, and the gap
+ * between them is most of the file: the two embedding tables are read one row
+ * at a time rather than swept, the vision and audio towers are not in the token
+ * loop at all, and a layer that shares another layer's keys binds no projection
+ * of its own for them.  A bandwidth figure divided out of the mapped total
+ * therefore overstates what the machine is asked to move, which is the whole
+ * point of measuring it here rather than assuming it. */
+size_t model_decode_bytes(const app_model *model) {
+  const model_form *form;
+  size_t total = 0;
+  int layer_index;
+  if (!model) return 0;
+  form = &model->form;
+
+  /* Both tables are indexed by the token, so a step touches one row of each. */
+  total += plane_row_bytes(&model->embed_sheet);
+  total += plane_row_bytes(&model->ple_embed_sheet);
+  total += plane_bytes(&model->ple_lift_sheet);
+  total += plane_bytes(&model->head_sheet);
+  if (model->ple_norm) total += sizeof(float) * (size_t)form->ple_size;
+  if (model->final_norm) total += sizeof(float) * (size_t)form->state_size;
+
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    const layer_wing *wing = &model->wing_list[layer_index];
+    size_t norm_count = 0;
+    total += plane_bytes(&wing->query_sheet);
+    total += plane_bytes(&wing->key_sheet);   /* void on a sharing layer */
+    total += plane_bytes(&wing->value_sheet); /* void where keys double as values */
+    total += plane_bytes(&wing->exit_sheet);
+    total += plane_bytes(&wing->gate_sheet);
+    total += plane_bytes(&wing->rise_sheet);
+    total += plane_bytes(&wing->drop_sheet);
+    total += plane_bytes(&wing->ple_gate_sheet);
+    total += plane_bytes(&wing->ple_lift_sheet);
+    if (wing->query_norm) norm_count += (size_t)wing->head_size;
+    if (wing->key_norm) norm_count += (size_t)wing->head_size;
+    if (wing->enter_norm) norm_count += (size_t)form->state_size;
+    if (wing->after_attn_norm) norm_count += (size_t)form->state_size;
+    if (wing->before_feed_norm) norm_count += (size_t)form->state_size;
+    if (wing->after_feed_norm) norm_count += (size_t)form->state_size;
+    if (wing->after_ple_norm) norm_count += (size_t)form->state_size;
+    if (form->moe_flag) {
+      /* Only the experts the router picks are read, so a mixture block costs
+       * the router plus `expert_top` of them rather than the whole bank. */
+      int pick_limit = form->expert_top < form->expert_count ? form->expert_top : form->expert_count;
+      int pick_index;
+      total += plane_bytes(&wing->route_sheet);
+      for (pick_index = 0; pick_index < pick_limit; ++pick_index) {
+        if (wing->expert_rise_list) total += plane_bytes(&wing->expert_rise_list[pick_index]);
+        if (wing->expert_drop_list) total += plane_bytes(&wing->expert_drop_list[pick_index]);
+      }
+      if (wing->route_scale) norm_count += (size_t)form->state_size;
+      if (wing->route_gain) norm_count += (size_t)form->expert_count;
+      if (wing->after_mlp_norm) norm_count += (size_t)form->state_size;
+      if (wing->before_moe_norm) norm_count += (size_t)form->state_size;
+      if (wing->after_moe_norm) norm_count += (size_t)form->state_size;
+    }
+    total += sizeof(float) * norm_count;
+  }
+  return total;
+}
+
 int model_vision_ready(const app_model *model) {
   return model && model->tower_list[TOWER_VISION].form.live_flag ? 1 : 0;
 }
@@ -7503,43 +7615,103 @@ int token_media_run(const app_model *model, app_media_span *span_list, int span_
   return id_count;
 }
 
+/* The pieces of a turn, in the caller's order, written where the caller has got
+ * to.  `part_list` may be null, which is the order the front end had before it
+ * could express any other: every span, and then the words.
+ *
+ * `lead_flag` follows the pieces rather than the loop.  A piece begins a chunk
+ * when it follows a special id, which a media run ends in and a stretch of
+ * words does not; that is what the reference does, splitting its input on the
+ * special tokens and normalizing each chunk on its own, and it is why the first
+ * words of a turn continue the line the role marker opened while the words
+ * after a picture start a new one. */
+static int token_body_parts(const app_model *model, const token_book *book,
+                            const app_part *part_list, int part_count, const char *plain_text,
+                            app_media_span *span_list, int span_count, int place_base,
+                            int32_t *id_list, int id_limit, int lead_flag) {
+  int id_count = 0, step_index;
+  int step_count = part_list ? part_count : span_count + 1;
+  for (step_index = 0; step_index < step_count; ++step_index) {
+    app_part step;
+    int wrote_count;
+    if (part_list) {
+      step = part_list[step_index];
+    } else if (step_index < span_count) {
+      step.kind_mark = APP_PART_MEDIA;
+      step.text_ref = NULL;
+      step.span_index = step_index;
+    } else {
+      step.kind_mark = APP_PART_TEXT;
+      step.text_ref = plain_text;
+      step.span_index = -1;
+    }
+    if (step.kind_mark == APP_PART_MEDIA) {
+      if (step.span_index < 0 || step.span_index >= span_count) return -1;
+      wrote_count = token_media_run(model, span_list + step.span_index, 1, place_base + id_count,
+                                    id_list + id_count, id_limit - id_count);
+      if (wrote_count > 0) {
+        id_count += wrote_count;
+        lead_flag = 1;
+      }
+      continue;
+    }
+    if (!step.text_ref) return -1;
+    wrote_count = token_encode_book(book, step.text_ref, lead_flag, id_list + id_count,
+                                    id_limit - id_count);
+    if (wrote_count > 0) id_count += wrote_count;
+    lead_flag = 0;
+  }
+  return id_count;
+}
+
 /* Wraps one user turn in the instruction-tuned chat frame. */
-int token_frame_media(const app_model *model, const char *user_text, app_media_span *span_list,
-                      int span_count, int32_t *id_list, int id_limit) {
+static int token_frame_inner(const app_model *model, const app_part *part_list, int part_count,
+                             const char *plain_text, app_media_span *span_list, int span_count,
+                             int32_t *id_list, int id_limit) {
   const token_book *book;
   int id_count = 0;
-  int part_count, lead_flag;
-  if (!model || !model->book_ref || !user_text || !id_list) return -1;
+  int wrote_count;
+  if (!model || !model->book_ref || !id_list) return -1;
+  if (!part_list && !plain_text) return -1;
   book = model->book_ref;
   if (book->start_id >= 0 && id_count < id_limit) id_list[id_count++] = book->start_id;
   if (book->turn_open_id >= 0) {
     if (id_count < id_limit) id_list[id_count++] = book->turn_open_id;
-    /* Every piece here follows a special id and so begins a chunk, except the
-     * user's words when nothing was attached: those continue the line the role
-     * marker opened, and a media run ends in a special id that starts a new one. */
-    part_count = token_encode_book(book, "user\n", 1, id_list + id_count, id_limit - id_count);
-    if (part_count > 0) id_count += part_count;
-    part_count = token_media_run(model, span_list, span_count, id_count, id_list + id_count,
-                                 id_limit - id_count);
-    lead_flag = part_count > 0;
-    if (part_count > 0) id_count += part_count;
-    part_count = token_encode_book(book, user_text, lead_flag, id_list + id_count,
-                                   id_limit - id_count);
-    if (part_count > 0) id_count += part_count;
+    wrote_count = token_encode_book(book, "user\n", 1, id_list + id_count, id_limit - id_count);
+    if (wrote_count > 0) id_count += wrote_count;
+    wrote_count = token_body_parts(model, book, part_list, part_count, plain_text, span_list,
+                                   span_count, id_count, id_list + id_count,
+                                   id_limit - id_count, 0);
+    if (wrote_count < 0) return -1;
+    id_count += wrote_count;
     if (id_count < id_limit && book->turn_shut_id >= 0) id_list[id_count++] = book->turn_shut_id;
-    part_count = token_encode_book(book, "\n", 1, id_list + id_count, id_limit - id_count);
-    if (part_count > 0) id_count += part_count;
+    wrote_count = token_encode_book(book, "\n", 1, id_list + id_count, id_limit - id_count);
+    if (wrote_count > 0) id_count += wrote_count;
     if (id_count < id_limit) id_list[id_count++] = book->turn_open_id;
-    part_count = token_encode_book(book, "model\n", 1, id_list + id_count, id_limit - id_count);
-    if (part_count > 0) id_count += part_count;
-  } else {
-    part_count = token_media_run(model, span_list, span_count, id_count, id_list + id_count,
-                                 id_limit - id_count);
-    if (part_count > 0) id_count += part_count;
-    part_count = token_encode_book(book, user_text, 1, id_list + id_count, id_limit - id_count);
-    if (part_count > 0) id_count += part_count;
+    wrote_count = token_encode_book(book, "model\n", 1, id_list + id_count, id_limit - id_count);
+    if (wrote_count > 0) id_count += wrote_count;
+    return id_count;
   }
-  return id_count;
+  /* No chat frame: the pieces on their own, and the first of them begins a
+   * chunk because nothing precedes it. */
+  wrote_count = token_body_parts(model, book, part_list, part_count, plain_text, span_list,
+                                 span_count, id_count, id_list + id_count, id_limit - id_count,
+                                 1);
+  if (wrote_count < 0) return -1;
+  return id_count + wrote_count;
+}
+
+int token_frame_media(const app_model *model, const char *user_text, app_media_span *span_list,
+                      int span_count, int32_t *id_list, int id_limit) {
+  if (!user_text) return -1;
+  return token_frame_inner(model, NULL, 0, user_text, span_list, span_count, id_list, id_limit);
+}
+
+int token_frame_parts(const app_model *model, const app_part *part_list, int part_count,
+                      app_media_span *span_list, int span_count, int32_t *id_list, int id_limit) {
+  if (!part_list || part_count < 0) return -1;
+  return token_frame_inner(model, part_list, part_count, NULL, span_list, span_count, id_list,
+                           id_limit);
 }
 
 int token_frame(const app_model *model, const char *user_text, int32_t *id_list, int id_limit) {
@@ -7672,6 +7844,29 @@ void session_reset(app_session *session) {
  *
  * `state_list` holds one embedding row per id and `state_flag` says which of
  * them a tower filled; both may be null, which is the text-only case. */
+/* Cache bytes one step reads at the fill the session is at.  Every layer scans
+ * its keys and then its values over whatever span its kind allows — the whole
+ * fill for a full-attention layer, the window for a sliding one — and a sharing
+ * layer scans the layer it shares from, so all of them are counted.  What is
+ * counted is the distinct bytes of the span: the heads of one group re-read the
+ * same key head, but a group's span is tens of kilobytes and stays in cache. */
+static size_t session_cache_bytes(const app_session *session) {
+  const model_form *form = &session->model->form;
+  int place_index = session->fill_count;
+  size_t total = 0;
+  int layer_index;
+  if (place_index < 0) return 0;
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    const layer_wing *wing = &session->model->wing_list[layer_index];
+    int span_count = place_index + 1;
+    if (wing->kind_mark == MODEL_KIND_SLIDE && span_count > form->slide_span)
+      span_count = form->slide_span;
+    total += (size_t)span_count * (size_t)wing->kv_count * (size_t)wing->head_size *
+             sizeof(float) * 2u;
+  }
+  return total;
+}
+
 app_code session_prime_media(app_session *session, const int32_t *id_list, int id_count,
                              const float *state_list, const uint8_t *state_flag) {
   double from_time;
@@ -7706,6 +7901,9 @@ const float *session_step_state(app_session *session, int32_t id_value, const fl
   uint8_t state_mark = state_data ? 1u : 0u;
   double from_time;
   if (!session) return NULL;
+  /* Counted before the clock starts, so the accounting is not in the timing it
+   * is there to divide. */
+  session->tally.serve_bytes += model_decode_bytes(session->model) + session_cache_bytes(session);
   from_time = time_now();
   logit_list = session_pass(session, &id_value, state_data, &state_mark, 1, 1);
   session->tally.serve_seconds += time_now() - from_time;

@@ -578,15 +578,43 @@ SEAM_PROMPT = "what is in this?"
 SEAM_TOP = 8
 
 # The cases that change which side of the join runs: no attachment at all, which
-# is the frame on its own, one of each, and both together in the order a content
-# list gives them.
-SEAM_PLAN = (("text only", 0, 0),
-             ("one image", 1, 0),
-             ("one clip", 0, 1),
-             ("image and clip", 1, 1))
+# is the frame on its own, one of each, both together in the order a content
+# list gives them, that order reversed, and more than one of a kind. The last
+# three are the front end's rather than the engine's — the substitution never
+# cared how many runs there were, and until 0.8.0 the command line did.
+SEAM_PLAN = (("text only", ()),
+             ("one image", ("image",)),
+             ("one clip", ("audio",)),
+             ("image and clip", ("image", "audio")),
+             ("clip and image", ("audio", "image")),
+             ("two images", ("image", "image")),
+             ("two images, a clip", ("image", "image", "audio")),
+             ("words, image, words", (("text", "look at"), "image",
+                                      ("text", "and say what it is"))),
+             ("image, words, image", ("image", ("text", "against"), "image")))
 
 
-def seam_engine(model_path, prompt, image_path, audio_path):
+def seam_runs(id_list, image_token, audio_token):
+    """The runs of placeholders in the ids, in the order they appear.
+
+    A prompt may carry several, so the count of an id is not the length of a
+    run: what is wanted is each run on its own, which is what the reference
+    substitutes one replacement string for.
+    """
+    run_list = []
+    run_kind, run_size = None, 0
+    for value in list(id_list) + [None]:
+        kind = "image" if value == image_token else ("audio" if value == audio_token else None)
+        if kind != run_kind:
+            if run_kind is not None:
+                run_list.append((run_kind, run_size))
+            run_kind, run_size = kind, 0
+        if kind is not None:
+            run_size += 1
+    return run_list
+
+
+def seam_engine(model_path, prompt, show_list):
     """Runs the engine over one prompt and its attachments."""
     import json
 
@@ -595,10 +623,8 @@ def seam_engine(model_path, prompt, image_path, audio_path):
     room = dict(os.environ, IGLLM_TRACE=trace_path)
     line = [engine_path(), "logits", "--model", model_path, "--prompt", prompt,
             "--serve", str(SEAM_TOP)]
-    if image_path:
-        line += ["--image", image_path]
-    if audio_path:
-        line += ["--audio", audio_path]
+    for kind_text, path_text in show_list:
+        line += ["--" + kind_text, path_text]
     done = subprocess.run(line, capture_output=True, text=True, env=room)
     if done.returncode != 0:
         raise RuntimeError("engine failed: %s" % done.stderr.strip())
@@ -609,7 +635,7 @@ def seam_engine(model_path, prompt, image_path, audio_path):
     return json.loads(done.stdout), found, trace_path
 
 
-def seam_reference_ids(processor, prompt, image_rows, audio_rows, mel_count):
+def seam_reference_ids(processor, prompt, show_list, run_list, mel_count):
     """The ids the reference lays down for the same turn.
 
     The counts are the engine's, because how long a run is and what surrounds it
@@ -622,22 +648,30 @@ def seam_reference_ids(processor, prompt, image_rows, audio_rows, mel_count):
     """
     import numpy
 
-    part_list = []
-    if image_rows > 0:
-        part_list.append({"type": "image"})
-    if audio_rows > 0:
-        part_list.append({"type": "audio"})
+    # The parts in the order the front end was given them, and the words the
+    # `--prompt` flag carries last, wherever on the line it was written.
+    part_list = [{"type": "text", "text": value_text} if kind_text == "text"
+                 else {"type": kind_text} for kind_text, value_text in show_list]
     part_list.append({"type": "text", "text": prompt})
     text = processor.tokenizer.apply_chat_template([{"role": "user", "content": part_list}],
                                                    tokenize=False, add_generation_prompt=True)
-    image_part = ([processor.replace_image_token({"num_soft_tokens_per_image": [image_rows]}, 0)]
-                  if image_rows > 0 else [])
-    # The reference reads the run's length off the feature mask, walking it
-    # through the two halvings of the subsampler, so it is handed the frames the
-    # engine says it made rather than a number.
-    audio_part = ([processor.replace_audio_token(
-        {"input_features_mask": [numpy.ones(mel_count, dtype=bool)]}, 0)]
-        if audio_rows > 0 else [])
+    image_part, audio_part = [], []
+    clip_count = len([kind_text for kind_text, _ in run_list if kind_text == "audio"])
+    for kind_text, row_count in run_list:
+        if kind_text == "image":
+            image_part.append(processor.replace_image_token(
+                {"num_soft_tokens_per_image": [row_count]}, 0))
+            continue
+        # The reference reads a run's length off the feature mask, walking it
+        # through the two halvings of the subsampler, so it is handed the frames
+        # the engine says it made rather than a number. With more than one clip
+        # in the prompt the dump holds one set of frames and cannot say which
+        # clip they came from, so those cases hand it a mask the subsampler
+        # halves down to the run instead, and the framing itself stays judged
+        # where it can be: the single clip cases, and `seam_reference_count`.
+        mask_size = mel_count if clip_count == 1 and mel_count else row_count * 4
+        audio_part.append(processor.replace_audio_token(
+            {"input_features_mask": [numpy.ones(mask_size, dtype=bool)]}, 0))
     full_list, _ = processor.get_text_with_replacements([text], image_part, [], audio_part)
     # The template writes the opening marker itself, as the shipped one does, so
     # the tokenizer must not add a second one.
@@ -887,8 +921,14 @@ def seam_graph_apart(model_path, trace_path, mine):
     return 0
 
 
-def diff_seam(model_path, image_path, audio_path, prompt, want_graph=True):
-    """Holds the join between the towers and the text stack to the reference."""
+def diff_seam(model_path, image_list, audio_list, prompt, want_graph=True):
+    """Holds the join between the towers and the text stack to the reference.
+
+    More than one picture or clip may be given. A case that wants more of a
+    kind than there are files repeats the last of them, which still walks the
+    right number of runs but cannot catch a length read once and used twice;
+    two files of different shapes can.
+    """
     import gc
 
     from transformers import AutoProcessor
@@ -904,17 +944,31 @@ def diff_seam(model_path, image_path, audio_path, prompt, want_graph=True):
     image_token = processor.image_token_id
     audio_token = processor.audio_token_id
     fail_count = 0
-    for title, want_image, want_audio in SEAM_PLAN:
-        if want_image and not image_path:
+    for title, kind_list in SEAM_PLAN:
+        if "image" in kind_list and not image_list:
             continue
-        if want_audio and not audio_path:
+        if "audio" in kind_list and not audio_list:
             continue
-        show_image = image_path if want_image else None
-        show_audio = audio_path if want_audio else None
-        mine, found, trace_path = seam_engine(model_path, prompt, show_image, show_audio)
+        show_list, seen_count = [], {"image": 0, "audio": 0}
+        for kind_text in kind_list:
+            # A pair is a stretch of the user's words, which the front end takes
+            # as `--text` and the template lays down where it stands.
+            if isinstance(kind_text, tuple):
+                show_list.append(kind_text)
+                continue
+            pool_list = image_list if kind_text == "image" else audio_list
+            show_list.append((kind_text, pool_list[min(seen_count[kind_text],
+                                                       len(pool_list) - 1)]))
+            seen_count[kind_text] += 1
+        media_show = [pair for pair in show_list if pair[0] != "text"]
+        mine, found, trace_path = seam_engine(model_path, prompt, show_list)
         id_list = mine["tokens"]
-        image_rows = id_list.count(image_token) if image_token is not None else 0
-        audio_rows = id_list.count(audio_token) if audio_token is not None else 0
+        # Each run on its own rather than a count of placeholder ids: a prompt
+        # with two pictures in it has two runs, and the reference substitutes a
+        # replacement string for each of them.
+        run_list = seam_runs(id_list, image_token, audio_token)
+        image_rows = sum(size for kind_text, size in run_list if kind_text == "image")
+        audio_rows = sum(size for kind_text, size in run_list if kind_text == "audio")
         mel_count = len(tower_seed_rows(found, "audio"))
         # The trace behind one picture is half a gigabyte, and the child is about
         # to read the same file for itself. Nothing here needs it beyond these
@@ -924,7 +978,7 @@ def diff_seam(model_path, image_path, audio_path, prompt, want_graph=True):
         wrote_audio = bool(tower_seed_rows(found, "audio"))
         del found
         gc.collect()
-        theirs = seam_reference_ids(processor, prompt, image_rows, audio_rows, mel_count)
+        theirs = seam_reference_ids(processor, prompt, show_list, run_list, mel_count)
 
         same_flag = list(id_list) == list(theirs)
         detail = "%d ids" % len(id_list)
@@ -937,24 +991,44 @@ def diff_seam(model_path, image_path, audio_path, prompt, want_graph=True):
                          theirs[place] if place < len(theirs) else "-"))
         fail_count += seam_report(title, "ids", same_flag, detail)
 
-        if want_image or want_audio:
-            image_want, audio_want = seam_reference_count(processor, show_image, show_audio)
-            if image_want is not None:
-                fail_count += seam_report("", "soft tokens", image_want == image_rows,
-                                          "the engine made %d rows for the picture, the "
-                                          "processor asks for %d" % (image_rows, image_want))
-            if audio_want is not None:
+        # One line per attachment, because a prompt that carries two pictures
+        # can lay the wrong number of rows down for the second of them and the
+        # total would still come out right.
+        if len(run_list) != len(media_show):
+            fail_count += seam_report("", "soft tokens", False,
+                                      "the engine laid down %d runs for %d attachments"
+                                      % (len(run_list), len(media_show)))
+        else:
+            for show_index, (kind_text, path_text) in enumerate(media_show):
+                row_count = run_list[show_index][1]
+                image_want, audio_want = seam_reference_count(
+                    processor, path_text if kind_text == "image" else None,
+                    path_text if kind_text == "audio" else None)
                 # This was reported rather than judged while the framing behind
-                # it was an open question. It is not one any more: the engine's
-                # frame count is the live count `input_features_mask` marks,
-                # held against the extractor across twenty-two clip lengths, so
-                # a disagreement here is a fault and is called one.
-                fail_count += seam_report("", "soft tokens", audio_want == audio_rows,
-                                          "the engine made %d rows for the clip, the "
-                                          "processor asks for %d" % (audio_rows, audio_want))
+                # the clip was an open question. It is not one any more: the
+                # engine's frame count is the live count `input_features_mask`
+                # marks, held against the extractor across twenty-two clip
+                # lengths, so a disagreement here is a fault and is called one.
+                want_count = image_want if kind_text == "image" else audio_want
+                if want_count is None:
+                    continue
+                fail_count += seam_report(
+                    "", "soft tokens", want_count == row_count,
+                    "the engine made %d rows for %s %d, the processor asks for %d"
+                    % (row_count, "picture" if kind_text == "image" else "clip",
+                       show_index + 1, want_count))
 
         try:
             if not want_graph or not same_flag:
+                continue
+            # The graph half is fed one picture and one clip, because the dump
+            # holds one set of rows per tower and cannot say which attachment
+            # they came from. A case with two of a kind is the layout's to judge
+            # and says so rather than running the reference against the wrong
+            # input.
+            if len(run_list) > len(set(kind_text for kind_text, _ in run_list)):
+                print("  %-16s %-14s skip  the dump cannot say which attachment its rows "
+                      "came from; the ids are the case" % ("", "logits"))
                 continue
             # The reference is fed the rows the engine says it read, so without
             # the activation dump there is nothing to feed it and the graph half
@@ -975,7 +1049,7 @@ def diff_seam_fake(work_path, seed_value):
 
     made = app_fake.whole_build(os.path.join(work_path, "whole"), seed_value)
     picture_path, sound_path = made["media"]
-    return diff_seam(made["plain"], picture_path, sound_path, SEAM_PROMPT, want_graph=True)
+    return diff_seam(made["plain"], [picture_path], [sound_path], SEAM_PROMPT, want_graph=True)
 
 
 # The axes that change which code path runs. Prompt lengths are chosen to
@@ -1004,8 +1078,10 @@ def main():
                         help="diff the vision and audio towers instead of the text stack")
     parser.add_argument("--seam", action="store_true",
                         help="diff the join between the towers and the text stack")
-    parser.add_argument("--image", help="the picture to show a vision tower")
-    parser.add_argument("--audio", help="the clip to play an audio tower")
+    parser.add_argument("--image", action="append",
+                        help="a picture to show a vision tower, repeatable")
+    parser.add_argument("--audio", action="append",
+                        help="a clip to play an audio tower, repeatable")
     parser.add_argument("--work", default=os.path.join(WORK_PATH, "fake"))
     parser.add_argument("--slack", type=float, default=0.0,
                         help="absolute tolerance, or 0 to measure the noise floor")
@@ -1043,7 +1119,8 @@ def main():
 
     if flag.media:
         if flag.model:
-            fail_count += diff_media_at(flag.model, flag.image, flag.audio)
+            fail_count += diff_media_at(flag.model, flag.image[0] if flag.image else None,
+                                        flag.audio[0] if flag.audio else None)
         else:
             fail_count += diff_media(flag.work, 7)
         print("\n%d checks failed" % fail_count)
@@ -1051,12 +1128,12 @@ def main():
 
     if flag.seam:
         if flag.model:
-            image_path = flag.image or os.path.join(flag.model, "picture.png")
-            audio_path = flag.audio or os.path.join(flag.model, "sound.wav")
+            image_list = flag.image or [os.path.join(flag.model, "picture.png")]
+            audio_list = flag.audio or [os.path.join(flag.model, "sound.wav")]
             print("checkpoint %s" % flag.model)
             fail_count += diff_seam(flag.model,
-                                    image_path if os.path.exists(image_path) else None,
-                                    audio_path if os.path.exists(audio_path) else None,
+                                    [path for path in image_list if os.path.exists(path)],
+                                    [path for path in audio_list if os.path.exists(path)],
                                     SEAM_PROMPT)
         else:
             fail_count += diff_seam_fake(flag.work, 7)

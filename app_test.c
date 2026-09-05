@@ -418,8 +418,37 @@ static void test_plane(void) {
     test_true(plane_bits_of(col_count, (col_count * bit_list[trial_index]) / 32, 0) ==
                   bit_list[trial_index],
               "plane_bits_of recovers the bit width");
+    /* What a product against this plane reads, counted from what the fixture
+     * allocated rather than from the function under test. */
+    {
+      int group_count = (col_count + 31) / 32;
+      size_t row_stride = (size_t)(((col_count * bit_list[trial_index] + 31) / 32) * 4);
+      size_t want_bytes = row_stride * (size_t)row_count +
+                          sizeof(float) * (size_t)row_count * (size_t)group_count +
+                          (kit.sheet.bias_data ? (size_t)row_count * (size_t)group_count : 0u);
+      test_true(plane_bytes(&kit.sheet) == want_bytes,
+                "plane_bytes counts the codes, the gains and the zero points");
+      test_true(plane_row_bytes(&kit.sheet) * (size_t)row_count == want_bytes,
+                "plane_row_bytes is one row of that");
+    }
     mem_free(row_list);
     test_plane_close(&kit);
+  }
+  {
+    /* A real plane is its own payload, and a plane that was never bound reads
+     * nothing at all — which is what a layer that shares another's keys has. */
+    plane real_sheet;
+    plane void_sheet;
+    memset(&real_sheet, 0, sizeof(real_sheet));
+    memset(&void_sheet, 0, sizeof(void_sheet));
+    real_sheet.form = PLANE_REAL;
+    real_sheet.row_count = 7;
+    real_sheet.col_count = 11;
+    real_sheet.real_type = STORE_BF16;
+    test_true(plane_bytes(&real_sheet) == 7u * 11u * 2u, "plane_bytes counts a real payload");
+    test_true(plane_row_bytes(&real_sheet) == 11u * 2u, "plane_row_bytes counts one real row");
+    test_true(plane_bytes(&void_sheet) == 0 && plane_row_bytes(&void_sheet) == 0,
+              "an unbound plane reads nothing");
   }
 }
 
@@ -1809,6 +1838,37 @@ static void test_wing(void) {
     test_true(model_load(test_yard_path, &setup, &model) == APP_OKAY,
               moe_flag ? "a mixture checkpoint loads" : "a dense checkpoint loads");
     if (!model) return;
+    /* What one step reads is a part of what the model holds, and for the
+     * mixture branch the part is nameable exactly: the router picks
+     * `expert_top` of the bank, so raising that to the whole bank has to move
+     * the figure by precisely the experts that were being left out.  Counting
+     * the bank whole, or counting none of it, both fail this. */
+    {
+      size_t read_bytes = model_decode_bytes(model);
+      test_true(read_bytes > 0, "a decode step reads weights");
+      test_true(read_bytes < model_memory_bytes(model),
+                "a decode step reads less than the model holds");
+      if (moe_flag) {
+        size_t rest_bytes = 0, wide_bytes;
+        int keep_top = model->form.expert_top;
+        int layer_index, expert_index;
+        test_true(keep_top < model->form.expert_count,
+                  "the fixture holds more experts than a step picks");
+        for (layer_index = 0; layer_index < model->form.layer_count; ++layer_index) {
+          const layer_wing *wing = &model->wing_list[layer_index];
+          for (expert_index = keep_top; expert_index < model->form.expert_count; ++expert_index)
+            rest_bytes += plane_bytes(&wing->expert_rise_list[expert_index]) +
+                          plane_bytes(&wing->expert_drop_list[expert_index]);
+        }
+        model->form.expert_top = model->form.expert_count;
+        wide_bytes = model_decode_bytes(model);
+        model->form.expert_top = keep_top; /* the session below routes with it */
+        test_true(rest_bytes > 0, "the bank holds experts a step does not read");
+        test_true(wide_bytes - read_bytes == rest_bytes,
+                  "only the experts the router picks are in the read");
+      }
+    }
+
     test_true(session_open(model, &thin_session) == APP_OKAY, "a session opens");
     test_true(session_open(model, &wide_session) == APP_OKAY, "a second session opens");
     if (!thin_session || !wide_session) { model_free(model); return; }
@@ -2421,6 +2481,97 @@ static void test_tower(void) {
               "the words follow the run marked as a fresh chunk, and the turn closes");
   }
 
+  /* -- several runs, in the order the caller gave them ------------------ */
+  {
+    /* A prompt can carry more than one picture or clip, and the order is the
+     * caller's rather than a picture and then a clip.  A tower that produced
+     * nothing keeps its place in the list, so an index into the spans stays an
+     * index into the attachments they came from. */
+    app_media_span span_list[4];
+    int32_t id_list[64];
+    int id_count, slot_index;
+    for (slot_index = 0; slot_index < 4; ++slot_index) span_list[slot_index].place_from = -1;
+    span_list[0].kind_mark = APP_MEDIA_AUDIO;
+    span_list[0].row_count = 2;
+    span_list[1].kind_mark = APP_MEDIA_IMAGE;
+    span_list[1].row_count = 3;
+    span_list[2].kind_mark = APP_MEDIA_IMAGE;
+    span_list[2].row_count = 0;
+    span_list[3].kind_mark = APP_MEDIA_IMAGE;
+    span_list[3].row_count = 1;
+    id_count = token_media_run(model, span_list, 4, 0, id_list, 64);
+    test_true(id_count == 4 + 5 + 3, "an empty span costs no ids and the others keep their runs");
+    test_true(id_list[0] == 22 && id_list[3] == 23 && id_list[4] == 20 && id_list[8] == 21,
+              "the clip leads because that is where the caller put it");
+    test_true(span_list[0].place_from == 1 && span_list[1].place_from == 5 &&
+                  span_list[2].place_from == -1 && span_list[3].place_from == 10,
+              "every run is reported where its rows go, and the empty one is not reported");
+    test_true(id_list[9] == 20 && id_list[10] == 5 && id_list[11] == 21,
+              "the second picture is bracketed like the first");
+  }
+
+  /* -- the pieces in the caller's order --------------------------------- */
+  {
+    /* A content list is an order, not a picture followed by words, and the
+     * frame builder takes one. The old call is the same list with every span
+     * first, so it has to write the same ids. */
+    app_media_span span_list[1];
+    app_part part_list[3];
+    int32_t plain_list[64], part_list_ids[64], word_list[16];
+    int plain_count, part_ids_count, word_count, lead_place, place_from, index;
+    int same_flag = 1;
+
+    span_list[0].kind_mark = APP_MEDIA_IMAGE;
+    span_list[0].row_count = 3;
+    span_list[0].place_from = -1;
+    plain_count = token_frame_media(model, "and say", span_list, 1, plain_list, 64);
+    lead_place = span_list[0].place_from;
+
+    part_list[0].kind_mark = APP_PART_MEDIA;
+    part_list[0].text_ref = NULL;
+    part_list[0].span_index = 0;
+    part_list[1].kind_mark = APP_PART_TEXT;
+    part_list[1].text_ref = "and say";
+    part_list[1].span_index = -1;
+    span_list[0].place_from = -1;
+    part_ids_count = token_frame_parts(model, part_list, 2, span_list, 1, part_list_ids, 64);
+    if (part_ids_count != plain_count) same_flag = 0;
+    for (index = 0; index < plain_count && index < part_ids_count; ++index)
+      if (plain_list[index] != part_list_ids[index]) same_flag = 0;
+    test_true(same_flag && span_list[0].place_from == lead_place,
+              "the span first and the words last is what the older call already wrote");
+
+    /* Words, the picture, more words. The frame's opening is unchanged, so the
+     * first words stand exactly where the opener stood before them, and the run
+     * begins that much further in. */
+    part_list[0].kind_mark = APP_PART_TEXT;
+    part_list[0].text_ref = "look at";
+    part_list[0].span_index = -1;
+    part_list[1].kind_mark = APP_PART_MEDIA;
+    part_list[1].text_ref = NULL;
+    part_list[1].span_index = 0;
+    part_list[2].kind_mark = APP_PART_TEXT;
+    part_list[2].text_ref = "and say";
+    part_list[2].span_index = -1;
+    span_list[0].place_from = -1;
+    part_ids_count = token_frame_parts(model, part_list, 3, span_list, 1, part_list_ids, 64);
+    place_from = span_list[0].place_from;
+    /* The words before the run continue the line the role marker opened, which
+     * is what the older call's trailing words did not do. */
+    word_count = token_encode(model, "look at", 0, word_list, 16);
+    same_flag = word_count > 0 && place_from == lead_place + word_count;
+    for (index = 0; index < word_count; ++index)
+      if (part_list_ids[lead_place - 1 + index] != word_list[index]) same_flag = 0;
+    test_true(same_flag, "the words in front of a picture stand where the opener stood");
+    test_true(part_list_ids[place_from - 1] == 20 && part_list_ids[place_from] == 5 &&
+                  part_list_ids[place_from + 3] == 21,
+              "the run is bracketed where the caller asked for it, not at the front");
+    test_true(part_ids_count == plain_count + word_count,
+              "words on both sides cost the words and nothing else");
+    test_true(token_frame_parts(model, part_list, 3, span_list, 0, part_list_ids, 64) < 0,
+              "a part naming a span that is not there is refused");
+  }
+
   /* -- the substitution ----------------------------------------------- */
   {
     int32_t id_list[8];
@@ -2652,6 +2803,19 @@ static void test_shot(void) {
    * longer clip is cut to: 750 soft tokens of 40 milliseconds, half a minute. */
   test_true(model_audio_rows(model) == 750 && model_audio_span_ms(model) == 40,
             "the shipped export allows a clip of thirty seconds");
+
+  /* What is resident and what a token reads, both recorded.  The second is
+   * under a third of the first on this export, and the reason is external to
+   * the engine: the per-layer embedding table alone is 1120 MiB of the file and
+   * a step reads one row of it.  A build that swept it would land above that
+   * figure on its own, so the bound below fails long before the exact totals
+   * would need to be re-recorded for an export of another shape. */
+  test_true(model_memory_bytes(model) == 2448245376u, "the shipped export is the size recorded");
+  test_true(model_decode_bytes(model) == 796326800u, "a token reads what was recorded");
+  test_true(model_decode_bytes(model) < 1120u * 1024u * 1024u,
+            "a token reads less than the per-layer embedding table alone");
+  test_true(model_decode_bytes(model) * 3u < model_memory_bytes(model),
+            "a token reads under a third of what the export holds");
 
   for (case_index = 0; case_index < 3; ++case_index) {
     const test_shot_case *shot = &shot_case_list[case_index];

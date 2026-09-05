@@ -4,12 +4,34 @@
 
 #define MAIN_PROMPT_LIMIT 16384
 
+#define MAIN_MEDIA_LIMIT 8
+
+/* One piece of the turn, kept where the command line put it.  The order the
+ * flags are given is the order the pieces are laid down in, which is what a
+ * content list means by order; before this the picture always led because there
+ * could only be one of each, and the words always came last because there was
+ * no way to say otherwise.
+ *
+ * `--prompt` still means the words after the attachments, wherever it is
+ * written, so every invocation that worked before works the same way. `--text`
+ * is the one that takes its place in the order. */
+#define MAIN_SHOW_IMAGE APP_MEDIA_IMAGE
+#define MAIN_SHOW_AUDIO APP_MEDIA_AUDIO
+#define MAIN_SHOW_TEXT  2
+
+typedef struct main_show {
+  const char *path_text; /* the file, or the words when this is a text piece */
+  int         kind_mark; /* MAIN_SHOW_IMAGE, MAIN_SHOW_AUDIO or MAIN_SHOW_TEXT */
+} main_show;
+
 typedef struct main_flag {
   const char *task_text;
   const char *model_path;
   const char *prompt_text;
-  const char *image_path;
-  const char *audio_path;
+  main_show   show_list[MAIN_MEDIA_LIMIT];
+  int         show_count;
+  int         text_count;   /* how many of those are words */
+  int         prompt_flag;  /* --prompt was given rather than defaulted */
   int         serve_limit;
   int         thread_count;
   int         window_limit;
@@ -76,8 +98,9 @@ static void main_usage(void) {
   printf("options:\n");
   printf("  --model <folder>    checkpoint folder in huggingface layout\n");
   printf("  --prompt <text>     prompt text, defaults to a short greeting\n");
-  printf("  --image <path>      a png, pnm or bmp shown before the prompt\n");
-  printf("  --audio <path>      a riff wave played before the prompt\n");
+  printf("  --text <text>       words in the order the flags give them, repeatable\n");
+  printf("  --image <path>      a png, pnm or bmp shown before the prompt, repeatable\n");
+  printf("  --audio <path>      a riff wave played before the prompt, repeatable\n");
   printf("  --serve <count>     tokens to produce, default 128\n");
   printf("  --threads <count>   worker threads, default host count\n");
   printf("  --window <count>    context length cap\n");
@@ -103,9 +126,23 @@ static int main_flags(int argc, char **argv, main_flag *flag_out) {
     const char *name_text = argv[argument_index];
     const char *value_text = argument_index + 1 < argc ? argv[argument_index + 1] : NULL;
     if (strcmp(name_text, "--model") == 0 && value_text) flag_out->model_path = argv[++argument_index];
-    else if (strcmp(name_text, "--prompt") == 0 && value_text) flag_out->prompt_text = argv[++argument_index];
-    else if (strcmp(name_text, "--image") == 0 && value_text) flag_out->image_path = argv[++argument_index];
-    else if (strcmp(name_text, "--audio") == 0 && value_text) flag_out->audio_path = argv[++argument_index];
+    else if (strcmp(name_text, "--prompt") == 0 && value_text) {
+      flag_out->prompt_text = argv[++argument_index];
+      flag_out->prompt_flag = 1;
+    }
+    else if ((strcmp(name_text, "--image") == 0 || strcmp(name_text, "--audio") == 0 ||
+              strcmp(name_text, "--text") == 0) && value_text) {
+      if (flag_out->show_count >= MAIN_MEDIA_LIMIT) {
+        fprintf(stderr, "prompt: at most %d pieces in one turn\n", MAIN_MEDIA_LIMIT);
+        return -1;
+      }
+      flag_out->show_list[flag_out->show_count].kind_mark =
+          name_text[2] == 'i' ? MAIN_SHOW_IMAGE
+                              : (name_text[2] == 'a' ? MAIN_SHOW_AUDIO : MAIN_SHOW_TEXT);
+      if (flag_out->show_list[flag_out->show_count].kind_mark == MAIN_SHOW_TEXT)
+        ++flag_out->text_count;
+      flag_out->show_list[flag_out->show_count++].path_text = argv[++argument_index];
+    }
     else if (strcmp(name_text, "--serve") == 0 && value_text) flag_out->serve_limit = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--threads") == 0 && value_text) flag_out->thread_count = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--window") == 0 && value_text) flag_out->window_limit = atoi(argv[++argument_index]);
@@ -129,42 +166,39 @@ static int main_flags(int argc, char **argv, main_flag *flag_out) {
  * ids each of them wants.  A tower the checkpoint does not carry, or a file it
  * cannot read, is a failure rather than a silently dropped attachment: a prompt
  * that quietly lost its picture would answer the wrong question. */
-static int main_media_load(app_model *model, const main_flag *flag, app_media *image_out,
-                           app_media *audio_out) {
-  app_code code;
-  memset(image_out, 0, sizeof(*image_out));
-  memset(audio_out, 0, sizeof(*audio_out));
-  if (flag->image_path) {
-    if (model_image_token(model) < 0) {
-      fprintf(stderr, "image: this checkpoint has no image placeholder token\n");
-      return 0;
+static int main_media_load(app_model *model, const main_flag *flag, app_media *media_list) {
+  int show_index;
+  for (show_index = 0; show_index < MAIN_MEDIA_LIMIT; ++show_index)
+    memset(&media_list[show_index], 0, sizeof(media_list[show_index]));
+  for (show_index = 0; show_index < flag->show_count; ++show_index) {
+    const main_show *show = &flag->show_list[show_index];
+    int audio_flag = show->kind_mark == MAIN_SHOW_AUDIO;
+    const char *kind_text = audio_flag ? "audio" : "image";
+    app_code code;
+    if (show->kind_mark == MAIN_SHOW_TEXT) continue; /* words open no file */
+    if ((audio_flag ? model_audio_token(model) : model_image_token(model)) < 0) {
+      fprintf(stderr, "%s: this checkpoint has no %s placeholder token\n", kind_text, kind_text);
+      break;
     }
-    code = media_image(model, flag->image_path, image_out);
+    code = audio_flag ? media_audio(model, show->path_text, &media_list[show_index])
+                      : media_image(model, show->path_text, &media_list[show_index]);
     if (code != APP_OKAY) {
-      fprintf(stderr, "image: %s (%s)\n", app_code_text(code), flag->image_path);
-      return 0;
-    }
-  }
-  if (flag->audio_path) {
-    if (model_audio_token(model) < 0) {
-      fprintf(stderr, "audio: this checkpoint has no audio placeholder token\n");
-      media_free(image_out);
-      return 0;
-    }
-    code = media_audio(model, flag->audio_path, audio_out);
-    if (code != APP_OKAY) {
-      fprintf(stderr, "audio: %s (%s)\n", app_code_text(code), flag->audio_path);
-      media_free(image_out);
-      return 0;
+      fprintf(stderr, "%s: %s (%s)\n", kind_text, app_code_text(code), show->path_text);
+      break;
     }
     /* A clip past the processor's budget is cut to it, which is what the
      * reference does with one.  Saying so is the difference between an answer
-     * about the whole clip and an answer about its first half. */
-    if (audio_out->cut_flag)
-      fprintf(stderr, "audio: the clip runs past the budget of %d s and is cut to it\n",
-              (model_audio_rows(model) * model_audio_span_ms(model) + 999) / 1000);
+     * about the whole clip and an answer about its first half, and with more
+     * than one clip in a prompt the line has to say which of them was cut. */
+    if (audio_flag && media_list[show_index].cut_flag)
+      fprintf(stderr, "audio: the clip runs past the budget of %d s and is cut to it (%s)\n",
+              (model_audio_rows(model) * model_audio_span_ms(model) + 999) / 1000,
+              show->path_text);
   }
-  return 1;
+  if (show_index >= flag->show_count) return 1;
+  /* Whatever loaded before the failure is the caller's to lose, not to leak. */
+  while (show_index-- > 0) media_free(&media_list[show_index]);
+  return 0;
 }
 
 /* `logits` frames the same turn `chat` would, because what it reports is the
@@ -175,55 +209,69 @@ static int main_media_load(app_model *model, const main_flag *flag, app_media *i
  * way the processor brackets it, and the rows the towers produced are laid down
  * on the placeholders inside that bracket. */
 static int main_reel_build(app_model *model, const main_flag *flag, main_reel *reel) {
-  app_media image_media, audio_media;
-  app_media_span span_list[2];
-  int span_count = 0;
-  int image_span = -1, audio_span = -1;
+  app_media media_list[MAIN_MEDIA_LIMIT];
+  app_media_span span_list[MAIN_MEDIA_LIMIT];
+  app_part part_list[MAIN_MEDIA_LIMIT + 1];
+  int span_count = flag->show_count;
+  int span_index, part_count = 0;
   int frame_flag = (strcmp(flag->task_text, "chat") == 0 ||
                     strcmp(flag->task_text, "logits") == 0) && !flag->raw_flag;
 
   if (!main_reel_open(reel, model_state_size(model))) return 0;
-  if (!main_media_load(model, flag, &image_media, &audio_media)) {
+  if (!main_media_load(model, flag, media_list)) {
     main_reel_free(reel);
     return 0;
   }
-  /* One span per attachment, in the order a content list puts them: the
-   * picture, then the clip, then the words. */
-  if (image_media.row_count > 0) {
-    span_list[span_count].kind_mark = APP_MEDIA_IMAGE;
-    span_list[span_count].row_count = image_media.row_count;
-    span_list[span_count].place_from = -1;
-    image_span = span_count++;
+  /* One span per attachment, in the order the command line gave them, which is
+   * the order a content list puts them in.  A tower that produced no rows keeps
+   * its place rather than being dropped, and so does a piece that is words, so
+   * a span index stays an attachment index and every run gets its own rows
+   * back. */
+  for (span_index = 0; span_index < span_count; ++span_index) {
+    int text_flag = flag->show_list[span_index].kind_mark == MAIN_SHOW_TEXT;
+    span_list[span_index].kind_mark = text_flag ? MAIN_SHOW_IMAGE
+                                                : flag->show_list[span_index].kind_mark;
+    span_list[span_index].row_count = text_flag ? 0 : media_list[span_index].row_count;
+    span_list[span_index].place_from = -1;
+    part_list[part_count].kind_mark = text_flag ? APP_PART_TEXT : APP_PART_MEDIA;
+    part_list[part_count].text_ref = text_flag ? flag->show_list[span_index].path_text : NULL;
+    part_list[part_count].span_index = text_flag ? -1 : span_index;
+    ++part_count;
   }
-  if (audio_media.row_count > 0) {
-    span_list[span_count].kind_mark = APP_MEDIA_AUDIO;
-    span_list[span_count].row_count = audio_media.row_count;
-    span_list[span_count].place_from = -1;
-    audio_span = span_count++;
+  /* `--prompt` is the words after the attachments, wherever on the line it was
+   * written, so every invocation that predates `--text` lays down what it always
+   * did.  The greeting it defaults to stands in only when nothing else spoke. */
+  if (flag->prompt_flag || flag->text_count == 0) {
+    part_list[part_count].kind_mark = APP_PART_TEXT;
+    part_list[part_count].text_ref = flag->prompt_text;
+    part_list[part_count].span_index = -1;
+    ++part_count;
   }
 
   if (frame_flag) {
-    reel->id_count = token_frame_media(model, flag->prompt_text, span_list, span_count,
+    reel->id_count = token_frame_parts(model, part_list, part_count, span_list, span_count,
                                        reel->id_list, MAIN_PROMPT_LIMIT);
   } else {
     int id_count = 0;
     int start_id = token_start_id(model);
-    int part_count;
+    int part_index;
     if (start_id >= 0) id_count = 1, reel->id_list[0] = (int32_t)start_id;
-    part_count = token_media_run(model, span_list, span_count, id_count, reel->id_list + id_count,
-                                 MAIN_PROMPT_LIMIT - id_count);
-    if (part_count > 0) id_count += part_count;
-    part_count = token_encode(model, flag->prompt_text, 1, reel->id_list + id_count,
-                              MAIN_PROMPT_LIMIT - id_count);
-    if (part_count > 0) id_count += part_count;
+    for (part_index = 0; part_index < part_count; ++part_index) {
+      const app_part *part = &part_list[part_index];
+      int wrote_count = part->kind_mark == APP_PART_MEDIA
+                            ? token_media_run(model, span_list + part->span_index, 1, id_count,
+                                              reel->id_list + id_count,
+                                              MAIN_PROMPT_LIMIT - id_count)
+                            : token_encode(model, part->text_ref, 1, reel->id_list + id_count,
+                                           MAIN_PROMPT_LIMIT - id_count);
+      if (wrote_count > 0) id_count += wrote_count;
+    }
     reel->id_count = id_count;
   }
-  if (image_span >= 0 && span_list[image_span].place_from >= 0)
-    main_reel_lay(reel, span_list[image_span].place_from, &image_media);
-  if (audio_span >= 0 && span_list[audio_span].place_from >= 0)
-    main_reel_lay(reel, span_list[audio_span].place_from, &audio_media);
-  media_free(&image_media);
-  media_free(&audio_media);
+  for (span_index = 0; span_index < span_count; ++span_index)
+    if (span_list[span_index].place_from >= 0)
+      main_reel_lay(reel, span_list[span_index].place_from, &media_list[span_index]);
+  for (span_index = 0; span_index < span_count; ++span_index) media_free(&media_list[span_index]);
   if (reel->id_count < 1) {
     fprintf(stderr, "prompt: empty\n");
     main_reel_free(reel);
@@ -287,9 +335,24 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
     app_tally tally = session_tally(session);
     double prime_rate = tally.prime_seconds > 0.0 ? (double)tally.prime_tokens / tally.prime_seconds : 0.0;
     double serve_rate = tally.serve_seconds > 0.0 ? (double)tally.serve_tokens / tally.serve_seconds : 0.0;
+    double read_rate =
+        tally.serve_seconds > 0.0
+            ? (double)tally.serve_bytes / tally.serve_seconds / (1024.0 * 1024.0 * 1024.0)
+            : 0.0;
+    double read_each = tally.serve_tokens > 0
+                           ? (double)tally.serve_bytes / (double)tally.serve_tokens /
+                                 (1024.0 * 1024.0)
+                           : 0.0;
     fprintf(stderr, "prefill %.2f tok/s over %zu tokens\n", prime_rate, tally.prime_tokens);
     fprintf(stderr, "decode  %.2f tok/s over %zu tokens\n", serve_rate, tally.serve_tokens);
-    fprintf(stderr, "memory  %.1f MiB\n", (double)tally.memory_bytes / (1024.0 * 1024.0));
+    /* The weights and cache the decode steps actually read, and the rate that
+     * comes to.  Dividing the resident total by the same seconds would name a
+     * bandwidth the run never asked the machine for. */
+    fprintf(stderr, "reads   %.1f MiB a token, %.2f GiB/s\n", read_each, read_rate);
+    fprintf(stderr, "weights %.1f MiB mapped\n",
+            (double)model_memory_bytes(model) / (1024.0 * 1024.0));
+    fprintf(stderr, "memory  %.1f MiB allocated\n",
+            (double)tally.memory_bytes / (1024.0 * 1024.0));
   }
   main_reel_free(&reel);
   session_close(session);
@@ -406,7 +469,10 @@ static int main_probe(app_model *model) {
            model_audio_token(model));
   else if (model_audio_ready(model))
     printf("  rows   no budget recorded, placeholder id %d\n", model_audio_token(model));
-  printf("weights  %.1f MiB\n", (double)model_memory_bytes(model) / (1024.0 * 1024.0));
+  printf("weights  %.1f MiB mapped\n", (double)model_memory_bytes(model) / (1024.0 * 1024.0));
+  /* What a token costs is not what the file weighs: the embedding tables are
+   * read a row at a time and the towers are not in the token loop at all. */
+  printf("decode   %.1f MiB a token\n", (double)model_decode_bytes(model) / (1024.0 * 1024.0));
   return 0;
 }
 
