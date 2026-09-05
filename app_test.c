@@ -70,7 +70,9 @@ static void test_yard_open(void) {
 static void test_yard_close(void) {
   /* Fixture names are known, so the folder is emptied by hand. */
   static const char *leaf_list[] = {"config.json", "tokenizer.json", "model.safetensors",
-                                    "shape.json", NULL};
+                                    "shape.json", "image.png",  "image.pnm",
+                                    "image.bmp",  "image.bad",  "clip.wav",
+                                    "preprocessor_config.json", NULL};
   int leaf_index;
   char path_text[1024];
   for (leaf_index = 0; leaf_list[leaf_index]; ++leaf_index) {
@@ -959,6 +961,510 @@ static void test_token(void) {
 }
 
 /* ======================================================================== */
+/* 7. media layer                                                           */
+/* ======================================================================== */
+
+/* The content of the two fixtures below is produced by a formula the test can
+ * evaluate for itself, and the bytes were written by an encoder that shares no
+ * code with the reader.  That is the point: a recorded output only shows that
+ * nothing has changed, while a formula plus a foreign encoder shows that the
+ * reader is right. */
+
+/* 400 bytes of `((i*i*7 + i*13) >> 3) & 0x1F`, deflated by an independent
+ * compressor into a dynamic Huffman block. */
+static const unsigned char test_puff_data[] = {
+    0x78, 0xDA, 0xCD, 0x8F, 0xC7, 0x11, 0xC4, 0x20, 0x00, 0x03, 0x4D, 0x36, 0xD9, 0x64, 0x93,
+    0xFB, 0xEF, 0xF2, 0x4C, 0x17, 0xF7, 0xDD, 0x19, 0x69, 0xA5, 0x0B, 0x52, 0x15, 0x17, 0xCF,
+    0x24, 0xB1, 0xEE, 0x38, 0x9C, 0xED, 0x7D, 0xDB, 0xC2, 0x32, 0x6E, 0x59, 0x79, 0xB7, 0xB8,
+    0x47, 0x23, 0xEE, 0x5B, 0x68, 0x5F, 0x81, 0x2C, 0x24, 0xD1, 0x6A, 0xF0, 0xC8, 0xFE, 0xB1,
+    0x4F, 0x28, 0x93, 0xD8, 0x7E, 0x97, 0xBB, 0x1D, 0xE2, 0x8C, 0xD6, 0x36, 0x54, 0x20, 0x12,
+    0x7C, 0x2E, 0x4F, 0x47, 0x50, 0x0C, 0x01, 0x80, 0x98, 0x0A, 0x83, 0xFA, 0xEB, 0x81, 0x49,
+    0x80, 0x1A, 0xAC, 0xD6, 0xC6, 0xE5, 0x81, 0x4D, 0xFB, 0x62, 0xDD, 0x92, 0x59, 0xC2, 0x57,
+    0xE4, 0x0F, 0xA9, 0x34, 0x91, 0x22, 0x41, 0xF5, 0xFA, 0xD8, 0x4C, 0xEC, 0xD8, 0x76, 0x5E,
+    0xE5, 0x8E, 0x12, 0xAF, 0xB3, 0x68, 0x42, 0xEE, 0x3A, 0x4B, 0x24, 0xF3, 0x15, 0x15, 0x85,
+    0xD7, 0xBE, 0x10, 0xD3, 0x69, 0xCB, 0x97, 0xBD, 0xE2, 0x10, 0xB0, 0xE6, 0xDC, 0x88, 0xBB,
+    0x46, 0x8E, 0x2D, 0x2B, 0x34, 0x4A, 0x70, 0x2E, 0x94, 0x81, 0x54, 0x3E, 0x8B, 0x48, 0x73,
+    0x1C, 0xED, 0x39, 0x17, 0x38, 0x6F, 0xC5, 0x17, 0x93, 0x3B, 0x69, 0x86, 0xBE, 0xA2, 0x3F,
+    0xFB, 0xFF, 0x03, 0xE2, 0xD2, 0x18, 0x0B,
+};
+
+/* A 12x8 eight bit RGB png whose pixel (x,y) is
+ * (x*17 + y*5, x*3 + y*29, x*x + y*y) modulo 256, written by an independent
+ * encoder with the five line filters used in turn so that undoing each of
+ * them is exercised. */
+static const unsigned char test_png_data[] = {
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+    0x52, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x42,
+    0x86, 0x89, 0xA6, 0x00, 0x00, 0x00, 0xBD, 0x49, 0x44, 0x41, 0x54, 0x78, 0xDA, 0x63, 0x60,
+    0x60, 0x60, 0x10, 0x64, 0x66, 0x54, 0x62, 0x63, 0x31, 0xE6, 0xE4, 0x74, 0xE1, 0x11, 0x08,
+    0xE5, 0x97, 0x4C, 0x13, 0x52, 0x29, 0x17, 0x35, 0xEC, 0x90, 0x70, 0x98, 0x29, 0x1D, 0xB8,
+    0x4A, 0x2E, 0x65, 0xB7, 0x62, 0x25, 0x23, 0xAB, 0x2C, 0x23, 0x50, 0x91, 0x20, 0x33, 0xB3,
+    0x20, 0x33, 0xAB, 0x20, 0x33, 0xBB, 0x20, 0x33, 0xA7, 0x20, 0x33, 0xB7, 0x20, 0x33, 0xAF,
+    0x20, 0x33, 0xBF, 0x20, 0xB3, 0xA0, 0x20, 0xB3, 0xB0, 0x20, 0xB3, 0x28, 0x13, 0xAB, 0x2C,
+    0x33, 0x41, 0xC4, 0xCC, 0x65, 0xC5, 0xCE, 0x2D, 0xC0, 0xCC, 0x2D, 0xC0, 0xC2, 0x2D, 0xC0,
+    0xCA, 0x2D, 0xC0, 0xC6, 0x2D, 0x00, 0xE4, 0x72, 0x70, 0x0B, 0x70, 0x72, 0x0B, 0x70, 0x71,
+    0x0B, 0x70, 0x73, 0x0B, 0xF0, 0x70, 0x0B, 0xF0, 0xB2, 0xB0, 0xCA, 0xB2, 0xB3, 0x32, 0x33,
+    0xB2, 0x32, 0x33, 0xB3, 0x32, 0xB3, 0xB2, 0x32, 0xB3, 0x63, 0x45, 0x0C, 0x92, 0x13, 0x25,
+    0xB5, 0xA6, 0x48, 0x59, 0x4F, 0x97, 0xF5, 0x99, 0xA5, 0x14, 0x3B, 0x57, 0x33, 0x6F, 0x81,
+    0x51, 0xFD, 0x62, 0xDB, 0x09, 0xCB, 0xBC, 0x16, 0xAE, 0x8C, 0xDC, 0xB4, 0x26, 0xEB, 0xF0,
+    0xFA, 0xDA, 0x2B, 0x9B, 0x26, 0x31, 0xCA, 0xAD, 0x53, 0x21, 0xC6, 0xE1, 0xBC, 0x04, 0x11,
+    0x00, 0x45, 0x1C, 0x21, 0xB1, 0x62, 0xA3, 0x76, 0xD4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+};
+
+static void test_puff(void) {
+  uint8_t *plain_room;
+  uint8_t stored_data[64];
+  uint8_t stored_out[32];
+  long wrote_count;
+  int slot_index, okay_flag = 1;
+  test_open("puff");
+
+  /* A stored block, assembled here rather than by a compressor: the zlib
+   * header, one final uncompressed block, its length and the complement. */
+  stored_data[0] = 0x78;
+  stored_data[1] = 0x01;
+  stored_data[2] = 0x01; /* final, stored */
+  stored_data[3] = 5;
+  stored_data[4] = 0;
+  stored_data[5] = (uint8_t)~5;
+  stored_data[6] = 0xFF;
+  for (slot_index = 0; slot_index < 5; ++slot_index)
+    stored_data[7 + slot_index] = (uint8_t)('a' + slot_index);
+  wrote_count = puff_run(stored_data, 12, stored_out, sizeof(stored_out));
+  test_true(wrote_count == 5, "a stored block inflates to its own length");
+  test_true(wrote_count == 5 && memcmp(stored_out, "abcde", 5) == 0,
+            "a stored block inflates to its own bytes");
+
+  plain_room = (uint8_t *)mem_clear(512);
+  if (!plain_room) { test_true(0, "the inflate room is allocated"); return; }
+  wrote_count = puff_run(test_puff_data, sizeof(test_puff_data), plain_room, 512);
+  test_true(wrote_count == 400, "a dynamic Huffman block inflates to the right length");
+  for (slot_index = 0; slot_index < 400 && wrote_count == 400; ++slot_index)
+    if (plain_room[slot_index] !=
+        (uint8_t)((((slot_index * slot_index * 7) + slot_index * 13) >> 3) & 0x1F))
+      okay_flag = 0;
+  test_true(okay_flag, "a dynamic Huffman block inflates to the right bytes");
+
+  /* A stream that stops in the middle has to be refused rather than returning
+   * whatever it managed, because the caller sizes its buffer from the header
+   * and would read the rest as image data. */
+  test_true(puff_run(test_puff_data, sizeof(test_puff_data) / 2, plain_room, 512) < 0,
+            "a truncated stream is refused");
+  test_true(puff_run(test_puff_data, sizeof(test_puff_data), plain_room, 16) < 0,
+            "a stream that overruns its room is refused");
+  mem_free(plain_room);
+}
+
+static int test_image_png_want(int wide_index, int high_index, int band_index) {
+  switch (band_index) {
+    case 0: return (wide_index * 17 + high_index * 5) & 0xFF;
+    case 1: return (wide_index * 3 + high_index * 29) & 0xFF;
+    default: return (wide_index * wide_index + high_index * high_index) & 0xFF;
+  }
+}
+
+/* A binary portable pixmap and a bottom-up 24 bit bitmap of the same picture,
+ * so that the three readers can be held to one answer. */
+static int test_image_pnm_write(int wide_count, int high_count) {
+  uint8_t *file_data;
+  size_t head_size, file_size;
+  char head_text[64];
+  int high_index, wide_index, band_index, okay_flag;
+  snprintf(head_text, sizeof(head_text), "P6\n# a comment\n%d %d\n255\n", wide_count, high_count);
+  head_size = strlen(head_text);
+  file_size = head_size + (size_t)wide_count * (size_t)high_count * 3u;
+  file_data = (uint8_t *)mem_clear(file_size);
+  if (!file_data) return 0;
+  memcpy(file_data, head_text, head_size);
+  for (high_index = 0; high_index < high_count; ++high_index)
+    for (wide_index = 0; wide_index < wide_count; ++wide_index)
+      for (band_index = 0; band_index < 3; ++band_index)
+        file_data[head_size +
+                  ((size_t)high_index * (size_t)wide_count + (size_t)wide_index) * 3u +
+                  (size_t)band_index] =
+            (uint8_t)test_image_png_want(wide_index, high_index, band_index);
+  okay_flag = test_file_write("image.pnm", file_data, file_size);
+  mem_free(file_data);
+  return okay_flag;
+}
+
+static int test_image_bmp_write(int wide_count, int high_count) {
+  size_t line_bytes = (((size_t)wide_count * 3u + 3u) / 4u) * 4u;
+  size_t file_size = 54u + line_bytes * (size_t)high_count;
+  uint8_t *file_data = (uint8_t *)mem_clear(file_size);
+  int high_index, wide_index, okay_flag;
+  if (!file_data) return 0;
+  file_data[0] = 'B';
+  file_data[1] = 'M';
+  file_data[10] = 54;
+  file_data[14] = 40;
+  file_data[18] = (uint8_t)(wide_count & 0xFF);
+  file_data[19] = (uint8_t)((wide_count >> 8) & 0xFF);
+  file_data[22] = (uint8_t)(high_count & 0xFF);
+  file_data[23] = (uint8_t)((high_count >> 8) & 0xFF);
+  file_data[26] = 1;
+  file_data[28] = 24;
+  for (high_index = 0; high_index < high_count; ++high_index) {
+    /* The first row of the file is the last row of the picture. */
+    uint8_t *line_data = file_data + 54u + (size_t)(high_count - 1 - high_index) * line_bytes;
+    for (wide_index = 0; wide_index < wide_count; ++wide_index) {
+      line_data[wide_index * 3 + 2] = (uint8_t)test_image_png_want(wide_index, high_index, 0);
+      line_data[wide_index * 3 + 1] = (uint8_t)test_image_png_want(wide_index, high_index, 1);
+      line_data[wide_index * 3 + 0] = (uint8_t)test_image_png_want(wide_index, high_index, 2);
+    }
+  }
+  okay_flag = test_file_write("image.bmp", file_data, file_size);
+  mem_free(file_data);
+  return okay_flag;
+}
+
+static void test_image_check(const char *leaf_text, const char *claim_text, int wide_count,
+                             int high_count) {
+  char path_text[1024];
+  flat_grid grid;
+  int high_index, wide_index, band_index, okay_flag = 1;
+  path_join(path_text, sizeof(path_text), test_yard_path, leaf_text);
+  if (image_read(path_text, &grid) != APP_OKAY) {
+    test_true(0, claim_text);
+    return;
+  }
+  if (grid.wide_count != wide_count || grid.high_count != high_count || grid.band_count != 3)
+    okay_flag = 0;
+  for (high_index = 0; okay_flag && high_index < high_count; ++high_index)
+    for (wide_index = 0; wide_index < wide_count; ++wide_index) {
+      const float *cell_data = grid_at(&grid, high_index, wide_index);
+      for (band_index = 0; band_index < 3; ++band_index) {
+        float want_value = (float)test_image_png_want(wide_index, high_index, band_index) / 255.0f;
+        float gap_value = cell_data[band_index] - want_value;
+        if (gap_value < 0.0f) gap_value = -gap_value;
+        if (gap_value > 1e-6f) okay_flag = 0;
+      }
+    }
+  test_true(okay_flag, claim_text);
+  grid_free(&grid);
+}
+
+static void test_image(void) {
+  static const int wide_count = 12, high_count = 8;
+  flat_grid grid;
+  char path_text[1024];
+  test_open("image");
+  test_true(test_file_write("image.png", test_png_data, sizeof(test_png_data)),
+            "the png fixture is written");
+  test_true(test_image_pnm_write(wide_count, high_count), "the pnm fixture is written");
+  test_true(test_image_bmp_write(wide_count, high_count), "the bmp fixture is written");
+  test_image_check("image.png", "a png decodes to the pixels it was built from", wide_count,
+                   high_count);
+  test_image_check("image.pnm", "a pnm decodes to the same pixels", wide_count, high_count);
+  test_image_check("image.bmp", "a bmp decodes to the same pixels", wide_count, high_count);
+
+  /* A file the reader does not recognise is refused rather than read as noise. */
+  test_true(test_file_write("image.bad", "not a picture at all", 20), "a decoy file is written");
+  path_join(path_text, sizeof(path_text), test_yard_path, "image.bad");
+  test_true(image_read(path_text, &grid) != APP_OKAY, "an unknown container is refused");
+  path_join(path_text, sizeof(path_text), test_yard_path, "no_such_image.png");
+  test_true(image_read(path_text, &grid) != APP_OKAY, "a missing file is refused");
+}
+
+/* An independent bicubic, gathered in two dimensions at once rather than as two
+ * separable passes, so agreement is between two different arrangements of the
+ * same definition. */
+static float test_scale_curve(float step_value) {
+  float step_abs = step_value < 0.0f ? -step_value : step_value;
+  if (step_abs < 1.0f) return (1.5f * step_abs - 2.5f) * step_abs * step_abs + 1.0f;
+  if (step_abs < 2.0f)
+    return ((-0.5f * step_abs + 2.5f) * step_abs - 4.0f) * step_abs + 2.0f;
+  return 0.0f;
+}
+
+static float test_scale_axis(const float *from_list, int from_count, int into_index, int into_count) {
+  double ratio_value = (double)from_count / (double)into_count;
+  double spread_value = ratio_value > 1.0 ? ratio_value : 1.0;
+  double reach_value = 2.0 * spread_value;
+  double centre_value = ((double)into_index + 0.5) * ratio_value;
+  int from_index = (int)floor(centre_value - reach_value + 0.5);
+  int upto_index = (int)floor(centre_value + reach_value + 0.5) + 1;
+  float total_value = 0.0f, sum_value = 0.0f;
+  int tap_index;
+  if (from_index < 0) from_index = 0;
+  if (upto_index > from_count) upto_index = from_count;
+  for (tap_index = from_index; tap_index < upto_index; ++tap_index) {
+    float weight_value =
+        test_scale_curve((float)(((double)tap_index + 0.5 - centre_value) / spread_value));
+    total_value += weight_value;
+    sum_value += weight_value * from_list[tap_index];
+  }
+  return total_value != 0.0f ? sum_value / total_value : 0.0f;
+}
+
+static void test_scale(void) {
+  flat_grid from_grid, into_grid;
+  int wide_index, high_index, okay_flag = 1;
+  test_open("scale");
+
+  /* A constant picture has to survive any resize, in either direction: the
+   * weights of one output sample sum to one. */
+  test_true(grid_open(&from_grid, 9, 7, 3) == APP_OKAY, "a source raster opens");
+  for (high_index = 0; high_index < 7; ++high_index)
+    for (wide_index = 0; wide_index < 9; ++wide_index) {
+      float *cell_data = grid_at(&from_grid, high_index, wide_index);
+      cell_data[0] = 0.25f;
+      cell_data[1] = 0.5f;
+      cell_data[2] = 0.75f;
+    }
+  test_true(grid_scale(&from_grid, 20, 16, &into_grid) == APP_OKAY, "an upscale runs");
+  for (high_index = 0; high_index < 16; ++high_index)
+    for (wide_index = 0; wide_index < 20; ++wide_index) {
+      const float *cell_data = grid_at(&into_grid, high_index, wide_index);
+      if (fabs((double)cell_data[0] - 0.25) > 1e-5 || fabs((double)cell_data[2] - 0.75) > 1e-5)
+        okay_flag = 0;
+    }
+  test_true(okay_flag, "an upscaled constant stays constant");
+  grid_free(&into_grid);
+  okay_flag = 1;
+  test_true(grid_scale(&from_grid, 4, 3, &into_grid) == APP_OKAY, "a downscale runs");
+  for (high_index = 0; high_index < 3; ++high_index)
+    for (wide_index = 0; wide_index < 4; ++wide_index) {
+      const float *cell_data = grid_at(&into_grid, high_index, wide_index);
+      if (fabs((double)cell_data[1] - 0.5) > 1e-5) okay_flag = 0;
+    }
+  test_true(okay_flag, "a downscaled constant stays constant");
+  grid_free(&into_grid);
+  grid_free(&from_grid);
+
+  /* A ramp along one axis is reproduced exactly wherever the four taps fit,
+   * because a cubic interpolant reproduces a straight line. */
+  test_true(grid_open(&from_grid, 8, 1, 1) == APP_OKAY, "a ramp opens");
+  for (wide_index = 0; wide_index < 8; ++wide_index)
+    grid_at(&from_grid, 0, wide_index)[0] = (float)wide_index;
+  test_true(grid_scale(&from_grid, 16, 1, &into_grid) == APP_OKAY, "the ramp upscales");
+  okay_flag = 1;
+  for (wide_index = 4; wide_index < 12; ++wide_index) {
+    double want_value = ((double)wide_index + 0.5) * 0.5 - 0.5;
+    if (fabs((double)grid_at(&into_grid, 0, wide_index)[0] - want_value) > 2e-5) okay_flag = 0;
+  }
+  test_true(okay_flag, "an upscaled ramp stays a straight line away from the edges");
+  grid_free(&into_grid);
+  grid_free(&from_grid);
+
+  /* And the whole thing against the two dimensional gather. */
+  test_true(grid_open(&from_grid, 11, 9, 2) == APP_OKAY, "a textured raster opens");
+  for (high_index = 0; high_index < 9; ++high_index)
+    for (wide_index = 0; wide_index < 11; ++wide_index) {
+      float *cell_data = grid_at(&from_grid, high_index, wide_index);
+      cell_data[0] = (float)sin((double)(wide_index * 3 + high_index) * 0.4);
+      cell_data[1] = (float)cos((double)(wide_index + high_index * 5) * 0.2);
+    }
+  test_true(grid_scale(&from_grid, 7, 5, &into_grid) == APP_OKAY, "the textured raster resizes");
+  okay_flag = 1;
+  {
+    float lane_list[16];
+    float mid_list[16];
+    int band_index, tap_index;
+    for (high_index = 0; high_index < 5; ++high_index)
+      for (wide_index = 0; wide_index < 7; ++wide_index)
+        for (band_index = 0; band_index < 2; ++band_index) {
+          double want_value;
+          for (tap_index = 0; tap_index < 9; ++tap_index) {
+            int lane_index;
+            for (lane_index = 0; lane_index < 11; ++lane_index)
+              lane_list[lane_index] = grid_at(&from_grid, tap_index, lane_index)[band_index];
+            mid_list[tap_index] = test_scale_axis(lane_list, 11, wide_index, 7);
+          }
+          want_value = (double)test_scale_axis(mid_list, 9, high_index, 5);
+          if (fabs((double)grid_at(&into_grid, high_index, wide_index)[band_index] - want_value) >
+              1e-5)
+            okay_flag = 0;
+        }
+  }
+  test_true(okay_flag, "the separable resize matches a direct gather");
+  grid_free(&into_grid);
+  grid_free(&from_grid);
+
+  /* Folding three bands onto one takes the luma weights, not a plain mean. */
+  test_true(grid_open(&from_grid, 2, 2, 3) == APP_OKAY, "a colour raster opens");
+  for (high_index = 0; high_index < 2; ++high_index)
+    for (wide_index = 0; wide_index < 2; ++wide_index) {
+      float *cell_data = grid_at(&from_grid, high_index, wide_index);
+      cell_data[0] = 1.0f;
+      cell_data[1] = 0.0f;
+      cell_data[2] = 0.0f;
+    }
+  test_true(grid_bands(&from_grid, 1) == APP_OKAY, "three bands fold onto one");
+  test_near((double)grid_at(&from_grid, 1, 1)[0], 0.299, 1e-6, "the fold uses the luma weights");
+  test_true(grid_bands(&from_grid, 3) == APP_OKAY, "one band spreads over three");
+  test_near((double)grid_at(&from_grid, 0, 1)[2], 0.299, 1e-6, "the spread copies the one band");
+  grid_free(&from_grid);
+}
+
+/* -- wave ----------------------------------------------------------------- */
+
+static void test_wave_put(uint8_t *data, size_t at, uint32_t value, int byte_count) {
+  int byte_index;
+  for (byte_index = 0; byte_index < byte_count; ++byte_index)
+    data[at + (size_t)byte_index] = (uint8_t)((value >> (8 * byte_index)) & 0xFFu);
+}
+
+/* Writes a two channel sixteen bit wave with an unknown chunk in front of the
+ * data, which is what a real recorder leaves behind. */
+static int test_wave_write_at(const char *leaf_text, int rate_value, int value_count,
+                              double turn_step) {
+  size_t body_size = (size_t)value_count * 4u;
+  size_t file_size = 12u + 24u + 12u + 8u + body_size;
+  uint8_t *file_data = (uint8_t *)mem_clear(file_size);
+  int value_index, okay_flag;
+  if (!file_data) return 0;
+  memcpy(file_data, "RIFF", 4);
+  test_wave_put(file_data, 4, (uint32_t)(file_size - 8), 4);
+  memcpy(file_data + 8, "WAVE", 4);
+  memcpy(file_data + 12, "fmt ", 4);
+  test_wave_put(file_data, 16, 16, 4);
+  test_wave_put(file_data, 20, 1, 2);  /* pcm */
+  test_wave_put(file_data, 22, 2, 2);  /* channels */
+  test_wave_put(file_data, 24, (uint32_t)rate_value, 4);
+  test_wave_put(file_data, 28, (uint32_t)(rate_value * 4), 4);
+  test_wave_put(file_data, 32, 4, 2);
+  test_wave_put(file_data, 34, 16, 2); /* bits */
+  memcpy(file_data + 36, "LIST", 4);
+  test_wave_put(file_data, 40, 4, 4);
+  memcpy(file_data + 44, "INFO", 4);
+  memcpy(file_data + 48, "data", 4);
+  test_wave_put(file_data, 52, (uint32_t)body_size, 4);
+  for (value_index = 0; value_index < value_count; ++value_index) {
+    int left_value = (int)(8000.0 * sin((double)value_index * turn_step));
+    int right_value = (int)(4000.0 * sin((double)value_index * turn_step));
+    test_wave_put(file_data, 56 + (size_t)value_index * 4u, (uint32_t)(left_value & 0xFFFF), 2);
+    test_wave_put(file_data, 58 + (size_t)value_index * 4u, (uint32_t)(right_value & 0xFFFF), 2);
+  }
+  okay_flag = test_file_write(leaf_text, file_data, file_size);
+  mem_free(file_data);
+  return okay_flag;
+}
+
+static int test_wave_write(const char *leaf_text, int rate_value, int value_count) {
+  return test_wave_write_at(leaf_text, rate_value, value_count, 0.31);
+}
+
+static void test_wave(void) {
+  wave_clip clip;
+  char path_text[1024];
+  int value_index, okay_flag = 1;
+  test_open("wave");
+  test_true(test_wave_write("clip.wav", 8000, 200), "the wave fixture is written");
+  path_join(path_text, sizeof(path_text), test_yard_path, "clip.wav");
+  test_true(wave_read(path_text, &clip) == APP_OKAY, "a riff wave reads");
+  test_true(clip.rate_value == 8000, "the sample rate comes from the format chunk");
+  test_true(clip.value_count == 200, "an unknown chunk before the data is stepped over");
+  for (value_index = 0; value_index < clip.value_count; ++value_index) {
+    /* Two channels at 8000 and 4000 average to 6000, and the reader scales a
+     * signed sixteen bit sample by 32768. */
+    double want_value = 6000.0 * sin((double)value_index * 0.31) / 32768.0;
+    if (fabs((double)clip.value_data[value_index] - want_value) > 2e-4) okay_flag = 0;
+  }
+  test_true(okay_flag, "the channels are averaged rather than dropped");
+  test_true(wave_rate(&clip, 4000) == APP_OKAY, "the clip resamples");
+  test_true(clip.rate_value == 4000 && clip.value_count == 100,
+            "halving the rate halves the sample count");
+  wave_free(&clip);
+}
+
+/* -- filterbank ----------------------------------------------------------- */
+
+static void test_mel(void) {
+  static const int turn_size = 64;
+  float real_list[64], imag_list[64];
+  float *bank_data = NULL;
+  wave_clip clip;
+  flat_grid mel_grid;
+  int slot_index, bin_index, mel_index, okay_flag = 1;
+  test_open("mel");
+
+  /* The transform against the sum it is a fast way of computing. */
+  for (slot_index = 0; slot_index < turn_size; ++slot_index) {
+    real_list[slot_index] = (float)sin((double)slot_index * 0.7) + 0.3f * (float)slot_index;
+    imag_list[slot_index] = 0.0f;
+  }
+  {
+    float want_real[64], want_imag[64];
+    for (bin_index = 0; bin_index < turn_size; ++bin_index) {
+      double sum_real = 0.0, sum_imag = 0.0;
+      for (slot_index = 0; slot_index < turn_size; ++slot_index) {
+        double angle_value =
+            -6.283185307179586 * (double)bin_index * (double)slot_index / (double)turn_size;
+        sum_real += (double)real_list[slot_index] * cos(angle_value);
+        sum_imag += (double)real_list[slot_index] * sin(angle_value);
+      }
+      want_real[bin_index] = (float)sum_real;
+      want_imag[bin_index] = (float)sum_imag;
+    }
+    wave_spin(real_list, imag_list, turn_size);
+    for (bin_index = 0; bin_index < turn_size; ++bin_index)
+      if (fabs((double)real_list[bin_index] - want_real[bin_index]) > 1e-2 ||
+          fabs((double)imag_list[bin_index] - want_imag[bin_index]) > 1e-2)
+        okay_flag = 0;
+    test_true(okay_flag, "the fast transform matches the discrete one");
+  }
+
+  /* Every filter has to be a triangle that starts and ends at zero, and two
+   * neighbours have to hand over between them: at the peak of one, the other
+   * two are already or still at nothing. */
+  test_true(mel_bank(8, 33, 8000, &bank_data) == APP_OKAY, "a filterbank builds");
+  okay_flag = 1;
+  for (mel_index = 0; mel_index < 8 && bank_data; ++mel_index) {
+    float peak_value = 0.0f;
+    float total_value = 0.0f;
+    for (bin_index = 0; bin_index < 33; ++bin_index) {
+      float weight_value = bank_data[mel_index * 33 + bin_index];
+      if (weight_value < 0.0f) okay_flag = 0;
+      if (weight_value > peak_value) peak_value = weight_value;
+      total_value += weight_value;
+    }
+    if (peak_value <= 0.0f || peak_value > 1.0f + 1e-6f) okay_flag = 0;
+    if (total_value <= 0.0f) okay_flag = 0;
+  }
+  test_true(okay_flag, "every filter is a positive triangle no taller than one");
+  /* The mel scale is not linear, so the filters have to widen with frequency. */
+  if (bank_data) {
+    int low_span = 0, high_span = 0;
+    for (bin_index = 0; bin_index < 33; ++bin_index) {
+      if (bank_data[0 * 33 + bin_index] > 0.0f) low_span += 1;
+      if (bank_data[7 * 33 + bin_index] > 0.0f) high_span += 1;
+    }
+    test_true(high_span > low_span, "the filters widen with frequency");
+  }
+  mem_free(bank_data);
+
+  /* A pure tone lands in the filter that covers it. */
+  memset(&clip, 0, sizeof(clip));
+  clip.rate_value = 8000;
+  clip.value_count = 512;
+  clip.value_data = (float *)mem_clear(sizeof(float) * 512);
+  if (!clip.value_data) { test_true(0, "the tone is allocated"); return; }
+  for (slot_index = 0; slot_index < 512; ++slot_index)
+    clip.value_data[slot_index] =
+        (float)sin(6.283185307179586 * 1000.0 * (double)slot_index / 8000.0);
+  test_true(mel_make(&clip, 16, 128, 64, 128, 1e-10f, 0, &mel_grid) == APP_OKAY,
+            "a spectrogram is taken");
+  test_true(mel_grid.high_count == 1 + (512 - (128 + 1)) / 64,
+            "the frame count follows the hop, over a frame cut one sample long");
+  test_true(mel_grid.wide_count == 16, "there is one column per filter");
+  {
+    const float *row_data = grid_at(&mel_grid, 2, 0);
+    int best_index = 0;
+    float want_edge;
+    for (mel_index = 1; mel_index < 16; ++mel_index)
+      if (row_data[mel_index] > row_data[best_index]) best_index = mel_index;
+    /* Where the peak belongs, from the mel scale alone. */
+    want_edge = mel_from_hertz(1000.0f) / (mel_from_hertz(4000.0f) / 17.0f);
+    test_true(best_index >= (int)want_edge - 2 && best_index <= (int)want_edge + 1,
+              "a pure tone peaks in the filter that covers it");
+  }
+  grid_free(&mel_grid);
+  wave_free(&clip);
+}
+
+/* ======================================================================== */
 /* 8. public surface                                                        */
 /* ======================================================================== */
 
@@ -966,146 +1472,195 @@ static void test_token(void) {
 /* 9. whole graph on a synthetic checkpoint                                 */
 /* ======================================================================== */
 
-#define TEST_WING_LIMIT 128
+/* A safetensors file under construction.  The values stay reachable by name
+ * after the file is written, which is what lets a reference forward read the
+ * same weights the engine mapped without parsing the file a second time. */
+#define TEST_KIT_LIMIT 280
 
-typedef struct test_wing_kit {
-  char   name_list[TEST_WING_LIMIT][96];
-  int    size_list[TEST_WING_LIMIT][3];
-  size_t from_list[TEST_WING_LIMIT];
-  size_t span_list[TEST_WING_LIMIT];
+typedef struct test_kit {
+  char   name_list[TEST_KIT_LIMIT][160];
+  int    size_list[TEST_KIT_LIMIT][4];
+  int    rank_list[TEST_KIT_LIMIT];
+  size_t from_list[TEST_KIT_LIMIT];
+  size_t span_list[TEST_KIT_LIMIT];
   int    item_count;
   size_t body_size;
-} test_wing_kit;
+  float *body_data;
+} test_kit;
 
-static void test_wing_add(test_wing_kit *kit, const char *name_text, int high_size, int wide_size,
-                          int deep_size) {
-  int slot = kit->item_count;
-  size_t value_count;
-  if (slot >= TEST_WING_LIMIT) return;
-  kit->item_count += 1;
-  snprintf(kit->name_list[slot], sizeof(kit->name_list[slot]), "%s", name_text);
-  kit->size_list[slot][0] = high_size;
-  kit->size_list[slot][1] = wide_size;
-  kit->size_list[slot][2] = deep_size;
-  value_count = (size_t)high_size * (size_t)(wide_size > 0 ? wide_size : 1) *
-                (size_t)(deep_size > 0 ? deep_size : 1);
-  kit->from_list[slot] = kit->body_size;
-  kit->span_list[slot] = value_count * sizeof(float);
-  kit->body_size += kit->span_list[slot];
+static void test_kit_add(test_kit *pack, const char *name_text, int size_a, int size_b,
+                          int size_c, int size_d) {
+  int slot = pack->item_count;
+  int axis_list[4];
+  int axis_index, rank_count = 0;
+  size_t value_count = 1;
+  if (slot >= TEST_KIT_LIMIT) return;
+  axis_list[0] = size_a;
+  axis_list[1] = size_b;
+  axis_list[2] = size_c;
+  axis_list[3] = size_d;
+  for (axis_index = 0; axis_index < 4 && axis_list[axis_index] > 0; ++axis_index) {
+    value_count *= (size_t)axis_list[axis_index];
+    rank_count += 1;
+  }
+  pack->item_count += 1;
+  snprintf(pack->name_list[slot], sizeof(pack->name_list[slot]), "%s", name_text);
+  for (axis_index = 0; axis_index < 4; ++axis_index)
+    pack->size_list[slot][axis_index] = axis_list[axis_index];
+  pack->rank_list[slot] = rank_count;
+  pack->from_list[slot] = pack->body_size;
+  pack->span_list[slot] = value_count * sizeof(float);
+  pack->body_size += pack->span_list[slot];
 }
 
-/* Writes a complete miniature checkpoint so the whole graph can be exercised. */
-static int test_wing_write(int moe_flag) {
-  static const int state_size = 16, inner_size = 24, layer_count = 2, head_count = 2;
-  static const int head_size = 8, kv_count = 1, ple_size = 4, vocab_count = 27;
-  static const int expert_count = 4, expert_inner = 6;
-  test_wing_kit *kit = (test_wing_kit *)mem_clear(sizeof(test_wing_kit));
-  char name_text[96];
+/* Allocates the payload and gives every tensor its own values.  Leaving whole
+ * families equal would hide any mistake about which one is picked. */
+static int test_kit_open(test_kit *pack) {
+  size_t value_index, value_count;
+  int slot;
+  pack->body_data = (float *)mem_clear(pack->body_size);
+  if (!pack->body_data) return 0;
+  for (slot = 0; slot < pack->item_count; ++slot) {
+    size_t from_slot = pack->from_list[slot] / sizeof(float);
+    value_count = pack->span_list[slot] / sizeof(float);
+    for (value_index = 0; value_index < value_count; ++value_index)
+      pack->body_data[from_slot + value_index] =
+          (float)(0.6 * sin((double)(value_index * 13 + (size_t)slot * 7 + 1) * 0.37));
+  }
+  return 1;
+}
+
+static float *test_kit_find(test_kit *pack, const char *name_text) {
+  int slot;
+  for (slot = 0; slot < pack->item_count; ++slot)
+    if (strcmp(pack->name_list[slot], name_text) == 0)
+      return pack->body_data + pack->from_list[slot] / sizeof(float);
+  return NULL;
+}
+
+static int test_kit_save(const test_kit *pack, const char *leaf_text) {
   char *header_text;
   size_t header_size, pad_count, file_size, header_fill = 0;
   uint8_t *file_data;
-  float *body_data;
   uint64_t header_count;
-  int layer_index, slot, byte_index, okay_flag;
-  char config_text[1024];
+  int slot, byte_index, okay_flag;
 
-  if (!kit) return 0;
-  test_wing_add(kit, "model.embed_tokens.weight", vocab_count, state_size, 0);
-  test_wing_add(kit, "model.embed_tokens_per_layer.weight", 32, layer_count * ple_size, 0);
-  test_wing_add(kit, "model.per_layer_model_projection.weight", layer_count * ple_size, state_size, 0);
-  test_wing_add(kit, "model.per_layer_projection_norm.weight", ple_size, 0, 0);
-  test_wing_add(kit, "model.norm.weight", state_size, 0, 0);
-  for (layer_index = 0; layer_index < layer_count; ++layer_index) {
-#define TEST_WING_NAME(leaf) \
-  (snprintf(name_text, sizeof(name_text), "model.layers.%d.%s", layer_index, leaf), name_text)
-    test_wing_add(kit, TEST_WING_NAME("self_attn.q_proj.weight"), head_count * head_size, state_size, 0);
-    test_wing_add(kit, TEST_WING_NAME("self_attn.k_proj.weight"), kv_count * head_size, state_size, 0);
-    test_wing_add(kit, TEST_WING_NAME("self_attn.v_proj.weight"), kv_count * head_size, state_size, 0);
-    test_wing_add(kit, TEST_WING_NAME("self_attn.o_proj.weight"), state_size, head_count * head_size, 0);
-    test_wing_add(kit, TEST_WING_NAME("self_attn.q_norm.weight"), head_size, 0, 0);
-    test_wing_add(kit, TEST_WING_NAME("self_attn.k_norm.weight"), head_size, 0, 0);
-    test_wing_add(kit, TEST_WING_NAME("mlp.gate_proj.weight"), inner_size, state_size, 0);
-    test_wing_add(kit, TEST_WING_NAME("mlp.up_proj.weight"), inner_size, state_size, 0);
-    test_wing_add(kit, TEST_WING_NAME("mlp.down_proj.weight"), state_size, inner_size, 0);
-    test_wing_add(kit, TEST_WING_NAME("input_layernorm.weight"), state_size, 0, 0);
-    test_wing_add(kit, TEST_WING_NAME("post_attention_layernorm.weight"), state_size, 0, 0);
-    test_wing_add(kit, TEST_WING_NAME("pre_feedforward_layernorm.weight"), state_size, 0, 0);
-    test_wing_add(kit, TEST_WING_NAME("post_feedforward_layernorm.weight"), state_size, 0, 0);
-    test_wing_add(kit, TEST_WING_NAME("per_layer_input_gate.weight"), ple_size, state_size, 0);
-    test_wing_add(kit, TEST_WING_NAME("per_layer_projection.weight"), state_size, ple_size, 0);
-    test_wing_add(kit, TEST_WING_NAME("post_per_layer_input_norm.weight"), state_size, 0, 0);
-    if (!moe_flag) continue;
-    test_wing_add(kit, TEST_WING_NAME("router.proj.weight"), expert_count, state_size, 0);
-    test_wing_add(kit, TEST_WING_NAME("router.scale"), state_size, 0, 0);
-    test_wing_add(kit, TEST_WING_NAME("router.per_expert_scale"), expert_count, 0, 0);
-    test_wing_add(kit, TEST_WING_NAME("experts.gate_up_proj"), expert_count, 2 * expert_inner,
-                  state_size);
-    test_wing_add(kit, TEST_WING_NAME("experts.down_proj"), expert_count, state_size, expert_inner);
-    test_wing_add(kit, TEST_WING_NAME("post_feedforward_layernorm_1.weight"), state_size, 0, 0);
-    test_wing_add(kit, TEST_WING_NAME("pre_feedforward_layernorm_2.weight"), state_size, 0, 0);
-    test_wing_add(kit, TEST_WING_NAME("post_feedforward_layernorm_2.weight"), state_size, 0, 0);
-#undef TEST_WING_NAME
-  }
-
-  header_size = 256 * (size_t)kit->item_count + 64;
+  if (!pack->body_data) return 0;
+  header_size = 256 * (size_t)pack->item_count + 64;
   header_text = (char *)mem_clear(header_size);
-  if (!header_text) { mem_free(kit); return 0; }
+  if (!header_text) return 0;
   header_fill += (size_t)snprintf(header_text, header_size, "{");
-  for (slot = 0; slot < kit->item_count; ++slot) {
+  for (slot = 0; slot < pack->item_count; ++slot) {
     char shape_text[64];
-    int wrote;
-    if (kit->size_list[slot][2] > 0)
-      snprintf(shape_text, sizeof(shape_text), "[%d,%d,%d]", kit->size_list[slot][0],
-               kit->size_list[slot][1], kit->size_list[slot][2]);
-    else if (kit->size_list[slot][1] > 0)
-      snprintf(shape_text, sizeof(shape_text), "[%d,%d]", kit->size_list[slot][0],
-               kit->size_list[slot][1]);
-    else
-      snprintf(shape_text, sizeof(shape_text), "[%d]", kit->size_list[slot][0]);
+    int wrote, axis_index, shape_fill = 1;
+    shape_text[0] = '[';
+    for (axis_index = 0; axis_index < pack->rank_list[slot]; ++axis_index)
+      shape_fill += snprintf(shape_text + shape_fill, sizeof(shape_text) - (size_t)shape_fill,
+                             "%s%d", axis_index ? "," : "", pack->size_list[slot][axis_index]);
+    snprintf(shape_text + shape_fill, sizeof(shape_text) - (size_t)shape_fill, "]");
     wrote = snprintf(header_text + header_fill, header_size - header_fill,
                      "%s\"%s\":{\"dtype\":\"F32\",\"shape\":%s,"
                      "\"data_offsets\":[%lu,%lu]}",
-                     slot ? "," : "", kit->name_list[slot], shape_text,
-                     (unsigned long)kit->from_list[slot],
-                     (unsigned long)(kit->from_list[slot] + kit->span_list[slot]));
+                     slot ? "," : "", pack->name_list[slot], shape_text,
+                     (unsigned long)pack->from_list[slot],
+                     (unsigned long)(pack->from_list[slot] + pack->span_list[slot]));
     /* The header room is generous, but a truncated entry would silently
      * produce a broken checkpoint, so refuse instead. */
     if (wrote < 0 || (size_t)wrote >= header_size - header_fill) {
       mem_free(header_text);
-      mem_free(kit);
       return 0;
     }
     header_fill += (size_t)wrote;
   }
-  if (header_fill + 1 >= header_size) { mem_free(header_text); mem_free(kit); return 0; }
+  if (header_fill + 1 >= header_size) { mem_free(header_text); return 0; }
   header_text[header_fill++] = '}';
   header_text[header_fill] = '\0';
 
   pad_count = (8 - (header_fill % 8)) % 8;
   header_count = (uint64_t)(header_fill + pad_count);
-  file_size = 8 + (size_t)header_count + kit->body_size;
+  file_size = 8 + (size_t)header_count + pack->body_size;
   file_data = (uint8_t *)mem_clear(file_size);
-  if (!file_data) { mem_free(header_text); mem_free(kit); return 0; }
+  if (!file_data) { mem_free(header_text); return 0; }
   for (byte_index = 0; byte_index < 8; ++byte_index)
     file_data[byte_index] = (uint8_t)((header_count >> (8 * byte_index)) & 0xFFu);
   memcpy(file_data + 8, header_text, header_fill);
   for (byte_index = 0; byte_index < (int)pad_count; ++byte_index)
     file_data[8 + header_fill + byte_index] = ' ';
-  body_data = (float *)(file_data + 8 + (size_t)header_count);
-  for (slot = 0; slot < kit->item_count; ++slot) {
-    size_t from_slot = kit->from_list[slot] / sizeof(float);
-    size_t value_count = kit->span_list[slot] / sizeof(float);
-    size_t value_index;
-    for (value_index = 0; value_index < value_count; ++value_index)
-      body_data[from_slot + value_index] =
-          (float)(0.6 * sin((double)(value_index * 13 + (size_t)slot * 7 + 1) * 0.37));
-  }
-  okay_flag = test_file_write("model.safetensors", file_data, file_size);
+  memcpy(file_data + 8 + (size_t)header_count, pack->body_data, pack->body_size);
+  okay_flag = test_file_write(leaf_text, file_data, file_size);
   mem_free(file_data);
   mem_free(header_text);
-  mem_free(kit);
+  return okay_flag;
+}
 
-  snprintf(config_text, sizeof(config_text),
+/* The text stack of the miniature checkpoint. */
+#define TEST_WING_STATE  16
+#define TEST_WING_INNER  24
+#define TEST_WING_LAYERS 2
+#define TEST_WING_HEADS  2
+#define TEST_WING_HEAD   8
+#define TEST_WING_KV     1
+#define TEST_WING_PLE    4
+#define TEST_WING_VOCAB  27
+#define TEST_WING_EXPERT 4
+#define TEST_WING_WIDTH  6
+
+static void test_wing_pack(test_kit *pack, int moe_flag) {
+  char name_text[96];
+  int layer_index;
+  test_kit_add(pack, "model.embed_tokens.weight", TEST_WING_VOCAB, TEST_WING_STATE, 0, 0);
+  test_kit_add(pack, "model.embed_tokens_per_layer.weight", 32,
+                TEST_WING_LAYERS * TEST_WING_PLE, 0, 0);
+  test_kit_add(pack, "model.per_layer_model_projection.weight", TEST_WING_LAYERS * TEST_WING_PLE,
+                TEST_WING_STATE, 0, 0);
+  test_kit_add(pack, "model.per_layer_projection_norm.weight", TEST_WING_PLE, 0, 0, 0);
+  test_kit_add(pack, "model.norm.weight", TEST_WING_STATE, 0, 0, 0);
+  for (layer_index = 0; layer_index < TEST_WING_LAYERS; ++layer_index) {
+#define TEST_WING_NAME(leaf) \
+  (snprintf(name_text, sizeof(name_text), "model.layers.%d.%s", layer_index, leaf), name_text)
+    test_kit_add(pack, TEST_WING_NAME("self_attn.q_proj.weight"), TEST_WING_HEADS * TEST_WING_HEAD,
+                  TEST_WING_STATE, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("self_attn.k_proj.weight"), TEST_WING_KV * TEST_WING_HEAD,
+                  TEST_WING_STATE, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("self_attn.v_proj.weight"), TEST_WING_KV * TEST_WING_HEAD,
+                  TEST_WING_STATE, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("self_attn.o_proj.weight"), TEST_WING_STATE,
+                  TEST_WING_HEADS * TEST_WING_HEAD, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("self_attn.q_norm.weight"), TEST_WING_HEAD, 0, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("self_attn.k_norm.weight"), TEST_WING_HEAD, 0, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("mlp.gate_proj.weight"), TEST_WING_INNER, TEST_WING_STATE, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("mlp.up_proj.weight"), TEST_WING_INNER, TEST_WING_STATE, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("mlp.down_proj.weight"), TEST_WING_STATE, TEST_WING_INNER, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("input_layernorm.weight"), TEST_WING_STATE, 0, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("post_attention_layernorm.weight"), TEST_WING_STATE, 0, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("pre_feedforward_layernorm.weight"), TEST_WING_STATE, 0, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("post_feedforward_layernorm.weight"), TEST_WING_STATE, 0, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("per_layer_input_gate.weight"), TEST_WING_PLE,
+                  TEST_WING_STATE, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("per_layer_projection.weight"), TEST_WING_STATE,
+                  TEST_WING_PLE, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("post_per_layer_input_norm.weight"), TEST_WING_STATE, 0, 0, 0);
+    if (!moe_flag) continue;
+    test_kit_add(pack, TEST_WING_NAME("router.proj.weight"), TEST_WING_EXPERT, TEST_WING_STATE, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("router.scale"), TEST_WING_STATE, 0, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("router.per_expert_scale"), TEST_WING_EXPERT, 0, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("experts.gate_up_proj"), TEST_WING_EXPERT,
+                  2 * TEST_WING_WIDTH, TEST_WING_STATE, 0);
+    test_kit_add(pack, TEST_WING_NAME("experts.down_proj"), TEST_WING_EXPERT, TEST_WING_STATE,
+                  TEST_WING_WIDTH, 0);
+    test_kit_add(pack, TEST_WING_NAME("post_feedforward_layernorm_1.weight"), TEST_WING_STATE, 0, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("pre_feedforward_layernorm_2.weight"), TEST_WING_STATE, 0, 0, 0);
+    test_kit_add(pack, TEST_WING_NAME("post_feedforward_layernorm_2.weight"), TEST_WING_STATE, 0, 0, 0);
+#undef TEST_WING_NAME
+  }
+}
+
+/* The configuration beside it.  `media_flag` adds the two tower blocks, which
+ * are the only thing that tells the loader to look for them at all. */
+static int test_wing_config(int moe_flag, int media_flag) {
+  char config_text[2048];
+  int fill_count;
+  fill_count = snprintf(config_text, sizeof(config_text),
            "{\"vocab_size\":%d,\"hidden_size\":%d,\"intermediate_size\":%d,"
            "\"num_hidden_layers\":%d,\"num_attention_heads\":%d,\"num_key_value_heads\":%d,"
            "\"head_dim\":%d,\"global_head_dim\":%d,\"sliding_window\":4,"
@@ -1114,10 +1669,47 @@ static int test_wing_write(int moe_flag) {
            "\"bos_token_id\":1,\"eos_token_id\":2,\"pad_token_id\":0,"
            "\"layer_types\":[\"sliding_attention\",\"full_attention\"],"
            "\"enable_moe_block\":%s,\"num_experts\":%d,\"top_k_experts\":2,"
-           "\"moe_intermediate_size\":%d}",
-           vocab_count, state_size, inner_size, layer_count, head_count, kv_count, head_size,
-           head_size, ple_size, moe_flag ? "true" : "false", expert_count, expert_inner);
-  if (!test_file_write("config.json", config_text, strlen(config_text))) okay_flag = 0;
+           "\"moe_intermediate_size\":%d",
+           TEST_WING_VOCAB, TEST_WING_STATE, TEST_WING_INNER, TEST_WING_LAYERS, TEST_WING_HEADS,
+           TEST_WING_KV, TEST_WING_HEAD, TEST_WING_HEAD, TEST_WING_PLE,
+           moe_flag ? "true" : "false", TEST_WING_EXPERT, TEST_WING_WIDTH);
+  if (media_flag && fill_count > 0)
+    fill_count += snprintf(config_text + fill_count, sizeof(config_text) - (size_t)fill_count,
+             ",\"image_token_id\":5,\"audio_token_id\":6,"
+             "\"vision_soft_tokens_per_image\":9,"
+             "\"vision_config\":{\"hidden_size\":12,\"intermediate_size\":16,"
+             "\"num_hidden_layers\":1,\"num_attention_heads\":2,\"head_dim\":8,"
+             "\"patch_size\":2,\"pooling_kernel_size\":2,\"position_embedding_size\":16,"
+             "\"standardize\":false,\"rms_norm_eps\":1e-6,"
+             "\"rope_parameters\":{\"rope_theta\":100.0,\"rope_type\":\"default\"}},"
+             "\"audio_config\":{\"hidden_size\":12,\"num_hidden_layers\":1,"
+             "\"num_attention_heads\":2,\"rms_norm_eps\":1e-6,\"conv_kernel_size\":3,"
+             "\"attention_chunk_size\":4,\"attention_context_left\":3,"
+             "\"attention_context_right\":0,\"attention_logit_cap\":5.0,"
+             "\"residual_weight\":0.5,\"output_proj_dims\":12}");
+  if (fill_count < 0 || (size_t)fill_count + 2 >= sizeof(config_text)) return 0;
+  config_text[fill_count++] = '}';
+  config_text[fill_count] = '\0';
+  if (media_flag) {
+    /* The analysis window lives beside the model, as the export writes it. */
+    static const char sound_text[] =
+        "{\"feature_size\":8,\"sampling_rate\":8000,\"frame_length\":8,"
+        "\"hop_length\":4,\"fft_length\":16,\"mel_floor\":0.001}";
+    if (!test_file_write("preprocessor_config.json", sound_text, sizeof(sound_text) - 1)) return 0;
+  }
+  return test_file_write("config.json", config_text, (size_t)fill_count);
+}
+
+/* Writes a complete miniature checkpoint so the whole graph can be exercised. */
+static int test_wing_write(int moe_flag) {
+  test_kit *pack = (test_kit *)mem_clear(sizeof(test_kit));
+  int okay_flag;
+  if (!pack) return 0;
+  test_wing_pack(pack, moe_flag);
+  okay_flag = test_kit_open(pack) && test_kit_save(pack, "model.safetensors");
+  mem_free(pack->body_data);
+  mem_free(pack);
+  if (!test_wing_config(moe_flag, 0)) okay_flag = 0;
   if (!test_file_write("tokenizer.json", test_token_json, sizeof(test_token_json) - 1)) okay_flag = 0;
   return okay_flag;
 }
@@ -1169,6 +1761,548 @@ static void test_wing(void) {
   }
 }
 
+/* ======================================================================== */
+/* 10. the vision and audio towers                                          */
+/* ======================================================================== */
+
+/* A miniature multi-modal checkpoint in the shipped export's arrangement — the
+ * reference's module names, its wrapper around every projection, its two axis
+ * position tables, its conformer — and a definition of the vision tower written
+ * out separately here to hold the engine against.
+ *
+ * The audio tower is not reproduced a second time in C.  It is a conformer with
+ * a dozen interacting parts, and a second transcription of it here would mostly
+ * be a copy of the first; what it gets instead is a check on each piece that is
+ * peculiar to it — the mean-subtracting norm, the depthwise causal convolution,
+ * the gated unit, and the window the local attention actually spans — plus the
+ * end-to-end run.  The tower as a whole is held against the real reference by
+ * `app_diff.py --media`, which is a stronger test than anything written here
+ * could be. */
+
+#define TOWER_TEXT   16 /* the text stack's hidden width, from test_wing */
+#define TOWER_HIDDEN 12
+#define TOWER_INNER  16
+#define TOWER_LAYERS 1
+#define TOWER_HEADS  2
+#define TOWER_HEAD   8  /* divisible by four: each axis takes half a head */
+#define TOWER_PATCH  2
+#define TOWER_POOL   2
+#define TOWER_PLACE  16
+#define TOWER_SOFT   9
+#define SOUND_HEADS  2
+#define SOUND_HEAD   6
+#define SOUND_INNER  16
+#define SOUND_MEL    8
+#define SOUND_CONV   4
+#define SOUND_DEEP   3
+#define SOUND_CHUNK  4
+#define SOUND_LEFT   3
+
+static void test_tower_add(test_kit *pack) {
+  char name_text[160];
+  int layer_index;
+#define VISION_AT(leaf)                                                                     \
+  (snprintf(name_text, sizeof(name_text), "model.vision_tower.encoder.layers.%d.%s",         \
+            layer_index, (leaf)),                                                             \
+   name_text)
+  for (layer_index = 0; layer_index < TOWER_LAYERS; ++layer_index) {
+    test_kit_add(pack, VISION_AT("self_attn.q_proj.linear.weight"), TOWER_HEADS * TOWER_HEAD,
+                 TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, VISION_AT("self_attn.k_proj.linear.weight"), TOWER_HEADS * TOWER_HEAD,
+                 TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, VISION_AT("self_attn.v_proj.linear.weight"), TOWER_HEADS * TOWER_HEAD,
+                 TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, VISION_AT("self_attn.o_proj.linear.weight"), TOWER_HIDDEN,
+                 TOWER_HEADS * TOWER_HEAD, 0, 0);
+    test_kit_add(pack, VISION_AT("self_attn.q_norm.weight"), TOWER_HEAD, 0, 0, 0);
+    test_kit_add(pack, VISION_AT("self_attn.k_norm.weight"), TOWER_HEAD, 0, 0, 0);
+    test_kit_add(pack, VISION_AT("input_layernorm.weight"), TOWER_HIDDEN, 0, 0, 0);
+    test_kit_add(pack, VISION_AT("post_attention_layernorm.weight"), TOWER_HIDDEN, 0, 0, 0);
+    test_kit_add(pack, VISION_AT("pre_feedforward_layernorm.weight"), TOWER_HIDDEN, 0, 0, 0);
+    test_kit_add(pack, VISION_AT("post_feedforward_layernorm.weight"), TOWER_HIDDEN, 0, 0, 0);
+    test_kit_add(pack, VISION_AT("mlp.gate_proj.linear.weight"), TOWER_INNER, TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, VISION_AT("mlp.up_proj.linear.weight"), TOWER_INNER, TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, VISION_AT("mlp.down_proj.linear.weight"), TOWER_HIDDEN, TOWER_INNER, 0, 0);
+  }
+#undef VISION_AT
+  test_kit_add(pack, "model.vision_tower.patch_embedder.input_proj.weight", TOWER_HIDDEN,
+               3 * TOWER_PATCH * TOWER_PATCH, 0, 0);
+  test_kit_add(pack, "model.vision_tower.patch_embedder.position_embedding_table", 2, TOWER_PLACE,
+               TOWER_HIDDEN, 0);
+  test_kit_add(pack, "model.embed_vision.embedding_projection.weight", TOWER_TEXT, TOWER_HIDDEN, 0, 0);
+
+#define SOUND_AT(leaf)                                                                      \
+  (snprintf(name_text, sizeof(name_text), "model.audio_tower.layers.%d.%s", layer_index,     \
+            (leaf)),                                                                          \
+   name_text)
+  for (layer_index = 0; layer_index < TOWER_LAYERS; ++layer_index) {
+    int side_index;
+    for (side_index = 1; side_index <= 2; ++side_index) {
+      char leaf_text[64];
+      snprintf(leaf_text, sizeof(leaf_text), "feed_forward%d.ffw_layer_1.linear.weight", side_index);
+      test_kit_add(pack, SOUND_AT(leaf_text), SOUND_INNER, TOWER_HIDDEN, 0, 0);
+      snprintf(leaf_text, sizeof(leaf_text), "feed_forward%d.ffw_layer_2.linear.weight", side_index);
+      test_kit_add(pack, SOUND_AT(leaf_text), TOWER_HIDDEN, SOUND_INNER, 0, 0);
+      snprintf(leaf_text, sizeof(leaf_text), "feed_forward%d.pre_layer_norm.weight", side_index);
+      test_kit_add(pack, SOUND_AT(leaf_text), TOWER_HIDDEN, 0, 0, 0);
+      snprintf(leaf_text, sizeof(leaf_text), "feed_forward%d.post_layer_norm.weight", side_index);
+      test_kit_add(pack, SOUND_AT(leaf_text), TOWER_HIDDEN, 0, 0, 0);
+    }
+    test_kit_add(pack, SOUND_AT("self_attn.q_proj.linear.weight"), SOUND_HEADS * SOUND_HEAD,
+                 TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, SOUND_AT("self_attn.k_proj.linear.weight"), SOUND_HEADS * SOUND_HEAD,
+                 TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, SOUND_AT("self_attn.v_proj.linear.weight"), SOUND_HEADS * SOUND_HEAD,
+                 TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, SOUND_AT("self_attn.post.linear.weight"), TOWER_HIDDEN,
+                 SOUND_HEADS * SOUND_HEAD, 0, 0);
+    test_kit_add(pack, SOUND_AT("self_attn.relative_k_proj.weight"), SOUND_HEADS * SOUND_HEAD,
+                 TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, SOUND_AT("self_attn.per_dim_scale"), SOUND_HEAD, 0, 0, 0);
+    test_kit_add(pack, SOUND_AT("lconv1d.linear_start.linear.weight"), 2 * TOWER_HIDDEN,
+                 TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, SOUND_AT("lconv1d.linear_end.linear.weight"), TOWER_HIDDEN, TOWER_HIDDEN, 0, 0);
+    test_kit_add(pack, SOUND_AT("lconv1d.depthwise_conv1d.weight"), TOWER_HIDDEN, 1, SOUND_DEEP, 0);
+    test_kit_add(pack, SOUND_AT("lconv1d.pre_layer_norm.weight"), TOWER_HIDDEN, 0, 0, 0);
+    test_kit_add(pack, SOUND_AT("lconv1d.conv_norm.weight"), TOWER_HIDDEN, 0, 0, 0);
+    test_kit_add(pack, SOUND_AT("norm_pre_attn.weight"), TOWER_HIDDEN, 0, 0, 0);
+    test_kit_add(pack, SOUND_AT("norm_post_attn.weight"), TOWER_HIDDEN, 0, 0, 0);
+    test_kit_add(pack, SOUND_AT("norm_out.weight"), TOWER_HIDDEN, 0, 0, 0);
+  }
+#undef SOUND_AT
+  test_kit_add(pack, "model.audio_tower.subsample_conv_projection.layer0.conv.weight", SOUND_CONV,
+               1, 3, 3);
+  test_kit_add(pack, "model.audio_tower.subsample_conv_projection.layer0.norm.weight", SOUND_CONV,
+               0, 0, 0);
+  test_kit_add(pack, "model.audio_tower.subsample_conv_projection.layer1.conv.weight", SOUND_CONV,
+               SOUND_CONV, 3, 3);
+  test_kit_add(pack, "model.audio_tower.subsample_conv_projection.layer1.norm.weight", SOUND_CONV,
+               0, 0, 0);
+  test_kit_add(pack, "model.audio_tower.subsample_conv_projection.input_proj_linear.weight",
+               TOWER_HIDDEN, SOUND_CONV * 2, 0, 0);
+  test_kit_add(pack, "model.audio_tower.output_proj.weight", TOWER_HIDDEN, TOWER_HIDDEN, 0, 0);
+  test_kit_add(pack, "model.audio_tower.output_proj.bias", TOWER_HIDDEN, 0, 0, 0);
+  test_kit_add(pack, "model.embed_audio.embedding_projection.weight", TOWER_TEXT, TOWER_HIDDEN, 0, 0);
+}
+
+/* -- an independent definition of the vision tower ------------------------ */
+
+static void test_tower_norm(const float *value_list, const float *gain_list, int value_count,
+                            float eps_value, float *value_out) {
+  double square_total = 0.0, shrink_value;
+  int value_index;
+  for (value_index = 0; value_index < value_count; ++value_index)
+    square_total += (double)value_list[value_index] * (double)value_list[value_index];
+  shrink_value = pow(square_total / (double)value_count + (double)eps_value, -0.5);
+  for (value_index = 0; value_index < value_count; ++value_index)
+    value_out[value_index] = (float)((double)value_list[value_index] * shrink_value *
+                                     (gain_list ? (double)gain_list[value_index] : 1.0));
+}
+
+static void test_tower_lift(const float *sheet_data, int row_count, int col_count,
+                            const float *act_data, float *out_data) {
+  int row_index, col_index;
+  for (row_index = 0; row_index < row_count; ++row_index) {
+    double total_value = 0.0;
+    for (col_index = 0; col_index < col_count; ++col_index)
+      total_value += (double)sheet_data[(size_t)row_index * (size_t)col_count + (size_t)col_index] *
+                     (double)act_data[col_index];
+    out_data[row_index] = (float)total_value;
+  }
+}
+
+static void test_tower_soft(float *value_list, int value_count) {
+  float peak_value = value_list[0], total_value = 0.0f;
+  int value_index;
+  for (value_index = 1; value_index < value_count; ++value_index)
+    if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+  for (value_index = 0; value_index < value_count; ++value_index) {
+    value_list[value_index] = expf(value_list[value_index] - peak_value);
+    total_value += value_list[value_index];
+  }
+  for (value_index = 0; value_index < value_count; ++value_index)
+    value_list[value_index] /= total_value;
+}
+
+static float test_tower_gelu(float value) {
+  double cube_value = (double)value * value * value;
+  return (float)(0.5 * value *
+                 (1.0 + tanh(0.7978845608028654 * ((double)value + 0.044715 * cube_value))));
+}
+
+/* The vision tower, written from the reference's description rather than from
+ * the engine's code: patch, position tables, two dimensional rotary paired
+ * inside each half of a head, attention scaled by one, pooling with the square
+ * root of the hidden width, and a projector whose norm carries no scale. */
+static void test_tower_vision(test_kit *pack, const flat_grid *grid, int wide_grid, int high_grid,
+                              float *out_data) {
+  static const float eps_value = 1e-6f;
+  int lane_count = wide_grid * high_grid;
+  int pool_wide = wide_grid / TOWER_POOL, pool_high = high_grid / TOWER_POOL;
+  int head_wide = TOWER_HEADS * TOWER_HEAD;
+  float *state_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * TOWER_HIDDEN);
+  float *query_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)head_wide);
+  float *key_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)head_wide);
+  float *value_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)head_wide);
+  float *blend_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)head_wide);
+  const float *patch_sheet =
+      test_kit_find(pack, "model.vision_tower.patch_embedder.input_proj.weight");
+  const float *place_table =
+      test_kit_find(pack, "model.vision_tower.patch_embedder.position_embedding_table");
+  const float *lift_sheet = test_kit_find(pack, "model.embed_vision.embedding_projection.weight");
+  float patch_list[3 * TOWER_PATCH * TOWER_PATCH];
+  float scrap_list[64], score_list[256], lift_list[64];
+  int lane_index, layer_index, head_index, span_index, value_index;
+
+  if (!state_data || !query_data || !key_data || !value_data || !blend_data) goto vision_done;
+
+  for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+    int wide_patch = lane_index % wide_grid, high_patch = lane_index / wide_grid;
+    int band_index, high_index, wide_index;
+    float *lane_data = state_data + (size_t)lane_index * TOWER_HIDDEN;
+    for (high_index = 0; high_index < TOWER_PATCH; ++high_index)
+      for (wide_index = 0; wide_index < TOWER_PATCH; ++wide_index) {
+        const float *cell_data = grid_at(grid, high_patch * TOWER_PATCH + high_index,
+                                         wide_patch * TOWER_PATCH + wide_index);
+        for (band_index = 0; band_index < 3; ++band_index)
+          patch_list[(high_index * TOWER_PATCH + wide_index) * 3 + band_index] =
+              2.0f * (cell_data[band_index] - 0.5f);
+      }
+    test_tower_lift(patch_sheet, TOWER_HIDDEN, 3 * TOWER_PATCH * TOWER_PATCH, patch_list, lane_data);
+    for (value_index = 0; value_index < TOWER_HIDDEN; ++value_index)
+      lane_data[value_index] += place_table[wide_patch * TOWER_HIDDEN + value_index] +
+                                place_table[(TOWER_PLACE + high_patch) * TOWER_HIDDEN + value_index];
+  }
+
+  for (layer_index = 0; layer_index < TOWER_LAYERS; ++layer_index) {
+    char name_text[160];
+#define VISION_FIND(leaf)                                                                  \
+  (snprintf(name_text, sizeof(name_text), "model.vision_tower.encoder.layers.%d.%s",        \
+            layer_index, (leaf)),                                                            \
+   test_kit_find(pack, name_text))
+    const float *enter_norm = VISION_FIND("input_layernorm.weight");
+    const float *after_norm = VISION_FIND("post_attention_layernorm.weight");
+    const float *query_sheet = VISION_FIND("self_attn.q_proj.linear.weight");
+    const float *key_sheet = VISION_FIND("self_attn.k_proj.linear.weight");
+    const float *value_sheet = VISION_FIND("self_attn.v_proj.linear.weight");
+    const float *exit_sheet = VISION_FIND("self_attn.o_proj.linear.weight");
+    const float *query_norm = VISION_FIND("self_attn.q_norm.weight");
+    const float *key_norm = VISION_FIND("self_attn.k_norm.weight");
+    const float *before_feed = VISION_FIND("pre_feedforward_layernorm.weight");
+    const float *after_feed = VISION_FIND("post_feedforward_layernorm.weight");
+    const float *gate_sheet = VISION_FIND("mlp.gate_proj.linear.weight");
+    const float *rise_sheet = VISION_FIND("mlp.up_proj.linear.weight");
+    const float *drop_sheet = VISION_FIND("mlp.down_proj.linear.weight");
+#undef VISION_FIND
+
+    for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+      float *query_lane = query_data + (size_t)lane_index * (size_t)head_wide;
+      float *key_lane = key_data + (size_t)lane_index * (size_t)head_wide;
+      float *value_lane = value_data + (size_t)lane_index * (size_t)head_wide;
+      int wide_place = lane_index % wide_grid, high_place = lane_index / wide_grid;
+      test_tower_norm(state_data + (size_t)lane_index * TOWER_HIDDEN, enter_norm, TOWER_HIDDEN,
+                      eps_value, scrap_list);
+      test_tower_lift(query_sheet, head_wide, TOWER_HIDDEN, scrap_list, query_lane);
+      test_tower_lift(key_sheet, head_wide, TOWER_HIDDEN, scrap_list, key_lane);
+      test_tower_lift(value_sheet, head_wide, TOWER_HIDDEN, scrap_list, value_lane);
+      for (head_index = 0; head_index < TOWER_HEADS; ++head_index) {
+        float *query_head = query_lane + head_index * TOWER_HEAD;
+        float *key_head = key_lane + head_index * TOWER_HEAD;
+        float *value_head = value_lane + head_index * TOWER_HEAD;
+        int part_index, pair_index;
+        test_tower_norm(query_head, query_norm, TOWER_HEAD, eps_value, query_head);
+        test_tower_norm(key_head, key_norm, TOWER_HEAD, eps_value, key_head);
+        test_tower_norm(value_head, NULL, TOWER_HEAD, eps_value, value_head);
+        /* Half a head to each axis, rotated as pairs inside that half. */
+        for (part_index = 0; part_index < 2; ++part_index) {
+          int place_value = part_index == 0 ? wide_place : high_place;
+          int half_size = TOWER_HEAD / 4;
+          for (pair_index = 0; pair_index < half_size; ++pair_index) {
+            double step_value =
+                1.0 / pow(100.0, (double)(2 * pair_index) / (double)(TOWER_HEAD / 2));
+            double angle_value = (double)place_value * step_value;
+            float cos_value = (float)cos(angle_value), sin_value = (float)sin(angle_value);
+            int slot = part_index * (TOWER_HEAD / 2) + pair_index;
+            float low_query = query_head[slot], high_query = query_head[slot + half_size];
+            float low_key = key_head[slot], high_key = key_head[slot + half_size];
+            query_head[slot] = low_query * cos_value - high_query * sin_value;
+            query_head[slot + half_size] = high_query * cos_value + low_query * sin_value;
+            key_head[slot] = low_key * cos_value - high_key * sin_value;
+            key_head[slot + half_size] = high_key * cos_value + low_key * sin_value;
+          }
+        }
+      }
+    }
+
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      for (head_index = 0; head_index < TOWER_HEADS; ++head_index) {
+        const float *query_head =
+            query_data + (size_t)lane_index * (size_t)head_wide + head_index * TOWER_HEAD;
+        float *blend_head =
+            blend_data + (size_t)lane_index * (size_t)head_wide + head_index * TOWER_HEAD;
+        for (span_index = 0; span_index < lane_count; ++span_index) {
+          const float *key_head =
+              key_data + (size_t)span_index * (size_t)head_wide + head_index * TOWER_HEAD;
+          double total_value = 0.0;
+          for (value_index = 0; value_index < TOWER_HEAD; ++value_index)
+            total_value += (double)query_head[value_index] * (double)key_head[value_index];
+          score_list[span_index] = (float)total_value; /* the norms absorb the scale */
+        }
+        test_tower_soft(score_list, lane_count);
+        for (value_index = 0; value_index < TOWER_HEAD; ++value_index) blend_head[value_index] = 0.0f;
+        for (span_index = 0; span_index < lane_count; ++span_index) {
+          const float *value_head =
+              value_data + (size_t)span_index * (size_t)head_wide + head_index * TOWER_HEAD;
+          for (value_index = 0; value_index < TOWER_HEAD; ++value_index)
+            blend_head[value_index] += score_list[span_index] * value_head[value_index];
+        }
+      }
+
+    for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+      float *lane_data = state_data + (size_t)lane_index * TOWER_HIDDEN;
+      float gate_list[TOWER_INNER], rise_list[TOWER_INNER];
+      test_tower_lift(exit_sheet, TOWER_HIDDEN, head_wide,
+                      blend_data + (size_t)lane_index * (size_t)head_wide, lift_list);
+      test_tower_norm(lift_list, after_norm, TOWER_HIDDEN, eps_value, lift_list);
+      for (value_index = 0; value_index < TOWER_HIDDEN; ++value_index)
+        lane_data[value_index] += lift_list[value_index];
+      test_tower_norm(lane_data, before_feed, TOWER_HIDDEN, eps_value, scrap_list);
+      test_tower_lift(gate_sheet, TOWER_INNER, TOWER_HIDDEN, scrap_list, gate_list);
+      test_tower_lift(rise_sheet, TOWER_INNER, TOWER_HIDDEN, scrap_list, rise_list);
+      for (value_index = 0; value_index < TOWER_INNER; ++value_index)
+        gate_list[value_index] = test_tower_gelu(gate_list[value_index]) * rise_list[value_index];
+      test_tower_lift(drop_sheet, TOWER_HIDDEN, TOWER_INNER, gate_list, lift_list);
+      test_tower_norm(lift_list, after_feed, TOWER_HIDDEN, eps_value, lift_list);
+      for (value_index = 0; value_index < TOWER_HIDDEN; ++value_index)
+        lane_data[value_index] += lift_list[value_index];
+    }
+  }
+
+  {
+    int high_pool, wide_pool, high_index, wide_index;
+    float root_gain = (float)sqrt((double)TOWER_HIDDEN);
+    for (high_pool = 0; high_pool < pool_high; ++high_pool)
+      for (wide_pool = 0; wide_pool < pool_wide; ++wide_pool) {
+        float pool_list[TOWER_HIDDEN];
+        for (value_index = 0; value_index < TOWER_HIDDEN; ++value_index) pool_list[value_index] = 0.0f;
+        for (high_index = high_pool * TOWER_POOL; high_index < (high_pool + 1) * TOWER_POOL;
+             ++high_index)
+          for (wide_index = wide_pool * TOWER_POOL; wide_index < (wide_pool + 1) * TOWER_POOL;
+               ++wide_index) {
+            const float *cell_data =
+                state_data + (size_t)(high_index * wide_grid + wide_index) * TOWER_HIDDEN;
+            for (value_index = 0; value_index < TOWER_HIDDEN; ++value_index)
+              pool_list[value_index] += cell_data[value_index];
+          }
+        for (value_index = 0; value_index < TOWER_HIDDEN; ++value_index)
+          pool_list[value_index] *= root_gain / (float)(TOWER_POOL * TOWER_POOL);
+        /* The projector's norm carries no scale. */
+        test_tower_norm(pool_list, NULL, TOWER_HIDDEN, eps_value, pool_list);
+        test_tower_lift(lift_sheet, TOWER_TEXT, TOWER_HIDDEN, pool_list,
+                        out_data + (size_t)(high_pool * pool_wide + wide_pool) * TOWER_TEXT);
+      }
+  }
+
+vision_done:
+  mem_free(state_data);
+  mem_free(query_data);
+  mem_free(key_data);
+  mem_free(value_data);
+  mem_free(blend_data);
+}
+
+/* -- the pieces peculiar to the conformer --------------------------------- */
+
+static void test_sound_parts(void) {
+  /* The mean-subtracting norm the subsampler uses, against its definition. */
+  {
+    float value_list[5] = {1.0f, -2.0f, 3.0f, 0.5f, -1.5f};
+    float gain_list[5] = {2.0f, 1.0f, 0.5f, 1.5f, 1.0f};
+    float out_list[5];
+    double mean_value = 0.0, spread_value = 0.0;
+    int slot;
+    for (slot = 0; slot < 5; ++slot) mean_value += value_list[slot];
+    mean_value /= 5.0;
+    for (slot = 0; slot < 5; ++slot)
+      spread_value += (value_list[slot] - mean_value) * (value_list[slot] - mean_value);
+    spread_value = pow(spread_value / 5.0 + 1e-6, -0.5);
+    kern_norm_layer(value_list, gain_list, 5, 1e-6f, out_list);
+    for (slot = 0; slot < 5; ++slot)
+      test_near((double)out_list[slot],
+                ((double)value_list[slot] - mean_value) * spread_value * gain_list[slot], 1e-6,
+                "the layer norm subtracts the mean before it scales");
+  }
+  /* And that it is not the root-mean-square norm wearing its name. */
+  {
+    float value_list[4] = {2.0f, 2.0f, 2.0f, 2.0f};
+    float out_list[4];
+    kern_norm_layer(value_list, NULL, 4, 1e-6f, out_list);
+    test_true(fabs((double)out_list[0]) < 1e-2, "a constant row normalizes to nothing");
+  }
+  {
+    float value_list[3] = {0.0f, 1.0f, -1.0f};
+    test_near((double)kern_silu(0.0f), 0.0, 1e-9, "silu is zero at zero");
+    test_near((double)kern_silu(value_list[1]), 1.0 / (1.0 + exp(-1.0)), 1e-6,
+              "silu is x over one plus e to the minus x");
+    test_near((double)kern_silu(value_list[2]), -1.0 / (1.0 + exp(1.0)), 1e-6,
+              "silu is negative below zero");
+    test_near((double)kern_soft_plus(0.0f), log(2.0), 1e-6, "softplus of zero is log two");
+    test_near((double)kern_soft_plus(30.0f), 30.0, 1e-3, "softplus is linear when large");
+  }
+}
+
+static void test_tower(void) {
+  test_kit *pack;
+  app_setup setup = app_setup_plain();
+  app_model *model = NULL;
+  app_session *session = NULL;
+  app_media media;
+  char path_text[1024];
+  flat_grid grid, work_grid;
+  float *want_list = NULL;
+  int row_index, value_index, okay_flag = 1;
+  int wide_grid = 0, high_grid = 0;
+
+  test_open("tower");
+  test_sound_parts();
+
+  pack = (test_kit *)mem_clear(sizeof(test_kit));
+  if (!pack) { test_true(0, "the fixture is allocated"); return; }
+  test_wing_pack(pack, 0);
+  test_tower_add(pack);
+  if (!test_kit_open(pack) || !test_kit_save(pack, "model.safetensors")) {
+    test_true(0, "the multi-modal checkpoint is written");
+    mem_free(pack->body_data);
+    mem_free(pack);
+    return;
+  }
+  test_true(test_wing_config(0, 1), "the multi-modal configuration is written");
+  test_true(test_file_write("tokenizer.json", test_token_json, sizeof(test_token_json) - 1),
+            "the tokenizer is written");
+  test_true(test_file_write("image.png", test_png_data, sizeof(test_png_data)),
+            "the image is written");
+  test_true(test_wave_write("clip.wav", 8000, 600), "the clip is written");
+
+  setup.thread_count = 2;
+  test_true(model_load(test_yard_path, &setup, &model) == APP_OKAY,
+            "a checkpoint with towers loads");
+  if (!model) { mem_free(pack->body_data); mem_free(pack); return; }
+  test_true(model_vision_ready(model), "the vision tower is bound");
+  test_true(model_audio_ready(model), "the audio tower is bound");
+  test_true(model_image_token(model) == 5, "the image placeholder id comes from the configuration");
+  test_true(model_image_rows(model) == TOWER_SOFT, "the soft token cap comes from the configuration");
+
+  /* -- vision -------------------------------------------------------- */
+  path_join(path_text, sizeof(path_text), test_yard_path, "image.png");
+  test_true(media_image(model, path_text, &media) == APP_OKAY, "an image runs the vision tower");
+  /* The picture is twelve by eight and the budget allows nine soft tokens, so
+   * the resize lands on twelve by eight pixels, a six by four patch grid, and a
+   * three by two pooled grid. */
+  test_true(media.row_count == 6, "the tower pools the grid the budget allows");
+  wide_grid = 6;
+  high_grid = 4;
+  want_list = (float *)mem_clear(sizeof(float) * 6u * TOWER_TEXT);
+  if (image_read(path_text, &grid) == APP_OKAY && want_list) {
+    test_true(grid_bands(&grid, 3) == APP_OKAY, "the picture is read for the reference");
+    test_true(grid_scale(&grid, wide_grid * TOWER_PATCH, high_grid * TOWER_PATCH, &work_grid) ==
+                  APP_OKAY,
+              "the picture is resized for the reference");
+    test_tower_vision(pack, &work_grid, wide_grid, high_grid, want_list);
+    for (row_index = 0; row_index < media.row_count && row_index < 6; ++row_index)
+      for (value_index = 0; value_index < TOWER_TEXT; ++value_index)
+        if (fabs((double)media.state_data[row_index * TOWER_TEXT + value_index] -
+                 (double)want_list[row_index * TOWER_TEXT + value_index]) > 1e-4)
+          okay_flag = 0;
+    test_true(okay_flag, "the vision tower matches an independent definition of it");
+    grid_free(&work_grid);
+    grid_free(&grid);
+  } else {
+    test_true(0, "the reference reads the picture");
+  }
+  mem_free(want_list);
+
+  /* -- audio --------------------------------------------------------- */
+  {
+    app_media sound;
+    path_join(path_text, sizeof(path_text), test_yard_path, "clip.wav");
+    test_true(media_audio(model, path_text, &sound) == APP_OKAY, "a clip runs the audio tower");
+    /* Six hundred samples at eight kilohertz become twelve hundred at sixteen,
+     * then frames of eight stepping four, then two halvings in the subsampler. */
+    test_true(sound.row_count > 0, "the conformer emits a row per subsampled frame");
+    okay_flag = 1;
+    for (row_index = 0; row_index < sound.row_count; ++row_index)
+      for (value_index = 0; value_index < TOWER_TEXT; ++value_index) {
+        float value_now = sound.state_data[row_index * TOWER_TEXT + value_index];
+        if (!(value_now == value_now) || fabs((double)value_now) > 1e6) okay_flag = 0;
+      }
+    test_true(okay_flag, "every value the conformer emits is finite");
+    /* The attention reaches backwards only, so a longer clip has to reproduce
+     * the rows of a shorter one that starts the same way; and a clip that
+     * sounds different has to reach a different answer, or the tower is not
+     * reading its input at all. */
+    {
+      app_media longer, other;
+      int same_flag = 1, keep_flag = 1;
+      test_true(test_wave_write("clip.wav", 8000, 900), "a longer clip is written");
+      test_true(media_audio(model, path_text, &longer) == APP_OKAY, "the longer clip runs");
+      test_true(longer.row_count > sound.row_count, "a longer clip makes more rows");
+      for (value_index = 0; value_index < TOWER_TEXT; ++value_index)
+        if (fabs((double)longer.state_data[value_index] - (double)sound.state_data[value_index]) >
+            1e-4)
+          keep_flag = 0;
+      test_true(keep_flag, "a longer clip repeats the first row of a shorter one");
+      media_free(&longer);
+
+      test_true(test_wave_write_at("clip.wav", 8000, 600, 0.77), "a different clip is written");
+      test_true(media_audio(model, path_text, &other) == APP_OKAY, "the different clip runs");
+      for (value_index = 0; value_index < TOWER_TEXT; ++value_index)
+        if (fabs((double)other.state_data[value_index] - (double)sound.state_data[value_index]) >
+            1e-6)
+          same_flag = 0;
+      test_true(!same_flag, "a clip that sounds different reaches a different answer");
+      media_free(&other);
+    }
+    media_free(&sound);
+  }
+
+  /* -- the substitution ----------------------------------------------- */
+  {
+    int32_t id_list[8];
+    uint8_t flag_list[8];
+    float *state_list = (float *)mem_clear(sizeof(float) * 8u * TOWER_TEXT);
+    const float *logit_list;
+    float keep_value = 0.0f;
+    int slot_index;
+    for (slot_index = 0; slot_index < 8; ++slot_index) {
+      id_list[slot_index] = slot_index < 4 ? 5 : (int32_t)(7 + slot_index);
+      flag_list[slot_index] = slot_index < 4 ? 1u : 0u;
+    }
+    if (state_list && media.row_count >= 4) {
+      memcpy(state_list, media.state_data, sizeof(float) * 4u * TOWER_TEXT);
+      test_true(session_open(model, &session) == APP_OKAY, "a session opens");
+      if (session) {
+        test_true(session_prime_media(session, id_list, 8, state_list, flag_list) == APP_OKAY,
+                  "a prompt with placeholders primes");
+        logit_list = session_step(session, id_list[7]);
+        test_true(logit_list != NULL, "the prompt reaches the head");
+        if (logit_list) keep_value = logit_list[0];
+        session_reset(session);
+        test_true(session_prime(session, id_list, 8) == APP_OKAY, "the same ids prime plainly");
+        logit_list = session_step(session, id_list[7]);
+        test_true(logit_list && fabs((double)logit_list[0] - keep_value) > 1e-6,
+                  "a substituted embedding changes what the stack computes");
+        session_close(session);
+      }
+    }
+    mem_free(state_list);
+  }
+
+  media_free(&media);
+  model_free(model);
+  mem_free(pack->body_data);
+  mem_free(pack);
+}
+
 static void test_face(void) {
   app_setup setup = app_setup_plain();
   app_taste taste = app_taste_plain();
@@ -1206,7 +2340,13 @@ int main(void) {
   test_kernel();
   test_rope();
   test_token();
+  test_puff();
+  test_image();
+  test_scale();
+  test_wave();
+  test_mel();
   test_wing();
+  test_tower();
   test_face();
 
   test_yard_close();

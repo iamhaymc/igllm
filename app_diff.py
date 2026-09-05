@@ -8,6 +8,8 @@ the function to look at rather than the model.
     python3 app_diff.py                       # build a fake checkpoint and diff it
     python3 app_diff.py --model /path/to/ckpt # diff a checkpoint you already have
     python3 app_diff.py --sweep               # the whole coverage matrix
+    python3 app_diff.py --media               # the vision and audio towers
+    python3 app_diff.py --media --model DIR   # the towers of a checkpoint you have
 
 The engine must be built with the activation dump compiled in:
 
@@ -33,6 +35,18 @@ stack is held to how far the reference moves there — over the whole run rather
 than one prompt at a time, because whether a given perturbation lands on a
 half step is a lottery, and a prompt where the reference happens to flip
 nothing says nothing about the engine.
+
+`--media` walks the two towers instead. Each is built from the reference's own
+module and loaded with the checkpoint's own weights, which works even for the
+shipped export: its language model dequantizes to about nineteen gigabytes and
+will not fit on an ordinary machine, but a tower is a couple of hundred
+megabytes and the reference gives each one a `base_model_prefix` so it can be
+built alone.
+
+Both sides start from the rows the engine says it read — the normalized patches,
+or the mel frames — because the png reader, the resize and the filterbank are
+each held against an independent definition in `app_test.c`, and what is in
+question here is the tower above them.
 """
 
 import argparse
@@ -403,6 +417,131 @@ def diff_real(model_path, ref_path, slack, length_list):
     return fail_count
 
 
+# -- the towers -----------------------------------------------------------
+
+# The engine's dump against the reference's own tower, on whatever weights the
+# checkpoint carries.
+#
+# Both sides start from the rows the engine says it read — the normalized
+# patches, or the mel frames — because the png reader, the bicubic resize and
+# the filterbank each have an independent definition in `app_test.c`, and what
+# is in question here is the tower above them.
+
+
+def tower_seed_rows(mine, kind):
+    """The rows the engine read: normalized patches, or mel frames."""
+    stem_text = "%s.%s." % (kind, "patch" if kind == "vision" else "mel")
+    row_list = []
+    while ("%s%d" % (stem_text, len(row_list))) in mine:
+        row_list.append(list(mine["%s%d" % (stem_text, len(row_list))]))
+    return row_list
+
+
+def engine_media(model_path, kind, media_path):
+    """Runs the engine over one picture or one clip and returns its dump."""
+    handle, trace_path = tempfile.mkstemp(suffix=".igtrace")
+    os.close(handle)
+    room = dict(os.environ, IGLLM_TRACE=trace_path)
+    line = [engine_path(), "tokens", "--model", model_path, "--prompt", "one two",
+            "--image" if kind == "vision" else "--audio", media_path]
+    done = subprocess.run(line, capture_output=True, text=True, env=room)
+    if done.returncode != 0:
+        raise RuntimeError("engine failed: %s" % done.stderr.strip())
+    found = trace_read(trace_path)
+    os.unlink(trace_path)
+    if not found:
+        raise RuntimeError("the engine wrote no activations; build with `run.py build --trace`")
+    return found
+
+
+def diff_tower(title, model_path, kind, media_path):
+    """Holds one tower against the reference and reports what it costs.
+
+    On a checkpoint that rounds every activation onto a static grid there is no
+    single answer to agree with: a sum that lands on a half step falls one way
+    here and the other way there, and one flipped step becomes a different
+    residual for every layer after it. So the engine is not asked to be exact.
+    It is asked to stay within the movement the grid itself allows, measured by
+    nudging the reference's own input by a part in a million and seeing how far
+    that carries. Anything tighter would report the checkpoint's rounding as an
+    engine fault.
+    """
+    import app_fake
+    import torch
+
+    mine = engine_media(model_path, kind, media_path)
+    seed_rows = tower_seed_rows(mine, kind)
+    if not seed_rows:
+        print("  %-28s FAIL  the engine read no %s rows" % (title, kind))
+        return 1
+    grid = None
+    if kind == "vision":
+        if "vision.grid.0" not in mine:
+            print("  %-28s FAIL  the engine reported no patch grid" % title)
+            return 1
+        grid = (int(mine["vision.grid.0"][0]), int(mine["vision.grid.0"][1]))
+
+    theirs = app_fake.tower_run(model_path, kind, seed_rows, torch.float32, grid)
+    if theirs is None:
+        print("  %-28s skip  the checkpoint has no %s tower" % (title, kind))
+        return 0
+    seed = torch.tensor(seed_rows, dtype=torch.float32)
+    maker = torch.Generator().manual_seed(11)
+    nudge = (seed * (1.0 + 1e-6 * torch.randn(seed.shape, generator=maker))).tolist()
+    moved = app_fake.tower_run(model_path, kind, nudge, torch.float32, grid)
+
+    row_list = []
+    while ("%s.lift.%d" % (kind, len(row_list))) in mine:
+        row_list.append(list(mine["%s.lift.%d" % (kind, len(row_list))]))
+    if len(row_list) != theirs.shape[0]:
+        print("  %-28s FAIL  the engine made %d rows, the reference %d"
+              % (title, len(row_list), theirs.shape[0]))
+        return 1
+    ours = torch.tensor(row_list, dtype=torch.float32)
+    gap = float((ours - theirs).abs().max())
+    floor = float((moved - theirs).abs().max())
+    peak = float(theirs.abs().max())
+    limit = max(floor * FLOOR_SHARE, 1e-4 * max(1.0, peak))
+    good = gap <= limit
+    print("  %-28s %-4s %d rows, off by %.3e, the reference by %.3e, allowed %.3e"
+          % (title, "ok" if good else "FAIL", len(row_list), gap, floor, limit))
+    return 0 if good else 1
+
+
+def diff_media(work_path, seed_value):
+    """Builds a checkpoint with each tower and diffs both of them."""
+    import app_fake
+
+    fail_count = 0
+    for kind in ("vision", "audio"):
+        out_path = os.path.join(work_path, "%s-0-0" % kind)
+        made = app_fake.fake_build(out_path, kind, seed_value, "real", 0, 0)
+        picture_path, sound_path = made["media"]
+        fail_count += diff_tower("%s tower" % kind, made["plain"], kind,
+                                 picture_path if kind == "vision" else sound_path)
+    return fail_count
+
+
+def diff_media_at(model_path, image_path, audio_path):
+    """Diffs the towers of a checkpoint that already carries them."""
+    import json as json_module
+
+    with open(os.path.join(model_path, "config.json"), "r", encoding="utf-8") as source:
+        tree = json_module.load(source)
+    fail_count = 0
+    for kind, media_path in (("vision", image_path), ("audio", audio_path)):
+        if "%s_config" % kind not in tree:
+            continue
+        if not media_path:
+            media_path = os.path.join(model_path,
+                                      "picture.png" if kind == "vision" else "sound.wav")
+        if not os.path.exists(media_path):
+            print("  %-28s skip  no %s to show it" % ("%s tower" % kind, kind))
+            continue
+        fail_count += diff_tower("%s tower" % kind, model_path, kind, media_path)
+    return fail_count
+
+
 # The axes that change which code path runs. Prompt lengths are chosen to
 # straddle the batch chunk and the sliding window rather than to be round.
 SWEEP_PLAN = (
@@ -425,6 +564,10 @@ def main():
     parser.add_argument("--model", help="a checkpoint to diff instead of a synthetic one")
     parser.add_argument("--reference", help="the checkpoint the reference reads, if it differs")
     parser.add_argument("--sweep", action="store_true", help="run the whole coverage matrix")
+    parser.add_argument("--media", action="store_true",
+                        help="diff the vision and audio towers instead of the text stack")
+    parser.add_argument("--image", help="the picture to show a vision tower")
+    parser.add_argument("--audio", help="the clip to play an audio tower")
     parser.add_argument("--work", default=os.path.join(WORK_PATH, "fake"))
     parser.add_argument("--slack", type=float, default=0.0,
                         help="absolute tolerance, or 0 to measure the noise floor")
@@ -432,9 +575,16 @@ def main():
 
     try:
         import torch  # noqa: F401
-        import transformers  # noqa: F401
     except ImportError:
-        print("skip: torch and transformers are not installed; run `python3 run.py install`")
+        print("skip: torch is not installed; run `python3 run.py install`")
+        return 0
+    # `--media` builds one tower of the reference at a time, which needs the
+    # gemma4 modelling code but not the language model; everything else needs
+    # the whole reference.
+    try:
+        from transformers.models import gemma4  # noqa: F401
+    except ImportError:
+        print("skip: this transformers has no gemma4; run `python3 run.py install`")
         return 0
     if not os.path.exists(engine_path()):
         print("skip: no engine built; run `python3 run.py build --trace`")
@@ -442,6 +592,14 @@ def main():
 
     slack = flag.slack
     fail_count = 0
+
+    if flag.media:
+        if flag.model:
+            fail_count += diff_media_at(flag.model, flag.image, flag.audio)
+        else:
+            fail_count += diff_media(flag.work, 7)
+        print("\n%d checks failed" % fail_count)
+        return 0 if fail_count == 0 else 1
 
     if flag.model:
         if slack <= 0:

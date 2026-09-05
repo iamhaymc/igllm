@@ -17,20 +17,28 @@ party library, and no build system beyond a C compiler.
   matrix product rather than a matrix-vector product per token
 - **mixture-of-experts** — routed blocks run beside the shared expert, with
   the stacked expert weights sliced as views
+- **vision and audio** — a bidirectional patch encoder at variable resolution
+  with two dimensional rotary positions, and a conformer audio encoder with
+  chunked local attention, each projecting into the text embedding space
+- **its own decoders** — png, pnm, bmp and riff wave readers, a bicubic
+  resize, and a mel filterbank, none of them borrowed
 
 ## Quickstart
 
 ```sh
+git lfs install                            # the checkpoint is stored with LFS
 python3 run.py build                       # build the cli and the tests
 python3 run.py test                        # build, then run the unit tests
-python3 run.py run -- chat \
-    --model /path/to/gemma-4-E2B-it-qat \
+python3 run.py run -- chat --model model \
     --prompt "Explain gravity to a child."
 ```
 
-The checkpoint folder is the one produced by
-`huggingface-cli download google/gemma-4-E2B-it-qat-mobile-transformers`.
-Nothing is downloaded by the engine itself.
+The checkpoint is vendored under `model/`, so a clone needs nothing from the
+network beyond itself. It is `google/gemma-4-E2B-it-qat-mobile-transformers`,
+split into three shards to stay under GitHub's two gigabyte limit for a single
+LFS object; `model/README.md` says what is in it and under what licence. Any
+other folder in the same layout serves just as well — `--model /path/to/folder`
+— and nothing is downloaded by the engine itself.
 
 ## Tasks
 
@@ -43,9 +51,18 @@ Nothing is downloaded by the engine itself.
 | `logits`   | print the next token distribution as json     |
 | `probe`    | print the resolved model shape                |
 
-Common flags: `--model`, `--prompt`, `--serve`, `--threads`, `--window`,
-`--heat`, `--top-k`, `--top-p`, `--echo-penalty`, `--seed`, `--raw`,
-`--verbose`. Run `igllm --help` for the full list.
+Common flags: `--model`, `--prompt`, `--image`, `--audio`, `--serve`,
+`--threads`, `--window`, `--heat`, `--top-k`, `--top-p`, `--echo-penalty`,
+`--seed`, `--raw`, `--verbose`. Run `igllm --help` for the full list.
+
+`--image` takes a png, pnm or bmp and `--audio` a riff wave. Each is run
+through its tower and put in front of the prompt, in the place a multi-modal
+chat template puts it:
+
+```sh
+python3 run.py run -- chat --model model \
+    --image photo.png --prompt "What is in this picture?"
+```
 
 ## Workflows
 
@@ -57,6 +74,7 @@ Common flags: `--model`, `--prompt`, `--serve`, `--threads`, `--window`,
 | `python3 run.py check --model <folder>` | test, then compare to the reference |
 | `python3 run.py parity`       | build a synthetic checkpoint, diff layer by layer |
 | `python3 run.py parity --model <folder>` | diff a real checkpoint layer by layer |
+| `python3 run.py parity --media` | diff the vision and audio towers    |
 | `python3 run.py run -- <args>`| build, then run the cli                       |
 | `python3 run.py clean`        | remove build products                         |
 
@@ -68,7 +86,7 @@ compile in the activation dump the parity harness reads.
 
 | file          | purpose                                        |
 | ------------- | ---------------------------------------------- |
-| `app_core.c`  | the engine, public interface and all ten layers |
+| `app_core.c`  | the engine, public interface and all eleven layers |
 | `app_main.c`  | the command line front end                     |
 | `app_test.c`  | the unit tests                                 |
 | `app_test.py` | comparison against the transformers reference  |
@@ -78,15 +96,15 @@ compile in the activation dump the parity harness reads.
 | `GUIDE.md`    | a complete tour of the implementation          |
 | `CHANGES.md`  | development progress and rationale             |
 | `TODO.md`     | open development tasks                         |
+| `model/`      | the vendored checkpoint, in Git LFS            |
 
 `GUIDE.md` is the place to start if you intend to read or extend the code.
 
 ## Status
 
 The engine builds clean and passes its unit tests on POSIX and Windows, on the
-scalar, SSE2 and AVX2 backends. Text generation, mixture-of-experts
-blocks, and batched prefill are implemented; the vision and audio towers are
-not, so the engine is text-only today.
+scalar, SSE2 and AVX2 backends. Text generation, mixture-of-experts blocks,
+batched prefill, and the vision and audio towers are all implemented.
 
 Numerical parity is **verified against the reference implementation on the
 shipped checkpoint**, `google/gemma-4-E2B-it-qat-mobile-transformers`, and on
@@ -99,11 +117,22 @@ a whole step, so the reference does not reproduce itself either, and both sides
 move by whole steps of it. `CHANGES.md` sets out what that means and why per
 tensor equality is not the criterion on a checkpoint like this one.
 
+The vision and audio towers are verified the same way, against the reference's
+own tower modules on the same shipped weights. The language model of that
+export dequantizes to about nineteen gigabytes and will not fit on an ordinary
+machine, but each tower is a couple of hundred megabytes and the reference lets
+one be built alone, so the towers are held to upstream rather than to a second
+reading of it. On the shipped checkpoint the engine is closer to the reference
+than the reference is to itself under a one-part-per-million change to its own
+input; on synthetic float weights, where the activation grid is absent, the
+vision tower agrees to a part in ten million.
+
 | command                                  | what it measures                     |
 | ---------------------------------------- | ------------------------------------ |
 | `run.py parity`                          | eleven synthetic configurations by six prompt lengths, against the noise floor measured on each |
 | `run.py parity --model <folder>`         | the real checkpoint, tensor by tensor, against how far the reference moves against itself |
 | `run.py check --model <folder>`          | the next token distribution, the greedy continuation, and the speed of both sides |
+| `run.py parity --media`                  | both towers against the reference's own tower modules, on the same weights |
 
 Decode runs at about six tokens a second on four cores of a 2017 desktop,
 against the reference's 0.16. It has not been optimized. See `TODO.md`.

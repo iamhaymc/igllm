@@ -9,6 +9,8 @@ rather than from anyone's reading of upstream.
 
     python3 app_fake.py --out build/fake --preset dense
     python3 app_fake.py --out build/fake --preset moe --bits 4 --group 32
+    python3 app_fake.py --out build/fake --preset vision
+    python3 app_fake.py --out some/checkpoint --towers vision --towers audio
 
 Three folders are produced under the output path:
 
@@ -20,15 +22,28 @@ The engine reads `packed` and the reference reads `dequant`. Both see the same
 numbers, so any disagreement is the engine's unpacking rather than the loss the
 quantizer introduced. What this cannot check is the naming used by the shipped
 checkpoint, the real tokenizer's merges, or behaviour at full scale.
+
+The `vision` and `audio` presets add an encoder beside the text stack, and
+`--towers` adds one to a checkpoint that already exists. Those weights come from
+the reference's own tower modules, the same way the text stack's come from its
+own model class, so `app_diff.py --media` compares against upstream rather than
+against a second reading of upstream.
+
+`tower_open` also builds one tower of a *shipped* checkpoint on its own. That
+matters because the language model of the released export dequantizes to about
+nineteen gigabytes and will not fit on an ordinary machine, while a tower is a
+couple of hundred megabytes: the towers can be held to the real weights even
+where the whole model cannot be loaded.
 """
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
 
-PRESET_LIST = ("dense", "moe", "wide", "twin")
+PRESET_LIST = ("dense", "moe", "wide", "twin", "vision", "audio")
 
 # Kept small enough that a whole sweep runs in seconds, but not so small that
 # every axis collapses: the head count, the key-value head count, and the two
@@ -173,6 +188,10 @@ PACK_LEAF = (
 
 
 def pack_wanted(name):
+    # The towers stay float, as the embeddings and the norms do in the shipped
+    # export, and their convolution kernels are four dimensional besides.
+    if "_tower." in name or "_projector." in name:
+        return False
     if not name.endswith(".weight") and not name.endswith("gate_up_proj"):
         return False
     stem = name[: -len(".weight")] if name.endswith(".weight") else name
@@ -283,6 +302,319 @@ def rule_write(path, bit_count, group_size):
         json.dump(tree, target, indent=1)
 
 
+# -- towers ---------------------------------------------------------------
+
+# The vision and audio encoders, as the reference builds them.
+#
+# The language model of the shipped checkpoint dequantizes to about nineteen
+# gigabytes, which will not fit on an ordinary machine, but each tower is a
+# couple of hundred megabytes and the reference gives both a `base_model_prefix`
+# so that they can be built alone. That is what makes a real comparison possible
+# here at all: the towers are held against upstream on the shipped weights, the
+# same standard the text stack is held to, rather than against a second reading
+# of the same description.
+#
+# The per-module bit widths in a checkpoint are written against the full model's
+# names (`vision_tower...`), so they are restated below against the standalone
+# module's names. The widths and the exclusions are the checkpoint's own, and
+# the unpacking is the reference's.
+
+TOWER_PLAN = {
+    "vision": {
+        "stem": "model.vision_tower.",
+        "lift": "model.embed_vision.",
+        "bits": {".": {"num_bits": 8}},
+        "keep": ["patch_embedder"],
+    },
+    "audio": {
+        "stem": "model.audio_tower.",
+        "lift": "model.embed_audio.",
+        "bits": {r"^(?!.*lconv1d\.linear_start).*$": {"num_bits": 2},
+                 r"lconv1d\.linear_start": {"num_bits": 4}},
+        "keep": ["subsample_conv_projection", "output_proj", "relative_k_proj"],
+    },
+}
+
+
+def tower_classes(kind):
+    from transformers.models.gemma4 import configuration_gemma4 as C, modeling_gemma4 as M
+
+    if kind == "vision":
+        return M.Gemma4VisionModel, C.Gemma4VisionConfig
+    return M.Gemma4AudioModel, C.Gemma4AudioConfig
+
+
+def tower_form(model_path, kind):
+    """The tower's configuration, as the reference's own config object."""
+    _, config_class = tower_classes(kind)
+    with open(os.path.join(model_path, "config.json"), "r", encoding="utf-8") as source:
+        whole = json.load(source)
+    if "%s_config" % kind not in whole:
+        return None, whole
+    field = {name: value for name, value in whole["%s_config" % kind].items()
+             if not name.startswith("_")}
+    field.pop("architectures", None)
+    return config_class(**field), whole
+
+
+def tower_hold(model_path):
+    """Every tensor of a checkpoint, whether it is one file or a set of shards.
+
+    A vendored checkpoint is sharded to stay under the host's per-object limit,
+    so a reader that only knows `model.safetensors` finds nothing.
+    """
+    from safetensors.torch import load_file
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as source:
+            leaf_list = sorted(set(json.load(source)["weight_map"].values()))
+    else:
+        leaf_list = ["model.safetensors"]
+    held = {}
+    for leaf in leaf_list:
+        held.update(load_file(os.path.join(model_path, leaf)))
+    return held
+
+
+def tower_open(model_path, kind, want_kind=None):
+    """Builds one tower on its own and loads the checkpoint's weights into it.
+
+    The weights stay packed; the reference's own `QuantizedLinear` decodes them,
+    so nothing about the unpacking or the activation rounding comes from this
+    side of the comparison.
+    """
+    import gc
+
+    import torch
+    from transformers.integrations.gemma_quant import replace_with_quant_layers
+    from transformers.utils.quantization_config import GemmaQuantizationConfig
+
+    plan = TOWER_PLAN[kind]
+    model_class, _ = tower_classes(kind)
+    config, whole = tower_form(model_path, kind)
+    if config is None:
+        return None, None
+    model = model_class(config)
+    if "quantization_config" in whole:
+        replace_with_quant_layers(
+            model,
+            GemmaQuantizationConfig(num_bits=whole["quantization_config"].get("num_bits", 8),
+                                    module_quant_configs=plan["bits"], quantize_embeddings=False),
+            plan["keep"])
+
+    held = tower_hold(model_path)
+    piece = {name[len(plan["stem"]):]: value.clone() for name, value in held.items()
+             if name.startswith(plan["stem"]) and not name.endswith("_cache_scale")}
+    del held
+    gc.collect()
+    missing, extra = model.load_state_dict(piece, strict=False)
+    missing = [name for name in missing if not name.endswith("activation_scale")]
+    if missing or extra:
+        raise ValueError("the %s tower did not load: missing %s, unexpected %s"
+                         % (kind, missing[:4], list(extra)[:4]))
+    model.eval()
+    if want_kind is not None:
+        model = model.to(want_kind)
+    return model, config
+
+
+def tower_lift(model_path, kind, config, want_kind=None):
+    """The projector that follows a tower into the text hidden width."""
+    import gc
+
+    from transformers.models.gemma4 import configuration_gemma4 as C, modeling_gemma4 as M
+
+    plan = TOWER_PLAN[kind]
+    with open(os.path.join(model_path, "config.json"), "r", encoding="utf-8") as source:
+        whole = json.load(source)
+    text = C.Gemma4TextConfig(**{name: value for name, value in
+                                 whole.get("text_config", whole).items()
+                                 if not name.startswith("_")})
+    lift = M.Gemma4MultimodalEmbedder(config, text)
+    held = tower_hold(model_path)
+    piece = {name[len(plan["lift"]):]: value.clone() for name, value in held.items()
+             if name.startswith(plan["lift"])}
+    del held
+    gc.collect()
+    lift.load_state_dict(piece, strict=False)
+    lift.eval()
+    if want_kind is not None:
+        lift = lift.to(want_kind)
+    return lift
+
+
+def tower_run(model_path, kind, seed_rows, want_kind=None, grid=None):
+    """Runs one tower over the rows the engine says it read, and projects them.
+
+    Starting from the engine's own patches or mel frames is deliberate: the png
+    reader, the bicubic resize and the filterbank are each held against
+    independent definitions in `app_test.c`, and what is in question here is the
+    tower above them.
+    """
+    import torch
+
+    if want_kind is None:
+        want_kind = torch.float32
+    model, config = tower_open(model_path, kind, want_kind)
+    if model is None:
+        return None
+    lift = tower_lift(model_path, kind, config, want_kind)
+    rows = torch.tensor(seed_rows, dtype=want_kind)[None]
+    with torch.no_grad():
+        if kind == "vision":
+            wide, high = grid
+            # the engine records a patch after the model-side scaling to [-1, 1]
+            place = torch.tensor([[index % wide, index // wide] for index in range(wide * high)],
+                                 dtype=torch.long)[None]
+            out = model(pixel_values=rows / 2.0 + 0.5, pixel_position_ids=place)
+        else:
+            mask = torch.ones(rows.shape[:2], dtype=torch.bool)
+            out = model(input_features=rows, attention_mask=mask)
+        return lift(inputs_embeds=out.last_hidden_state).float().reshape(-1, lift.text_hidden_size)
+
+
+def tower_build(out_path, kind, seed_value=7):
+    """Writes a synthetic checkpoint carrying one tower, built by the reference.
+
+    The tower's weights, names and shapes come from the reference's own modules,
+    the same way the text stack's do, so a comparison against it is a comparison
+    against upstream rather than against a second reading of upstream.
+    """
+    import torch
+    from safetensors.torch import load_file, save_file
+    from transformers.models.gemma4 import configuration_gemma4 as C, modeling_gemma4 as M
+
+    plan = TOWER_PLAN[kind]
+    model_class, config_class = tower_classes(kind)
+    field = dict(VISION_FORM if kind == "vision" else AUDIO_FORM)
+    config = config_class(**field)
+    torch.manual_seed(seed_value)
+    tower = model_class(config)
+    form_seed(tower, seed_value, "real")
+
+    with open(os.path.join(out_path, "config.json"), "r", encoding="utf-8") as source:
+        tree = json.load(source)
+    text = C.Gemma4TextConfig(**{name: value for name, value in
+                                 tree.get("text_config", tree).items()
+                                 if not name.startswith("_")})
+    lift = M.Gemma4MultimodalEmbedder(config, text)
+    form_seed(lift, seed_value + 1, "real")
+
+    held = load_file(os.path.join(out_path, "model.safetensors"))
+    piece = {name: value.clone() for name, value in held.items()}
+    del held
+    for name, value in tower.state_dict().items():
+        piece[plan["stem"] + name] = value.clone().contiguous()
+    for name, value in lift.state_dict().items():
+        piece[plan["lift"] + name] = value.clone().contiguous()
+    save_file(piece, os.path.join(out_path, "model.safetensors"))
+
+    tree["%s_config" % kind] = config.to_diff_dict() if hasattr(config, "to_diff_dict") else field
+    tree.setdefault("image_token_id", 5)
+    tree.setdefault("audio_token_id", 6)
+    if kind == "vision":
+        tree["vision_soft_tokens_per_image"] = VISION_SOFT
+    with open(os.path.join(out_path, "config.json"), "w", encoding="utf-8") as target:
+        json.dump(tree, target, indent=1)
+    if kind == "audio":
+        with open(os.path.join(out_path, "preprocessor_config.json"), "w",
+                  encoding="utf-8") as target:
+            json.dump(SOUND_FORM, target, indent=1)
+    return tower_media(out_path, kind)
+
+
+# Small enough that a whole sweep runs in seconds, and shaped so that every axis
+# that could be confused for another is distinct: the two grid sides differ, the
+# head divides by four but not by eight, and the pooled grid is not square.
+VISION_SOFT = 9
+VISION_FORM = {
+    "hidden_size": 24,
+    "intermediate_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 3,
+    "num_key_value_heads": 3,
+    "head_dim": 8,
+    "patch_size": 2,
+    "pooling_kernel_size": 2,
+    "position_embedding_size": 32,
+    "rms_norm_eps": 1e-6,
+    "rope_parameters": {"rope_type": "default", "rope_theta": 100.0},
+}
+
+AUDIO_FORM = {
+    "hidden_size": 24,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 3,
+    "conv_kernel_size": 3,
+    # The reference sizes the subsampler's projection as
+    # `channels[0] // 4 * channels[1]`, which is the filter count after two
+    # halvings only when the first channel count equals the mel bin count.
+    "subsampling_conv_channels": [16, 4],
+    "attention_chunk_size": 4,
+    "attention_context_left": 3,
+    "attention_context_right": 0,
+    "attention_logit_cap": 5.0,
+    "residual_weight": 0.5,
+    "output_proj_dims": 24,
+    "rms_norm_eps": 1e-6,
+    "hidden_act": "silu",
+}
+
+SOUND_FORM = {
+    "feature_extractor_type": "Gemma4AudioFeatureExtractor",
+    "feature_size": 16,
+    "sampling_rate": 8000,
+    "frame_length": 16,
+    "hop_length": 8,
+    "fft_length": 16,
+    "mel_floor": 1e-3,
+    "min_frequency": 0.0,
+    "max_frequency": 4000.0,
+    "preemphasis": 0.0,
+    "dither": 0.0,
+}
+
+
+def tower_media(out_path, kind):
+    """Writes one picture and one clip for a tower to be shown."""
+    import struct
+    import zlib
+
+    wide, high = 27, 19
+    raw = bytearray()
+    for y in range(high):
+        raw.append(0)
+        for x in range(wide):
+            raw += bytes(((x * 7 + y * 3) & 0xFF, (x * 11 + y * 5) & 0xFF, (x * x + y) & 0xFF))
+
+    def chunk(tag, body):
+        return (struct.pack(">I", len(body)) + tag + body +
+                struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF))
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", wide, high, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    png += chunk(b"IEND", b"")
+    picture_path = os.path.join(out_path, "picture.png")
+    with open(picture_path, "wb") as target:
+        target.write(png)
+
+    rate = SOUND_FORM["sampling_rate"]
+    count = rate // 4
+    body = b"".join(struct.pack("<h", int(9000 * math.sin(index * 0.21) *
+                                          math.cos(index * 0.013)))
+                    for index in range(count))
+    wave = b"RIFF" + struct.pack("<I", 36 + len(body)) + b"WAVEfmt "
+    wave += struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+    wave += b"data" + struct.pack("<I", len(body)) + body
+    sound_path = os.path.join(out_path, "sound.wav")
+    with open(sound_path, "wb") as target:
+        target.write(wave)
+    del kind
+    return picture_path, sound_path
+
+
 # -- workflow -------------------------------------------------------------
 
 
@@ -317,6 +649,12 @@ def fake_build(out_path, preset, seed_value, magnitude, bit_count, group_size, e
         pack_write(plain_path, packed_path, dequant_path, bit_count, group_size)
         made["packed"] = packed_path
         made["dequant"] = dequant_path
+    if preset in ("vision", "audio"):
+        # Added after the packing, and to every folder, because the towers stay
+        # float: both sides then read the same tower weights whichever folder
+        # they were pointed at.
+        for path in list(made.values()):
+            made["media"] = tower_build(path, preset, seed_value)
     return made
 
 
@@ -330,13 +668,33 @@ def main():
                         help="bit width for the packed pair, or 0 for float only")
     parser.add_argument("--group", type=int, default=0,
                         help="group size along the input axis, or 0 for one group per row")
+    parser.add_argument("--towers", action="append", choices=("vision", "audio"),
+                        help="add a tower to the checkpoint already at --out and stop")
+    parser.add_argument("--seed-only", action="store_true", help=argparse.SUPPRESS)
     flag = parser.parse_args()
 
     try:
         import torch  # noqa: F401
-        import transformers  # noqa: F401
     except ImportError:
-        print("skip: torch and transformers are not installed; run `python3 run.py install`")
+        print("skip: torch is not installed; run `python3 run.py install`")
+        return 0
+
+    # `--towers` adds the encoders to a checkpoint that already has a text
+    # stack, which is the only part of this builder that does not need the
+    # reference library.
+    if flag.towers:
+        for kind in flag.towers:
+            for path in tower_build(flag.out, kind, flag.seed):
+                print("%-8s %s" % ("media", path))
+        return 0
+
+    try:
+        # The tower presets need the reference only for the text stack, but
+        # every preset needs `gemma4` itself, and a `transformers` that predates
+        # it is the common case rather than the odd one.
+        from transformers.models import gemma4  # noqa: F401
+    except ImportError:
+        print("skip: this transformers has no gemma4; run `python3 run.py install`")
         return 0
 
     made = fake_build(flag.out, flag.preset, flag.seed, flag.magnitude, flag.bits, flag.group)
