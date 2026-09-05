@@ -82,6 +82,19 @@ typedef struct app_media {
   int    state_size;
 } app_media;
 
+/* Where one image's or one clip's soft tokens sit in a prompt.  The caller says
+ * which tower made the rows and how many there are; the frame builder lays the
+ * run down with the opener and the closer the processor puts around it, and
+ * reports where the run itself begins so the rows can be laid on top of it. */
+#define APP_MEDIA_IMAGE 0
+#define APP_MEDIA_AUDIO 1
+
+typedef struct app_media_span {
+  int kind_mark;  /* APP_MEDIA_IMAGE or APP_MEDIA_AUDIO */
+  int row_count;  /* soft tokens the tower produced */
+  int place_from; /* set by the frame builder: the first id of the run */
+} app_media_span;
+
 typedef struct app_model   app_model;
 typedef struct app_session app_session;
 
@@ -96,17 +109,27 @@ int         model_state_size(const app_model *model);
 size_t      model_memory_bytes(const app_model *model);
 
 /* token layer -------------------------------------------------------------*/
+/* `lead_marker` says this text begins a chunk rather than continuing one.  A
+ * tokenizer that marks the start of a chunk — a metaspace prefix, a prepend
+ * normalizer — marks it only then, which is what the reference does: it splits
+ * its input on the special tokens and normalizes each chunk on its own. */
 int  token_encode(const app_model *model, const char *text, int lead_marker,
                   int32_t *id_list, int id_limit);
 int  token_decode(const app_model *model, int32_t id_value, char *text_out, int text_limit);
 int  token_frame(const app_model *model, const char *user_text,
                  int32_t *id_list, int id_limit); /* chat framing for IT models */
 /* The same frame with a run of media placeholders between the turn opener and
- * the user's text, which is where a multi-modal template puts them.  The index
- * the run starts at is reported through `lead_from`, so the caller can lay its
- * embedding rows down against it. */
-int  token_frame_media(const app_model *model, const char *user_text, const int32_t *lead_list,
-                       int lead_count, int32_t *id_list, int id_limit, int *lead_from);
+ * the user's text, which is where a multi-modal template puts them.  Each span
+ * is bracketed the way the processor brackets it, and has its `place_from`
+ * filled in, so the caller can lay its embedding rows down against the run
+ * rather than against the bracket. */
+int  token_frame_media(const app_model *model, const char *user_text,
+                       app_media_span *span_list, int span_count, int32_t *id_list, int id_limit);
+/* Just the media run: for every span an opener, one placeholder per row, and a
+ * closer.  `place_base` is what the caller has already written, and is added to
+ * each span's `place_from`. */
+int  token_media_run(const app_model *model, app_media_span *span_list, int span_count,
+                     int place_base, int32_t *id_list, int id_limit);
 int  token_start_id(const app_model *model);
 int  token_close_id(const app_model *model);
 int  token_is_close(const app_model *model, int32_t id_value);
@@ -116,6 +139,11 @@ int      model_vision_ready(const app_model *model);
 int      model_audio_ready(const app_model *model);
 int      model_image_token(const app_model *model);  /* placeholder id, -1 when absent */
 int      model_audio_token(const app_model *model);
+/* The ids the processor puts either side of a soft token run, and zero when the
+ * checkpoint records no pair: an export without them is read as bracketing
+ * nothing, and half a pair is treated as none. */
+int      model_image_wrap(const app_model *model, int *open_out, int *shut_out);
+int      model_audio_wrap(const app_model *model, int *open_out, int *shut_out);
 int      model_image_rows(const app_model *model);   /* rows one image produces */
 app_code media_image(app_model *model, const char *path_text, app_media *media_out);
 app_code media_audio(app_model *model, const char *path_text, app_media *media_out);
@@ -3264,6 +3292,8 @@ typedef struct tower_form {
   float norm_eps;
   float head_gain;    /* attention scale, 1/sqrt(head_size) */
   int   token_id;     /* placeholder id in the text vocabulary */
+  int   open_id;      /* the id the processor writes before the run */
+  int   shut_id;      /* and after it */
 
   /* vision */
   int patch_size, band_count, pool_size;
@@ -3773,6 +3803,7 @@ static void config_tower_read(const json_tree *tree, const char *node_text, int 
   memset(form_out, 0, sizeof(*form_out));
   form_out->kind_mark = kind_mark;
   form_out->token_id = -1;
+  form_out->open_id = form_out->shut_id = -1;
   if (node_index < 0) return;
   form_out->live_flag = 1;
   form_out->state_size = (int)json_field_number(tree, node_index, "hidden_size", 0);
@@ -3978,6 +4009,19 @@ static app_code config_read(app_model *model, const char *folder_path) {
       (int)json_field_number(tree, 0, "image_token_id", -1);
   model->tower_list[TOWER_AUDIO].form.token_id =
       (int)json_field_number(tree, 0, "audio_token_id", -1);
+  /* The processor does not lay a bare run of placeholders down: it brackets
+   * each one, and the model reads those two ids as ordinary text.  A prompt
+   * built without them is a prompt the reference never sees.  The end of an
+   * audio run is `eoa_token_id` in one export and `eoa_token_index` in
+   * another, so both spellings are accepted. */
+  model->tower_list[TOWER_VISION].form.open_id =
+      (int)json_field_number(tree, 0, "boi_token_id", -1);
+  model->tower_list[TOWER_VISION].form.shut_id =
+      (int)json_field_number(tree, 0, "eoi_token_id", -1);
+  model->tower_list[TOWER_AUDIO].form.open_id =
+      (int)json_field_number(tree, 0, "boa_token_id", -1);
+  model->tower_list[TOWER_AUDIO].form.shut_id = (int)json_field_number(
+      tree, 0, "eoa_token_id", json_field_number(tree, 0, "eoa_token_index", -1));
 
   json_free(tree);
   if (model->setup.window_limit > 0 && model->setup.window_limit < form->window_limit)
@@ -6034,7 +6078,12 @@ static int token_split(const token_book *book, const char *text, int lead_marker
   int piece_count = 0;
   size_t text_head = 0;
   size_t text_size = strlen(text);
-  int want_prefix = book->prefix_mode == 1 || (book->prefix_mode == 2 && lead_marker);
+  /* The prefix belongs to the start of a chunk of text, not to the start of a
+   * call.  The reference splits its input on the special tokens and normalizes
+   * each chunk on its own, so the marker follows a special id and nothing else;
+   * a caller stitching one turn together out of several pieces says which of
+   * them begins a chunk. */
+  int want_prefix = lead_marker && book->prefix_mode != 0;
 
   while (text_head < text_size && piece_count < piece_limit) {
     unsigned char lead_byte = (unsigned char)text[text_head];
@@ -6540,9 +6589,11 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
 
   /* A lane a tower filled carries its embedding rather than looking one up.
    * The substitution happens after the token path's scale, not before it, so
-   * what a projector emits is already in the units the residual carries.  The
-   * id is still the placeholder's, because the per-layer embedding below reads
-   * the id and the reference feeds it the placeholder too. */
+   * what a projector emits is already in the units the residual carries.  What
+   * the id is used for afterwards is the per-layer embedding below, and there
+   * the reference does not read the placeholder: it rewrites every media
+   * position to the pad id first, so the token-identity half of the per-layer
+   * input is the pad token's row and carries nothing of the placeholder. */
   for (lane_index = 0; lane_index < lane_count; ++lane_index) {
     float *state_data = session->state_room + (size_t)lane_index * session->state_stride;
     if (state_flag && state_flag[lane_index] && state_list) {
@@ -6563,9 +6614,12 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
     for (lane_index = 0; lane_index < lane_count; ++lane_index) {
       float *seed_data = session->ple_seed + (size_t)lane_index * session->ple_stride;
       float *lane_room = session->ple_room + (size_t)lane_index * session->ple_stride;
+      int32_t seed_id = state_flag && state_flag[lane_index] && state_list
+                            ? (int32_t)form->pad_id
+                            : id_list[lane_index];
       int chunk_index;
-      plane_row(&model->ple_embed_sheet, id_list[lane_index] % model->ple_embed_sheet.row_count,
-                seed_data);
+      if (seed_id < 0) seed_id = 0;
+      plane_row(&model->ple_embed_sheet, seed_id % model->ple_embed_sheet.row_count, seed_data);
       kern_scale(seed_data, (float)sqrt((double)form->ple_size), chunk_count);
       kern_scale(lane_room, (float)(1.0 / sqrt((double)form->state_size)), chunk_count);
       for (chunk_index = 0; chunk_index < form->layer_count; ++chunk_index) {
@@ -6709,17 +6763,46 @@ app_code model_load(const char *folder_path, const app_setup *setup, app_model *
   /* A placeholder id the configuration did not record is looked up in the
    * vocabulary instead, which is where the exporters that omit it put it. */
   {
-    static const char *image_name[] = {"<image_soft_token>", "<image>", "<start_of_image>"};
-    static const char *audio_name[] = {"<audio_soft_token>", "<audio>", "<start_of_audio>"};
+    static const char *image_name[] = {"<|image|>", "<image_soft_token>", "<image>",
+                                       "<start_of_image>"};
+    static const char *audio_name[] = {"<|audio|>", "<audio_soft_token>", "<audio>",
+                                       "<start_of_audio>"};
+    /* The two ids the processor writes either side of a run, in the spellings
+     * the exports use: this one's angle-bracket pairs, and the older words. */
+    static const char *image_open[] = {"<|image>", "<start_of_image>"};
+    static const char *image_shut[] = {"<image|>", "<end_of_image>"};
+    static const char *audio_open[] = {"<|audio>", "<start_of_audio>"};
+    static const char *audio_shut[] = {"<audio|>", "<end_of_audio>"};
+    tower_form *vision_form = &model->tower_list[TOWER_VISION].form;
+    tower_form *audio_form = &model->tower_list[TOWER_AUDIO].form;
     size_t name_index;
-    for (name_index = 0; name_index < 3; ++name_index) {
-      if (model->tower_list[TOWER_VISION].form.token_id < 0)
-        model->tower_list[TOWER_VISION].form.token_id =
-            token_find(model->book_ref, image_name[name_index]);
-      if (model->tower_list[TOWER_AUDIO].form.token_id < 0)
-        model->tower_list[TOWER_AUDIO].form.token_id =
-            token_find(model->book_ref, audio_name[name_index]);
+    for (name_index = 0; name_index < 4; ++name_index) {
+      if (vision_form->token_id < 0)
+        vision_form->token_id = token_find(model->book_ref, image_name[name_index]);
+      if (audio_form->token_id < 0)
+        audio_form->token_id = token_find(model->book_ref, audio_name[name_index]);
     }
+    for (name_index = 0; name_index < 2; ++name_index) {
+      if (vision_form->open_id < 0)
+        vision_form->open_id = token_find(model->book_ref, image_open[name_index]);
+      if (vision_form->shut_id < 0)
+        vision_form->shut_id = token_find(model->book_ref, image_shut[name_index]);
+      if (audio_form->open_id < 0)
+        audio_form->open_id = token_find(model->book_ref, audio_open[name_index]);
+      if (audio_form->shut_id < 0)
+        audio_form->shut_id = token_find(model->book_ref, audio_shut[name_index]);
+    }
+    /* An export that names its placeholder `<start_of_image>` has no bracket at
+     * all, whatever the vocabulary is read for, so a bracket that came back as
+     * the placeholder itself is not one. */
+    if (vision_form->open_id == vision_form->token_id) vision_form->open_id = -1;
+    if (audio_form->open_id == audio_form->token_id) audio_form->open_id = -1;
+    /* A run is bracketed on both sides or on neither.  Half a bracket is a
+     * prompt the reference never lays down, and would be worse than none. */
+    if (vision_form->open_id < 0 || vision_form->shut_id < 0)
+      vision_form->open_id = vision_form->shut_id = -1;
+    if (audio_form->open_id < 0 || audio_form->shut_id < 0)
+      audio_form->open_id = audio_form->shut_id = -1;
   }
 
   thread_count = model->setup.thread_count > 0 ? model->setup.thread_count : host_thread_count();
@@ -6875,6 +6958,21 @@ int model_audio_token(const app_model *model) {
   return model ? model->tower_list[TOWER_AUDIO].form.token_id : -1;
 }
 
+static int model_wrap_of(const app_model *model, int kind_mark, int *open_out, int *shut_out) {
+  const tower_form *form = model ? &model->tower_list[kind_mark].form : NULL;
+  if (open_out) *open_out = form ? form->open_id : -1;
+  if (shut_out) *shut_out = form ? form->shut_id : -1;
+  return form && form->open_id >= 0 && form->shut_id >= 0 ? 1 : 0;
+}
+
+int model_image_wrap(const app_model *model, int *open_out, int *shut_out) {
+  return model_wrap_of(model, TOWER_VISION, open_out, shut_out);
+}
+
+int model_audio_wrap(const app_model *model, int *open_out, int *shut_out) {
+  return model_wrap_of(model, TOWER_AUDIO, open_out, shut_out);
+}
+
 /* The most rows one image can produce.  The tower takes a variable resolution,
  * so what a given picture yields is known only after it is read; this is the
  * cap the checkpoint sets. */
@@ -6949,35 +7047,67 @@ int token_is_close(const app_model *model, int32_t id_value) {
   return 0;
 }
 
+/* The ids one image or one clip contributes: the opener, one placeholder per
+ * row, and the closer.  That is what the processor substitutes for its marker,
+ * and the two brackets are ordinary text to the model — it reads them, and a
+ * prompt without them is one the reference never sees.
+ *
+ * Only the placeholders stand for tower rows, so `place_from` points past the
+ * opener; the caller lays its rows down from there. */
+int token_media_run(const app_model *model, app_media_span *span_list, int span_count,
+                    int place_base, int32_t *id_list, int id_limit) {
+  int id_count = 0;
+  int span_index, row_index;
+  if (!model || (span_count > 0 && !span_list) || !id_list) return -1;
+  for (span_index = 0; span_index < span_count; ++span_index) {
+    app_media_span *span = &span_list[span_index];
+    const tower_form *form = &model->tower_list[span->kind_mark == APP_MEDIA_AUDIO ? TOWER_AUDIO
+                                                                                   : TOWER_VISION]
+                                  .form;
+    span->place_from = -1;
+    if (span->row_count < 1) continue;
+    if (form->open_id >= 0 && id_count < id_limit) id_list[id_count++] = (int32_t)form->open_id;
+    span->place_from = place_base + id_count;
+    for (row_index = 0; row_index < span->row_count && id_count < id_limit; ++row_index)
+      id_list[id_count++] = (int32_t)form->token_id;
+    if (form->shut_id >= 0 && id_count < id_limit) id_list[id_count++] = (int32_t)form->shut_id;
+  }
+  return id_count;
+}
+
 /* Wraps one user turn in the instruction-tuned chat frame. */
-int token_frame_media(const app_model *model, const char *user_text, const int32_t *lead_list,
-                      int lead_count, int32_t *id_list, int id_limit, int *lead_from) {
+int token_frame_media(const app_model *model, const char *user_text, app_media_span *span_list,
+                      int span_count, int32_t *id_list, int id_limit) {
   const token_book *book;
   int id_count = 0;
-  int part_count, lead_index;
-  if (lead_from) *lead_from = -1;
+  int part_count, lead_flag;
   if (!model || !model->book_ref || !user_text || !id_list) return -1;
   book = model->book_ref;
   if (book->start_id >= 0 && id_count < id_limit) id_list[id_count++] = book->start_id;
   if (book->turn_open_id >= 0) {
     if (id_count < id_limit) id_list[id_count++] = book->turn_open_id;
-    part_count = token_encode_book(book, "user\n", 0, id_list + id_count, id_limit - id_count);
+    /* Every piece here follows a special id and so begins a chunk, except the
+     * user's words when nothing was attached: those continue the line the role
+     * marker opened, and a media run ends in a special id that starts a new one. */
+    part_count = token_encode_book(book, "user\n", 1, id_list + id_count, id_limit - id_count);
     if (part_count > 0) id_count += part_count;
-    if (lead_from && lead_count > 0) *lead_from = id_count;
-    for (lead_index = 0; lead_index < lead_count && id_count < id_limit; ++lead_index)
-      id_list[id_count++] = lead_list[lead_index];
-    part_count = token_encode_book(book, user_text, 0, id_list + id_count, id_limit - id_count);
+    part_count = token_media_run(model, span_list, span_count, id_count, id_list + id_count,
+                                 id_limit - id_count);
+    lead_flag = part_count > 0;
+    if (part_count > 0) id_count += part_count;
+    part_count = token_encode_book(book, user_text, lead_flag, id_list + id_count,
+                                   id_limit - id_count);
     if (part_count > 0) id_count += part_count;
     if (id_count < id_limit && book->turn_shut_id >= 0) id_list[id_count++] = book->turn_shut_id;
-    part_count = token_encode_book(book, "\n", 0, id_list + id_count, id_limit - id_count);
+    part_count = token_encode_book(book, "\n", 1, id_list + id_count, id_limit - id_count);
     if (part_count > 0) id_count += part_count;
     if (id_count < id_limit) id_list[id_count++] = book->turn_open_id;
-    part_count = token_encode_book(book, "model\n", 0, id_list + id_count, id_limit - id_count);
+    part_count = token_encode_book(book, "model\n", 1, id_list + id_count, id_limit - id_count);
     if (part_count > 0) id_count += part_count;
   } else {
-    if (lead_from && lead_count > 0) *lead_from = id_count;
-    for (lead_index = 0; lead_index < lead_count && id_count < id_limit; ++lead_index)
-      id_list[id_count++] = lead_list[lead_index];
+    part_count = token_media_run(model, span_list, span_count, id_count, id_list + id_count,
+                                 id_limit - id_count);
+    if (part_count > 0) id_count += part_count;
     part_count = token_encode_book(book, user_text, 1, id_list + id_count, id_limit - id_count);
     if (part_count > 0) id_count += part_count;
   }
@@ -6985,7 +7115,7 @@ int token_frame_media(const app_model *model, const char *user_text, const int32
 }
 
 int token_frame(const app_model *model, const char *user_text, int32_t *id_list, int id_limit) {
-  return token_frame_media(model, user_text, NULL, 0, id_list, id_limit, NULL);
+  return token_frame_media(model, user_text, NULL, 0, id_list, id_limit);
 }
 
 app_code session_open(app_model *model, app_session **session_out) {

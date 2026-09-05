@@ -15,7 +15,7 @@ and where an accelerator would attach.
 | `app_test.c`  | the unit tests                                               |
 | `app_test.py` | parity and throughput comparison against transformers        |
 | `app_fake.py` | builds a synthetic checkpoint and quantizes it               |
-| `app_diff.py` | layer by layer comparison against transformers               |
+| `app_diff.py` | layer by layer comparison against transformers, and the seam |
 | `run.py`      | install, build, test, check, parity, run, clean workflows    |
 
 `app_core.c` is a single translation unit. `app_main.c` and `app_test.c`
@@ -452,9 +452,26 @@ one embedding row per placeholder token. The caller lays those rows against the
 ids and hands both to `session_prime_media`, which substitutes a row for the
 embedding lookup of the lanes it is given. The substitution happens *after* the
 token path's `sqrt(hidden_size)` scale, not before it, so a projector's output
-is already in the units the residual stream carries. The id stays the
-placeholder's, because the per-layer embedding block reads the id and the
-reference feeds it the placeholder too.
+is already in the units the residual stream carries.
+
+What the id at a filled lane is used for afterwards is the per-layer embedding,
+and there the reference does not read the placeholder: it rewrites every media
+position to the pad id before it computes the token-identity half of the
+per-layer input. So `session_pass` seeds that half from `pad_id` at a filled
+lane, and nothing of the placeholder reaches the stack — the id under a filled
+lane cannot change an answer, which is what `test_tower` asserts.
+
+**The ids around the run.** A run of placeholders is not laid down bare. The
+processor opens and closes each one — `boi_token_id` and `eoi_token_id` for a
+picture, `boa_token_id` and `eoa_token_id` for a clip — and the model reads
+those two ids as ordinary text, so a prompt built without them is a prompt the
+reference never sees. `token_media_run` writes one span's ids and reports where
+its placeholders begin, and `token_frame_media` splices that between the role
+marker and the user's words, which is where a multi-modal template puts it. The
+caller lays its rows against the reported index rather than against the opener.
+
+An export that records neither bracket is read as having none; half a bracket is
+treated as none at all, because half of one is a prompt nothing lays down.
 
 A tower allocates its own scratch per call rather than per session: it runs once
 for a prompt and never inside the token loop.
@@ -467,10 +484,17 @@ normalizer and pre-tokenizer records. Byte-fallback entries of the form
 `<0xNN>` are indexed into a 256 entry table.
 
 `token_split` maps text to UTF-8 runes, replacing spaces with the metaspace
-mark and prepending the mark when the tokenizer asks. `token_encode_book`
-then applies the standard byte-pair merge loop, always taking the lowest
-ranked adjacent pair, and falls back to byte tokens for anything the
-vocabulary does not hold. `token_decode_book` reverses that, turning the
+mark and prepending the mark when the tokenizer asks and the caller says this
+text begins a chunk. The mark belongs to the start of a chunk rather than to the
+start of a call: the reference splits its input on the special tokens and
+normalizes each chunk on its own, so a piece that follows a special id is marked
+and a piece continuing the line before it is not. That is why `token_frame_media`
+marks `user\n` and the words after a media run, and does not mark the words when
+nothing was attached.
+
+`token_encode_book` then applies the standard byte-pair merge loop, always
+taking the lowest ranked adjacent pair, and falls back to byte tokens for
+anything the vocabulary does not hold. `token_decode_book` reverses that, turning the
 metaspace mark back into a space, expanding byte tokens, and emitting
 nothing for control tokens.
 
@@ -563,8 +587,9 @@ sound ──► wave_read ──► mel ──────┤     key/value cach
               └► audio_run  ──► rows
 ```
 
-An image or a clip enters as a run of placeholder ids with one embedding row
-laid against each of them; everything after that is the text path.
+An image or a clip enters as a bracketed run of placeholder ids with one
+embedding row laid against each placeholder; everything after that is the text
+path.
 
 ## 5. Formats read
 
@@ -747,6 +772,37 @@ the audio tower's by 2.38 where the nudge moves it by 5.36 — in both cases the
 engine is closer to the reference than the reference is to itself under a change
 that should not matter. On synthetic float weights, where there is no grid, the
 vision tower agrees to 1.2e-07 and the audio tower to 2.2e-05.
+
+**`app_diff.py --seam` walks the join between them.** A tower that agrees with
+the reference and a text stack that agrees with the reference still say nothing
+about where they meet: the ids the processor lays down around a run of soft
+tokens, and what the model makes of them, exist only when the whole graph runs.
+
+It is two halves, because they can be reached separately.
+
+The *layout* half asks the reference's own `Gemma4Processor` where the
+placeholders go. A processor is a tokenizer and three small configurations, so
+this needs no weights at all and runs against the shipped export as easily as
+against a synthetic one. The chat template frames the turn, `replace_image_token`
+and `replace_audio_token` substitute a bracketed run for the marker it wrote, and
+the ids that come out have to be the engine's, id for id. Two counts are checked
+beside them: what the processor's own arithmetic says a picture of that size is
+worth, which is the aspect-preserving resize against the patch budget, and what
+it says the clip is worth. The second is the feature extractor's framing, which
+is an open question tracked in `TODO.md`, so it is reported rather than judged.
+
+The *graph* half runs `Gemma4ForConditionalGeneration` over those same ids and
+compares the distribution. That wants the whole model in memory, which the
+shipped export does not give; `app_fake.whole_build` writes a synthetic one that
+does — the reference's own model class, both towers, both projectors, a tokenizer
+carrying the media tokens, and the processor files beside them. The towers are
+fed the rows the engine says it read, as `--media` feeds them, so what is
+measured is the seam rather than the png reader or the filterbank.
+
+Two engine faults came out of writing it, neither of which any single-tower
+comparison could have reached: the run was laid down without the ids the
+processor brackets it with, and the per-layer embedding at a filled lane read the
+placeholder where the reference reads the pad id.
 
 ## 7. Extending
 

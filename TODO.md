@@ -2,12 +2,11 @@
 
 Open development tasks, most consequential first.
 
-- Verify the whole multi-modal graph end to end against the reference, not just
-  each tower against its own. The language model of the shipped export
-  dequantizes to about nineteen gigabytes, so `Gemma4ForConditionalGeneration`
-  could not be loaded on the development host; the text stack and the two
-  towers are each verified separately, and what is not yet checked is the seam
-  — the placeholder run the processor lays down and the ids around it.
+- Run the seam against the shipped checkpoint. `run.py parity --seam` compares
+  the ids without loading any weights, so it works on the real export, but the
+  export could not be fetched on the host the seam was written on; what has been
+  run there is the synthetic checkpoint, whole, and the two towers against the
+  real weights. The layout half wants one run against `model/`.
 - Match the processor's soft-token policy. `processor_config.json` records
   `audio_seq_length` 750 and `audio_ms_per_token` 40, so the reference pads or
   trims a clip to a fixed token count; the engine emits whatever the clip
@@ -47,6 +46,3 @@ Open development tasks, most consequential first.
 - Build under MSVC. The suite builds clean and passes on a Windows host with
   MinGW gcc, on the scalar, SSE2 and AVX2 backends; `cl` and its `/arch:AVX2`
   path have still only been read.
-- Run the sanitizers over the tower and media changes. `run.py test --debug`
-  needs a toolchain that ships `libasan` and `libubsan`, which the MinGW build
-  used for the Windows run does not.

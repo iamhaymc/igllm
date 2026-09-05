@@ -56,8 +56,9 @@ Common flags: `--model`, `--prompt`, `--image`, `--audio`, `--serve`,
 `--seed`, `--raw`, `--verbose`. Run `igllm --help` for the full list.
 
 `--image` takes a png, pnm or bmp and `--audio` a riff wave. Each is run
-through its tower and put in front of the prompt, in the place a multi-modal
-chat template puts it:
+through its tower and put in front of the prompt, bracketed by the ids the
+reference's processor brackets it with, in the place a multi-modal chat template
+puts it:
 
 ```sh
 python3 run.py run -- chat --model model \
@@ -75,6 +76,7 @@ python3 run.py run -- chat --model model \
 | `python3 run.py parity`       | build a synthetic checkpoint, diff layer by layer |
 | `python3 run.py parity --model <folder>` | diff a real checkpoint layer by layer |
 | `python3 run.py parity --media` | diff the vision and audio towers    |
+| `python3 run.py parity --seam` | diff the whole multi-modal graph end to end |
 | `python3 run.py run -- <args>`| build, then run the cli                       |
 | `python3 run.py clean`        | remove build products                         |
 
@@ -117,6 +119,13 @@ a whole step, so the reference does not reproduce itself either, and both sides
 move by whole steps of it. `CHANGES.md` sets out what that means and why per
 tensor equality is not the criterion on a checkpoint like this one.
 
+The whole multi-modal graph is verified end to end. The ids are held to the
+reference's own `Gemma4Processor` — the run of soft tokens, the pair of ids
+around it, and the frame either side — which needs no weights and so runs
+against the shipped export; the distribution over them is held to
+`Gemma4ForConditionalGeneration` on a synthetic checkpoint that fits in memory,
+where the engine agrees with the reference to a part in ten million.
+
 The vision and audio towers are verified the same way, against the reference's
 own tower modules on the same shipped weights. The language model of that
 export dequantizes to about nineteen gigabytes and will not fit on an ordinary
@@ -133,6 +142,7 @@ vision tower agrees to a part in ten million.
 | `run.py parity --model <folder>`         | the real checkpoint, tensor by tensor, against how far the reference moves against itself |
 | `run.py check --model <folder>`          | the next token distribution, the greedy continuation, and the speed of both sides |
 | `run.py parity --media`                  | both towers against the reference's own tower modules, on the same weights |
+| `run.py parity --seam`                   | the join between them: the ids the reference's processor lays down around a run of soft tokens, and the distribution the whole graph reaches over them |
 
 Decode runs at about six tokens a second on four cores of a 2017 desktop,
 against the reference's 0.16. It has not been optimized. See `TODO.md`.

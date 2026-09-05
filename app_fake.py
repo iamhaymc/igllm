@@ -34,6 +34,13 @@ matters because the language model of the released export dequantizes to about
 nineteen gigabytes and will not fit on an ordinary machine, while a tower is a
 couple of hundred megabytes: the towers can be held to the real weights even
 where the whole model cannot be loaded.
+
+`whole_build` goes the other way: a checkpoint small enough to be loaded whole,
+carrying both towers, a tokenizer with the media tokens, and the processor files
+beside them. That is what lets `app_diff.py --seam` run the join between the
+towers and the text stack, which no separate comparison reaches.
+
+    python3 app_fake.py --out build/whole --whole
 """
 
 import argparse
@@ -140,17 +147,22 @@ def form_check(model):
 # -- tokenizer ------------------------------------------------------------
 
 
-def book_build(vocab_count):
+def book_build(vocab_count, extra_list=()):
     """Builds a small sentencepiece-shaped tokenizer.
 
     The engine expects Gemma's arrangement: a metaspace pre-tokenizer, `<0xNN>`
     byte pieces for the fallback, and the four special ids. Both sides load this
     same file, so tokenization is shared rather than compared, and a
     disagreement can only come from the arithmetic.
+
+    `extra_list` adds further specials at the end, which is where the turn and
+    media tokens of a multi-modal checkpoint go: appending them leaves every id
+    the text presets already use where it was.
     """
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
     special_list = ["<pad>", "<eos>", "<bos>", "<unk>", "<start_of_turn>", "<end_of_turn>"]
+    special_list += [name for name in extra_list if name not in special_list]
     byte_list = ["<0x%02X>" % value for value in range(256)]
     book = Tokenizer(models.BPE(unk_token="<unk>", byte_fallback=True))
     book.pre_tokenizer = pre_tokenizers.Metaspace(prepend_scheme="always")
@@ -561,12 +573,18 @@ AUDIO_FORM = {
     "hidden_act": "silu",
 }
 
+# The engine reads a window in samples, because that is what
+# `preprocessor_config.json` records; the reference derives the same window from
+# a duration in milliseconds. Both are written, and they agree: two milliseconds
+# of eight kilohertz is sixteen samples, and one is eight.
 SOUND_FORM = {
     "feature_extractor_type": "Gemma4AudioFeatureExtractor",
     "feature_size": 16,
     "sampling_rate": 8000,
     "frame_length": 16,
     "hop_length": 8,
+    "frame_length_ms": 2.0,
+    "hop_length_ms": 1.0,
     "fft_length": 16,
     "mel_floor": 1e-3,
     "min_frequency": 0.0,
@@ -613,6 +631,159 @@ def tower_media(out_path, kind):
         target.write(wave)
     del kind
     return picture_path, sound_path
+
+
+# -- the whole multi-modal model ------------------------------------------
+
+# One tower at a time leaves the seam unchecked: what the processor lays down
+# around a run of soft tokens, and what the model makes of the ids either side
+# of it, exists only when the whole graph runs. The shipped export cannot be
+# loaded whole — its language model dequantizes to about nineteen gigabytes —
+# but a synthetic one can, and `Gemma4ForConditionalGeneration` writes the
+# arrangement and the names itself, so the seam is compared against upstream
+# rather than against a second reading of it.
+#
+# The processor files are written beside the weights because the ids under
+# examination are the processor's: it is `Gemma4Processor` that decides a run is
+# opened and closed, and how long it is.
+
+# The turn markers and the six media tokens, in the spellings the shipped
+# tokenizer uses. They are appended to the tokenizer's specials, so every id the
+# text presets already produce stays where it was.
+WHOLE_TOKENS = ("<|turn>", "<turn|>",
+                "<|image>", "<|image|>", "<image|>",
+                "<|audio>", "<|audio|>", "<audio|>",
+                "<|video|>")
+
+# The image processor accepts a soft-token budget from a fixed set, so the
+# synthetic checkpoint uses the smallest of them rather than a smaller number of
+# its own.
+WHOLE_SOFT = 70
+
+# The user turn of the shipped template, and nothing else: a role marker, the
+# content parts in the order they are given, and the turn's close. What the
+# frame around a turn looks like is settled against the shipped template
+# elsewhere; what is in question here is the run inside it.
+WHOLE_TEMPLATE = """{{- bos_token -}}
+{%- for message in messages -%}
+{{- '<|turn>' + message['role'] + '\n' -}}
+{%- if message['content'] is string -%}
+{{- message['content'] | trim -}}
+{%- else -%}
+{%- for item in message['content'] -%}
+{%- if item['type'] == 'text' -%}
+{{- item['text'] | trim -}}
+{%- elif item['type'] in ['image', 'image_url'] -%}
+{{- '<|image|>' -}}
+{%- elif item['type'] in ['audio', 'input_audio'] -%}
+{{- '<|audio|>' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{- '<turn|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<|turn>model\n' -}}
+{%- endif -%}
+"""
+
+
+def whole_processor(out_path):
+    """Writes the processor files beside a multi-modal checkpoint."""
+    image_form = {
+        "image_processor_type": "Gemma4ImageProcessor",
+        "do_convert_rgb": True,
+        "do_normalize": False,
+        "do_rescale": True,
+        "do_resize": True,
+        "image_mean": [0.0, 0.0, 0.0],
+        "image_std": [1.0, 1.0, 1.0],
+        "image_seq_length": WHOLE_SOFT,
+        "max_soft_tokens": WHOLE_SOFT,
+        "patch_size": VISION_FORM["patch_size"],
+        "pooling_kernel_size": VISION_FORM["pooling_kernel_size"],
+        "rescale_factor": 1.0 / 255.0,
+        "resample": 3,
+    }
+    video_form = dict(image_form)
+    video_form.pop("image_processor_type")
+    video_form.update(video_processor_type="Gemma4VideoProcessor", do_normalize=True,
+                      do_sample_frames=True, num_frames=4, max_soft_tokens=WHOLE_SOFT,
+                      return_metadata=False)
+    with open(os.path.join(out_path, "processor_config.json"), "w", encoding="utf-8") as target:
+        json.dump({"processor_class": "Gemma4Processor",
+                   "image_seq_length": WHOLE_SOFT,
+                   "audio_seq_length": 750,
+                   "audio_ms_per_token": 40,
+                   "feature_extractor": dict(SOUND_FORM),
+                   "image_processor": image_form,
+                   "video_processor": video_form}, target, indent=1)
+    with open(os.path.join(out_path, "preprocessor_config.json"), "w", encoding="utf-8") as target:
+        json.dump(SOUND_FORM, target, indent=1)
+
+
+def whole_build(out_path, seed_value=7):
+    """Writes a synthetic checkpoint the reference can load whole.
+
+    Returns the folder and the picture and clip written beside it. The text
+    stack, both towers and both projectors come from the reference's own model
+    class, and the tokenizer carries the media tokens the processor expects to
+    find, so `AutoProcessor` and `Gemma4ForConditionalGeneration` both open the
+    folder without anything being adapted by hand.
+    """
+    import torch
+    from transformers.models.gemma4 import (Gemma4AudioConfig, Gemma4Config,
+                                            Gemma4ForConditionalGeneration, Gemma4VisionConfig)
+
+    os.makedirs(out_path, exist_ok=True)
+    book = book_build(BASE_FORM["vocab_size"], WHOLE_TOKENS)
+    book.save(os.path.join(out_path, "tokenizer.json"))
+    named = {name: book.token_to_id(name) for name in WHOLE_TOKENS}
+    if any(value is None for value in named.values()):
+        raise ValueError("the tokenizer did not keep the media tokens: %s" % named)
+    with open(os.path.join(out_path, "tokenizer_config.json"), "w", encoding="utf-8") as target:
+        json.dump({"tokenizer_class": "PreTrainedTokenizerFast",
+                   "bos_token": "<bos>", "eos_token": "<eos>",
+                   "pad_token": "<pad>", "unk_token": "<unk>",
+                   "boi_token": "<|image>", "image_token": "<|image|>", "eoi_token": "<image|>",
+                   "boa_token": "<|audio>", "audio_token": "<|audio|>", "eoa_token": "<audio|>",
+                   "sot_token": "<|turn>", "eot_token": "<turn|>",
+                   "processor_class": "Gemma4Processor"}, target, indent=1)
+    with open(os.path.join(out_path, "chat_template.jinja"), "w", encoding="utf-8") as target:
+        target.write(WHOLE_TEMPLATE)
+
+    # Two soft-token runs and a turn frame are longer than the text presets ever
+    # ask for, so the window is widened; the sliding span stays small, because a
+    # media prompt that does not cross it would leave the sliding path untried.
+    text_form = form_build("dense", {"pad_token_id": 0, "bos_token_id": book.token_to_id("<bos>"),
+                                     "eos_token_id": book.token_to_id("<eos>"),
+                                     "max_position_embeddings": 512})
+    config = Gemma4Config(text_config=text_form,
+                          vision_config=Gemma4VisionConfig(**VISION_FORM),
+                          audio_config=Gemma4AudioConfig(**AUDIO_FORM),
+                          boi_token_id=named["<|image>"], image_token_id=named["<|image|>"],
+                          eoi_token_id=named["<image|>"], boa_token_id=named["<|audio>"],
+                          audio_token_id=named["<|audio|>"], eoa_token_index=named["<audio|>"],
+                          video_token_id=named["<|video|>"])
+    torch.manual_seed(seed_value)
+    model = Gemma4ForConditionalGeneration(config)
+    form_seed(model, seed_value, "real")
+    limp_list = form_check(model)
+    if limp_list:
+        raise ValueError("degenerate synthetic weights: %s" % ", ".join(limp_list[:4]))
+    model.eval()
+    model.save_pretrained(out_path, safe_serialization=True)
+
+    # The soft-token budget is the processor's rather than the model's, so the
+    # reference does not write it into `config.json` and the engine reads it
+    # from there. The shipped export carries it; this adds it in the same place.
+    with open(os.path.join(out_path, "config.json"), "r", encoding="utf-8") as source:
+        tree = json.load(source)
+    tree["vision_soft_tokens_per_image"] = WHOLE_SOFT
+    with open(os.path.join(out_path, "config.json"), "w", encoding="utf-8") as target:
+        json.dump(tree, target, indent=1)
+    whole_processor(out_path)
+    return {"plain": out_path, "media": tower_media(out_path, "vision")}
 
 
 # -- workflow -------------------------------------------------------------
@@ -670,6 +841,8 @@ def main():
                         help="group size along the input axis, or 0 for one group per row")
     parser.add_argument("--towers", action="append", choices=("vision", "audio"),
                         help="add a tower to the checkpoint already at --out and stop")
+    parser.add_argument("--whole", action="store_true",
+                        help="write a multi-modal checkpoint the reference can load whole")
     parser.add_argument("--seed-only", action="store_true", help=argparse.SUPPRESS)
     flag = parser.parse_args()
 
@@ -695,6 +868,13 @@ def main():
         from transformers.models import gemma4  # noqa: F401
     except ImportError:
         print("skip: this transformers has no gemma4; run `python3 run.py install`")
+        return 0
+
+    if flag.whole:
+        made = whole_build(flag.out, flag.seed)
+        print("%-8s %s" % ("whole", made["plain"]))
+        for path in made["media"]:
+            print("%-8s %s" % ("media", path))
         return 0
 
     made = fake_build(flag.out, flag.preset, flag.seed, flag.magnitude, flag.bits, flag.group)

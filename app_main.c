@@ -165,12 +165,14 @@ static int main_media_load(app_model *model, const main_flag *flag, app_media *i
  * distribution the chat task samples from; comparing it against the reference
  * is only meaningful when both sides read the same prompt. `--raw` opts out.
  *
- * Media placeholders sit between the turn opener and the user's text, and the
- * rows the towers produced are laid down on top of them. */
+ * A media run sits between the turn opener and the user's text, bracketed the
+ * way the processor brackets it, and the rows the towers produced are laid down
+ * on the placeholders inside that bracket. */
 static int main_reel_build(app_model *model, const main_flag *flag, main_reel *reel) {
   app_media image_media, audio_media;
-  int32_t *lead_list = NULL;
-  int lead_count, lead_index, lead_from = -1;
+  app_media_span span_list[2];
+  int span_count = 0;
+  int image_span = -1, audio_span = -1;
   int frame_flag = (strcmp(flag->task_text, "chat") == 0 ||
                     strcmp(flag->task_text, "logits") == 0) && !flag->raw_flag;
 
@@ -179,42 +181,41 @@ static int main_reel_build(app_model *model, const main_flag *flag, main_reel *r
     main_reel_free(reel);
     return 0;
   }
-  lead_count = image_media.row_count + audio_media.row_count;
-  if (lead_count > 0) {
-    lead_list = (int32_t *)malloc(sizeof(int32_t) * (size_t)lead_count);
-    if (!lead_list) {
-      media_free(&image_media);
-      media_free(&audio_media);
-      main_reel_free(reel);
-      return 0;
-    }
-    for (lead_index = 0; lead_index < image_media.row_count; ++lead_index)
-      lead_list[lead_index] = (int32_t)model_image_token(model);
-    for (lead_index = 0; lead_index < audio_media.row_count; ++lead_index)
-      lead_list[image_media.row_count + lead_index] = (int32_t)model_audio_token(model);
+  /* One span per attachment, in the order a content list puts them: the
+   * picture, then the clip, then the words. */
+  if (image_media.row_count > 0) {
+    span_list[span_count].kind_mark = APP_MEDIA_IMAGE;
+    span_list[span_count].row_count = image_media.row_count;
+    span_list[span_count].place_from = -1;
+    image_span = span_count++;
+  }
+  if (audio_media.row_count > 0) {
+    span_list[span_count].kind_mark = APP_MEDIA_AUDIO;
+    span_list[span_count].row_count = audio_media.row_count;
+    span_list[span_count].place_from = -1;
+    audio_span = span_count++;
   }
 
   if (frame_flag) {
-    reel->id_count = token_frame_media(model, flag->prompt_text, lead_list, lead_count,
-                                       reel->id_list, MAIN_PROMPT_LIMIT, &lead_from);
+    reel->id_count = token_frame_media(model, flag->prompt_text, span_list, span_count,
+                                       reel->id_list, MAIN_PROMPT_LIMIT);
   } else {
     int id_count = 0;
     int start_id = token_start_id(model);
     int part_count;
     if (start_id >= 0) id_count = 1, reel->id_list[0] = (int32_t)start_id;
-    lead_from = lead_count > 0 ? id_count : -1;
-    for (lead_index = 0; lead_index < lead_count && id_count < MAIN_PROMPT_LIMIT; ++lead_index)
-      reel->id_list[id_count++] = lead_list[lead_index];
+    part_count = token_media_run(model, span_list, span_count, id_count, reel->id_list + id_count,
+                                 MAIN_PROMPT_LIMIT - id_count);
+    if (part_count > 0) id_count += part_count;
     part_count = token_encode(model, flag->prompt_text, 1, reel->id_list + id_count,
                               MAIN_PROMPT_LIMIT - id_count);
     if (part_count > 0) id_count += part_count;
     reel->id_count = id_count;
   }
-  if (lead_from >= 0) {
-    main_reel_lay(reel, lead_from, &image_media);
-    main_reel_lay(reel, lead_from + image_media.row_count, &audio_media);
-  }
-  free(lead_list);
+  if (image_span >= 0 && span_list[image_span].place_from >= 0)
+    main_reel_lay(reel, span_list[image_span].place_from, &image_media);
+  if (audio_span >= 0 && span_list[audio_span].place_from >= 0)
+    main_reel_lay(reel, span_list[audio_span].place_from, &audio_media);
   media_free(&image_media);
   media_free(&audio_media);
   if (reel->id_count < 1) {

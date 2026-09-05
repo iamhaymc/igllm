@@ -823,3 +823,128 @@ a triple loop over 2340 patches.
 
 The sanitizers were not run over any of this, for the same reason as before.
 `TODO.md` has the rest.
+
+---
+
+## 0.7.0 — the seam
+
+### Why
+
+Two towers agreed with the reference and a text stack agreed with the reference,
+and neither result said anything about where they meet. Version 0.6.0 recorded
+that gap as the first open item: the placeholder run the processor lays down, and
+the ids around it, had never been compared to anything. The reason given was that
+`Gemma4ForConditionalGeneration` will not load — the shipped export's language
+model dequantizes to about nineteen gigabytes — which is true and turned out not
+to matter, for the same reason it did not matter for the towers: when a model is
+too large to hold, the piece under suspicion usually is not.
+
+The seam splits into two questions that can be reached separately.
+
+**Where the ids go** is the processor's answer, and a processor is a tokenizer
+and three small configurations. It needs no weights at all, so that half runs
+against the shipped export as easily as against anything else.
+
+**What the graph makes of them** needs the whole model. A synthetic one fits: the
+reference's own model class writes the arrangement, both towers, both projectors
+and the names, and `app_fake.whole_build` adds the tokenizer and the processor
+files beside them so that `AutoProcessor` and `Gemma4ForConditionalGeneration`
+both open the folder with nothing adapted by hand.
+
+### What the comparison found
+
+**The run was laid down bare.** `Gemma4Processor.replace_image_token` returns
+`boi_token` + one `image_token` per soft token + `eoi_token`, and
+`replace_audio_token` the same with `boa_token` and `eoa_token`. The engine wrote
+the placeholders and neither bracket. Those two ids are ordinary text to the
+model — it embeds them, attends to them, and they shift every position after
+them — so a prompt without them is a prompt the reference never sees. The shipped
+config records all four (`boi_token_id` 255999, `eoi_token_id` 258882,
+`boa_token_id` 256000, `eoa_token_id` 258883, which one export spells
+`eoa_token_index`), and the vocabulary carries them under `<|image>`, `<image|>`,
+`<|audio>` and `<audio|>` when a config omits them.
+
+**The per-layer embedding read the placeholder.** 0.6.0's comment said the
+reference feeds the placeholder id to the per-layer embedding too. It does not.
+`Gemma4Model.forward` builds `llm_input_ids` by rewriting every media position to
+`text_config.pad_token_id` and computes the token-identity half of the per-layer
+input from that; only the context half sees the tower's row, through the merged
+embeddings. So nothing of the placeholder reaches the stack. Removing the fix
+again moves the top eight of the synthetic checkpoint's distribution into a
+different order, which is how much it was worth.
+
+**The metaspace mark was applied per call rather than per chunk.** The reference
+splits its input on the special tokens and normalizes each chunk on its own, so
+the mark lands after a special id and nowhere else. The engine applied it at the
+start of every `token_encode_book` call, which put one in front of the user's
+words when they merely continued the line the role marker opened. On a tokenizer
+whose scheme is `always` — the synthetic one — that is one spurious id in every
+chat-framed prompt. `lead_marker` now means "this text begins a chunk", which is
+what `token_split` needed all along and what the two callers were already trying
+to say.
+
+None of the three could have been found one tower at a time.
+
+### The result
+
+`run.py parity --seam` walks four cases — no attachment, one picture, one clip,
+and both in the order a content list gives them — and reports, for each, whether
+the ids are the reference's id for id, whether the soft-token counts are what the
+processor's own arithmetic asks for, and how far the distribution differs.
+
+On the synthetic checkpoint every case agrees: the ids exactly, the picture's 63
+soft tokens against the 63 the aspect-preserving resize asks for, and the logits
+to between 5e-07 and 6e-05 where nudging the reference's own input by a part in a
+million moves it by up to 2e-06. The seam carries no activation grid of its own,
+so what is left is float noise.
+
+The clip's count is reported rather than judged. How many rows the engine's own
+frames become is the seam's arithmetic and the ids assert it; how many frames the
+clip should have made is the feature extractor's framing, which is the next item
+in `TODO.md`.
+
+### The harness
+
+`app_fake.whole_build` writes the whole model: text stack, both towers, both
+projectors, a tokenizer carrying the turn markers and the six media tokens, a
+chat template that is the shipped one's user turn and nothing else, and the
+processor files. Two things had to be made honest rather than convenient. The
+soft-token budget is one of the five the image processor accepts, so the
+synthetic checkpoint uses the smallest, 70, instead of a number of its own. And
+the audio window is now written twice, in samples for the engine and in
+milliseconds for the reference, because the reference derives its window from a
+duration and was quietly using a default while the engine used the stated
+sixteen — two extractors described in one file, agreeing about nothing.
+
+The towers are fed the rows the engine says it read, as `--media` feeds them, so
+what is measured is the seam and not the png reader or the filterbank, both of
+which have independent definitions in `app_test.c` already.
+
+### Testing
+
+`test_tower` gained the bracketing — that a run is an opener, one placeholder a
+row, and a closer; that each span is reported past its opener, where the rows go;
+that the words after a run are marked as a fresh chunk and the turn then closes —
+and one property that only holds now: priming the same rows under a different
+placeholder id reaches the same logits to the last bit, because the id under a
+filled lane reaches nothing. The tokenizer test that asserted a prepend
+normalizer marks the lead word "whatever the caller asks" now asserts the
+opposite, which is what the reference does.
+
+The suite is 298 assertions. `run.py parity`, `--media` and `--seam` all pass,
+and the engine builds clean under `-Wall -Wextra`.
+
+The sanitizers have now been run, which 0.5.0 and 0.6.0 both had to leave
+undone for want of a toolchain that ships them. `run.py test --debug` passes all
+298 assertions under the address and behaviour sanitizers, and so does a
+multi-modal prompt through the command line — a picture, a clip and a turn frame,
+which is every line the media path has.
+
+### Known gaps
+
+The seam has not been run against the shipped checkpoint. It needs no weights to
+run the layout half there, and the export could not be fetched on this host.
+
+`run.py install` now asks for `torchvision` and `pillow` as well: the reference's
+image processor is a torchvision backend, and a processor cannot be opened
+without it. `TODO.md` has the rest.
