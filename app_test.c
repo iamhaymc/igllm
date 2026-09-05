@@ -924,10 +924,17 @@ static void test_token(void) {
     }
   }
   {
+    /* The prefix marks the start of a chunk of text, not the start of a call.
+     * The reference splits its input on the special tokens and normalizes each
+     * chunk on its own, so a piece that continues the chunk before it — the
+     * user's words after the role marker's newline — is not marked, and one
+     * that follows a special id is. */
     int32_t id_list[32];
     int id_count = token_encode_book(book, "hello", 0, id_list, 32);
-    test_true(id_count == 1 && id_list[0] == 18,
-              "a prepend normalizer marks the lead word whatever the caller asks");
+    test_true(id_count == 1 && id_list[0] == 17,
+              "a piece continuing a chunk is not marked, whatever the normalizer says");
+    id_count = token_encode_book(book, "hello", 1, id_list, 32);
+    test_true(id_count == 1 && id_list[0] == 18, "a piece beginning a chunk is marked");
   }
   {
     char text_room[64];
@@ -946,7 +953,7 @@ static void test_token(void) {
     for (word_index = 0; word_list[word_index]; ++word_index) {
       int32_t id_list[32];
       char text_room[128];
-      int id_count = token_encode_book(book, word_list[word_index], 0, id_list, 32);
+      int id_count = token_encode_book(book, word_list[word_index], 1, id_list, 32);
       int id_index, fill_count = 0;
       char want_room[128];
       snprintf(want_room, sizeof(want_room), " %s", word_list[word_index]);
@@ -1676,6 +1683,8 @@ static int test_wing_config(int moe_flag, int media_flag) {
   if (media_flag && fill_count > 0)
     fill_count += snprintf(config_text + fill_count, sizeof(config_text) - (size_t)fill_count,
              ",\"image_token_id\":5,\"audio_token_id\":6,"
+             "\"boi_token_id\":20,\"eoi_token_id\":21,"
+             "\"boa_token_id\":22,\"eoa_token_index\":23,"
              "\"vision_soft_tokens_per_image\":9,"
              "\"vision_config\":{\"hidden_size\":12,\"intermediate_size\":16,"
              "\"num_hidden_layers\":1,\"num_attention_heads\":2,\"head_dim\":8,"
@@ -2265,6 +2274,51 @@ static void test_tower(void) {
     media_free(&sound);
   }
 
+  /* -- the ids around a run -------------------------------------------- */
+  {
+    /* The processor does not lay a bare run of placeholders down.  It opens and
+     * closes each one, and the model reads those two ids as ordinary text, so a
+     * prompt built without them is a prompt the reference never sees. */
+    app_media_span span_list[2];
+    int32_t id_list[64];
+    int open_id = -1, shut_id = -1, id_count, place_from;
+    test_true(model_image_wrap(model, &open_id, &shut_id) && open_id == 20 && shut_id == 21,
+              "the image brackets come from the configuration");
+    test_true(model_audio_wrap(model, &open_id, &shut_id) && open_id == 22 && shut_id == 23,
+              "the audio brackets come from the configuration");
+    span_list[0].kind_mark = APP_MEDIA_IMAGE;
+    span_list[0].row_count = 3;
+    span_list[0].place_from = -1;
+    span_list[1].kind_mark = APP_MEDIA_AUDIO;
+    span_list[1].row_count = 2;
+    span_list[1].place_from = -1;
+    id_count = token_media_run(model, span_list, 2, 0, id_list, 64);
+    test_true(id_count == 9, "a run is an opener, one placeholder a row, and a closer");
+    test_true(id_list[0] == 20 && id_list[1] == 5 && id_list[3] == 5 && id_list[4] == 21,
+              "the image run is bracketed and as long as the tower's rows");
+    test_true(id_list[5] == 22 && id_list[6] == 6 && id_list[7] == 6 && id_list[8] == 23,
+              "the clip's run follows the picture's, bracketed the same way");
+    test_true(span_list[0].place_from == 1 && span_list[1].place_from == 6,
+              "each run is reported past its opener, where the rows go");
+
+    span_list[0].place_from = span_list[1].place_from = -1;
+    id_count = token_frame_media(model, "hello", span_list, 2, id_list, 64);
+    place_from = span_list[0].place_from;
+    test_true(id_count > 9 && place_from > 0, "the frame carries the run and the words");
+    test_true(id_list[place_from - 1] == 20 && id_list[place_from] == 5 &&
+                  id_list[place_from + 3] == 21,
+              "the frame brackets the picture's run where the run is reported");
+    test_true(span_list[1].place_from == place_from + 5 &&
+                  id_list[span_list[1].place_from - 1] == 22 &&
+                  id_list[span_list[1].place_from + 2] == 23,
+              "the clip's run follows it, bracketed and reported the same way");
+    /* The words after a run begin a fresh chunk of text, because a special id
+     * ended the one before: the tokenizer's lead mark belongs to them. */
+    test_true(id_list[span_list[1].place_from + 3] == 18 &&
+                  id_list[span_list[1].place_from + 4] == 4,
+              "the words follow the run marked as a fresh chunk, and the turn closes");
+  }
+
   /* -- the substitution ----------------------------------------------- */
   {
     int32_t id_list[8];
@@ -2291,6 +2345,21 @@ static void test_tower(void) {
         logit_list = session_step(session, id_list[7]);
         test_true(logit_list && fabs((double)logit_list[0] - keep_value) > 1e-6,
                   "a substituted embedding changes what the stack computes");
+        /* The reference rewrites every media position to the pad id before it
+         * reads the per-layer embedding, so nothing of the placeholder reaches
+         * the stack and the id under a filled lane cannot matter. */
+        {
+          int32_t other_list[8];
+          int slot_other;
+          for (slot_other = 0; slot_other < 8; ++slot_other)
+            other_list[slot_other] = slot_other < 4 ? 6 : id_list[slot_other];
+          session_reset(session);
+          test_true(session_prime_media(session, other_list, 8, state_list, flag_list) == APP_OKAY,
+                    "another placeholder id primes the same rows");
+          logit_list = session_step(session, other_list[7]);
+          test_true(logit_list && fabs((double)logit_list[0] - keep_value) < 1e-9,
+                    "the id under a lane a tower filled reaches nothing");
+        }
         session_close(session);
       }
     }

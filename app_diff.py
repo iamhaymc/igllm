@@ -10,6 +10,8 @@ the function to look at rather than the model.
     python3 app_diff.py --sweep               # the whole coverage matrix
     python3 app_diff.py --media               # the vision and audio towers
     python3 app_diff.py --media --model DIR   # the towers of a checkpoint you have
+    python3 app_diff.py --seam                # the join between the two, end to end
+    python3 app_diff.py --seam --model DIR    # the same join on a checkpoint you have
 
 The engine must be built with the activation dump compiled in:
 
@@ -47,6 +49,12 @@ Both sides start from the rows the engine says it read — the normalized patche
 or the mel frames — because the png reader, the resize and the filterbank are
 each held against an independent definition in `app_test.c`, and what is in
 question here is the tower above them.
+
+`--seam` walks the join instead: the ids the reference's processor lays down
+around a run of soft tokens, and the distribution the whole graph reaches over
+them. The ids need no weights, so that half runs against the shipped export; the
+graph needs the whole model in memory, which only a synthetic checkpoint gives,
+and `app_fake.whole_build` writes one from the reference's own model class.
 """
 
 import argparse
@@ -542,6 +550,298 @@ def diff_media_at(model_path, image_path, audio_path):
     return fail_count
 
 
+# -- the seam -------------------------------------------------------------
+
+# A tower that agrees with the reference and a text stack that agrees with the
+# reference still say nothing about the join between them: the ids the processor
+# lays down around a run of soft tokens, and what the model makes of them, exist
+# only when the whole graph runs.
+#
+# Two halves, because they can be reached separately.
+#
+# The layout half asks the reference's own `Gemma4Processor` where the
+# placeholders go, and needs no weights at all — a processor is a tokenizer and
+# three small configurations — so it runs against the shipped export as easily
+# as against a synthetic one.
+#
+# The graph half runs `Gemma4ForConditionalGeneration` over those same ids and
+# compares the distribution. That needs the whole model in memory, which the
+# shipped export does not fit into; a synthetic checkpoint does, and it carries
+# the reference's own arrangement because the reference wrote it.
+#
+# The towers themselves are fed the rows the engine says it read, as `--media`
+# feeds them, so that what is measured here is the seam rather than the png
+# reader or the filterbank.
+
+SEAM_PROMPT = "what is in this?"
+SEAM_TOP = 8
+
+# The cases that change which side of the join runs: no attachment at all, which
+# is the frame on its own, one of each, and both together in the order a content
+# list gives them.
+SEAM_PLAN = (("text only", 0, 0),
+             ("one image", 1, 0),
+             ("one clip", 0, 1),
+             ("image and clip", 1, 1))
+
+
+def seam_engine(model_path, prompt, image_path, audio_path):
+    """Runs the engine over one prompt and its attachments."""
+    import json
+
+    handle, trace_path = tempfile.mkstemp(suffix=".igtrace")
+    os.close(handle)
+    room = dict(os.environ, IGLLM_TRACE=trace_path)
+    line = [engine_path(), "logits", "--model", model_path, "--prompt", prompt,
+            "--serve", str(SEAM_TOP)]
+    if image_path:
+        line += ["--image", image_path]
+    if audio_path:
+        line += ["--audio", audio_path]
+    done = subprocess.run(line, capture_output=True, text=True, env=room)
+    if done.returncode != 0:
+        raise RuntimeError("engine failed: %s" % done.stderr.strip())
+    found = trace_read(trace_path)
+    os.unlink(trace_path)
+    return json.loads(done.stdout), found
+
+
+def seam_reference_ids(processor, prompt, image_rows, audio_rows, mel_count):
+    """The ids the reference lays down for the same turn.
+
+    The counts are the engine's, because how long a run is and what surrounds it
+    are separate questions and only the second is asked here; the first is asked
+    by `seam_reference_count` against the processor's own arithmetic.
+
+    Everything else is the reference's: the chat template frames the turn, and
+    `Gemma4Processor` decides that a run is opened and closed and substitutes it
+    for the marker the template wrote.
+    """
+    import numpy
+
+    part_list = []
+    if image_rows > 0:
+        part_list.append({"type": "image"})
+    if audio_rows > 0:
+        part_list.append({"type": "audio"})
+    part_list.append({"type": "text", "text": prompt})
+    text = processor.tokenizer.apply_chat_template([{"role": "user", "content": part_list}],
+                                                   tokenize=False, add_generation_prompt=True)
+    image_part = ([processor.replace_image_token({"num_soft_tokens_per_image": [image_rows]}, 0)]
+                  if image_rows > 0 else [])
+    # The reference reads the run's length off the feature mask, walking it
+    # through the two halvings of the subsampler, so it is handed the frames the
+    # engine says it made rather than a number.
+    audio_part = ([processor.replace_audio_token(
+        {"input_features_mask": [numpy.ones(mel_count, dtype=bool)]}, 0)]
+        if audio_rows > 0 else [])
+    full_list, _ = processor.get_text_with_replacements([text], image_part, [], audio_part)
+    # The template writes the opening marker itself, as the shipped one does, so
+    # the tokenizer must not add a second one.
+    return processor.tokenizer(full_list[0], add_special_tokens=False)["input_ids"]
+
+
+def seam_reference_count(processor, image_path, audio_path):
+    """How many soft tokens the processor would ask for, from the files alone.
+
+    This is the other half of the count: not what the engine produced, but what
+    the reference's own arithmetic says a picture of that size and a clip of that
+    length are worth. For a picture it is the aspect-preserving resize against
+    the patch budget; for a clip it is the mel framing and the subsampler.
+    """
+    import wave
+
+    # `_get_num_multimodal_tokens` is the processor's own answer to this, the one
+    # a serving stack asks before it allocates: the aspect-preserving resize for
+    # a picture, and the mel framing and subsampler for a clip.
+    size_list = None
+    length_list = None
+    if image_path:
+        from PIL import Image
+
+        with Image.open(image_path) as picture:
+            size_list = [[picture.size[1], picture.size[0]]]
+    if audio_path:
+        with wave.open(audio_path, "rb") as clip:
+            rate_value = getattr(processor.feature_extractor, "sampling_rate", 16000)
+            length_list = [int(round(clip.getnframes() * rate_value /
+                                     float(clip.getframerate())))]
+    found = processor._get_num_multimodal_tokens(image_sizes=size_list, audio_lengths=length_list)
+    return (found.num_image_tokens[0] if size_list else None,
+            found.num_audio_tokens[0] if length_list else None)
+
+
+def seam_reference_run(model, id_list, mine, grid):
+    """The reference's distribution over the engine's ids and the engine's rows."""
+    import torch
+
+    room = {"input_ids": torch.tensor([id_list], dtype=torch.long)}
+    patch_rows = tower_seed_rows(mine, "vision")
+    mel_rows = tower_seed_rows(mine, "audio")
+    if patch_rows:
+        wide, high = grid
+        rows = torch.tensor(patch_rows, dtype=torch.float32)[None]
+        # The engine records a patch after the model-side scaling to [-1, 1].
+        room["pixel_values"] = rows / 2.0 + 0.5
+        room["image_position_ids"] = torch.tensor(
+            [[index % wide, index // wide] for index in range(wide * high)], dtype=torch.long)[None]
+    if mel_rows:
+        feature = torch.tensor(mel_rows, dtype=torch.float32)[None]
+        room["input_features"] = feature
+        room["input_features_mask"] = torch.ones(feature.shape[:2], dtype=torch.bool)
+    with torch.no_grad():
+        return model(**room).logits[0, -1].float(), room
+
+
+def seam_reference_floor(model, room):
+    """How far the same forward moves when its input is nudged by a millionth.
+
+    The engine is not asked to be nearer the reference than the reference is to
+    itself under a change that should not matter. On a checkpoint that rounds its
+    activations onto a static grid that distance is not small, and on one that
+    does not it is float noise; either way it is measured rather than assumed.
+    """
+    import torch
+
+    maker = torch.Generator().manual_seed(11)
+    moved = dict(room)
+    nudged = False
+    for name in ("pixel_values", "input_features"):
+        if name in room:
+            moved[name] = room[name] * (1.0 + 1e-6 * torch.randn(room[name].shape,
+                                                                 generator=maker))
+            nudged = True
+    # A prompt with nothing attached has no input to nudge: its ids are exact on
+    # both sides and there is nothing for a grid to round.
+    if not nudged:
+        return 0.0
+    with torch.no_grad():
+        return model(**moved).logits[0, -1].float()
+
+
+def seam_report(title, name, good_flag, detail):
+    print("  %-16s %-14s %-4s %s" % (title, name, "ok" if good_flag else "FAIL", detail))
+    return 0 if good_flag else 1
+
+
+def diff_seam(model_path, image_path, audio_path, prompt, want_graph=True):
+    """Holds the join between the towers and the text stack to the reference."""
+    import torch
+    from transformers import AutoProcessor
+
+    try:
+        processor = AutoProcessor.from_pretrained(model_path)
+    except (OSError, ValueError, KeyError) as trouble:
+        # A checkpoint with no processor is a text-only export, not a broken
+        # one, and there is no seam in it to walk.
+        print("  %-16s %-14s skip  no processor here: %s"
+              % ("", "ids", str(trouble).split("\n")[0][:60]))
+        return 0
+    image_token = processor.image_token_id
+    audio_token = processor.audio_token_id
+    model = None
+    if want_graph:
+        from transformers.models.gemma4 import Gemma4ForConditionalGeneration
+
+        try:
+            model = Gemma4ForConditionalGeneration.from_pretrained(model_path,
+                                                                   dtype=torch.float32).eval()
+        except (MemoryError, RuntimeError, ValueError, OSError) as trouble:
+            print("  %-16s %-14s skip  the whole model did not load: %s"
+                  % ("", "graph", str(trouble).split("\n")[0][:70]))
+
+    fail_count = 0
+    for title, want_image, want_audio in SEAM_PLAN:
+        if want_image and not image_path:
+            continue
+        if want_audio and not audio_path:
+            continue
+        show_image = image_path if want_image else None
+        show_audio = audio_path if want_audio else None
+        mine, found = seam_engine(model_path, prompt, show_image, show_audio)
+        id_list = mine["tokens"]
+        image_rows = id_list.count(image_token) if image_token is not None else 0
+        audio_rows = id_list.count(audio_token) if audio_token is not None else 0
+        mel_count = len(tower_seed_rows(found, "audio"))
+        theirs = seam_reference_ids(processor, prompt, image_rows, audio_rows, mel_count)
+
+        same_flag = list(id_list) == list(theirs)
+        detail = "%d ids" % len(id_list)
+        if not same_flag:
+            place = next((index for index in range(min(len(id_list), len(theirs)))
+                          if id_list[index] != theirs[index]), min(len(id_list), len(theirs)))
+            detail = ("%d ids against %d, first apart at %d: %s against %s"
+                      % (len(id_list), len(theirs), place,
+                         id_list[place] if place < len(id_list) else "-",
+                         theirs[place] if place < len(theirs) else "-"))
+        fail_count += seam_report(title, "ids", same_flag, detail)
+
+        if want_image or want_audio:
+            image_want, audio_want = seam_reference_count(processor, show_image, show_audio)
+            if image_want is not None:
+                fail_count += seam_report("", "soft tokens", image_want == image_rows,
+                                          "the engine made %d rows for the picture, the "
+                                          "processor asks for %d" % (image_rows, image_want))
+            if audio_want is not None:
+                # How many rows the engine's own frames become is the seam's
+                # arithmetic, and the ids above assert it. How many frames the
+                # clip should have made in the first place is the feature
+                # extractor's framing, which is open and tracked separately, so
+                # a disagreement there is reported rather than judged.
+                print("  %-16s %-14s %-4s the engine made %d rows for the clip, the processor "
+                      "asks for %d%s"
+                      % ("", "soft tokens", "ok" if audio_want == audio_rows else "note",
+                         audio_rows, audio_want,
+                         "" if audio_want == audio_rows
+                         else " from the clip itself; the framing is the open question"))
+
+        if model is None or not same_flag:
+            continue
+        # The reference is fed the rows the engine says it read, so without the
+        # activation dump there is nothing to feed it and the graph half is not
+        # attempted rather than run against the wrong input.
+        if (image_rows and not tower_seed_rows(found, "vision")) or \
+                (audio_rows and not tower_seed_rows(found, "audio")):
+            print("  %-16s %-14s skip  the engine wrote no rows; build with `run.py build --trace`"
+                  % ("", "logits"))
+            continue
+        grid = None
+        if "vision.grid.0" in found:
+            grid = (int(found["vision.grid.0"][0]), int(found["vision.grid.0"][1]))
+        their_value, room = seam_reference_run(model, id_list, found, grid)
+        my_value = {entry["id"]: entry["logit"] for entry in mine["top"]}
+        order = torch.topk(their_value, SEAM_TOP)
+        their_top = order.indices.tolist()
+        gap = max((abs(my_value[slot] - float(value)) for slot, value in
+                   zip(their_top, order.values.tolist()) if slot in my_value), default=float("inf"))
+        moved = seam_reference_floor(model, room)
+        floor = float((moved - their_value).abs().max()) if not isinstance(moved, float) else 0.0
+        # The nudge measures what the input is worth, not what a different
+        # summation order is worth, and over sixty conformer rows the second is
+        # the larger of the two. So the bar has a floor under it, wide enough for
+        # float32 addition in another order and still well inside what the two
+        # faults this comparison found were worth: the per-layer embedding
+        # reading the placeholder moved these logits by 3.4e-03.
+        limit = max(floor * FLOOR_SHARE, 1e-3)
+        lead_flag = bool(mine["top"]) and mine["top"][0]["id"] == their_top[0]
+        share = len([slot for slot in their_top if slot in my_value]) / float(len(their_top))
+        fail_count += seam_report("", "logits", lead_flag and share >= 0.75 and gap <= limit,
+                                  "rank one %s, %.0f%% of the top %d shared, largest gap %.3e, "
+                                  "the reference moves %.3e, allowed %.3e"
+                                  % ("agrees" if lead_flag else "differs", 100.0 * share,
+                                     SEAM_TOP, gap, floor, limit))
+    return fail_count
+
+
+def diff_seam_fake(work_path, seed_value):
+    """Builds a checkpoint the reference can load whole, and walks the seam."""
+    import app_fake
+
+    made = app_fake.whole_build(os.path.join(work_path, "whole"), seed_value)
+    picture_path, sound_path = made["media"]
+    return diff_seam(made["plain"], picture_path, sound_path, SEAM_PROMPT, want_graph=True)
+
+
 # The axes that change which code path runs. Prompt lengths are chosen to
 # straddle the batch chunk and the sliding window rather than to be round.
 SWEEP_PLAN = (
@@ -566,6 +866,8 @@ def main():
     parser.add_argument("--sweep", action="store_true", help="run the whole coverage matrix")
     parser.add_argument("--media", action="store_true",
                         help="diff the vision and audio towers instead of the text stack")
+    parser.add_argument("--seam", action="store_true",
+                        help="diff the join between the towers and the text stack")
     parser.add_argument("--image", help="the picture to show a vision tower")
     parser.add_argument("--audio", help="the clip to play an audio tower")
     parser.add_argument("--work", default=os.path.join(WORK_PATH, "fake"))
@@ -598,6 +900,20 @@ def main():
             fail_count += diff_media_at(flag.model, flag.image, flag.audio)
         else:
             fail_count += diff_media(flag.work, 7)
+        print("\n%d checks failed" % fail_count)
+        return 0 if fail_count == 0 else 1
+
+    if flag.seam:
+        if flag.model:
+            image_path = flag.image or os.path.join(flag.model, "picture.png")
+            audio_path = flag.audio or os.path.join(flag.model, "sound.wav")
+            print("checkpoint %s" % flag.model)
+            fail_count += diff_seam(flag.model,
+                                    image_path if os.path.exists(image_path) else None,
+                                    audio_path if os.path.exists(audio_path) else None,
+                                    SEAM_PROMPT)
+        else:
+            fail_count += diff_seam_fake(flag.work, 7)
         print("\n%d checks failed" % fail_count)
         return 0 if fail_count == 0 else 1
 
