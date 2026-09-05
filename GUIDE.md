@@ -693,6 +693,23 @@ sliding layer's ring is narrower than the batch. The caller feeds
 the last token to `session_step`, which is the only call that pays for the
 head.
 
+`cache_lay` is the one point a row enters a cache, and it is where a
+quantized cache is paid for. The export calibrates a static range for each
+layer's keys and values — one magnitude per tensor, held in
+`key_cache_scale` and `value_cache_scale` — describing an eight bit float
+grid: four exponent bits, three mantissa bits, and 448 as the largest
+magnitude, over which a value saturates rather than becoming an infinity the
+format has no room for. With `setup.cache_bits` at zero the row is stored as
+it arrives. At eight it makes the round trip through that grid in float via
+`cache_pack8`, so the error a backend holding bytes would carry is paid where
+it can be measured against the same run without it. Nothing is stored smaller
+yet.
+
+The largest magnitude a session has put in each cache is tracked either way,
+in `key_peak` and `value_peak`. What the calibrated range has to cover is a
+question only a real prompt answers, and `session_cache_peak` beside
+`model_cache_scale` is how the `cache` task asks it.
+
 `session_pick` draws a token: repetition penalty over a recent window,
 temperature, top-k, top-p, then a draw from an xorshift stream. A
 temperature of zero short-circuits to the maximum.
