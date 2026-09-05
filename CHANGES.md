@@ -2289,16 +2289,33 @@ is the rest — and 48.3 against 12.1 is a quarter to the tenth of a mebibyte,
 which is the arithmetic working. The 588 id case is 804.8 against 770.8, the
 same quarter of a slightly shorter span.
 
-What that buys in tokens a second is not answered here, and the honest reason is
-the host. These figures were taken on a shared four core virtual machine, and
-over the session the same build in the same configuration — the SSE2 default
-with a float cache, on the same prompt — decoded at 4.52 tok/s in one window and
-2.32 in another. A spread of two to one on the control is larger than any effect
-the storage could have, so no rate is quoted from it, in either direction. What
-can be said is what the counter says: the byte cache asks the machine for 36.2
-MiB a token less, and it asks for a table read per value that the float cache
-did not, which SSE2 and NEON have no gather for. Which of those wins is a
-measurement, and it wants a quiet host.
+What that buys in tokens a second is another matter, and the host will not give
+a number. This was written on a shared four core virtual machine, and over the
+session the same build in the same configuration — the SSE2 default with a float
+cache, on the same prompt — decoded at 4.52 tok/s in one window and 2.32 in
+another. A control that moves two to one cannot measure an effect smaller than
+that, so no rate is quoted here.
+
+What the runs do agree on is a sign, and only on one of the two builds. Five
+pairs were taken, each pair adjacent in its own window:
+
+| build | float | bytes |
+| --- | --- | --- |
+| tuned, AVX2 | 3.15 | 2.16 |
+| tuned, AVX2 | 5.53 | 3.76 |
+| tuned, AVX2 | 5.40 | 2.25 |
+| default, SSE2 | 4.52 | 4.18 |
+| default, SSE2 | 2.32 | 4.09 |
+
+All three tuned pairs put the byte cache behind, by a third to a half. The two
+default pairs disagree with each other about which way it goes at all. Three of
+one sign is not a measurement and the spread across them is far too wide to
+average, but it is the direction the trade predicts on the build that has the
+gather: `cache_dot` spends a `vgatherdps` per eight values to save three
+quarters of the cache traffic, on a build 0.8.1 showed is not against the memory
+in the first place. If that holds on a quiet host, the gather is the wrong shape
+for this and the byte cache wants a different read path rather than a faster
+one. Which is a measurement, and `TODO.md` carries it.
 
 ### Known gaps
 

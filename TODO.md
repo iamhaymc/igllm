@@ -43,16 +43,21 @@ weights or on none. Most consequential first within each group.
   conformer's convolution module still walks its kernel per channel per frame.
   None of it runs in the token loop, and a prompt may now carry several of
   them, which makes it the cost of the first answer rather than of the run.
-- Measure what the byte cache costs in tokens a second. 0.8.3 holds the key and
-  value cache as bytes and counts what that reads — 48.3 MiB a token as floats
-  against 12.1 as bytes, a quarter, on a 694 id prompt — but it could not time
-  it: on the host it was written on the same build in the same configuration
-  decoded at 4.52 tok/s in one window and 2.32 in another, a spread wider than
-  anything the storage could do. It wants the desktop 0.8.1's table was measured
-  on, and it wants both builds, because the AVX2 gather in `cache_dot` and the
-  four scalar table reads SSE2 and NEON fall back on will not answer the same
-  way. Fewer bytes and more instructions is the same trade the gain mirror above
-  is, taken in the other direction, and the answer for one informs the other.
+- Find out whether the gather is the wrong read for the byte cache. 0.8.3 counts
+  what the byte cache saves — 48.3 MiB a token as floats against 12.1 as bytes
+  on a 694 id prompt, a quarter — but could not time it: the host it was written
+  on decoded the same build in the same configuration at 4.52 tok/s in one
+  window and 2.32 in another. What the five pairs there do agree on is a sign,
+  and only on the tuned build: all three tuned pairs put the byte cache a third
+  to a half behind, where the two default pairs disagree about the direction.
+  Three of one sign is not a measurement, but it is what the trade predicts —
+  `cache_dot` spends a `vgatherdps` per eight values to save three quarters of
+  the cache traffic, on a build 0.8.1 showed is not against the memory. If a
+  quiet host confirms it, the answer is a different read rather than a faster
+  one: the codes are four to a dword and a shuffle-based spread may beat the
+  gather outright, which would serve the SSE2 and NEON paths too. This is the
+  gain mirror's trade above taken in the other direction, and the answer for one
+  informs the other.
 - Cache dequantized scales for the hottest planes. Gains are converted from
   their stored dtype on every group; a per-plane float mirror trades memory for
   a shorter inner loop. 0.8.0 struck this from the tuned build on the reading
