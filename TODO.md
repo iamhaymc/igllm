@@ -43,19 +43,16 @@ weights or on none. Most consequential first within each group.
   conformer's convolution module still walks its kernel per channel per frame.
   None of it runs in the token loop, and a prompt may now carry several of
   them, which makes it the cost of the first answer rather than of the run.
-- Store the key and value cache on the grid the export calibrates for. The
-  scales are read now and 0.8.2 says what they hold: an eight bit float grid,
-  not a byte's, with the ranges comfortably over what a prompt puts in them.
-  `--cache 8` makes the round trip in float and costs the next token nothing —
-  the top id agrees on every prompt tried — while greedy decoding diverges at
-  the first close call, around eighty characters in. What is left is the part
-  that collects the win: `key_store` and `value_store` are still float arrays,
-  and holding them as bytes is 1803.0 MiB of cache down to 450.8 at the default
-  window. That is a backend change rather than a session one.
-- Measure what a quantized cache costs at length. The divergence above is five
-  text prompts at short context, where the sliding window has not begun to turn
-  over. The case that decides whether the footprint is worth taking is the long
-  one, and it is untested.
+- Measure what the byte cache costs in tokens a second. 0.8.3 holds the key and
+  value cache as bytes and counts what that reads — 48.3 MiB a token as floats
+  against 12.1 as bytes, a quarter, on a 694 id prompt — but it could not time
+  it: on the host it was written on the same build in the same configuration
+  decoded at 4.52 tok/s in one window and 2.32 in another, a spread wider than
+  anything the storage could do. It wants the desktop 0.8.1's table was measured
+  on, and it wants both builds, because the AVX2 gather in `cache_dot` and the
+  four scalar table reads SSE2 and NEON fall back on will not answer the same
+  way. Fewer bytes and more instructions is the same trade the gain mirror above
+  is, taken in the other direction, and the answer for one informs the other.
 - Cache dequantized scales for the hottest planes. Gains are converted from
   their stored dtype on every group; a per-plane float mirror trades memory for
   a shorter inner loop. 0.8.0 struck this from the tuned build on the reading

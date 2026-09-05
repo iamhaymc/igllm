@@ -60,9 +60,11 @@ full list.
 `--cache 8` holds the key and value cache as bytes, on the eight bit float grid
 the export calibrates static ranges for. It is off by default. On the shipped
 export it takes the cache at full span from 1803.0 MiB to 450.8 MiB — a saving
-larger than the checkpoint's own mapped weights — and the bytes a decode step
-reads fall with it. What it costs is accuracy, not speed: the next token is
-never in doubt, and greedy decoding diverges at the first genuinely close call.
+larger than the checkpoint's own mapped weights — and a decode step reads a
+quarter of the cache bytes it read as floats. What it costs is accuracy: the
+next token is never in doubt, and greedy decoding diverges at the first
+genuinely close call — around eighty characters in on a short prompt, and inside
+twenty once the context is long enough for the sliding window to turn over.
 The `cache` task prints the calibrated ranges against the peaks a prompt
 actually reaches, and what the cache costs at full span either way.
 
