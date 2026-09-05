@@ -2244,11 +2244,21 @@ floats and again as bytes:
 | greedy agrees for | 78 to 102 characters | **17** | **23** |
 
 That is the answer, and it is worse than the short case by a factor of four to
-five. The first token is still not in doubt — both runs agree on it, as every
-short prompt did — but the first genuinely close call arrives almost at once
-when a decode step is blending several hundred rounded rows instead of a dozen.
-Both continuations stay fluent and on topic afterwards and say different things:
-one carries on about `app_core.c` where the other turns to `app_main.c`.
+five. Both continuations stay fluent and on topic afterwards and say different
+things: one carries on about `app_core.c` where the other turns to `app_main.c`.
+
+What has not decayed with them is the head of the distribution, and the two want
+saying together or the first number reads as worse than it is. Taken on the same
+702 ids, the next token is not in doubt and is not even close: both storages put
+id 2094 first, 28.8084 against 28.6828, over a runner-up 5.16 and 5.22 behind.
+The top eight are in the same order on both, and it is rank nine and below where
+they begin to trade places, eleven of the top sixteen still in step.
+
+So the divergence at seventeen characters is not the head of the distribution
+coming apart at length. It is that a step blending several hundred rounded rows
+instead of a dozen needs only one genuinely close call to part the two runs, and
+over ninety-six steps it finds one early. Which is the same mechanism 0.8.2
+described — it simply arrives four to five times sooner.
 
 What does not happen is clipping, and it is worth recording that it does not.
 The peaks a long prompt reaches are higher than a short one's but still well
