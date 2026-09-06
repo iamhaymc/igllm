@@ -281,7 +281,20 @@ app_setup   app_setup_plain(void);
 #  include <unistd.h>
 #endif
 
-#if defined(__AVX2__)
+/* AVX-512 is a tier above AVX2 rather than an alternative to it: a host that
+ * has the one has the other, and only the kernels with something to gain from
+ * the wider vector are written twice.  So it sets both names, and a kernel that
+ * has no AVX-512 path of its own compiles as the AVX2 one it always was.
+ *
+ * The four subsets named are the ones the kernels reach for — `bw` for the byte
+ * shuffle, `dq` and `vl` for the narrower forms of it — and asking for all four
+ * keeps the path off the early parts that have `f` alone. */
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && \
+    defined(__AVX512VL__)
+#  include <immintrin.h>
+#  define APP_SIMD_AVX2 1
+#  define APP_SIMD_AVX512 1
+#elif defined(__AVX2__)
 #  include <immintrin.h>
 #  define APP_SIMD_AVX2 1
 #elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
@@ -1680,6 +1693,13 @@ static float kern_dot_real(const void *row_data, store_type row_type, const floa
   return total;
 }
 
+#if defined(APP_SIMD_AVX512)
+/* Horizontal sum of a sixteen lane accumulator.  It is a separate name rather
+ * than another arm of the chain below, because an AVX-512 host has the eight
+ * lane one too and every kernel without a wide path still calls it. */
+static float kern_zmm_total(__m512 wide_total) { return _mm512_reduce_add_ps(wide_total); }
+#endif
+
 /* Horizontal sum of the widest accumulator the selected path uses. */
 #if defined(APP_SIMD_AVX2)
 static float kern_wide_total(__m256 wide_total) {
@@ -1902,7 +1922,27 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
    * that path applies the flip a whole vector at a time. */
   if (bit_count == 4 && code_flip == 0 && (from_index & 1) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 2;
-#if defined(APP_SIMD_AVX2)
+#if defined(APP_SIMD_AVX512)
+    {
+      /* Sixteen packed bytes are thirty-two codes, which is exactly two of the
+       * wide accumulators: the split into nibbles is the AVX2 path's, done once
+       * over twice the bytes, and the widening is one instruction a half. */
+      const __m128i low_mask = _mm_set1_epi8(0x0F);
+      __m512 part_a = _mm512_setzero_ps(), part_b = _mm512_setzero_ps();
+      for (; slot + 32 <= span_count; slot += 32) {
+        __m128i pack_data = _mm_loadu_si128((const __m128i *)(const void *)(byte_head + slot / 2));
+        __m128i low_part = _mm_and_si128(pack_data, low_mask);
+        __m128i high_part = _mm_and_si128(_mm_srli_epi16(pack_data, 4), low_mask);
+        part_a = _mm512_fmadd_ps(
+            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(low_part, high_part))),
+            _mm512_loadu_ps(act_data + slot), part_a);
+        part_b = _mm512_fmadd_ps(
+            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpackhi_epi8(low_part, high_part))),
+            _mm512_loadu_ps(act_data + slot + 16), part_b);
+      }
+      total = kern_zmm_total(_mm512_add_ps(part_a, part_b));
+    }
+#elif defined(APP_SIMD_AVX2)
     {
       const __m128i low_mask = _mm_set1_epi8(0x0F);
       __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
@@ -1977,7 +2017,25 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
   if (bit_count == 8) {
     const uint8_t *byte_head = code_row + (size_t)from_index;
     uint8_t flip_byte = (uint8_t)code_flip;
-#if defined(APP_SIMD_AVX2)
+#if defined(APP_SIMD_AVX512)
+    {
+      /* Thirty-two bytes are thirty-two codes, and the flip is one exclusive
+       * or over all of them before either half is widened. */
+      const __m256i flip_data = _mm256_set1_epi8((char)flip_byte);
+      __m512 part_a = _mm512_setzero_ps(), part_b = _mm512_setzero_ps();
+      for (; slot + 32 <= span_count; slot += 32) {
+        __m256i code_byte = _mm256_xor_si256(
+            _mm256_loadu_si256((const __m256i *)(const void *)(byte_head + slot)), flip_data);
+        part_a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                                     _mm256_castsi256_si128(code_byte))),
+                                 _mm512_loadu_ps(act_data + slot), part_a);
+        part_b = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                                     _mm256_extracti128_si256(code_byte, 1))),
+                                 _mm512_loadu_ps(act_data + slot + 16), part_b);
+      }
+      total = kern_zmm_total(_mm512_add_ps(part_a, part_b));
+    }
+#elif defined(APP_SIMD_AVX2)
     {
       const __m128i flip_data = _mm_set1_epi8((char)flip_byte);
       __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
@@ -2044,7 +2102,31 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
 
   if (bit_count == 2 && code_flip == 0 && (from_index & 3) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 4;
-#if defined(APP_SIMD_AVX2)
+#if defined(APP_SIMD_AVX512)
+    {
+      /* A dword is sixteen codes, which is the whole vector: the two halves
+       * the AVX2 path below shifts out separately are one shift here, and a
+       * broadcast serves sixteen codes rather than eight. */
+      const __m512i step_wide = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24,
+                                                  26, 28, 30);
+      const __m512i code_mask = _mm512_set1_epi32(3);
+      __m512 part_a = _mm512_setzero_ps(), part_b = _mm512_setzero_ps();
+      for (; slot + 32 <= span_count; slot += 32) {
+        uint32_t word_a, word_b;
+        memcpy(&word_a, byte_head + slot / 4, 4);
+        memcpy(&word_b, byte_head + slot / 4 + 4, 4);
+        part_a = _mm512_fmadd_ps(
+            _mm512_cvtepi32_ps(_mm512_and_si512(
+                _mm512_srlv_epi32(_mm512_set1_epi32((int)word_a), step_wide), code_mask)),
+            _mm512_loadu_ps(act_data + slot), part_a);
+        part_b = _mm512_fmadd_ps(
+            _mm512_cvtepi32_ps(_mm512_and_si512(
+                _mm512_srlv_epi32(_mm512_set1_epi32((int)word_b), step_wide), code_mask)),
+            _mm512_loadu_ps(act_data + slot + 16), part_b);
+      }
+      total = kern_zmm_total(_mm512_add_ps(part_a, part_b));
+    }
+#elif defined(APP_SIMD_AVX2)
     {
       /* One broadcast of the whole dword rather than one of each half.
        *
@@ -2234,6 +2316,23 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
   if (bit_count == 8) {
     const uint8_t *byte_head = code_row + (size_t)from_index;
     uint8_t flip_byte = (uint8_t)code_flip;
+#if defined(APP_SIMD_AVX512)
+    {
+      /* The one width whose spread was a scalar loop everywhere: a byte is a
+       * code, so there was nothing to unpack and the loop was the store and the
+       * conversion.  Sixteen at a time is worth having even so. */
+      const __m256i flip_data = _mm256_set1_epi8((char)flip_byte);
+      for (; slot + 32 <= span_count; slot += 32) {
+        __m256i code_byte = _mm256_xor_si256(
+            _mm256_loadu_si256((const __m256i *)(const void *)(byte_head + slot)), flip_data);
+        _mm512_storeu_ps(out_data + slot, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                                              _mm256_castsi256_si128(code_byte))));
+        _mm512_storeu_ps(
+            out_data + slot + 16,
+            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm256_extracti128_si256(code_byte, 1))));
+      }
+    }
+#endif
     for (; slot < span_count; ++slot)
       out_data[slot] = (float)(uint8_t)(byte_head[slot] ^ flip_byte);
     return;
@@ -2241,7 +2340,22 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
 
   if (bit_count == 4 && code_flip == 0 && (from_index & 1) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 2;
-#if defined(APP_SIMD_AVX2)
+#if defined(APP_SIMD_AVX512)
+    {
+      const __m128i low_mask = _mm_set1_epi8(0x0F);
+      for (; slot + 32 <= span_count; slot += 32) {
+        __m128i pack_data = _mm_loadu_si128((const __m128i *)(const void *)(byte_head + slot / 2));
+        __m128i low_part = _mm_and_si128(pack_data, low_mask);
+        __m128i high_part = _mm_and_si128(_mm_srli_epi16(pack_data, 4), low_mask);
+        _mm512_storeu_ps(
+            out_data + slot,
+            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(low_part, high_part))));
+        _mm512_storeu_ps(
+            out_data + slot + 16,
+            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpackhi_epi8(low_part, high_part))));
+      }
+    }
+#elif defined(APP_SIMD_AVX2)
     {
       const __m128i low_mask = _mm_set1_epi8(0x0F);
       for (; slot + 16 <= span_count; slot += 16) {
@@ -2302,7 +2416,23 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
 
   if (bit_count == 2 && code_flip == 0 && (from_index & 3) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 4;
-#if defined(APP_SIMD_AVX2)
+#if defined(APP_SIMD_AVX512)
+    {
+      /* One broadcast of the whole dword, as the fused dot above takes it —
+       * and here the dword's sixteen codes are one vector rather than two. */
+      const __m512i step_wide = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24,
+                                                  26, 28, 30);
+      const __m512i code_mask = _mm512_set1_epi32(3);
+      for (; slot + 16 <= span_count; slot += 16) {
+        uint32_t word_value;
+        memcpy(&word_value, byte_head + slot / 4, 4);
+        _mm512_storeu_ps(out_data + slot,
+                         _mm512_cvtepi32_ps(_mm512_and_si512(
+                             _mm512_srlv_epi32(_mm512_set1_epi32((int)word_value), step_wide),
+                             code_mask)));
+      }
+    }
+#elif defined(APP_SIMD_AVX2)
     {
       /* One broadcast of the whole dword, as the fused dot above takes it. */
       const __m256i step_low = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);

@@ -6,6 +6,8 @@ compiler invocation. No make, cmake, or third party build tool is involved.
 
     python3 run.py install          # optional python packages for parity work
     python3 run.py build            # build the cli and the unit tests
+    python3 run.py build --tuned    # the same, with the host's own instructions
+    python3 run.py build --wide     # the same again, with the AVX-512 kernels
     python3 run.py test             # build, then run the unit tests
     python3 run.py check            # test, plus the reference comparison
     python3 run.py parity           # build a fake checkpoint and diff every layer
@@ -57,15 +59,25 @@ def tool_pick():
     raise SystemExit("no C compiler found; set CC to one")
 
 
-def tool_line(kind, program, source, target, tuned, debug, trace=False):
+# The four AVX-512 subsets the kernels reach for.  `--wide` implies `--tuned`:
+# a host with these has AVX2, and every kernel without a wide path of its own is
+# still the AVX2 one.
+WIDE_FLAGS = ["-mavx512f", "-mavx512bw", "-mavx512dq", "-mavx512vl"]
+
+
+def tool_line(kind, program, source, target, tuned, debug, trace=False, wide=False):
     """Builds the full command line for one translation unit."""
     source_path = os.path.join(ROOT_PATH, source)
+    if wide:
+        tuned = True
     if kind == "msvc":
         line = [program, "/nologo", "/std:c11", "/W3", source_path]
         if trace:
             line += ["/DAPP_TRACE"]
         line += ["/Od", "/Zi"] if debug else ["/O2"]
-        if tuned:
+        if wide:
+            line += ["/arch:AVX512"]
+        elif tuned:
             line += ["/arch:AVX2"]
         line += ["/Fe:" + target, "/Fo:" + os.path.join(WORK_PATH, "")]
         return line
@@ -75,6 +87,8 @@ def tool_line(kind, program, source, target, tuned, debug, trace=False):
     line += ["-O0", "-g", "-fsanitize=address,undefined"] if debug else ["-O3"]
     if tuned and platform.machine().lower() in ("x86_64", "amd64", "x86", "i386", "i686"):
         line += ["-mavx2", "-mfma"]
+        if wide:
+            line += WIDE_FLAGS
     line += ["-lm"]
     if platform.system() != "Windows":
         line += ["-lpthread"]
@@ -108,7 +122,7 @@ def work_build(flag):
         plan = [item for item in plan if item[1] == flag.only]
     for source, target in plan:
         line = tool_line(kind, program, source, target_path(target), flag.tuned, flag.debug,
-                         getattr(flag, "trace", False))
+                         getattr(flag, "trace", False), getattr(flag, "wide", False))
         step_show("build", line)
         code = subprocess.call(line, cwd=WORK_PATH)
         if code != 0:
@@ -188,6 +202,8 @@ def main():
     parser.add_argument("work", choices=sorted(WORK_TABLE), help="workflow to perform")
     parser.add_argument("--debug", action="store_true", help="unoptimized build with sanitizers")
     parser.add_argument("--tuned", action="store_true", help="allow host specific instructions")
+    parser.add_argument("--wide", action="store_true",
+                        help="the AVX-512 kernels beside the AVX2 ones; implies --tuned")
     parser.add_argument("--trace", action="store_true",
                         help="compile in the activation dump the layer comparison reads")
     parser.add_argument("--only", help="build a single target")
