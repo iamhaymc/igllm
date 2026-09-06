@@ -74,8 +74,40 @@ the tower's logits in the third decimal, so it was not taken.
 
 ## Anywhere
 
-- Read a wider range of pictures. The png reader refuses interlaced files and
-  bit depths under eight, and there is no jpeg reader at all.
+- Read jpeg. This is the gap that shows: most pictures a caller actually has are
+  jpeg, and `--image` refuses all of them. The wiring is small — `image_read`
+  sniffs three magics and hands off to `png_read`, `pnm_read` or `bmp_read`, each
+  of which fills a `flat_grid` of floats, so a fourth branch on `FF D8 FF` and a
+  `jpeg_read` beside them is the whole of it. What sits behind that branch is a
+  baseline decoder: the marker walk (SOI, APPn, DQT, SOF0, DHT, SOS, DRI, EOI), a
+  Huffman decode per component, dequantization against the tables DQT carried, an
+  eight by eight inverse DCT, chroma upsampling at whatever the sampling factors
+  say, and YCbCr to RGB. Restart markers are a page more. Progressive jpeg — SOF2,
+  coefficients arriving across several scans with successive approximation — is a
+  second job of its own size and should be scoped as one; refusing it the way the
+  png reader refuses interlacing is a fair first version.
+
+  `stb_image.h` is the reference to read for it: one header, public domain or MIT
+  at the reader's choice, baseline and progressive both, and its decisions about
+  where to round and how to lay the IDCT out are the ones worth understanding
+  before writing another. It is a
+  reference and not a source — nothing in this repository is borrowed, and
+  vendoring it would cost the claim on the front page. Some of the hard part is
+  already here in another guise: `puff_tree_build` and `puff_sign` are a canonical
+  Huffman decoder, and DHT hands over code lengths in much the shape deflate's
+  dynamic block does, so the tree builder may want widening rather than a second
+  copy beside it.
+
+  One thing to settle before the parity harness sees a jpeg. `app_diff.py` opens
+  the picture with `Image.open`, which is libjpeg, while the engine would open it
+  with its own IDCT. On png both sides start from identical pixels and the
+  comparison is of the tower alone; on jpeg they would start a bit or two apart
+  per pixel, and the tower's disagreement would be measured on top of the
+  decoder's. Either the harness feeds both sides the same decoded pixels, or the
+  jpeg cases are held to a looser floor than the png ones and the release says
+  which. The second is easier and the first is more honest.
+- Read a wider range of png. The reader refuses interlaced files and bit depths
+  under eight.
 - Support more than one concurrent session per model in the CLI, and add a
   multi-turn chat loop rather than a single turn.
 - Persist and restore a session cache, so a long prompt need not be primed
