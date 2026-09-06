@@ -883,6 +883,58 @@ static void test_kernel(void) {
     quant_act(value_list, 6, &rule);
     test_near(value_list[3], keep_list[3], 0.0, "quant_act is a no-op when the rule is idle");
   }
+
+  { /* The blocked blend against the row-at-a-time loop it replaces.
+     *
+     * The blocking is only about where the running sum lives, so the two are
+     * held to each other rather than to a tolerance on a third account: every
+     * value takes the same spans in the same order either way.  A stride wider
+     * than the values covers the case the audio tower brings, where the rows
+     * are heads of a wider array rather than a run of their own, and the value
+     * counts straddle the block so the tail is walked as well as the body. */
+    int value_list[5] = {1, 31, 32, 64, 72};
+    int span_list[4] = {1, 2, 13, 96};
+    int value_slot, span_slot, okay_flag = 1;
+    for (value_slot = 0; value_slot < 5; ++value_slot) {
+      int value_count = value_list[value_slot];
+      int wide_stride = value_count + 7; /* rows further apart than they are long */
+      for (span_slot = 0; span_slot < 4; ++span_slot) {
+        int span_count = span_list[span_slot];
+        int stride_slot;
+        for (stride_slot = 0; stride_slot < 2; ++stride_slot) {
+          int from_stride = stride_slot ? wide_stride : value_count;
+          float *from_data =
+              (float *)mem_clear(sizeof(float) * (size_t)span_count * (size_t)from_stride);
+          float *weight_list = (float *)mem_clear(sizeof(float) * (size_t)span_count);
+          float *into_data = (float *)mem_clear(sizeof(float) * (size_t)value_count);
+          float *want_data = (float *)mem_clear(sizeof(float) * (size_t)value_count);
+          int span_index, value_index;
+          for (span_index = 0; span_index < span_count; ++span_index) {
+            weight_list[span_index] = (float)sin((double)span_index * 0.41) * 0.5f;
+            for (value_index = 0; value_index < value_count; ++value_index)
+              from_data[(size_t)span_index * (size_t)from_stride + (size_t)value_index] =
+                  (float)cos((double)(span_index * 13 + value_index) * 0.07);
+          }
+          for (value_index = 0; value_index < value_count; ++value_index) want_data[value_index] = 0.0f;
+          for (span_index = 0; span_index < span_count; ++span_index)
+            for (value_index = 0; value_index < value_count; ++value_index)
+              want_data[value_index] +=
+                  weight_list[span_index] *
+                  from_data[(size_t)span_index * (size_t)from_stride + (size_t)value_index];
+          kern_blend_rows(from_data, from_stride, weight_list, span_count, value_count, into_data);
+          for (value_index = 0; value_index < value_count; ++value_index)
+            if (fabs((double)into_data[value_index] - (double)want_data[value_index]) > 1e-5)
+              okay_flag = 0;
+          mem_free(from_data);
+          mem_free(weight_list);
+          mem_free(into_data);
+          mem_free(want_data);
+        }
+      }
+    }
+    test_true(okay_flag, "kern_blend_rows matches the row-at-a-time blend it replaces");
+  }
+
 }
 
 /* ======================================================================== */

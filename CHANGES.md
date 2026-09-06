@@ -2328,3 +2328,242 @@ The divergence measurement is still text only, and still greedy. What a
 quantized cache costs a sampled run at length — where the draw is already
 stochastic and a shifted distribution may not be visible at all — is a different
 question and an open one.
+
+---
+
+## 0.8.4 — one broadcast instead of two, and three questions answered
+
+### Scope
+
+`TODO.md` put six items on the shipped export. Three of them were questions
+rather than work — is the gain mirror worth its bytes, is the gather the wrong
+read for the byte cache, and where does a picture's time actually go — and all
+three are answered here, on a host that holds still. One of the three turned
+into a change; two turned into an answer of "no", which is worth having written
+down at the same weight.
+
+The change that came out of it is two lines of the two bit decode kernel and
+does not move a single bit of any result on the shipped export.
+
+### A different host, and why it is the right one for this
+
+Every number before this release was taken on a four core 2017 desktop. This
+one is a four core virtual machine, and it is not that desktop: it is slower at
+arithmetic and about as fast at memory, which puts decode much further from the
+wall than 0.8.1 measured. The read only sweep of a 2.4 GB buffer, three passes,
+best kept, is 0.8.1's own:
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| sequential read | 10.41 GiB/s | 19.82 | 21.79 | **27.24** |
+
+Against that, before any change here:
+
+| build, four threads | decode | which is | of what the memory gives |
+| --- | --- | --- | --- |
+| tuned, AVX2 | 6.33 tok/s | 4.73 GiB/s | 17% |
+| default, SSE2 | 5.45 tok/s | 4.07 GiB/s | 15% |
+
+The desktop was at 42% and 30%. So this host is a poor place to ask a memory
+question and a good place to ask an instruction one, which is what the three
+open questions are. It is also quiet, which 0.8.3's host was not: four adjacent
+tuned runs on the same prompt gave 6.51, 6.43, 6.37 and 6.32 tok/s, a spread of
+3% where 0.8.3 saw a factor of two.
+
+### The gain mirror has nothing to convert on this export
+
+Two items — the candidate under "spend fewer instructions" and "cache
+dequantized scales for the hottest planes" — were the same trade seen from two
+directions: a per-plane float mirror of the group gains, memory against
+conversions. Both are closed, and neither by a measurement: the export does not
+give them anything to do.
+
+Walking every plane the token loop reads, and counting what a product against
+each streams:
+
+| what a step sweeps | |
+| --- | --- |
+| two bit codes | 366.00 MiB |
+| four bit codes | 335.25 MiB |
+| eight bit codes | 26.25 MiB |
+| gains | 4.59 MiB |
+
+and the gains are already what the mirror would hold. All 548 `weight_scale`
+tensors in the checkpoint are `F32` of shape `[rows, 1]`: one gain per row, in
+the dtype the kernel wants. `plane_gain` is therefore a plain indexed float
+load, taken once per row beside a dot product 768 to 12288 elements long —
+1,203,456 of them a token against 727.5 MiB of codes, which is one load per 634
+bytes read. There is no conversion to save and the mirror would be a verbatim
+copy of 4.59 MiB.
+
+One tensor in the export does carry more than one gain a row —
+`embed_tokens_per_layer.embedding_scale`, `F32` of `[262144, 35]` — and it is an
+indexed table rather than a swept plane. A step reads one row of it, 0.005 MiB,
+and those gains are `F32` too.
+
+This is a fact about the export rather than about the idea. A checkpoint that
+shipped `bf16` group scales would put the trade back on the table, and 0.1.0's
+note about scales staying in their stored dtype is still the right rule for one.
+On this one there is nothing to trade.
+
+### One broadcast instead of two
+
+What was left of "spend fewer instructions in the decode kernels" is the two bit
+path, and it is more than half of what a step sweeps: 366 MiB of the 727.5.
+
+The AVX2 path read a dword of codes and broadcast each half of it separately,
+then shifted each broadcast by 0, 2, 4 … 14 places and masked two bits off. A
+variable shift reaches bit thirty-one, so the upper eight codes are the same
+broadcast shifted by sixteen places more, and the mask keeps the same two bits
+either way. One broadcast per sixteen codes rather than two.
+
+The lanes, the codes and the order of the sum are untouched, so this is the same
+number to the last bit. On the export's widest two bit row, 12288 by 1536, one
+thread: 0.0027 s becomes 0.0019 s. `kern_code_spread` beside it takes the same
+change, which is where prefill's share of it comes from.
+
+Two other candidates were measured on the same row and not taken. Building the
+float from the code's bits — `0x4B000000 | code` read as a float, less 2^23,
+which is exact for codes this small and keeps the conversion off the shuffle
+port — came in at 0.0021 s, behind the broadcast it would replace. The same
+trick on the four bit path made it worse: 0.0011 s becomes 0.0014 s.
+
+Decode on the shipped export, four cores, tuned:
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| before | 2.63 tok/s | 4.45 | 5.75 | 6.54 |
+| after | 3.19 | 5.39 | 6.86 | **7.13** |
+| gain | 21% | 21% | 19% | 9% |
+
+Over three adjacent pairs at four threads on a shorter run the same change reads
+6.33 to 7.23 tok/s, and prefill on a 721 id prompt 11.16 to 11.48. The default
+build does not have this path and does not move: 5.59 against 5.62.
+
+The gain narrowing as threads are added is the shape of a build walking towards
+the memory rather than away from it. At four threads the tuned build is now
+reading 5.33 GiB/s of the 27.24 the sweep gives, so there is a great deal of
+room left and the next thing to spend it on is no longer the two bit decode.
+
+### The byte cache: the gather is the wrong read, measured
+
+0.8.3 could not time `--cache 8` — its host decoded the same build in the same
+configuration at 4.52 tok/s in one window and 2.32 in another — and left three
+tuned pairs of one sign as "not a measurement". This host answers it. Six pairs,
+each pair adjacent, on a 721 id prompt at four threads, 64 tokens:
+
+| build | float | bytes | |
+| --- | --- | --- | --- |
+| tuned, AVX2 | 5.77 | 3.84 | |
+| tuned, AVX2 | 5.63 | 3.84 | |
+| tuned, AVX2 | 5.54 | 3.79 | −33% |
+| default, SSE2 | 4.75 | 4.11 | |
+| default, SSE2 | 4.56 | 4.21 | |
+| default, SSE2 | 4.71 | 4.16 | −11% |
+
+Every pair puts the byte cache behind, and the two builds are behind by
+different amounts — which is the whole point, because the two builds differ in
+exactly one thing: `cache_dot` reads its table with a `vgatherdps` on AVX2 and
+with four scalar loads on SSE2. The build with the gather loses a third; the
+build without it loses a ninth.
+
+The clearest way to say it is that with the byte cache the tuned build is slower
+than the default build — 3.82 against 4.16 — having been a fifth faster than it
+with floats. A wider kernel that reads its operands through a gather is not a
+wider kernel.
+
+So the trade is confirmed as 0.8.3 guessed it: the byte cache saves three
+quarters of the cache traffic on a build that was never against the memory, and
+pays for it with a gather per eight values. What it collects — 1803.0 MiB of
+cache down to 450.8 — is unchanged and is still the reason to have it. It is a
+footprint option, not a speed one, and the flag stays off by default.
+
+What a different read should be is now a better question than it was, and there
+is a larger answer in it than a faster table read. This export ships
+`num_key_value_heads` of one against eight attention heads, so `group_share` is
+eight and every one of a layer's eight heads scores against the *same* cached
+key row and blends the *same* cached value row. `session_layer` decodes each of
+them once per head: eight table reads of every byte, where one would do. A read
+that decoded a block of rows once and then ran all eight heads over the floats
+would cut the decode work by eight without touching the storage saving, and it
+would serve every backend rather than only the one with the gather. That is a
+restructuring of the attention loop rather than a kernel swap, and `TODO.md`
+carries it in that shape now.
+
+### The towers: the loops the TODO named are not where the time is
+
+0.7.2 left "the score and blend loops are scalar where the dot product has a
+vector path". They are scalar in the source. They were not scalar in the
+binary — the compiler had been vectorizing them — and writing them out through
+the macro layer buys almost nothing.
+
+An image at the full patch budget is a 48 by 48 grid, 2304 patches, sixteen
+layers of twelve heads. Timed inside one thread, of the 148 s that whole run
+takes: the score loop is 9.6 s, the softmax over the scores 6.6 s, the blend
+7.9 s and the projection out of attention 2.6 s. Twenty-four seconds of a
+hundred and forty-eight. The rest is the projections and the feed-forward, which
+is where the six hundred billion multiply-adds actually are, and they already
+run through the packed kernels.
+
+Two of the three changes were still worth making and are kept, because both are
+free:
+
+- **The blend is blocked by value.** `kern_blend_rows` holds thirty-two running
+  sums in registers across every span rather than folding each span into the
+  destination, which is one memory operation per multiply-add instead of three.
+  A value still takes its spans in the order it took them. It is worth about 2%
+  of a picture on the default build and nothing measurable on the tuned one.
+- **The conformer's depthwise kernel is turned tap-major once, at bind time.**
+  The checkpoint stores it one row per channel, which made a tap a stride of the
+  whole state and the innermost loop a walk of the kernel per channel per frame.
+  Tap-major it is `kern_fma_row`, an element-wise multiply-add over every
+  channel at once. A channel still sums its taps in the order it did.
+
+The third was measured and dropped. Vectorizing the conformer's score — the sum
+of a query against a key plus the lag projection — is a reassociation, because
+the loop it replaces is a serial reduction that no compiler may reorder. It
+measured at nothing on the shipped export, the conformer's window being thirteen
+keys wide, and it moved the tower's logits in the third decimal. A refactor
+should not be spending that, and 0.8.3 said so about a different one.
+
+### The result moves nothing
+
+Everything in this release is held to the build before it, on the shipped
+export, through `logits` rather than through a greedy continuation: text, a
+picture at the full patch budget, a thirty second clip, and a picture and a clip
+in one prompt, on both the tuned and the default builds. Every distribution is
+byte for byte what it was. The suite's `shot` section, which holds three prompts
+through the whole stack to what the judged build produced, passes on both.
+
+That is stated as a result rather than as an aspiration because the first draft
+of the blend did not have it. Written with a fused multiply-add — which the loop
+it replaced was not getting — it changed the greedy continuation of a picture at
+the seventh token. The kernel adds and multiplies the way each build's loop did,
+and the check above is what caught it.
+
+### Testing
+
+Two assertions, and both are held against the loop they replace rather than
+against a tolerance. `kern_blend_rows` is compared value for value with the
+row-at-a-time blend over five value counts that straddle its thirty-two wide
+block, four span counts, and both strides it is called with — the head width
+where rows are heads of a wider array, and the head size where they have been
+gathered into a run. 390 assertions, up from 389, passing on the scalar, SSE2
+and AVX2 backends.
+
+### Known gaps
+
+The 2017 desktop's table in `README.md` is left as it was. This release's gains
+are measured on a different machine and the desktop's percentages of memory do
+not transfer; what does transfer is that the two bit path spends one broadcast
+where it spent two, which is not a property of a host.
+
+The softmax over a picture's scores is 6.6 s of a 148 s single threaded run and
+is a scalar `expf` per patch pair per head per layer — a billion of them for one
+picture. Nothing here touches it.
+
+`run.py check` and `run.py parity` were not re-run: the machine this was
+measured on has no `transformers`, and every distribution the engine produces on
+the shipped export is byte for byte what the previous build produced, so a
+comparison against the reference would be comparing the same numbers it compared
+before. That is an argument, not a run, and it is worth saying which.
