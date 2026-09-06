@@ -57,11 +57,16 @@ Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
 `--echo-penalty`, `--seed`, `--raw`, `--verbose`. Run `igllm --help` for the
 full list.
 
-`--cache 8` rounds the key and value cache through the eight bit float grid the
-export calibrates static ranges for — the error a backend that stored the cache
-as bytes would carry, paid where it can be measured. It is off by default. The
-`cache` task prints those ranges against the peaks a prompt actually reaches,
-and what the cache costs at full span either way.
+`--cache 8` holds the key and value cache as bytes, on the eight bit float grid
+the export calibrates static ranges for. It is off by default. On the shipped
+export it takes the cache at full span from 1803.0 MiB to 450.8 MiB — a saving
+larger than the checkpoint's own mapped weights — and a decode step reads a
+quarter of the cache bytes it read as floats. What it costs is accuracy: the
+next token is never in doubt, and greedy decoding diverges at the first
+genuinely close call — around eighty characters in on a short prompt, and inside
+twenty once the context is long enough for the sliding window to turn over.
+The `cache` task prints the calibrated ranges against the peaks a prompt
+actually reaches, and what the cache costs at full span either way.
 
 `--image` takes a png, pnm or bmp and `--audio` a riff wave. Each is run
 through its tower and put in front of the prompt, bracketed by the ids the

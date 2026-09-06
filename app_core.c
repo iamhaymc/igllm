@@ -200,9 +200,12 @@ int          session_fill(const app_session *session); /* tokens held in cache *
 float        model_cache_scale(const app_model *model, int layer_index, int value_side);
 float        session_cache_peak(const app_session *session, int layer_index, int value_side);
 
-/* Bytes the key and value cache occupies at full span, as it is stored now.  A
- * backend that held it at `cache_bits` would pay a quarter of this. */
+/* Bytes the key and value cache occupies at full span, as this session stores
+ * it, and what it would occupy at the storage `cache_bits` names.  Eight counts
+ * a byte a value for every layer the export ships a scale for and a float for
+ * the rest; zero counts floats throughout. */
 size_t       session_cache_room(const app_session *session);
+size_t       session_cache_room_at(const app_session *session, int cache_bits);
 app_tally    session_tally(const app_session *session);
 
 /* helper layer ------------------------------------------------------------*/
@@ -6734,8 +6737,14 @@ struct app_session {
   app_tally  tally;
   uint64_t   draw_state;
 
-  float **key_store;
-  float **value_store;
+  /* One row a slot, held either as floats or as the eight bit floats the
+   * export calibrates for.  `key_grid` is the layer's dequantizing table where
+   * it holds bytes and null where it holds floats, so it doubles as the flag
+   * that says which of the two a store is. */
+  void  **key_store;
+  void  **value_store;
+  float **key_grid;
+  float **value_grid;
 
   /* The largest magnitude this session has put in each layer's cache, tracked
    * so the static ranges the export calibrates can be judged against what the
@@ -6804,6 +6813,14 @@ static void session_free_rooms(app_session *session) {
     mem_free(session->key_store);
     mem_free(session->value_store);
   }
+  if (session->key_grid) {
+    for (layer_index = 0; layer_index < session->model->form.layer_count; ++layer_index) {
+      mem_free(session->key_grid[layer_index]);
+      mem_free(session->value_grid[layer_index]);
+    }
+    mem_free(session->key_grid);
+    mem_free(session->value_grid);
+  }
   mem_free(session->key_peak);
   mem_free(session->value_peak);
   mem_free(session->state_room);
@@ -6850,33 +6867,203 @@ static float cache_pack8(float value) {
   return sign * (size > CACHE_FP8_TOP ? CACHE_FP8_TOP : size);
 }
 
+/* The byte the grid holds a value as, and the value back out of the byte.
+ *
+ * The layout is the format's own: one sign bit, four exponent bits biased by
+ * seven, three of significand.  A zero exponent field is the subnormal range,
+ * where the significand counts steps of 2^-9 outright; every other exponent
+ * carries the implied leading one, so the value is `(8 + significand) *
+ * 2^(exponent - 10)`.  `cache_pack8` has already rounded and saturated by the
+ * time the encoder runs, so all it has to do is name the byte the value landed
+ * on -- and 0x7F, which the format spends on a NaN, is never reached, because
+ * 448 saturates at 0x7E.
+ *
+ * `cache_real8(cache_code8(x))` is `cache_pack8(x)` for every float.  That is
+ * what lets a byte cache be put under a float one without moving a result. */
+static uint8_t cache_code8(float value) {
+  float size = cache_pack8(value);
+  uint8_t sign = 0;
+  int power, step;
+  if (size < 0.0f) { sign = 0x80u; size = -size; }
+  if (size < CACHE_FP8_NORM)
+    return (uint8_t)(sign | (uint8_t)(int)(size / CACHE_FP8_STEP + 0.5f));
+  frexpf(size, &power);           /* size is in [2^(power-1), 2^power) */
+  step = (int)(ldexpf(size, 4 - power) + 0.5f) - 8;
+  return (uint8_t)(sign | (uint8_t)((power + 6) << 3) | (uint8_t)step);
+}
+
+static float cache_real8(uint8_t code) {
+  int power = (code >> 3) & 15;
+  int step = code & 7;
+  float size = power == 0 ? (float)step * CACHE_FP8_STEP
+                          : ldexpf((float)(8 + step), power - 10);
+  return (code & 0x80u) ? -size : size;
+}
+
+/* A cache row is written once and read on every step that can still see it, so
+ * the decoding is a table read rather than a shift and a scale.  The table
+ * folds the layer's scale in, which makes an entry the exact float the round
+ * trip through the grid stored before anything was held as a byte: a kilobyte a
+ * side a layer buys value-for-value agreement with the float cache rather than
+ * mere closeness. */
+static void cache_grid_fill(float *grid, float scale) {
+  int code;
+  for (code = 0; code < 256; ++code) grid[code] = cache_real8((uint8_t)code) * scale;
+}
+
+#if defined(APP_SIMD_SSE2) && !defined(APP_SIMD_AVX2)
+/* Four table reads gathered into one vector, in the lanes a float load would
+ * have put them in, so the sum that follows is the same sum in the same order.
+ * Neither SSE2 nor NEON has a gather, and four scalar reads of a table that
+ * stays in the first level cache are cheaper than the branch to avoid them. */
+static __m128 cache_four_wide(const float *grid, const uint8_t *code_list) {
+  return _mm_set_ps(grid[code_list[3]], grid[code_list[2]], grid[code_list[1]],
+                    grid[code_list[0]]);
+}
+#define CACHE_SSE_FOUR(grid, code_list) cache_four_wide((grid), (code_list))
+#elif defined(APP_SIMD_NEON)
+static float32x4_t cache_four_wide(const float *grid, const uint8_t *code_list) {
+  float part_list[4];
+  part_list[0] = grid[code_list[0]];
+  part_list[1] = grid[code_list[1]];
+  part_list[2] = grid[code_list[2]];
+  part_list[3] = grid[code_list[3]];
+  return vld1q_f32(part_list);
+}
+#define CACHE_NEON_FOUR(grid, code_list) cache_four_wide((grid), (code_list))
+#endif
+
+/* What one stored value of a layer's cache costs. */
+static size_t cache_slot_bytes(const float *grid) { return grid ? 1u : sizeof(float); }
+
+/* One cached key row of bytes against one query head.
+ *
+ * The blocking, the pair of accumulators and the horizontal sum are the packed
+ * dot kernel's, term for term, and the table hands back exactly the float the
+ * float cache held, so a byte cache and a float one reach the same score bit
+ * for bit rather than to a tolerance.  A layer holding floats does not come
+ * here at all: it keeps the kernel it always used, so `--cache 8` off is the
+ * arithmetic it was before any of this. */
+static float cache_dot(const uint8_t *code_list, const float *grid, const float *act_data,
+                       int span_count) {
+  float total = 0.0f;
+  int slot = 0;
+#if defined(APP_SIMD_AVX2)
+  {
+    __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
+    __m256 wide_total;
+    for (; slot + 16 <= span_count; slot += 16) {
+      __m256i code_a = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(code_list + slot)));
+      __m256i code_b =
+          _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(code_list + slot + 8)));
+      part_a = _mm256_fmadd_ps(_mm256_i32gather_ps(grid, code_a, 4),
+                               _mm256_loadu_ps(act_data + slot), part_a);
+      part_b = _mm256_fmadd_ps(_mm256_i32gather_ps(grid, code_b, 4),
+                               _mm256_loadu_ps(act_data + slot + 8), part_b);
+    }
+    for (; slot + 8 <= span_count; slot += 8) {
+      __m256i code_a = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(code_list + slot)));
+      part_a = _mm256_fmadd_ps(_mm256_i32gather_ps(grid, code_a, 4),
+                               _mm256_loadu_ps(act_data + slot), part_a);
+    }
+    wide_total = _mm256_add_ps(part_a, part_b);
+    {
+      __m128 half_total = _mm_add_ps(_mm256_castps256_ps128(wide_total),
+                                     _mm256_extractf128_ps(wide_total, 1));
+      half_total = _mm_hadd_ps(half_total, half_total);
+      half_total = _mm_hadd_ps(half_total, half_total);
+      total = _mm_cvtss_f32(half_total);
+    }
+  }
+#elif defined(APP_SIMD_SSE2)
+  {
+    __m128 part_a = _mm_setzero_ps(), part_b = _mm_setzero_ps();
+    __m128 wide_total;
+    for (; slot + 8 <= span_count; slot += 8) {
+      part_a = _mm_add_ps(part_a, _mm_mul_ps(CACHE_SSE_FOUR(grid, code_list + slot),
+                                             _mm_loadu_ps(act_data + slot)));
+      part_b = _mm_add_ps(part_b, _mm_mul_ps(CACHE_SSE_FOUR(grid, code_list + slot + 4),
+                                             _mm_loadu_ps(act_data + slot + 4)));
+    }
+    for (; slot + 4 <= span_count; slot += 4)
+      part_a = _mm_add_ps(part_a, _mm_mul_ps(CACHE_SSE_FOUR(grid, code_list + slot),
+                                             _mm_loadu_ps(act_data + slot)));
+    wide_total = _mm_add_ps(part_a, part_b);
+    {
+      __m128 half_total = _mm_add_ps(wide_total, _mm_movehl_ps(wide_total, wide_total));
+      half_total = _mm_add_ss(half_total, _mm_shuffle_ps(half_total, half_total, 0x55));
+      total = _mm_cvtss_f32(half_total);
+    }
+  }
+#elif defined(APP_SIMD_NEON)
+  {
+    float32x4_t part_a = vdupq_n_f32(0.0f), part_b = vdupq_n_f32(0.0f);
+    float32x4_t wide_total;
+    for (; slot + 8 <= span_count; slot += 8) {
+      part_a = vmlaq_f32(part_a, CACHE_NEON_FOUR(grid, code_list + slot),
+                         vld1q_f32(act_data + slot));
+      part_b = vmlaq_f32(part_b, CACHE_NEON_FOUR(grid, code_list + slot + 4),
+                         vld1q_f32(act_data + slot + 4));
+    }
+    for (; slot + 4 <= span_count; slot += 4)
+      part_a = vmlaq_f32(part_a, CACHE_NEON_FOUR(grid, code_list + slot),
+                         vld1q_f32(act_data + slot));
+    wide_total = vaddq_f32(part_a, part_b);
+    total = vgetq_lane_f32(wide_total, 0) + vgetq_lane_f32(wide_total, 1) +
+            vgetq_lane_f32(wide_total, 2) + vgetq_lane_f32(wide_total, 3);
+  }
+#endif
+  for (; slot < span_count; ++slot) total += grid[code_list[slot]] * act_data[slot];
+  return total;
+}
+
+/* One cached value row of bytes, weighted, into the blend the head is
+ * accumulating.  Scalar, which is what the float blend loop is. */
+static void cache_add(const uint8_t *code_list, const float *grid, float weight_value,
+                      float *blend_data, int span_count) {
+  int slot;
+  for (slot = 0; slot < span_count; ++slot)
+    blend_data[slot] += weight_value * grid[code_list[slot]];
+}
+
 /* Lay one row into the key or value cache.
  *
  * The export calibrates a static range a layer for each of them — a single
  * scalar, the same for every channel and every position — and ships seventy of
  * them the reference never reads.  They describe the eight bit float grid
- * above: a backend that holds the cache quantized stores `value / scale`
- * rounded to that grid, and reads back what it rounded to times the scale.
+ * above: a layer whose store is bytes holds `value / scale` rounded to that
+ * grid, and reads it back through a table that multiplies the scale in again.
  * With `cache_bits` at zero the row is stored as it arrives and the scales cost
- * nothing; at eight it makes that round trip here, in float, so the error a
- * quantized cache would carry is paid where it can be measured against the same
- * run without it.
+ * nothing.
+ *
+ * A layer's store is bytes exactly where its dequantizing table exists, which
+ * `session_open` decides once: `cache_bits` at eight and a scale the export
+ * actually ships.  Nothing is rounded on a layer that has no scale, because
+ * there is no grid to round it onto.
  *
  * The peak is tracked either way.  What the range has to cover is the question
  * the scalars answer, and it can only be asked of a real prompt. */
-static void cache_lay(app_session *session, int layer_index, float *slot, const float *row,
+static void cache_lay(app_session *session, int layer_index, size_t slot_first, const float *row,
                       int width, float scale, int value_side) {
   float *peak = (value_side ? session->value_peak : session->key_peak) + layer_index;
+  const float *grid = (value_side ? session->value_grid : session->key_grid)[layer_index];
+  void *base_data = (value_side ? session->value_store : session->key_store)[layer_index];
   int index;
   for (index = 0; index < width; ++index) {
     float size = row[index] < 0.0f ? -row[index] : row[index];
     if (size > *peak) *peak = size;
   }
-  if (session->model->setup.cache_bits != 8 || !(scale > 0.0f)) {
-    memcpy(slot, row, sizeof(float) * (size_t)width);
+  if (!grid) {
+    memcpy((float *)base_data + slot_first, row, sizeof(float) * (size_t)width);
     return;
   }
-  for (index = 0; index < width; ++index) slot[index] = cache_pack8(row[index] / scale) * scale;
+  {
+    uint8_t *code_list = (uint8_t *)base_data + slot_first;
+    /* A divide rather than a multiply by the reciprocal: this runs once a row
+     * where the read runs over the whole span, and the divide is what the float
+     * round trip through the grid did, so the two storages agree to the bit. */
+    for (index = 0; index < width; ++index) code_list[index] = cache_code8(row[index] / scale);
+  }
 }
 
 static void session_attend(app_session *session, int layer_index, int place_from, int lane_count,
@@ -6890,6 +7077,8 @@ static void session_attend(app_session *session, int layer_index, int place_from
   int kv_width = wing->kv_count * head_size;
   int head_stride = session->head_stride;
   int state_stride = session->state_stride;
+  const float *key_grid = session->key_grid[owner_slot];
+  const float *value_grid = session->value_grid[owner_slot];
   int head_index, lane_index;
 
   session_lift_many(session, &wing->query_sheet, enter_data, state_stride, lane_count,
@@ -6920,10 +7109,7 @@ static void session_attend(app_session *session, int layer_index, int place_from
     if (!wing->share_flag) {
       float *key_lane = session->key_room + (size_t)lane_index * (size_t)head_stride;
       float *value_lane = session->value_room + (size_t)lane_index * (size_t)head_stride;
-      float *key_slot = session->key_store[layer_index] +
-                        (size_t)(place_index % wing->cache_span) * (size_t)kv_width;
-      float *value_slot = session->value_store[layer_index] +
-                          (size_t)(place_index % wing->cache_span) * (size_t)kv_width;
+      size_t slot_first = (size_t)(place_index % wing->cache_span) * (size_t)kv_width;
       if (wing->value_sheet.form == PLANE_VOID)
         memcpy(value_lane, key_lane, sizeof(float) * (size_t)kv_width);
       for (head_index = 0; head_index < wing->kv_count; ++head_index) {
@@ -6935,8 +7121,8 @@ static void session_attend(app_session *session, int layer_index, int place_from
                               session->sin_room);
         model->desk.norm_rms(&model->desk, value_head, NULL, head_size, form->norm_eps, value_head);
       }
-      cache_lay(session, layer_index, key_slot, key_lane, kv_width, wing->key_cache_scale, 0);
-      cache_lay(session, layer_index, value_slot, value_lane, kv_width, wing->value_cache_scale, 1);
+      cache_lay(session, layer_index, slot_first, key_lane, kv_width, wing->key_cache_scale, 0);
+      cache_lay(session, layer_index, slot_first, value_lane, kv_width, wing->value_cache_scale, 1);
     }
 
     if (wing->kind_mark == MODEL_KIND_SLIDE) {
@@ -6950,25 +7136,43 @@ static void session_attend(app_session *session, int layer_index, int place_from
       int span_count = place_index - place_start + 1;
       int span_index, value_index;
 
-      for (span_index = 0; span_index < span_count; ++span_index) {
-        int slot_index = (place_start + span_index) % owner->cache_span;
-        const float *key_head = session->key_store[owner_slot] +
+      if (key_grid)
+        for (span_index = 0; span_index < span_count; ++span_index) {
+          int slot_index = (place_start + span_index) % owner->cache_span;
+          const uint8_t *key_head = (const uint8_t *)session->key_store[owner_slot] +
+                                    (size_t)slot_index * (size_t)kv_width +
+                                    (size_t)kv_index * head_size;
+          session->score_room[span_index] = cache_dot(key_head, key_grid, query_head, head_size);
+        }
+      else
+        for (span_index = 0; span_index < span_count; ++span_index) {
+          int slot_index = (place_start + span_index) % owner->cache_span;
+          const float *key_head = (const float *)session->key_store[owner_slot] +
                                 (size_t)slot_index * (size_t)kv_width + (size_t)kv_index * head_size;
-        session->score_room[span_index] =
-            kern_dot_real(key_head, STORE_F32, query_head, head_size);
-      }
+          session->score_room[span_index] =
+              kern_dot_real(key_head, STORE_F32, query_head, head_size);
+        }
       model->desk.soft_max(&model->desk, session->score_room, span_count);
 
       for (value_index = 0; value_index < head_size; ++value_index) blend_head[value_index] = 0.0f;
-      for (span_index = 0; span_index < span_count; ++span_index) {
-        int slot_index = (place_start + span_index) % owner->cache_span;
-        const float *value_head = session->value_store[owner_slot] +
-                                  (size_t)slot_index * (size_t)kv_width +
-                                  (size_t)kv_index * head_size;
-        float weight_value = session->score_room[span_index];
-        for (value_index = 0; value_index < head_size; ++value_index)
-          blend_head[value_index] += weight_value * value_head[value_index];
-      }
+      if (value_grid)
+        for (span_index = 0; span_index < span_count; ++span_index) {
+          int slot_index = (place_start + span_index) % owner->cache_span;
+          const uint8_t *value_head = (const uint8_t *)session->value_store[owner_slot] +
+                                      (size_t)slot_index * (size_t)kv_width +
+                                      (size_t)kv_index * head_size;
+          cache_add(value_head, value_grid, session->score_room[span_index], blend_head, head_size);
+        }
+      else
+        for (span_index = 0; span_index < span_count; ++span_index) {
+          int slot_index = (place_start + span_index) % owner->cache_span;
+          const float *value_head = (const float *)session->value_store[owner_slot] +
+                                    (size_t)slot_index * (size_t)kv_width +
+                                    (size_t)kv_index * head_size;
+          float weight_value = session->score_room[span_index];
+          for (value_index = 0; value_index < head_size; ++value_index)
+            blend_head[value_index] += weight_value * value_head[value_index];
+        }
     }
   }
   session_lift_many(session, &wing->exit_sheet, session->blend_room, head_stride, lane_count,
@@ -7832,6 +8036,7 @@ app_code session_open(app_model *model, app_session **session_out) {
   model_form *form;
   int layer_index;
   int head_peak = 0, inner_peak = 0, half_peak = 0, wide_peak;
+  int setup_bits;
 
   if (!model || !session_out) return APP_FAIL_ARGUMENT;
   *session_out = NULL;
@@ -7839,6 +8044,7 @@ app_code session_open(app_model *model, app_session **session_out) {
   if (!session) return APP_FAIL_MEMORY;
   session->model = model;
   form = &model->form;
+  setup_bits = model->setup.cache_bits;
 
   for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
     layer_wing *wing = &model->wing_list[layer_index];
@@ -7853,21 +8059,40 @@ app_code session_open(app_model *model, app_session **session_out) {
   wide_peak = form->head_count * head_peak;
   if (form->state_size > wide_peak) wide_peak = form->state_size;
 
-  session->key_store = (float **)mem_clear(sizeof(float *) * (size_t)form->layer_count);
-  session->value_store = (float **)mem_clear(sizeof(float *) * (size_t)form->layer_count);
+  session->key_store = (void **)mem_clear(sizeof(void *) * (size_t)form->layer_count);
+  session->value_store = (void **)mem_clear(sizeof(void *) * (size_t)form->layer_count);
+  session->key_grid = (float **)mem_clear(sizeof(float *) * (size_t)form->layer_count);
+  session->value_grid = (float **)mem_clear(sizeof(float *) * (size_t)form->layer_count);
   session->key_peak = (float *)mem_clear(sizeof(float) * (size_t)form->layer_count);
   session->value_peak = (float *)mem_clear(sizeof(float) * (size_t)form->layer_count);
-  if (!session->key_store || !session->value_store || !session->key_peak || !session->value_peak) {
+  if (!session->key_store || !session->value_store || !session->key_grid || !session->value_grid ||
+      !session->key_peak || !session->value_peak) {
     session_close(session);
     return APP_FAIL_MEMORY;
   }
+  /* A side of a layer is held as bytes where the export ships it a scale and
+   * `cache_bits` asks for it, and as floats otherwise, so a checkpoint that
+   * calibrates nothing costs nothing for asking.  A zero byte decodes to a zero
+   * float, which is what makes a cleared store a cleared cache either way. */
   for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
     layer_wing *wing = &model->wing_list[layer_index];
     size_t slot_count;
     if (wing->share_flag) continue;
     slot_count = (size_t)wing->cache_span * (size_t)wing->kv_count * (size_t)wing->head_size;
-    session->key_store[layer_index] = (float *)mem_clear(sizeof(float) * slot_count);
-    session->value_store[layer_index] = (float *)mem_clear(sizeof(float) * slot_count);
+    if (setup_bits == 8 && wing->key_cache_scale > 0.0f) {
+      session->key_grid[layer_index] = (float *)mem_clear(sizeof(float) * 256u);
+      if (!session->key_grid[layer_index]) { session_close(session); return APP_FAIL_MEMORY; }
+      cache_grid_fill(session->key_grid[layer_index], wing->key_cache_scale);
+    }
+    if (setup_bits == 8 && wing->value_cache_scale > 0.0f) {
+      session->value_grid[layer_index] = (float *)mem_clear(sizeof(float) * 256u);
+      if (!session->value_grid[layer_index]) { session_close(session); return APP_FAIL_MEMORY; }
+      cache_grid_fill(session->value_grid[layer_index], wing->value_cache_scale);
+    }
+    session->key_store[layer_index] =
+        mem_clear(slot_count * cache_slot_bytes(session->key_grid[layer_index]));
+    session->value_store[layer_index] =
+        mem_clear(slot_count * cache_slot_bytes(session->value_grid[layer_index]));
     if (!session->key_store[layer_index] || !session->value_store[layer_index]) {
       session_close(session);
       return APP_FAIL_MEMORY;
@@ -7949,8 +8174,10 @@ void session_reset(app_session *session) {
     size_t slot_count;
     if (wing->share_flag || !session->key_store[layer_index]) continue;
     slot_count = (size_t)wing->cache_span * (size_t)wing->kv_count * (size_t)wing->head_size;
-    memset(session->key_store[layer_index], 0, sizeof(float) * slot_count);
-    memset(session->value_store[layer_index], 0, sizeof(float) * slot_count);
+    memset(session->key_store[layer_index], 0,
+           slot_count * cache_slot_bytes(session->key_grid[layer_index]));
+    memset(session->value_store[layer_index], 0,
+           slot_count * cache_slot_bytes(session->value_grid[layer_index]));
   }
 }
 
@@ -7963,7 +8190,11 @@ void session_reset(app_session *session) {
  * fill for a full-attention layer, the window for a sliding one — and a sharing
  * layer scans the layer it shares from, so all of them are counted.  What is
  * counted is the distinct bytes of the span: the heads of one group re-read the
- * same key head, but a group's span is tens of kilobytes and stays in cache. */
+ * same key head, but a group's span is tens of kilobytes and stays in cache.
+ *
+ * A layer that holds its rows as bytes reads a quarter of what it read as
+ * floats, which is most of the point of holding them that way, so the width of
+ * a stored value is asked of the layer rather than assumed. */
 static size_t session_cache_bytes(const app_session *session) {
   const model_form *form = &session->model->form;
   int place_index = session->fill_count;
@@ -7972,11 +8203,14 @@ static size_t session_cache_bytes(const app_session *session) {
   if (place_index < 0) return 0;
   for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
     const layer_wing *wing = &session->model->wing_list[layer_index];
+    int owner_slot = wing->share_flag ? wing->source_slot : layer_index;
     int span_count = place_index + 1;
+    size_t span_size;
     if (wing->kind_mark == MODEL_KIND_SLIDE && span_count > form->slide_span)
       span_count = form->slide_span;
-    total += (size_t)span_count * (size_t)wing->kv_count * (size_t)wing->head_size *
-             sizeof(float) * 2u;
+    span_size = (size_t)span_count * (size_t)wing->kv_count * (size_t)wing->head_size;
+    total += span_size * cache_slot_bytes(session->key_grid[owner_slot]);
+    total += span_size * cache_slot_bytes(session->value_grid[owner_slot]);
   }
   return total;
 }
@@ -8039,17 +8273,23 @@ float model_cache_scale(const app_model *model, int layer_index, int value_side)
   return value_side ? wing->value_cache_scale : wing->key_cache_scale;
 }
 
-size_t session_cache_room(const app_session *session) {
+size_t session_cache_room_at(const app_session *session, int cache_bits) {
   size_t total = 0;
   int layer_index;
   if (!session) return 0;
   for (layer_index = 0; layer_index < session->model->form.layer_count; ++layer_index) {
     const layer_wing *wing = &session->model->wing_list[layer_index];
+    size_t slot_count;
     if (wing->share_flag) continue; /* reads another layer's cache, allocates none */
-    total += (size_t)wing->cache_span * (size_t)wing->kv_count * (size_t)wing->head_size *
-             sizeof(float) * 2u;
+    slot_count = (size_t)wing->cache_span * (size_t)wing->kv_count * (size_t)wing->head_size;
+    total += slot_count * (cache_bits == 8 && wing->key_cache_scale > 0.0f ? 1u : sizeof(float));
+    total += slot_count * (cache_bits == 8 && wing->value_cache_scale > 0.0f ? 1u : sizeof(float));
   }
   return total;
+}
+
+size_t session_cache_room(const app_session *session) {
+  return session ? session_cache_room_at(session, session->model->setup.cache_bits) : 0;
 }
 
 float session_cache_peak(const app_session *session, int layer_index, int value_side) {

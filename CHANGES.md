@@ -2145,3 +2145,186 @@ The divergence measurement is five prompts on one export, text only, at short
 context. What quantizing costs when the cache is long enough for the sliding
 window to be turning over is the case that matters most for a small host, and it
 is untested here.
+
+---
+
+## 0.8.3 — the cache stops being floats
+
+### Scope
+
+0.8.2 read the export's seventy cache scales, implemented the eight bit float
+grid they describe, and measured what a round trip through it costs. It stored
+nothing smaller: `key_store` and `value_store` were float arrays, and the
+release said so under its own known gaps. This one holds them as bytes and
+collects the 1352 MiB, and then asks the question 0.8.2 left untested — what
+quantizing costs when the cache is long enough for the sliding window to have
+turned over.
+
+### A change of storage, not of arithmetic
+
+`cache_code8` names the byte a value lands on and `cache_real8` reads it back:
+one sign bit, four exponent bits biased by seven, three of significand, with a
+zero exponent field standing for the subnormal range. `cache_pack8` has already
+rounded and saturated by the time the encoder runs, so the encoder only names
+the byte, and 0x7F — where the format keeps its NaN — is never reached, because
+448 saturates one code short of it.
+
+Which storage a layer uses is settled once, in `session_open`, a side of a layer
+at a time, and is carried by a 256 entry table filled by `cache_grid_fill`: null
+where the layer holds floats, and otherwise the grid times that layer's scale. A
+null table is the flag, and it also decides what one stored value costs. A layer
+the export ships no scale for keeps floats, so a checkpoint that calibrates
+nothing costs nothing for asking, and a byte of zero decodes to a float of zero,
+which is what lets one `memset` clear either store.
+
+Folding the scale into the table is the point. An entry is exactly
+`cache_pack8(value / scale) * scale`, which is the float the 0.8.2 round trip
+stored, so a layer holding bytes reaches the same score as one holding floats —
+bit for bit, not to a tolerance. `cache_dot` mirrors the packed dot kernel's
+blocking, its pair of accumulators and its horizontal sum term for term to keep
+it that way: on AVX2 the table read is a gather, on SSE2 and NEON four scalar
+reads of a kilobyte that stays in the first level cache.
+
+A layer holding floats never reaches those kernels. It keeps `kern_dot_real` and
+the blend loop it always had, so `--cache 8` off is the arithmetic it was before
+any of this existed. That is worth stating as a decision rather than an
+accident: the first draft of this change routed both storages through one pair
+of helpers, and that alone moved the default build's logits enough to change the
+top token — the same size of shift the SSE2 and AVX2 builds already differ by,
+and no more, but a refactor should not be spending it.
+
+### What it collects
+
+On the shipped export, at the default window:
+
+| | float | bytes |
+| --- | --- | --- |
+| cache at full span | 1803.0 MiB | 450.8 MiB |
+| the process allocates | 2067.9 MiB | 715.7 MiB |
+
+The saving is larger than the checkpoint's own mapped weights. What a decode
+step reads falls with it, and `session_cache_bytes` asks the layer rather than
+assuming a float, so `bench` reports the fall rather than having to be told
+about it.
+
+### Surfaces
+
+`session_cache_room_at` says what the cache costs at either storage;
+`session_cache_room` is that at the storage the session actually uses. The
+`cache` task prints both, so the trade is on the same line as the ranges.
+
+### Tests
+
+Nine more, on the byte rather than on the grid: every code round trips except
+the two the format spends on a NaN, which saturate to 0x7E; the encoder and the
+rounding agree over a sweep of forty thousand values and twenty-three powers;
+and the table hands back exactly what the float round trip stored, at four
+scales, two of them the shipped export's own. The suite is **389** with the
+export beside it, clean under `-Wall -Wextra` and under the sanitizers.
+
+The stronger check is not in the suite, because it needs two binaries: against
+one built from 0.8.2's tree, the logits and the greedy continuation agree byte
+for byte, with `--cache 8` and without it, on the SSE2 and the AVX2 build alike.
+That is the claim the folded table exists to make, and it is the reason this
+release needs no re-run against the reference: on the default path nothing
+moved, and on the quantized path it moved to the same place 0.8.2 measured.
+
+### What a quantized cache costs at length
+
+0.8.2 measured the divergence on five short prompts and said plainly that the
+case which decides whether the footprint is worth taking — a context long enough
+for the sliding window to be turning over — was untested. It is tested now.
+
+Two prompts of ordinary English prose, 694 and 588 ids, both past the 512 the
+sliding layers hold, each decoded greedily for 96 tokens with the cache held as
+floats and again as bytes:
+
+| | 0.8.2, five prompts at 7 to 18 ids | here, 694 ids | here, 588 ids |
+| --- | --- | --- | --- |
+| greedy agrees for | 78 to 102 characters | **17** | **23** |
+
+That is the answer, and it is worse than the short case by a factor of four to
+five. Both continuations stay fluent and on topic afterwards and say different
+things: one carries on about `app_core.c` where the other turns to `app_main.c`.
+
+What has not decayed with them is the head of the distribution, and the two want
+saying together or the first number reads as worse than it is. Taken on the same
+702 ids, the next token is not in doubt and is not even close: both storages put
+id 2094 first, 28.8084 against 28.6828, over a runner-up 5.16 and 5.22 behind.
+The top eight are in the same order on both, and it is rank nine and below where
+they begin to trade places, eleven of the top sixteen still in step.
+
+So the divergence at seventeen characters is not the head of the distribution
+coming apart at length. It is that a step blending several hundred rounded rows
+instead of a dozen needs only one genuinely close call to part the two runs, and
+over ninety-six steps it finds one early. Which is the same mechanism 0.8.2
+described — it simply arrives four to five times sooner.
+
+What does not happen is clipping, and it is worth recording that it does not.
+The peaks a long prompt reaches are higher than a short one's but still well
+inside the calibration — the fullest is layer 8's values at 52.2% of its range,
+against 26.6% on a seven id prompt, and no layer of the thirty passes 53%. The
+export's static ranges are not the thing that gives way at length. The damage is
+the rounding itself, accumulated over a span twenty times longer.
+
+So the case for `--cache 8` is footprint, and at length the price is higher than
+0.8.2 could see: 1352 MiB saved against a greedy continuation that parts company
+four to five times sooner than the short prompts suggested. On a host that has
+the memory it is not worth taking. On one that does not it is the difference
+between running and not, and the first token is unaffected either way.
+
+### What it costs to read
+
+What a decode step reads is not timed, it is counted from the shapes, so it is
+exact and it is the same on every host. Over the 96 decode steps behind the 694
+id prompt:
+
+| | float | bytes |
+| --- | --- | --- |
+| a decode step reads | 807.7 MiB | 771.5 MiB |
+| of which the cache is | 48.3 MiB | 12.1 MiB |
+
+A step reads 759.4 MiB of weights whichever way the cache is held, so the cache
+is the rest — and 48.3 against 12.1 is a quarter to the tenth of a mebibyte,
+which is the arithmetic working. The 588 id case is 804.8 against 770.8, the
+same quarter of a slightly shorter span.
+
+What that buys in tokens a second is another matter, and the host will not give
+a number. This was written on a shared four core virtual machine, and over the
+session the same build in the same configuration — the SSE2 default with a float
+cache, on the same prompt — decoded at 4.52 tok/s in one window and 2.32 in
+another. A control that moves two to one cannot measure an effect smaller than
+that, so no rate is quoted here.
+
+What the runs do agree on is a sign, and only on one of the two builds. Five
+pairs were taken, each pair adjacent in its own window:
+
+| build | float | bytes |
+| --- | --- | --- |
+| tuned, AVX2 | 3.15 | 2.16 |
+| tuned, AVX2 | 5.53 | 3.76 |
+| tuned, AVX2 | 5.40 | 2.25 |
+| default, SSE2 | 4.52 | 4.18 |
+| default, SSE2 | 2.32 | 4.09 |
+
+All three tuned pairs put the byte cache behind, by a third to a half. The two
+default pairs disagree with each other about which way it goes at all. Three of
+one sign is not a measurement and the spread across them is far too wide to
+average, but it is the direction the trade predicts on the build that has the
+gather: `cache_dot` spends a `vgatherdps` per eight values to save three
+quarters of the cache traffic, on a build 0.8.1 showed is not against the memory
+in the first place. If that holds on a quiet host, the gather is the wrong shape
+for this and the byte cache wants a different read path rather than a faster
+one. Which is a measurement, and `TODO.md` carries it.
+
+### Known gaps
+
+What the byte cache costs in decode rate is untested, and 0.8.1's table cannot
+be extended with it from here — see above for why. It wants the desktop those
+numbers were taken on, and it wants both builds, because the AVX2 gather and the
+four scalar reads SSE2 falls back on will not answer the same way.
+
+The divergence measurement is still text only, and still greedy. What a
+quantized cache costs a sampled run at length — where the draw is already
+stochastic and a shifted distribution may not be visible at all — is a different
+question and an open one.

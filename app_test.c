@@ -1295,6 +1295,70 @@ static void test_cache(void) {
 
   /* Anything under half the subnormal step has no neighbour but zero. */
   test_true(cache_pack8(1.0f / 4096.0f) == 0.0f, "a magnitude under the smallest step falls to zero");
+
+  /* The byte the cache actually holds.  Everything above is the grid as an
+   * arithmetic; what a stored cache costs is the grid as a byte, and the two
+   * have to name the same value or a byte cache would not be the float cache
+   * it replaced.
+   *
+   * Two codes stand outside the round trip and are meant to.  0x7F and 0xFF are
+   * where the format keeps its NaN, and this grid has no NaN: the encoder
+   * saturates at 448 and stops one code short of them, so decoding either and
+   * encoding it back lands on 0x7E.  A negative zero encodes to the positive
+   * one for the same reason a float cache never held one. */
+  okay_flag = 1;
+  for (step_index = 0; step_index < 256; ++step_index) {
+    float exact = cache_real8((uint8_t)step_index);
+    if ((step_index & 0x7F) == 0x7F) continue;
+    if (cache_code8(exact) != (uint8_t)step_index && exact != 0.0f) okay_flag = 0;
+    if (cache_real8(cache_code8(exact)) != cache_pack8(exact)) okay_flag = 0;
+  }
+  test_true(okay_flag, "every code the grid carries encodes back to itself");
+  test_true(cache_code8(cache_real8(0x7Fu)) == 0x7Eu && cache_code8(cache_real8(0xFFu)) == 0xFEu,
+            "the two codes the format spends on a NaN saturate rather than round-tripping");
+
+  okay_flag = 1;
+  for (step_index = -20000; step_index <= 20000; ++step_index) {
+    float value = (float)step_index / 37.0f;
+    if (cache_real8(cache_code8(value)) != cache_pack8(value)) okay_flag = 0;
+  }
+  for (power_index = -12; power_index <= 10; ++power_index) {
+    float value = ldexpf(1.3f, power_index);
+    if (cache_real8(cache_code8(value)) != cache_pack8(value)) okay_flag = 0;
+    if (cache_real8(cache_code8(-value)) != cache_pack8(-value)) okay_flag = 0;
+  }
+  test_true(okay_flag, "the byte and the rounding agree on every value tried");
+
+  test_true(cache_code8(0.0f) == 0x00u, "zero is the zero byte");
+  test_true(cache_code8(-1e9f) == 0xFEu && cache_real8(0xFEu) == -448.0f,
+            "the saturating magnitude is the last code before the format's NaN");
+  test_true(cache_code8(1.0f) == 0x38u, "one is exponent seven with an empty significand");
+  test_true(cache_real8(0x08u) == CACHE_FP8_NORM, "the smallest normal is the first normal code");
+  test_true(cache_real8(0x01u) == CACHE_FP8_STEP, "the smallest subnormal is one step");
+
+  /* The table the session reads a cached row through.  Its whole purpose is
+   * that an entry equals the round trip a float cache made, scale and all, so
+   * a layer holding bytes reaches the same score as one holding floats. */
+  {
+    float grid_room[256];
+    float scale_list[4];
+    int scale_index;
+    scale_list[0] = 2.686925f;   /* layer 0's keys on the shipped export */
+    scale_list[1] = 21.165359f;  /* and its values */
+    scale_list[2] = 128.0f / 448.0f;
+    scale_list[3] = 1.0f;
+    okay_flag = 1;
+    for (scale_index = 0; scale_index < 4; ++scale_index) {
+      float scale = scale_list[scale_index];
+      cache_grid_fill(grid_room, scale);
+      for (step_index = -3000; step_index <= 3000; ++step_index) {
+        float value = (float)step_index * scale / 211.0f;
+        if (grid_room[cache_code8(value / scale)] != cache_pack8(value / scale) * scale)
+          okay_flag = 0;
+      }
+    }
+    test_true(okay_flag, "the table hands back exactly what the float round trip stored");
+  }
 }
 
 static void test_scale(void) {
