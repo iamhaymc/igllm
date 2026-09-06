@@ -17,6 +17,16 @@ weights or on none. Most consequential first within each group.
   of the 727.5 a step sweeps and did not answer to either candidate 0.8.4 tried,
   and the eight bit path at 26 MiB. Both want a reading of what they are
   actually waiting on rather than another guess.
+
+  0.8.7 answers part of it and leaves the rest. On a host with AVX-512 the four
+  bit fused dot is 46% quicker and the eight bit one 44%, for no change but a
+  wider vector, and decode gains 23% at one thread — which says these paths were
+  spending instructions rather than waiting on the memory, and settles the
+  question for a wide host. It does not settle it for an AVX2 one, where both
+  paths are what they were, and it does not settle what they wait on at four
+  threads: the same wide build gains only about 6% there, so past one thread the
+  memory is a real part of the cost and a narrower reading of it is what is
+  still missing.
 - Hold the seam open as the prompt grows. All nine cases are judged on the
   shipped export now, each in a process of its own, and the longest is 664 ids
   with two pictures and a clip in it. What has not been tried is a prompt long
@@ -74,26 +84,6 @@ layers behind it and amplifies a last bit either way.
   session and gives the host's cores to whoever asks first — or a queue in front
   of the one pool, which is the shape a server wants anyway and is the larger
   change. Neither is worth guessing at without a caller that needs it.
-- Give the odd widths a vector path for the spread. 0.8.6 read the block of
-  eight codes as one word rather than assembling it a byte at a time, which took
-  all four of three, five, six and seven bits onto the same rate — about 6.0 G
-  codes a second on the tuned build against 3.1 to 4.5 before, and 1.6 on the
-  default build against 1.2 to 1.4 — so the width no longer shapes the loop. The
-  fused dot is 38% of what two and four bits reach rather than a fifth to a
-  quarter, and the remaining distance is nearly all in `kern_code_spread`, which
-  still writes the block to scratch and reads it back a value at a time: 2.5 G
-  codes a second against 20 at two bits. What would close it is the unpack in
-  the shape the two bit path has — a shuffle over a wider load, thirty-two codes
-  at a time — which is a different shuffle per width and is why it was not taken
-  with the word read. Synthetic weights reach every width, which the shipped
-  export does not, so none of this moves a token on the checkpoint that ships.
-- Add an AVX-512 path beside AVX2, selected by the same macro layer. On the
-  evidence it would have something to show rather than nothing: the tuned build
-  used 42% of what the memory gives on the 2017 desktop and 20% on the virtual
-  machine 0.8.4 was measured on, so a wider kernel has room to move the token
-  rate on either. Neither of those two hosts is the place to judge it — the
-  desktop has no AVX-512 at all, and the virtual machine is far enough from its
-  memory that a wider kernel would flatter itself there.
 - Add a device handle beside `plane` and a second `back_open`, so an
   accelerator backend can be dropped in without touching the loader.
 - Build under MSVC. The suite builds clean and passes on a Windows host with
@@ -105,6 +95,31 @@ layers behind it and amplifies a last bit either way.
   of them is what a caller with a photograph on disk has, and arithmetic coding
   in particular is what nothing in the wild produces, so this is a completeness
   item rather than a useful one.
+
+Two items are off this list because 0.8.7 did them, one from each group as it
+stood.
+
+The spread's vector path at the odd widths is there, and it took the fused dot
+with it, because both readers of a block now decode it the same way. A block of
+eight always begins on a byte boundary, so every block of a width picks the same
+bytes at the same shifts and the whole decode is one shuffle over a sixteen byte
+load, with the tables built once for a run. On the host 0.8.7 measured, a five
+bit row of 12288 at one thread: the spread 8.90 G codes a second against 1.19,
+level with the 9.89 at two bits and 9.79 at four, which is the distance closed
+rather than narrowed. The fused dot is 6.29 against 3.34, which is 60% of the
+two bit rate where 0.8.6 left it at 38%. The shipped export packs no odd width,
+so none of it moves a token there.
+
+And AVX-512 is in, as a tier above AVX2 rather than an alternative to it: a host
+with the one has the other, so the macro layer sets both names and only the five
+kernels with something to gain from sixteen lanes are written twice. The
+evidence the item wanted arrived with a host that has both the instructions and
+the headroom — a bare sweep gives 33.99 GiB/s at four threads there and the
+tuned build reads 5.25 — and it showed something: the fused dot 39% to 46%
+quicker at the three widths the export packs, and decode on the export 23%
+quicker at one thread. At four threads it is about 6%, because the memory is
+more of the cost once four threads pull on it, which is the reading the item
+asked for rather than a disappointment.
 
 Four items are off this list because 0.8.5 did them: baseline jpeg, the wider
 range of png, the multi-turn chat loop with several conversations on one model,
