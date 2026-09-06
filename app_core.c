@@ -218,6 +218,16 @@ float        session_cache_peak(const app_session *session, int layer_index, int
  * native, and it is refused rather than restored where the shapes it was
  * written from disagree with the session reading it.
  *
+ * `kind_mark` says which of two things the file is, because a session cannot
+ * tell from the cache alone and the two are resumed differently.  A prompt is
+ * saved before its first token is sampled, so it is one id short of the prompt
+ * it holds — the id `session_step` was about to be fed — and what it is for is
+ * to be matched against the front of a later prompt and primed onto.  A
+ * conversation is saved after an answer, holds every id of it, and what it is
+ * for is to have the next turn framed onto it.  A caller that read one where it
+ * wanted the other would drop an id or repeat a turn, so `session_load` hands
+ * the mark back and the caller checks it.
+ *
  * `stamp_value` is written beside the cache and handed back unread.  The ids
  * alone cannot say that a picture in a prompt is the same picture — two
  * pictures lay down the same placeholder ids — so what identifies the rest of
@@ -226,8 +236,12 @@ float        session_cache_peak(const app_session *session, int layer_index, int
  * `session_ids` hands back the ids a session holds, which is how a caller finds
  * out whether the prompt it is about to run begins with the one in the file.
  * It returns the count it needs when the room given is too small. */
-app_code    session_save(const app_session *session, const char *path_text, uint64_t stamp_value);
-app_code    session_load(app_session *session, const char *path_text, uint64_t *stamp_out);
+#define APP_KEEP_PROMPT 0 /* a prompt primed and not yet answered */
+#define APP_KEEP_TALK   1 /* a conversation the model has answered in */
+app_code    session_save(const app_session *session, const char *path_text, uint64_t stamp_value,
+                         int kind_mark);
+app_code    session_load(app_session *session, const char *path_text, uint64_t *stamp_out,
+                         int *kind_out);
 int         session_ids(const app_session *session, int32_t *id_list, int id_limit);
 
 size_t       session_cache_room(const app_session *session);
@@ -9618,8 +9632,20 @@ static int token_frame_inner(const app_model *model, const app_part *part_list, 
  * handed back by `session_load`.  The engine never reads it: the ids alone
  * cannot say that a picture in the prompt is the same picture, because two
  * pictures lay down the same placeholder ids, and the caller is the one that
- * knows what it fed. */
-#define KEEP_MARK_TEXT "igllm cache 1\n\0\0"
+ * knows what it fed.
+ *
+ * `kind_mark` is written beside it and is read, at least far enough to hand it
+ * back.  What it distinguishes is not two file layouts but two moments: a
+ * prompt saved before its answer is one id short of what it holds and is meant
+ * to be primed onto, and a conversation saved after one holds every id and is
+ * meant to be framed onto.  The cache is the same either way, which is why
+ * nothing but this word tells them apart and why a caller that reads the wrong
+ * one gets a turn that drops an id rather than an error.
+ *
+ * The mark text carries a version because this word was not in the first
+ * layout: a file written before it is refused rather than read as a prompt it
+ * might not be. */
+#define KEEP_MARK_TEXT "igllm cache 2\n\0\0"
 #define KEEP_MARK_SIZE 16
 
 static uint64_t keep_mix(uint64_t mark_value, uint64_t value_now) {
@@ -9662,12 +9688,14 @@ static int keep_row_count(const app_session *session, const layer_wing *wing) {
   return fill_count < wing->cache_span ? fill_count : wing->cache_span;
 }
 
-app_code session_save(const app_session *session, const char *path_text, uint64_t stamp_value) {
+app_code session_save(const app_session *session, const char *path_text, uint64_t stamp_value,
+                      int kind_mark) {
   FILE *handle;
-  uint64_t head_list[6];
+  uint64_t head_list[7];
   int layer_index;
   app_code code = APP_OKAY;
   if (!session || !path_text) return APP_FAIL_ARGUMENT;
+  if (kind_mark != APP_KEEP_PROMPT && kind_mark != APP_KEEP_TALK) return APP_FAIL_ARGUMENT;
   handle = fopen(path_text, "wb");
   if (!handle) return APP_FAIL_MISSING;
   head_list[0] = keep_mark(session);
@@ -9676,8 +9704,9 @@ app_code session_save(const app_session *session, const char *path_text, uint64_
   head_list[3] = (uint64_t)session->echo_count;
   head_list[4] = (uint64_t)session->model->form.layer_count;
   head_list[5] = (uint64_t)session->model->setup.cache_bits;
+  head_list[6] = (uint64_t)kind_mark;
   if (fwrite(KEEP_MARK_TEXT, 1, KEEP_MARK_SIZE, handle) != KEEP_MARK_SIZE ||
-      fwrite(head_list, sizeof(uint64_t), 6, handle) != 6)
+      fwrite(head_list, sizeof(uint64_t), 7, handle) != 7)
     code = APP_FAIL_FORMAT;
   if (code == APP_OKAY && session->echo_count > 0 &&
       fwrite(session->echo_room, sizeof(int32_t), (size_t)session->echo_count, handle) !=
@@ -9710,19 +9739,25 @@ app_code session_save(const app_session *session, const char *path_text, uint64_
   return code;
 }
 
-app_code session_load(app_session *session, const char *path_text, uint64_t *stamp_out) {
+app_code session_load(app_session *session, const char *path_text, uint64_t *stamp_out,
+                      int *kind_out) {
   FILE *handle;
   char mark_room[KEEP_MARK_SIZE];
-  uint64_t head_list[6];
+  uint64_t head_list[7];
   int layer_index, fill_count, echo_count;
   app_code code = APP_OKAY;
   if (!session || !path_text) return APP_FAIL_ARGUMENT;
   if (stamp_out) *stamp_out = 0;
+  if (kind_out) *kind_out = APP_KEEP_PROMPT;
   handle = fopen(path_text, "rb");
   if (!handle) return APP_FAIL_MISSING;
   if (fread(mark_room, 1, KEEP_MARK_SIZE, handle) != KEEP_MARK_SIZE ||
       memcmp(mark_room, KEEP_MARK_TEXT, KEEP_MARK_SIZE) != 0 ||
-      fread(head_list, sizeof(uint64_t), 6, handle) != 6) {
+      fread(head_list, sizeof(uint64_t), 7, handle) != 7) {
+    fclose(handle);
+    return APP_FAIL_FORMAT;
+  }
+  if (head_list[6] != APP_KEEP_PROMPT && head_list[6] != APP_KEEP_TALK) {
     fclose(handle);
     return APP_FAIL_FORMAT;
   }
@@ -9778,6 +9813,7 @@ app_code session_load(app_session *session, const char *path_text, uint64_t *sta
   }
   session->echo_count = echo_count;
   if (stamp_out) *stamp_out = head_list[1];
+  if (kind_out) *kind_out = (int)head_list[6];
   return APP_OKAY;
 }
 

@@ -64,7 +64,8 @@ the next turn is framed onto it rather than replacing it. A line beginning with
 a slash is an instruction rather than a turn — `/image` and `/audio` put a
 picture or a clip in front of the next one, `/new` starts another conversation
 on the same loaded model, `/talk n` switches between them, `/list` says what
-each is holding, `/drop` closes one, `/help` lists them all.
+each is holding, `/drop` closes one, `/save` and `/open` write one out and read
+it back, `/help` lists them all.
 
 Several conversations at once is the point of the split between a model and a
 session: the weights are mapped once and each conversation costs only its own
@@ -81,6 +82,15 @@ matched on the rows the tower made rather than on the ids, because two pictures
 lay down the same placeholder ids. It holds a prompt rather than a
 conversation: it is written before the first token is sampled, so a rerun starts
 where the last run started.
+
+`/save <path>` and `/open <path>` hold the other of the two — a conversation,
+written after an answer rather than before one, so the next turn is framed onto
+it and the model remembers in a later process what it said in an earlier one.
+The file says which of the two it is, and the other is refused: the cache alone
+cannot tell a prompt from a conversation, and reading one for the other would
+drop the id the sampler stopped on or lay a turn down twice. The turns the
+conversation holds ride in the caller's stamp, which is what `/list` reports
+after a `/open`.
 
 `--cache 8` holds the key and value cache as bytes, on the eight bit float grid
 the export calibrates static ranges for. It is off by default. On the shipped

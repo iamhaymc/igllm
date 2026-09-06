@@ -4305,7 +4305,7 @@ static void test_keep(void) {
   const float *logit_list;
   uint64_t stamp_back = 0;
   float peak_key = 0.0f, peak_value = 0.0f;
-  int id_count = 12, slot_index, okay_flag = 1;
+  int id_count = 12, slot_index, okay_flag = 1, kind_back = -1;
   test_open("keep");
   setup.thread_count = 2;
   if (!test_wing_write(0)) {
@@ -4337,7 +4337,8 @@ static void test_keep(void) {
   test_true(session_ids(from_session, back_list, 24) == id_count - 1 &&
                 memcmp(back_list, id_list, sizeof(int32_t) * (size_t)(id_count - 1)) == 0,
             "and hands them back in the order it was fed them");
-  test_true(session_save(from_session, path_text, 0x1234567890ABCDEFull) == APP_OKAY,
+  test_true(session_save(from_session, path_text, 0x1234567890ABCDEFull, APP_KEEP_PROMPT) ==
+                APP_OKAY,
             "the conversation is written out");
   peak_key = session_cache_peak(from_session, 0, 0);
   peak_value = session_cache_peak(from_session, 0, 1);
@@ -4350,9 +4351,10 @@ static void test_keep(void) {
     memcpy(keep_list, logit_list, sizeof(float) * (size_t)model->head_sheet.row_count);
   test_true(logit_list != NULL, "the prompt reaches the head");
 
-  test_true(session_load(into_session, path_text, &stamp_back) == APP_OKAY,
+  test_true(session_load(into_session, path_text, &stamp_back, &kind_back) == APP_OKAY,
             "the conversation is read back");
   test_true(stamp_back == 0x1234567890ABCDEFull, "the caller's stamp comes back unread");
+  test_true(kind_back == APP_KEEP_PROMPT, "and says it holds a prompt rather than a conversation");
   test_true(session_fill(into_session) == id_count - 1, "and holds what it was written with");
   /* The peaks go in the file too: what a range has to cover is a question about
    * the whole conversation, and half of it would answer it wrongly. */
@@ -4377,14 +4379,14 @@ static void test_keep(void) {
       path_join(other_text, sizeof(other_text), test_yard_path, "short.cache");
       test_true(test_file_write("short.cache", file_data, file_size / 2),
                 "a truncated cache is written");
-      test_true(session_load(into_session, other_text, NULL) != APP_OKAY,
+      test_true(session_load(into_session, other_text, NULL, NULL) != APP_OKAY,
                 "a cache that stops short is refused");
       test_true(session_fill(into_session) == 0, "and leaves the session cleared");
 
       file_data[3] ^= 0xFF;
       path_join(other_text, sizeof(other_text), test_yard_path, "wrong.cache");
       test_true(test_file_write("wrong.cache", file_data, file_size), "a damaged cache is written");
-      test_true(session_load(into_session, other_text, NULL) != APP_OKAY,
+      test_true(session_load(into_session, other_text, NULL, NULL) != APP_OKAY,
                 "a file that is not one of these is refused");
       file_data[3] ^= 0xFF;
 
@@ -4393,12 +4395,55 @@ static void test_keep(void) {
       file_data[KEEP_MARK_SIZE] ^= 0x01;
       path_join(other_text, sizeof(other_text), test_yard_path, "alien.cache");
       test_true(test_file_write("alien.cache", file_data, file_size), "an alien cache is written");
-      test_true(session_load(into_session, other_text, NULL) == APP_FAIL_STATE,
+      test_true(session_load(into_session, other_text, NULL, NULL) == APP_FAIL_STATE,
                 "a cache written from other shapes is refused");
       mem_free(file_data);
     }
-    test_true(session_load(into_session, "no_such_cache_file", NULL) == APP_FAIL_MISSING,
+    test_true(session_load(into_session, "no_such_cache_file", NULL, NULL) == APP_FAIL_MISSING,
               "a cache that is not there is refused");
+  }
+
+  /* The other of the two things a file can be.  A conversation is written after
+   * an answer rather than before one, holds every id the session was fed, and
+   * says so — so a caller can tell which it has without guessing, and a session
+   * that reads it is where the one that wrote it stopped rather than one id
+   * short of it. */
+  {
+    char talk_text[1024];
+    const float *step_list;
+    int32_t answer_id, follow_id;
+    session_reset(from_session);
+    session_reset(into_session);
+    path_join(talk_text, sizeof(talk_text), test_yard_path, "talk.cache");
+    test_true(session_prime(from_session, id_list, id_count) == APP_OKAY, "a prompt primes again");
+    step_list = session_step(from_session, id_list[id_count - 1]);
+    test_true(step_list != NULL, "and is answered once");
+    answer_id = (int32_t)(id_list[0] + 1);
+    follow_id = (int32_t)(id_list[0] + 2);
+    step_list = session_step(from_session, answer_id);
+    test_true(step_list != NULL, "and the answer is fed back");
+    test_true(session_ids(from_session, NULL, 0) == id_count + 1,
+              "a conversation holds every id it was fed");
+    test_true(session_save(from_session, talk_text, 3, APP_KEEP_TALK) == APP_OKAY,
+              "a conversation is written out");
+    test_true(session_load(into_session, talk_text, &stamp_back, &kind_back) == APP_OKAY &&
+                  kind_back == APP_KEEP_TALK && stamp_back == 3,
+              "and reads back as a conversation, with what the caller stamped it");
+    test_true(session_fill(into_session) == id_count + 1,
+              "and holds every id rather than one short of them");
+    /* The next turn is the first id of it fed onto what the file held.  The
+     * session that wrote the file and the session that read it have to reach
+     * the same place from that id, which is what makes the file a conversation
+     * rather than a picture of one. */
+    step_list = session_step(from_session, follow_id);
+    if (step_list)
+      memcpy(keep_list, step_list, sizeof(float) * (size_t)model->head_sheet.row_count);
+    okay_flag = step_list != NULL;
+    step_list = session_step(into_session, follow_id);
+    for (slot_index = 0; step_list && slot_index < model->head_sheet.row_count; ++slot_index)
+      if (step_list[slot_index] != keep_list[slot_index]) okay_flag = 0;
+    test_true(step_list && okay_flag,
+              "and carries on from where the conversation stopped, bit for bit");
   }
 
   mem_free(keep_list);

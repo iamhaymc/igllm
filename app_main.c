@@ -333,13 +333,17 @@ static uint64_t main_keep_stamp(const main_reel *reel, int id_count) {
 static app_code main_keep_prime(const main_flag *flag, app_session *session,
                                 const main_reel *reel) {
   int32_t *held_list = NULL;
-  int held_count = 0, same_count = 0;
+  int held_count = 0, same_count = 0, held_kind = APP_KEEP_PROMPT;
   uint64_t stamp_value = 0, held_stamp = 0;
   app_code code;
 
   if (!flag->keep_path) return session_prime_media(session, reel->id_list, reel->id_count,
                                                    reel->state_list, reel->state_flag);
-  if (session_load(session, flag->keep_path, &held_stamp) == APP_OKAY) {
+  /* Only a prompt file is a prompt cache.  A conversation holds an answer and
+   * every id of it, so priming a prompt onto it would be a turn the model never
+   * had; the loop's `/open` is what a conversation is read with. */
+  if (session_load(session, flag->keep_path, &held_stamp, &held_kind) == APP_OKAY &&
+      held_kind == APP_KEEP_PROMPT) {
     held_count = session_ids(session, NULL, 0);
     held_list = (int32_t *)calloc((size_t)(held_count > 0 ? held_count : 1), sizeof(int32_t));
     if (held_list) session_ids(session, held_list, held_count);
@@ -369,7 +373,8 @@ static app_code main_keep_prime(const main_flag *flag, app_session *session,
    * did. */
   if (same_count < reel->id_count - 1) {
     app_code keep_code = session_save(session, flag->keep_path,
-                                      main_keep_stamp(reel, reel->id_count - 1));
+                                      main_keep_stamp(reel, reel->id_count - 1),
+                                      APP_KEEP_PROMPT);
     if (keep_code != APP_OKAY)
       fprintf(stderr, "keep: %s\n", app_code_text(keep_code));
   }
@@ -513,6 +518,8 @@ static void main_talk_help(void) {
   printf("  /talk <n>     switch to conversation n\n");
   printf("  /list         the conversations, their turns and what they hold\n");
   printf("  /drop         close the current conversation\n");
+  printf("  /save <path>  write this conversation out\n");
+  printf("  /open <path>  read one back into this conversation\n");
   printf("  /quit         leave\n");
   printf("  anything else is a turn in the current conversation\n");
 }
@@ -638,6 +645,52 @@ static int main_loop(app_model *model, const main_flag *flag) {
           if (talk_list[talk_index].session) { next_slot = talk_index; break; }
         if (next_slot < 0) break; /* the last one closed is the end of the loop */
         talk_slot = next_slot;
+        continue;
+      }
+      /* A conversation written out and read back.  What `--keep` holds is a
+       * prompt, written before its first token is sampled so that a rerun
+       * starts where the last run started; what these two hold is a
+       * conversation, written after an answer so that the next turn is framed
+       * onto it.  The file says which of the two it is and the other is
+       * refused, because the cache alone cannot tell them apart and reading one
+       * for the other drops an id or repeats a turn.
+       *
+       * The turns a conversation holds ride in the stamp the engine hands back
+       * unread: a conversation restored whole has nothing to match a stamp
+       * against, and whether the model has already answered is what decides
+       * how the next turn is framed. */
+      if (strncmp(line_text, "/save ", 6) == 0) {
+        main_talk *talk = &talk_list[talk_slot];
+        app_code keep_code =
+            session_save(talk->session, line_text + 6, (uint64_t)talk->turn_count, APP_KEEP_TALK);
+        if (keep_code != APP_OKAY)
+          printf("save: %s\n", app_code_text(keep_code));
+        else
+          printf("conversation %d written, %d turns, %d ids\n", talk_slot + 1, talk->turn_count,
+                 session_fill(talk->session));
+        continue;
+      }
+      if (strncmp(line_text, "/open ", 6) == 0) {
+        main_talk *talk = &talk_list[talk_slot];
+        uint64_t held_stamp = 0;
+        int held_kind = APP_KEEP_PROMPT;
+        app_code keep_code = session_load(talk->session, line_text + 6, &held_stamp, &held_kind);
+        if (keep_code != APP_OKAY) {
+          printf("open: %s\n", app_code_text(keep_code));
+          continue;
+        }
+        if (held_kind != APP_KEEP_TALK) {
+          /* A prompt read here would leave the session one id short of what it
+           * says it holds, so it is put back rather than continued. */
+          session_reset(talk->session);
+          printf("open: that file holds a prompt rather than a conversation\n");
+          continue;
+        }
+        talk->turn_count = (int)held_stamp;
+        talk->open_flag = talk->turn_count > 0;
+        talk->show_count = 0;
+        printf("conversation %d restored, %d turns, %d ids\n", talk_slot + 1, talk->turn_count,
+               session_fill(talk->session));
         continue;
       }
       if (strncmp(line_text, "/image ", 7) == 0 || strncmp(line_text, "/audio ", 7) == 0) {

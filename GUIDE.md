@@ -852,6 +852,16 @@ sessions on the one loaded model, which `/new`, `/talk` and `/drop` move
 between. They run one at a time: the sessions are independent, and the fork and
 join pool the kernels underneath them reach is not.
 
+A session's cache goes to a file and comes back through `session_save` and
+`session_load`, as one of two things. A prompt is saved before its first token
+is sampled — so it is one id short of the prompt it holds, the id `session_step`
+was about to be fed — and is meant to be matched against the front of a later
+prompt and primed onto; `--keep` is that. A conversation is saved after an
+answer, holds every id the session was fed, and is meant to have the next turn
+framed onto it; the loop's `/save` and `/open` are that. The cache is identical
+either way, so the file carries a mark saying which it is and a caller reading
+the wrong one is refused rather than left a turn out of step.
+
 ## 5. Formats read
 
 | file                      | needed for                                     |
@@ -863,7 +873,7 @@ join pool the kernels underneath them reach is not.
 | `tokenizer.json`          | vocabulary, merges, special tokens              |
 | `preprocessor_config.json` | the audio analysis window, when present        |
 | `processor_config.json`   | the clip's soft token budget, when present      |
-| `.png`, `.jpg`, `.pnm`, `.bmp` | a picture for the vision tower             |
+| `.png`, `.jpg`, `.pnm`, `.bmp` | a picture for the vision tower — jpeg baseline, extended sequential and progressive, at eight or twelve bits, over one, three or four components |
 | `.wav`                    | a clip for the audio tower                      |
 
 ## 6. Testing
