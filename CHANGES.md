@@ -2567,3 +2567,190 @@ measured on has no `transformers`, and every distribution the engine produces on
 the shipped export is byte for byte what the previous build produced, so a
 comparison against the reference would be comparing the same numbers it compared
 before. That is an argument, not a run, and it is worth saying which.
+
+---
+
+## 0.8.5 — the cache is read once for the heads that share it, and jpeg
+
+### Scope
+
+`TODO.md` put one item at the head of each of its two groups. The first was the
+restructuring 0.8.4 arrived at while measuring the byte cache: eight heads read
+the same cached row and the loop read it eight times. The second was the reader
+that was missing — most pictures a caller actually has are jpeg, and `--image`
+refused all of them.
+
+Both are done here. The first moves no bit of any result and takes back almost
+all of what the byte cache cost. The second is a new decoder of about four
+hundred lines with an encoder of its own beside it in the tests.
+
+### Reading a cached row once for all the heads that share it
+
+This export ships `num_key_value_heads` of one against eight attention heads, so
+`group_share` is eight: every head of a layer scores against the same cached key
+row and blends the same cached value row. `session_attend` walked head by head,
+which reads every cached byte eight times and, on a byte cache, decodes it eight
+times.
+
+`session_attend_group` walks the other way round. A run of cached rows is laid
+into `cache_room` once — `CACHE_BLOCK_BYTES` of floats, small enough to stay in
+the first level cache — and then every head of the group reads it there. On a
+byte cache that is one table lookup a row instead of one a row a head. On a
+float cache it is one sweep of the store instead of eight.
+
+What it costs is a row of scores per head of the group rather than one, because
+a group is scored before any of it is softmaxed. That is `score_stride` in the
+session's rooms: a few megabytes beside a cache measured in gigabytes.
+
+**It is the same arithmetic.** The block hands each head exactly the floats
+`cache_dot` would have looked up for it, and the dot and the blend it then runs
+are `kern_dot_real` and the blend loop the float cache always used — which
+0.8.3 had already made term for term identical to `cache_dot` and `cache_add`.
+The `logits` distribution and forty-eight greedy tokens of `chat` are byte
+identical to 0.8.4's on both builds and at both cache settings.
+
+Six hundred and seventy-nine ids, sixty-four tokens, four threads, three
+adjacent pairs a configuration on the quiet virtual machine 0.8.4 used:
+
+| build, cache | decode before | after | | prefill before | after |
+| --- | --- | --- | --- | --- | --- |
+| tuned, bytes | 5.91 tok/s | **7.22** | +22% | 14.85 tok/s | **18.94** | +28% |
+| tuned, floats | 6.96 | **7.32** | +5% | 19.52 | **19.69** | +1% |
+| default, bytes | 5.18 | **5.87** | +13% | 10.22 | **11.77** | +15% |
+| default, floats | 5.70 | **6.03** | +6% | 11.82 | **12.15** | +3% |
+
+Every pair is of one sign and the three runs of a configuration never overlap
+the three of its pair.
+
+The headline is the first row against the second. 0.8.4 measured the byte cache
+a third behind the float cache on the tuned build and a ninth behind on the
+default, and said the flag was a footprint option rather than a speed one. On
+this host that gap was 15% and 9%; it is now 1.4% and 2.7%. **`--cache 8` is
+now very nearly free**, and it still takes the cache at full span from 1803.0
+MiB to 450.8. It stays off by default because of what it costs in accuracy —
+greedy decoding still diverges at the first genuinely close call — and not any
+more because of what it costs in time.
+
+The float cache gaining 5% is the part that was not asked for. The block was
+written for the table lookup and it turns out the sweep is worth something too:
+eight heads reading a shared key plane of hundreds of kilobytes read it out of
+the second or third level cache eight times, where the block reads it once and
+is read out of the first. So `session_attend_wide` does not ask which storage
+the layer is on. It asks only whether more than one head shares a row, because
+where a head has its own there is nothing to divide and the block would be a
+copy for its own sake.
+
+Prefill gains more than decode on the byte cache because a prefill lane attends
+over the whole run behind it, so the rows are more of what it does.
+
+### Reading jpeg
+
+`image_read` sniffed three magics. It sniffs four now, and `FF D8 FF` reaches a
+baseline decoder: the marker walk, a canonical Huffman decode per component,
+dequantization against the tables `DQT` carried, an eight by eight inverse
+cosine transform, chroma upsampling at whatever the sampling factors say, and
+YCbCr to RGB. Restart markers are stepped over, and a scan of one component is
+walked as that component's own blocks, so a file that sends its planes one after
+another reads as well as an interleaved one.
+
+Refused, each in the shape the png reader refuses interlacing: progressive
+(`SOF2`), lossless, arithmetic coded and hierarchical frames, four component
+files — CMYK and YCCK need an inversion rule this reader cannot check — and a
+precision other than eight. Progressive is the one that will be missed, and it
+is a second decoder rather than a fourth branch of this one: coefficients
+arriving across several scans with successive approximation need the whole
+picture's coefficients held until the last scan lands.
+
+Three decisions worth naming.
+
+**The transform is float and rounds once.** Two eight by eight products through
+an orthonormal basis built once per picture, and a single round to nearest at
+the level shift. A fixed point transform would round twice and land within a
+step of this.
+
+**Chroma is blended, not repeated.** A component below the peak sampling is
+sampled at the picture's pixel centres and interpolated linearly between the two
+nearest samples in each axis. On the two-to-one factors every real file uses,
+that is exactly the three-quarters-and-a-quarter blend libjpeg calls fancy
+upsampling. Repetition would cost the same and put a step on every chroma edge.
+
+**A marker inside the entropy stream feeds zeros rather than failing.** An
+encoder ends a run on a byte boundary and a decoder that needed the last few
+bits of a block would otherwise refuse files every other reader accepts. What
+keeps that from swallowing a truncated file is that the scan refuses one that is
+still fabricating bits with more than its last unit to go.
+
+The canonical decoder beside deflate's was not widened to serve both, which
+`TODO.md` had floated. `DHT` ships the table in exactly the form `puff_tree`
+holds — a count per code length, then the symbols in code order — so there is
+nothing to build; and the walk over it reads bits the other way round, most
+significant first, out of a stream where `FF 00` means a literal `FF`. What
+could have been shared is four lines of arithmetic over a bit reader that could
+not be.
+
+#### What it is checked against
+
+`test_jpeg` carries a baseline encoder of its own: its own forward transform in
+double precision, its own canonical code assignment, its own bit writer, and the
+coefficient order derived from the diagonals of the block rather than copied
+from the reader's table. It quantizes with tables of ones, so a round trip loses
+only what the two transforms round. Its Huffman table is deliberately not the
+specification's — eight to twelve bits over all 256 symbols, an incomplete code
+no encoder in the wild produces — so the reader's walk is exercised rather than
+a table it might have been written around.
+
+Six pictures have to come back as the picture that went in: grey, three
+component, chroma at half the horizontal sampling, chroma at half the sampling
+in both directions, a file broken by a restart marker after every unit, and one
+held constant over each eight by eight tile. The last two are the ones with
+teeth. The tile constant file has nothing in it but dc coefficients, so the
+transform round trip is exact and the colour transform is the only thing between
+the samples and the pixels — half a level is the floor there, which catches a
+coefficient a percent wrong or a pair the wrong way round. The plane file has a
+chroma pair that is linear in both directions, where averaging a block gives its
+centre and interpolating between centres gives the plane back exactly, so a
+reader that repeated the nearest sample instead is caught by a floor a real file
+could not be held to. A progressive frame header and a truncated entropy stream
+both have to be refused.
+
+Every one of those floors was checked by breaking the reader on purpose: the
+colour coefficients moved by a percent, the two chroma bands swapped, the
+vertical blend dropped, the horizontal blend dropped, the restart predictors
+left unreset, and two entries of the coefficient order transposed. Each fault
+fails the test that is meant to catch it, and the first pass of the suite caught
+none of them, which is why the floors are where they are now rather than where
+they started.
+
+Against libjpeg, which is the comparison that matters and is not in the suite
+because it is not in the repository: seven files written by Pillow at four
+qualities, three sampling factors, with and without restart markers and with and
+without optimized Huffman tables. Grey agrees to within a single level. Colour
+agrees to within 2.8 levels of 255 at the worst pixel and 0.4 on average, which
+is the two decoders' rounding and their transforms, not a disagreement about
+what the file says. Odd sizes down to one pixel by one, an 800 by 600, a CMYK
+file and a progressive file all do what they should. Four hundred mutations of
+a real file — bytes flipped, streams truncated — produce no fault under the
+address and undefined behaviour sanitizers, and neither does the suite.
+
+#### The question the harness was going to have to answer
+
+`TODO.md` asked which way `app_diff.py` should handle a jpeg, given that the
+harness opens the picture with libjpeg where the engine would open it with its
+own transform: feed both sides the same decoded pixels, or hold the jpeg cases
+to a looser floor and say so.
+
+Neither, as it turns out, because the harness already does the first. `diff_tower`
+feeds the reference `tower_seed_rows` — the normalized patches the engine says it
+read, out of the activation dump — and the seam's graph half is fed the same. The
+only thing either half reads from the picture file itself is its width and height,
+in `seam_reference_count`, and the two decoders agree about those exactly. So the
+decoder is not in the comparison at all, and a jpeg case is held to the same floor
+as a png one without any change to the harness. The item is closed rather than
+carried.
+
+### Everything else
+
+The engine end to end on the shipped export, one scene written as a png, as a
+4:4:4 jpeg and as a 4:2:0 jpeg: three descriptions of the same building, sky,
+sun and grass. `--image` takes jpeg everywhere it takes png, including in the
+media parity workflows.

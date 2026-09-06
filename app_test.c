@@ -1277,6 +1277,494 @@ static void test_image(void) {
   test_true(image_read(path_text, &grid) != APP_OKAY, "a missing file is refused");
 }
 
+/* An independent baseline jpeg encoder, written here so that the reader is
+ * checked against the format rather than against a recorded file.  It shares
+ * nothing with the reader: its own forward transform in double precision, its
+ * own canonical code assignment, its own bit writer.
+ *
+ * Its quantization tables are all ones, so a round trip through it loses only
+ * what the two transforms round, and the pixels that come back can be held to
+ * within a level or two of the pixels that went in.  Its Huffman table is
+ * deliberately not the specification's: lengths of eight to twelve bits over
+ * all 256 symbols, which is an incomplete code — legal, and a shape no encoder
+ * in the wild produces — so the reader's walk is exercised rather than a table
+ * it might have been written around. */
+typedef struct test_jpeg_room {
+  uint8_t *file_data;
+  size_t   file_fill;
+  size_t   file_room;
+  uint32_t bit_room;
+  int      bit_count;
+  int      fault_flag;
+} test_jpeg_room;
+
+static void test_jpeg_byte(test_jpeg_room *room, int byte_value) {
+  if (room->file_fill >= room->file_room) { room->fault_flag = 1; return; }
+  room->file_data[room->file_fill++] = (uint8_t)byte_value;
+}
+
+static void test_jpeg_word(test_jpeg_room *room, int word_value) {
+  test_jpeg_byte(room, (word_value >> 8) & 0xFF);
+  test_jpeg_byte(room, word_value & 0xFF);
+}
+
+/* Bits land most significant first, and a byte that comes out `FF` is followed
+ * by a zero so that no marker can appear inside the entropy stream. */
+static void test_jpeg_bits(test_jpeg_room *room, int code_value, int bit_count) {
+  int bit_index;
+  for (bit_index = bit_count - 1; bit_index >= 0; --bit_index) {
+    room->bit_room = (room->bit_room << 1) | (uint32_t)((code_value >> bit_index) & 1);
+    room->bit_count += 1;
+    if (room->bit_count == 8) {
+      int byte_value = (int)(room->bit_room & 0xFFu);
+      test_jpeg_byte(room, byte_value);
+      if (byte_value == 0xFF) test_jpeg_byte(room, 0x00);
+      room->bit_count = 0;
+      room->bit_room = 0;
+    }
+  }
+}
+
+static void test_jpeg_flush(test_jpeg_room *room) {
+  while (room->bit_count != 0) test_jpeg_bits(room, 1, 1); /* the padding is ones */
+}
+
+/* The table the encoder uses, in the two forms it needs it: the lengths and
+ * symbol order a `DHT` segment carries, and the code per symbol. */
+typedef struct test_jpeg_code {
+  int length_list[256];
+  int code_list[256];
+  int count_list[17];
+} test_jpeg_code;
+
+static void test_jpeg_code_build(test_jpeg_code *table) {
+  int sign_index, length_index, code_value = 0;
+  for (sign_index = 0; sign_index < 256; ++sign_index)
+    table->length_list[sign_index] = 8 + (sign_index % 5);
+  for (length_index = 0; length_index <= 16; ++length_index) table->count_list[length_index] = 0;
+  for (sign_index = 0; sign_index < 256; ++sign_index)
+    table->count_list[table->length_list[sign_index]] += 1;
+  for (length_index = 1; length_index <= 16; ++length_index) {
+    for (sign_index = 0; sign_index < 256; ++sign_index)
+      if (table->length_list[sign_index] == length_index) table->code_list[sign_index] = code_value++;
+    code_value <<= 1;
+  }
+}
+
+static void test_jpeg_sign(test_jpeg_room *room, const test_jpeg_code *table, int sign_value) {
+  test_jpeg_bits(room, table->code_list[sign_value], table->length_list[sign_value]);
+}
+
+/* How many bits a coefficient needs, and the bits themselves — a negative
+ * value written as the ones complement of its magnitude, which is what the
+ * format's extension rule means. */
+static int test_jpeg_size(int value_now) {
+  int size_value = 0, size_abs = value_now < 0 ? -value_now : value_now;
+  while (size_abs) { size_value += 1; size_abs >>= 1; }
+  return size_value;
+}
+
+static void test_jpeg_value(test_jpeg_room *room, int value_now, int size_value) {
+  if (size_value == 0) return;
+  if (value_now < 0) value_now += (1 << size_value) - 1;
+  test_jpeg_bits(room, value_now, size_value);
+}
+
+/* The forward transform, gathered directly from the definition rather than
+ * through any factorization. */
+static void test_jpeg_turn(const int *cell_list, double *coef_out) {
+  int freq_wide, freq_high, slot_wide, slot_high;
+  for (freq_high = 0; freq_high < 8; ++freq_high)
+    for (freq_wide = 0; freq_wide < 8; ++freq_wide) {
+      double total = 0.0;
+      double gain_high = freq_high == 0 ? sqrt(0.125) : 0.5;
+      double gain_wide = freq_wide == 0 ? sqrt(0.125) : 0.5;
+      for (slot_high = 0; slot_high < 8; ++slot_high)
+        for (slot_wide = 0; slot_wide < 8; ++slot_wide)
+          total += (double)cell_list[slot_high * 8 + slot_wide] *
+                   cos((2.0 * slot_wide + 1.0) * freq_wide * 3.14159265358979323846 / 16.0) *
+                   cos((2.0 * slot_high + 1.0) * freq_high * 3.14159265358979323846 / 16.0);
+      coef_out[freq_high * 8 + freq_wide] = total * gain_wide * gain_high;
+    }
+}
+
+/* The order the coefficients are sent in, derived rather than copied: the
+ * anti-diagonals of the block in turn, each walked the way the one before it
+ * was not.  The reader carries the same order as a literal table, and the two
+ * are held against each other below. */
+static void test_jpeg_zig_fill(int *zig_out) {
+  int slot_index = 0, sum_index, step_index;
+  for (sum_index = 0; sum_index <= 14; ++sum_index) {
+    int from_index = sum_index < 7 ? sum_index : 7;
+    int upto_index = sum_index - 7 > 0 ? sum_index - 7 : 0;
+    for (step_index = from_index; step_index >= upto_index; --step_index) {
+      int high_index = sum_index % 2 == 0 ? step_index : sum_index - step_index;
+      int wide_index = sum_index - high_index;
+      zig_out[slot_index++] = high_index * 8 + wide_index;
+    }
+  }
+}
+
+/* Writes one baseline file.  `band_count` bands at the picture's own size are
+ * handed in as bytes; a component whose sampling factor is below the peak is
+ * built by averaging the samples it covers. */
+static int test_jpeg_write(const char *leaf_text, const uint8_t *band_data, int wide_count,
+                           int high_count, int band_count, const int *wide_share_list,
+                           const int *high_share_list, int rest_span, int frame_mark) {
+  test_jpeg_code table;
+  test_jpeg_room room;
+  int zig_list[64];
+  int wide_peak = 1, high_peak = 1, mcu_wide, mcu_high, mcu_index, part_index;
+  int last_dc[3];
+  int okay_flag;
+  size_t file_room = 1024u + (size_t)wide_count * (size_t)high_count * (size_t)band_count * 8u;
+
+  memset(&room, 0, sizeof(room));
+  memset(last_dc, 0, sizeof(last_dc));
+  test_jpeg_code_build(&table);
+  test_jpeg_zig_fill(zig_list);
+  room.file_room = file_room;
+  room.file_data = (uint8_t *)mem_clear(file_room);
+  if (!room.file_data) return 0;
+  for (part_index = 0; part_index < band_count; ++part_index) {
+    if (wide_share_list[part_index] > wide_peak) wide_peak = wide_share_list[part_index];
+    if (high_share_list[part_index] > high_peak) high_peak = high_share_list[part_index];
+  }
+  mcu_wide = (wide_count + wide_peak * 8 - 1) / (wide_peak * 8);
+  mcu_high = (high_count + high_peak * 8 - 1) / (high_peak * 8);
+
+  test_jpeg_word(&room, 0xFFD8);
+  test_jpeg_word(&room, 0xFFDB); /* one quantization table, every step a one */
+  test_jpeg_word(&room, 67);
+  test_jpeg_byte(&room, 0x00);
+  for (part_index = 0; part_index < 64; ++part_index) test_jpeg_byte(&room, 1);
+  test_jpeg_word(&room, 0xFF00 | frame_mark);
+  test_jpeg_word(&room, 8 + 3 * band_count);
+  test_jpeg_byte(&room, 8);
+  test_jpeg_word(&room, high_count);
+  test_jpeg_word(&room, wide_count);
+  test_jpeg_byte(&room, band_count);
+  for (part_index = 0; part_index < band_count; ++part_index) {
+    test_jpeg_byte(&room, part_index + 1);
+    test_jpeg_byte(&room, (wide_share_list[part_index] << 4) | high_share_list[part_index]);
+    test_jpeg_byte(&room, 0);
+  }
+  for (part_index = 0; part_index < 2; ++part_index) { /* the same table as dc and as ac */
+    int length_index, sign_index;
+    test_jpeg_word(&room, 0xFFC4);
+    test_jpeg_word(&room, 19 + 256);
+    test_jpeg_byte(&room, part_index << 4);
+    for (length_index = 1; length_index <= 16; ++length_index)
+      test_jpeg_byte(&room, table.count_list[length_index]);
+    for (length_index = 1; length_index <= 16; ++length_index)
+      for (sign_index = 0; sign_index < 256; ++sign_index)
+        if (table.length_list[sign_index] == length_index) test_jpeg_byte(&room, sign_index);
+  }
+  if (rest_span > 0) {
+    test_jpeg_word(&room, 0xFFDD);
+    test_jpeg_word(&room, 4);
+    test_jpeg_word(&room, rest_span);
+  }
+  test_jpeg_word(&room, 0xFFDA);
+  test_jpeg_word(&room, 6 + 2 * band_count);
+  test_jpeg_byte(&room, band_count);
+  for (part_index = 0; part_index < band_count; ++part_index) {
+    test_jpeg_byte(&room, part_index + 1);
+    test_jpeg_byte(&room, 0x00);
+  }
+  test_jpeg_byte(&room, 0);
+  test_jpeg_byte(&room, 63);
+  test_jpeg_byte(&room, 0);
+
+  for (mcu_index = 0; mcu_index < mcu_wide * mcu_high; ++mcu_index) {
+    int mcu_x = mcu_index % mcu_wide, mcu_y = mcu_index / mcu_wide;
+    if (rest_span > 0 && mcu_index > 0 && mcu_index % rest_span == 0) {
+      test_jpeg_flush(&room);
+      test_jpeg_word(&room, 0xFFD0 | ((mcu_index / rest_span - 1) & 7));
+      for (part_index = 0; part_index < band_count; ++part_index) last_dc[part_index] = 0;
+    }
+    for (part_index = 0; part_index < band_count; ++part_index) {
+      int wide_share = wide_share_list[part_index], high_share = high_share_list[part_index];
+      int block_x, block_y;
+      for (block_y = 0; block_y < high_share; ++block_y)
+        for (block_x = 0; block_x < wide_share; ++block_x) {
+          int cell_list[64];
+          double coef_list[64];
+          int slot_wide, slot_high, slot_index, run_value, size_value;
+          for (slot_high = 0; slot_high < 8; ++slot_high)
+            for (slot_wide = 0; slot_wide < 8; ++slot_wide) {
+              /* The sample this cell stands for, averaged over the picture
+               * pixels it covers where the component is sampled below the
+               * peak, and clamped to the picture at the padded edge. */
+              int part_x = (mcu_x * wide_share + block_x) * 8 + slot_wide;
+              int part_y = (mcu_y * high_share + block_y) * 8 + slot_high;
+              int step_wide = wide_peak / wide_share, step_high = high_peak / high_share;
+              int walk_x, walk_y, total = 0, seen = 0;
+              for (walk_y = 0; walk_y < step_high; ++walk_y)
+                for (walk_x = 0; walk_x < step_wide; ++walk_x) {
+                  int pick_x = part_x * step_wide + walk_x, pick_y = part_y * step_high + walk_y;
+                  if (pick_x >= wide_count) pick_x = wide_count - 1;
+                  if (pick_y >= high_count) pick_y = high_count - 1;
+                  total += band_data[((size_t)pick_y * (size_t)wide_count + (size_t)pick_x) *
+                                         (size_t)band_count + (size_t)part_index];
+                  seen += 1;
+                }
+              cell_list[slot_high * 8 + slot_wide] = total / seen - 128;
+            }
+          test_jpeg_turn(cell_list, coef_list);
+          {
+            int coef_whole[64];
+            for (slot_index = 0; slot_index < 64; ++slot_index)
+              coef_whole[slot_index] = (int)(coef_list[slot_index] < 0.0
+                                                 ? coef_list[slot_index] - 0.5
+                                                 : coef_list[slot_index] + 0.5);
+            size_value = test_jpeg_size(coef_whole[0] - last_dc[part_index]);
+            test_jpeg_sign(&room, &table, size_value);
+            test_jpeg_value(&room, coef_whole[0] - last_dc[part_index], size_value);
+            last_dc[part_index] = coef_whole[0];
+            run_value = 0;
+            for (slot_index = 1; slot_index < 64; ++slot_index) {
+              int coef_value = coef_whole[zig_list[slot_index]];
+              if (coef_value == 0) { run_value += 1; continue; }
+              while (run_value > 15) {
+                test_jpeg_sign(&room, &table, 0xF0);
+                run_value -= 16;
+              }
+              size_value = test_jpeg_size(coef_value);
+              test_jpeg_sign(&room, &table, (run_value << 4) | size_value);
+              test_jpeg_value(&room, coef_value, size_value);
+              run_value = 0;
+            }
+            if (run_value > 0) test_jpeg_sign(&room, &table, 0x00); /* end of block */
+          }
+        }
+    }
+  }
+  test_jpeg_flush(&room);
+  test_jpeg_word(&room, 0xFFD9);
+  okay_flag = !room.fault_flag && test_file_write(leaf_text, room.file_data, room.file_fill);
+  mem_free(room.file_data);
+  return okay_flag;
+}
+
+/* The bands a fixture is built from, in three shapes.  The luma is always
+ * busy.  The chroma pair is busy too at shape zero, flat along a row at shape
+ * one — so that halving the horizontal sampling loses nothing to the averaging
+ * — and a plane at shape two.
+ *
+ * A plane is the shape that pins the upsampler down.  Averaging a plane over a
+ * block gives its value at the block's centre, and interpolating linearly
+ * between those centres gives the plane back exactly, so a chroma pair at half
+ * the sampling in both directions has to come back to the level it went in at.
+ * A reader that repeated the nearest sample instead would come back a step
+ * away, which is the difference these coefficients are chosen large enough to
+ * show. */
+/* Which eight by eight tile a pixel is in, for the shape that holds a tile
+ * constant so that the transform round trip is exact and the colour transform
+ * is the only thing between the samples and the pixels. */
+static int test_jpeg_tile(int wide_index, int high_index) {
+  return (wide_index / 8) + (high_index / 8) * 3;
+}
+
+static int test_jpeg_band(int wide_index, int high_index, int band_index, int shape_mark) {
+  switch (band_index) {
+    case 0:
+      if (shape_mark == 3) return 100 + (test_jpeg_tile(wide_index, high_index) % 5) * 20;
+      return (wide_index * 17 + high_index * 5) & 0xFF;
+    case 1:
+      if (shape_mark == 1) return 100 + (high_index % 3) * 10;
+      if (shape_mark == 2) return 60 + wide_index * 3 + high_index * 5;
+      if (shape_mark == 3) return 40 + (test_jpeg_tile(wide_index, high_index) % 6) * 35;
+      return (wide_index * 3 + high_index * 29) & 0xFF;
+    default:
+      if (shape_mark == 1) return 150 - (high_index % 4) * 7;
+      if (shape_mark == 2) return 200 - wide_index * 4 - high_index * 2;
+      if (shape_mark == 3) return 30 + (test_jpeg_tile(wide_index, high_index) % 5) * 40;
+      return (wide_index * wide_index + high_index * high_index) & 0xFF;
+  }
+}
+
+static uint8_t *test_jpeg_bands(int wide_count, int high_count, int band_count, int shape_mark) {
+  uint8_t *band_data =
+      (uint8_t *)mem_clear((size_t)wide_count * (size_t)high_count * (size_t)band_count);
+  int high_index, wide_index, band_index;
+  if (!band_data) return NULL;
+  for (high_index = 0; high_index < high_count; ++high_index)
+    for (wide_index = 0; wide_index < wide_count; ++wide_index)
+      for (band_index = 0; band_index < band_count; ++band_index)
+        band_data[((size_t)high_index * (size_t)wide_count + (size_t)wide_index) *
+                      (size_t)band_count + (size_t)band_index] =
+            (uint8_t)test_jpeg_band(wide_index, high_index, band_index, shape_mark);
+  return band_data;
+}
+
+/* Reads a fixture back and holds every pixel to the bands it was built from,
+ * through the colour transform where there are three of them. */
+static void test_jpeg_check(const char *leaf_text, const char *claim_text, int wide_count,
+                            int high_count, int band_count, int shape_mark, int edge_skip,
+                            float slack_value) {
+  char path_text[1024];
+  flat_grid grid;
+  int high_index, wide_index, band_index, okay_flag = 1;
+  path_join(path_text, sizeof(path_text), test_yard_path, leaf_text);
+  if (image_read(path_text, &grid) != APP_OKAY) {
+    test_true(0, claim_text);
+    return;
+  }
+  if (grid.wide_count != wide_count || grid.high_count != high_count ||
+      grid.band_count != (band_count == 3 ? 3 : 1))
+    okay_flag = 0;
+  /* A plane read at the picture's edge is the one place the blend cannot
+   * reproduce it: there is no sample beyond the border to blend with, so both
+   * this reader and libjpeg hold the edge sample flat.  The margin is skipped
+   * rather than modelled. */
+  for (high_index = edge_skip; okay_flag && high_index < high_count - edge_skip; ++high_index)
+    for (wide_index = edge_skip; wide_index < wide_count - edge_skip; ++wide_index) {
+      const float *cell_data = grid_at(&grid, high_index, wide_index);
+      float want_list[3];
+      if (band_count == 1) {
+        want_list[0] = (float)test_jpeg_band(wide_index, high_index, 0, shape_mark);
+      } else {
+        float bright = (float)test_jpeg_band(wide_index, high_index, 0, shape_mark);
+        float blue_off = (float)test_jpeg_band(wide_index, high_index, 1, shape_mark) - 128.0f;
+        float red_off = (float)test_jpeg_band(wide_index, high_index, 2, shape_mark) - 128.0f;
+        want_list[0] = bright + 1.402f * red_off;
+        want_list[1] = bright - 0.344136f * blue_off - 0.714136f * red_off;
+        want_list[2] = bright + 1.772f * blue_off;
+      }
+      for (band_index = 0; band_index < grid.band_count; ++band_index) {
+        float want_value = want_list[band_index] / 255.0f;
+        float gap_value;
+        if (want_value < 0.0f) want_value = 0.0f;
+        if (want_value > 1.0f) want_value = 1.0f;
+        gap_value = cell_data[band_index] - want_value;
+        if (gap_value < 0.0f) gap_value = -gap_value;
+        if (gap_value > slack_value) okay_flag = 0;
+      }
+    }
+  test_true(okay_flag, claim_text);
+  grid_free(&grid);
+}
+
+static void test_jpeg(void) {
+  static const int wide_count = 24, high_count = 16;
+  static const int share_one[3] = {1, 1, 1};
+  static const int share_two[3] = {2, 1, 1};
+  uint8_t *gray_data, *band_data, *flat_data, *ramp_data, *tile_data;
+  char path_text[1024];
+  flat_grid grid;
+  test_open("jpeg");
+
+  {
+    int zig_list[64], slot_index, okay_flag = 1;
+    test_jpeg_zig_fill(zig_list);
+    for (slot_index = 0; slot_index < 64; ++slot_index)
+      if (zig_list[slot_index] != (int)jpeg_zig_list[slot_index]) okay_flag = 0;
+    test_true(okay_flag, "the coefficient order is the diagonals of the block in turn");
+  }
+
+  gray_data = test_jpeg_bands(wide_count, high_count, 1, 0);
+  band_data = test_jpeg_bands(wide_count, high_count, 3, 0);
+  flat_data = test_jpeg_bands(wide_count, high_count, 3, 1);
+  ramp_data = test_jpeg_bands(wide_count, high_count, 3, 2);
+  tile_data = test_jpeg_bands(wide_count, high_count, 3, 3);
+  if (!gray_data || !band_data || !flat_data || !ramp_data || !tile_data) {
+    test_true(0, "the jpeg fixtures are allocated");
+    mem_free(gray_data);
+    mem_free(band_data);
+    mem_free(flat_data);
+    mem_free(ramp_data);
+    mem_free(tile_data);
+    return;
+  }
+
+  /* One component, every component at the picture's own sampling: what comes
+   * back is the picture the encoder was given, to within what two transforms
+   * round. */
+  test_true(test_jpeg_write("gray.jpg", gray_data, wide_count, high_count, 1, share_one, share_one,
+                            0, 0xC0),
+            "a grey jpeg fixture is written");
+  test_jpeg_check("gray.jpg", "a grey jpeg decodes to the samples it was built from", wide_count,
+                  high_count, 1, 0, 0, 1.5f / 255.0f);
+
+  test_true(test_jpeg_write("colour.jpg", band_data, wide_count, high_count, 3, share_one,
+                            share_one, 0, 0xC0),
+            "a three component jpeg fixture is written");
+  test_jpeg_check("colour.jpg", "a three component jpeg decodes through the colour transform",
+                  wide_count, high_count, 3, 0, 0, 2.0f / 255.0f);
+
+  /* Chroma at half the horizontal sampling, over a picture whose chroma does
+   * not vary along a row: the averaging the encoder does is exact and so is
+   * the blend the reader undoes it with, so this is held to the same floor as
+   * the unsampled one rather than a looser one. */
+  test_true(test_jpeg_write("share.jpg", flat_data, wide_count, high_count, 3, share_two, share_one,
+                            0, 0xC0),
+            "a chroma subsampled fixture is written");
+  test_jpeg_check("share.jpg", "chroma at half the sampling is lifted back to the picture's grid",
+                  wide_count, high_count, 3, 1, 0, 1.5f / 255.0f);
+
+  /* A picture that is constant over each eight by eight tile has nothing in it
+   * but dc coefficients, so the transform round trip is exact to the level and
+   * what is left between the samples and the pixels is the colour transform
+   * alone.  Half a level is a tight enough floor to catch a coefficient that is
+   * a percent wrong, or a pair the wrong way round. */
+  test_true(test_jpeg_write("tile.jpg", tile_data, wide_count, high_count, 3, share_one, share_one,
+                            0, 0xC0),
+            "a tile constant fixture is written");
+  test_jpeg_check("tile.jpg", "the colour transform is exact where the transform loses nothing",
+                  wide_count, high_count, 3, 3, 0, 0.51f / 255.0f);
+
+  /* Chroma at half the sampling in both directions, over a picture whose
+   * chroma is a plane: the blend that undoes it has to put every interior
+   * pixel back where it started, which repeating the nearest sample would
+   * not. */
+  test_true(test_jpeg_write("plane.jpg", ramp_data, wide_count, high_count, 3, share_two,
+                            share_two, 0, 0xC0),
+            "a fixture subsampled in both directions is written");
+  test_jpeg_check("plane.jpg", "chroma at half the sampling both ways is blended, not repeated",
+                  wide_count, high_count, 3, 2, 2, 2.5f / 255.0f);
+
+  /* The same picture with a restart marker after every unit, which resets both
+   * the bit reader and the dc predictors. */
+  test_true(test_jpeg_write("rest.jpg", band_data, wide_count, high_count, 3, share_one, share_one,
+                            1, 0xC0),
+            "a restarting fixture is written");
+  test_jpeg_check("rest.jpg", "a file broken by restart markers decodes to the same picture",
+                  wide_count, high_count, 3, 0, 0, 2.0f / 255.0f);
+
+  /* A progressive frame header is refused rather than read as a baseline one,
+   * the way the png reader refuses an interlaced file. */
+  test_true(test_jpeg_write("wave.jpg", band_data, wide_count, high_count, 3, share_one, share_one,
+                            0, 0xC2),
+            "a progressive fixture is written");
+  path_join(path_text, sizeof(path_text), test_yard_path, "wave.jpg");
+  test_true(image_read(path_text, &grid) == APP_FAIL_SUPPORT, "a progressive jpeg is refused");
+
+  /* An entropy stream that stops before its last unit is a truncated file, not
+   * a picture with a grey corner. */
+  {
+    char full_text[1024];
+    uint8_t *file_data;
+    size_t file_size = 0;
+    path_join(full_text, sizeof(full_text), test_yard_path, "colour.jpg");
+    file_data = (uint8_t *)file_slurp(full_text, &file_size);
+    test_true(file_data != NULL && file_size > 400, "the fixture is read back for truncation");
+    if (file_data) {
+      test_true(test_file_write("short.jpg", file_data, file_size - file_size / 4),
+                "a truncated fixture is written");
+      path_join(path_text, sizeof(path_text), test_yard_path, "short.jpg");
+      test_true(image_read(path_text, &grid) != APP_OKAY, "a truncated jpeg is refused");
+      mem_free(file_data);
+    }
+  }
+
+  mem_free(gray_data);
+  mem_free(band_data);
+  mem_free(flat_data);
+  mem_free(ramp_data);
+  mem_free(tile_data);
+}
+
 /* An independent bicubic, gathered in two dimensions at once rather than as two
  * separable passes, so agreement is between two different arrangements of the
  * same definition. */
@@ -3051,6 +3539,7 @@ int main(void) {
   test_token();
   test_puff();
   test_image();
+  test_jpeg();
   test_scale();
   test_cache();
   test_wave();

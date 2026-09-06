@@ -20,7 +20,7 @@ party library, and no build system beyond a C compiler.
 - **vision and audio** — a bidirectional patch encoder at variable resolution
   with two dimensional rotary positions, and a conformer audio encoder with
   chunked local attention, each projecting into the text embedding space
-- **its own decoders** — png, pnm, bmp and riff wave readers, a bicubic
+- **its own decoders** — png, baseline jpeg, pnm, bmp and riff wave readers, a bicubic
   resize, and a mel filterbank, none of them borrowed
 
 ## Quickstart
@@ -61,10 +61,13 @@ full list.
 the export calibrates static ranges for. It is off by default. On the shipped
 export it takes the cache at full span from 1803.0 MiB to 450.8 MiB — a saving
 larger than the checkpoint's own mapped weights — and a decode step reads a
-quarter of the cache bytes it read as floats. It is a footprint option rather
-than a speed one: 0.8.4 timed six pairs on a quiet host and the byte cache is a
-third behind the float cache on the tuned build and a ninth behind on the
-default, because on AVX2 the table it decodes through is read with a gather.
+quarter of the cache bytes it read as floats. Until 0.8.5 it was a footprint option that cost speed —
+0.8.4 measured the byte cache a third behind the float cache on the tuned build
+— because every head decoded the same cached row for itself and on AVX2 the
+table is read with a gather. The cache is now read blocked by row instead, once
+per row for the whole group of heads that shares it, and on the same host the
+byte cache is within a percent or two of the float cache on both builds: 7.22
+tokens a second against 7.32 tuned, 5.87 against 6.03 default.
 What it costs besides is accuracy: the next token is never in doubt, and greedy
 decoding diverges at the first genuinely close call — around eighty characters
 in on a short prompt, and inside twenty once the context is long enough for the
@@ -72,8 +75,8 @@ sliding window to turn over.
 The `cache` task prints the calibrated ranges against the peaks a prompt
 actually reaches, and what the cache costs at full span either way.
 
-`--image` takes a png, pnm or bmp and `--audio` a riff wave. Each is run
-through its tower and put in front of the prompt, bracketed by the ids the
+`--image` takes a png, a baseline jpeg, a pnm or a bmp, and `--audio` a riff
+wave. Each is run through its tower and put in front of the prompt, bracketed by the ids the
 reference's processor brackets it with, in the place a multi-modal chat template
 puts it. Either flag may be given more than once, up to eight pieces in one
 prompt, and they are laid down in the order the flags appear — which is the
@@ -191,7 +194,7 @@ On four cores of a 2017 desktop, against the reference's 0.16 tokens a second:
 decode runs at about 9.5 and prefill at about 12.4, and a build tuned for the
 host — `--tuned`, which selects the AVX2 path — reaches 13.2 and 21.2.
 
-The kernels have had three passes over them, and neither build is against the
+The kernels have had four passes over them, and neither build is against the
 memory yet. A decode step reads 759.4 MiB — the projections, the output head,
 and one row of each embedding table, which is what `probe` and `bench` now
 report beside the 2334.8 MiB the export maps. At 14.2 tokens a second that is
@@ -213,3 +216,13 @@ and does not move a single bit of any result. 0.8.4 also closes two of the
 candidates `TODO.md` was carrying: the per-group gain mirror has nothing to
 convert on an export whose scales are already one `F32` a row, and the byte
 cache's gather is confirmed as the wrong read rather than merely suspected.
+
+The fourth pass is 0.8.5's, on the same machine as the third, and it is a
+restructuring rather than a kernel: the cache is read blocked by row instead of
+by head, so a row shared by eight heads is read — and on a byte cache decoded —
+once for all of them instead of once each. Three adjacent pairs a configuration,
+every pair of one sign: decode 5.91 to 7.22 tokens a second on the tuned build
+with `--cache 8` and 6.96 to 7.32 with floats, prefill 14.85 to 18.94 and 19.52
+to 19.69; on the default build decode 5.18 to 5.87 and 5.70 to 6.03. Not one bit
+of any result moves. What it takes back is most of what the byte cache cost:
+`--cache 8` was 15% behind floats on this host and is now 1%.

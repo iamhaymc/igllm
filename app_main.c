@@ -101,7 +101,7 @@ static void main_usage(void) {
   printf("  --model <folder>    checkpoint folder in huggingface layout\n");
   printf("  --prompt <text>     prompt text, defaults to a short greeting\n");
   printf("  --text <text>       words in the order the flags give them, repeatable\n");
-  printf("  --image <path>      a png, pnm or bmp shown before the prompt, repeatable\n");
+  printf("  --image <path>      a png, jpeg, pnm or bmp shown before the prompt, repeatable\n");
   printf("  --audio <path>      a riff wave played before the prompt, repeatable\n");
   printf("  --serve <count>     tokens to produce, default 128\n");
   printf("  --threads <count>   worker threads, default host count\n");

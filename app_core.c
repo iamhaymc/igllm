@@ -3092,6 +3092,538 @@ static app_code bmp_read(const uint8_t *file_data, size_t file_size, flat_grid *
   return APP_OKAY;
 }
 
+/* -- jpeg ----------------------------------------------------------------- */
+
+/* A baseline jpeg reader: the marker walk, a canonical Huffman decode per
+ * component, dequantization against the tables `DQT` carried, an eight by eight
+ * inverse cosine transform, chroma upsampling at whatever the sampling factors
+ * say, and YCbCr to RGB.  Restart markers are handled; progressive files are
+ * refused the way the png reader refuses interlacing, because coefficients
+ * arriving across several scans with successive approximation is a second
+ * decoder rather than a fourth branch of this one.
+ *
+ * Nothing here is borrowed.  `stb_image.h` was read for where a decoder has to
+ * make a choice rather than follow the specification — what to do with a marker
+ * in the middle of the entropy stream, and where the transform rounds — and the
+ * two places this reader decides differently are named where they are decided.
+ *
+ * The canonical decoder beside deflate's is not reused.  `DHT` already ships
+ * the table in exactly the form `puff_tree` holds — a count per code length,
+ * then the symbols in code order — so there is nothing to build; and the walk
+ * over it reads bits the other way round, most significant first, out of a
+ * stream where `FF 00` means a literal `FF`.  What could be shared is four
+ * lines of arithmetic over a bit reader that cannot be. */
+
+#define JPEG_PART_LIMIT  4 /* components in one frame */
+#define JPEG_TREE_LIMIT  4 /* Huffman tables a class */
+#define JPEG_QUANT_LIMIT 4
+
+/* Where a coefficient in the order the entropy stream sends them belongs in the
+ * eight by eight block: row major, the row being the vertical frequency. */
+static const uint8_t jpeg_zig_list[64] = {
+    0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,  7,  14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
+
+/* A canonical Huffman table as `DHT` ships it: how many codes carry each of
+ * the sixteen lengths, and the symbols in code order. */
+typedef struct jpeg_tree {
+  short count_list[17];
+  short sign_list[256];
+  int   have_flag;
+} jpeg_tree;
+
+/* The entropy stream: bits most significant first, `FF 00` standing for a
+ * literal `FF`, and any other `FF` being the marker that ends the run. */
+typedef struct jpeg_scan {
+  const uint8_t *from_data;
+  size_t         from_size;
+  size_t         from_walk;
+  uint32_t       bit_room;
+  int            bit_count;
+  int            mark_flag; /* the run reached a marker and is feeding zeros */
+} jpeg_scan;
+
+typedef struct jpeg_part {
+  int      id_mark;
+  int      wide_share, high_share; /* sampling factors */
+  int      quant_slot;
+  int      dc_slot, ac_slot;
+  int      wide_size, high_size;   /* samples this component actually carries */
+  int      line_bytes;             /* stride of the plane below */
+  int      high_room;              /* rows of the plane below */
+  int      last_dc;                /* the running dc predictor */
+  uint8_t *plane_data;
+} jpeg_part;
+
+/* One bit, or a zero once the run has reached its marker.
+ *
+ * A marker is not consumed and does not fail: an encoder ends a run on a byte
+ * boundary, and a decoder that needed the last few bits of a block would rather
+ * read zeros than refuse a file every other reader accepts.  What it does is
+ * raise `mark_flag`, and the scan loop refuses a file that is still fabricating
+ * bits with more than its last unit to go — which is the difference between a
+ * stream that ended tidily and one that was truncated. */
+static int jpeg_bit(jpeg_scan *scan) {
+  if (scan->bit_count == 0) {
+    int byte_value;
+    if (scan->mark_flag || scan->from_walk >= scan->from_size) {
+      scan->mark_flag = 1;
+      return 0;
+    }
+    byte_value = scan->from_data[scan->from_walk];
+    if (byte_value == 0xFF) {
+      int next_value =
+          scan->from_walk + 1 < scan->from_size ? scan->from_data[scan->from_walk + 1] : 0xD9;
+      if (next_value != 0x00) {
+        scan->mark_flag = 1;
+        return 0;
+      }
+      scan->from_walk += 2;
+    } else {
+      scan->from_walk += 1;
+    }
+    scan->bit_room = (uint32_t)byte_value;
+    scan->bit_count = 8;
+  }
+  scan->bit_count -= 1;
+  return (int)((scan->bit_room >> scan->bit_count) & 1u);
+}
+
+static int jpeg_take(jpeg_scan *scan, int bit_count) {
+  int value_now = 0, bit_index;
+  for (bit_index = 0; bit_index < bit_count; ++bit_index)
+    value_now = (value_now << 1) | jpeg_bit(scan);
+  return value_now;
+}
+
+/* The signed value a run of `bit_count` bits stands for: the top half of the
+ * range as it reads, the bottom half as a negative of the same magnitude. */
+static int jpeg_wide(int value_now, int bit_count) {
+  if (bit_count == 0) return 0;
+  return value_now < (1 << (bit_count - 1)) ? value_now - (1 << bit_count) + 1 : value_now;
+}
+
+/* The canonical walk: one bit at a time, comparing against the first code of
+ * each length.  Same shape as `puff_sign`, over sixteen lengths and this
+ * stream's bit order. */
+static int jpeg_sign(jpeg_scan *scan, const jpeg_tree *tree) {
+  int code_value = 0, first_code = 0, index_base = 0, length_index;
+  for (length_index = 1; length_index <= 16; ++length_index) {
+    int count_value = tree->count_list[length_index];
+    code_value |= jpeg_bit(scan);
+    if (code_value - first_code < count_value)
+      return tree->sign_list[index_base + (code_value - first_code)];
+    index_base += count_value;
+    first_code = (first_code + count_value) << 1;
+    code_value <<= 1;
+  }
+  return -1;
+}
+
+/* The separable inverse transform, through an orthonormal basis built once for
+ * the whole picture.
+ *
+ * Two eight by eight products rather than one sixty-four wide one, and the
+ * rounding is a single round to nearest at the end because everything before it
+ * is float.  A fixed point transform would round twice and land within a step
+ * of this; the difference shows against libjpeg and is why `app_diff.py` holds
+ * a jpeg to a looser floor than a png. */
+static void jpeg_basis_fill(float *basis_data) {
+  int freq_index, slot_index;
+  for (freq_index = 0; freq_index < 8; ++freq_index) {
+    double gain_value = freq_index == 0 ? sqrt(0.125) : 0.5;
+    for (slot_index = 0; slot_index < 8; ++slot_index)
+      basis_data[freq_index * 8 + slot_index] =
+          (float)(gain_value *
+                  cos((2.0 * slot_index + 1.0) * freq_index * 3.14159265358979323846 / 16.0));
+  }
+}
+
+static void jpeg_block_turn(const float *basis_data, const float *coef_data, uint8_t *into_data,
+                            int line_bytes) {
+  float mid_list[64];
+  int row_index, slot_index, freq_index;
+  for (row_index = 0; row_index < 8; ++row_index)
+    for (slot_index = 0; slot_index < 8; ++slot_index) {
+      float total = 0.0f;
+      for (freq_index = 0; freq_index < 8; ++freq_index)
+        total += basis_data[freq_index * 8 + slot_index] * coef_data[row_index * 8 + freq_index];
+      mid_list[row_index * 8 + slot_index] = total;
+    }
+  for (row_index = 0; row_index < 8; ++row_index)
+    for (slot_index = 0; slot_index < 8; ++slot_index) {
+      float total = 0.0f;
+      int level_value;
+      for (freq_index = 0; freq_index < 8; ++freq_index)
+        total += basis_data[freq_index * 8 + row_index] * mid_list[freq_index * 8 + slot_index];
+      level_value = (int)(total + 128.5f); /* the level shift and the one rounding */
+      if (level_value < 0) level_value = 0;
+      if (level_value > 255) level_value = 255;
+      into_data[(size_t)row_index * (size_t)line_bytes + (size_t)slot_index] =
+          (uint8_t)level_value;
+    }
+}
+
+/* One block: the dc difference against the component's running predictor, then
+ * the ac coefficients as run-length pairs, dequantized where they land and
+ * transformed straight into the component's plane.  Sequential means a block is
+ * final when its scan has read it, so no coefficient buffer outlives this. */
+static int jpeg_block_read(jpeg_scan *scan, jpeg_part *part, const jpeg_tree *dc_tree,
+                           const jpeg_tree *ac_tree, const uint16_t *quant_list,
+                           const float *basis_data, uint8_t *into_data, int line_bytes) {
+  float coef_list[64];
+  int sign_value, slot_index;
+
+  for (slot_index = 0; slot_index < 64; ++slot_index) coef_list[slot_index] = 0.0f;
+  sign_value = jpeg_sign(scan, dc_tree);
+  if (sign_value < 0 || sign_value > 16) return 0;
+  part->last_dc += jpeg_wide(jpeg_take(scan, sign_value), sign_value);
+  coef_list[0] = (float)part->last_dc * (float)quant_list[0];
+
+  slot_index = 1;
+  while (slot_index < 64) {
+    int run_value, size_value;
+    sign_value = jpeg_sign(scan, ac_tree);
+    if (sign_value < 0) return 0;
+    run_value = (sign_value >> 4) & 15;
+    size_value = sign_value & 15;
+    if (size_value == 0) {
+      if (run_value != 15) break; /* end of block */
+      slot_index += 16;
+      continue;
+    }
+    slot_index += run_value;
+    if (slot_index > 63) return 0;
+    coef_list[jpeg_zig_list[slot_index]] =
+        (float)jpeg_wide(jpeg_take(scan, size_value), size_value) * (float)quant_list[slot_index];
+    slot_index += 1;
+  }
+  jpeg_block_turn(basis_data, coef_list, into_data, line_bytes);
+  return 1;
+}
+
+/* Steps over a restart marker: the run is byte aligned again, the predictors
+ * start from zero, and the two bytes must be `FF D0` through `FF D7`. */
+static int jpeg_restart(jpeg_scan *scan, jpeg_part *part_list, int part_count) {
+  size_t walk = scan->from_walk;
+  int part_index;
+  scan->bit_count = 0;
+  scan->mark_flag = 0;
+  while (walk + 1 < scan->from_size && scan->from_data[walk] == 0xFF &&
+         scan->from_data[walk + 1] == 0xFF)
+    walk += 1; /* fill bytes before the marker */
+  if (walk + 1 >= scan->from_size || scan->from_data[walk] != 0xFF) return 0;
+  if (scan->from_data[walk + 1] < 0xD0 || scan->from_data[walk + 1] > 0xD7) return 0;
+  scan->from_walk = walk + 2;
+  for (part_index = 0; part_index < part_count; ++part_index) part_list[part_index].last_dc = 0;
+  return 1;
+}
+
+/* One component sampled at a picture pixel's centre.
+ *
+ * A component at the picture's own sampling factor lands exactly on a sample
+ * and this is a load.  A chroma plane at half the factor lands between two, and
+ * what comes back is the linear blend of them — which on the two-to-one factors
+ * every real file uses is the three-quarters-and-a-quarter of libjpeg's fancy
+ * upsampling.  Repeating the nearest sample instead would put a visible step on
+ * every chroma edge, and cost the same. */
+static float jpeg_part_at(const jpeg_part *part, int wide_peak, int high_peak, int wide_index,
+                          int high_index) {
+  float wide_spot = ((float)wide_index + 0.5f) * (float)part->wide_share / (float)wide_peak - 0.5f;
+  float high_spot = ((float)high_index + 0.5f) * (float)part->high_share / (float)high_peak - 0.5f;
+  int wide_from = (int)(wide_spot + 1.0f) - 1; /* a floor, the spot never below -1 */
+  int high_from = (int)(high_spot + 1.0f) - 1;
+  float wide_part = wide_spot - (float)wide_from;
+  float high_part = high_spot - (float)high_from;
+  int wide_upto = wide_from + 1, high_upto = high_from + 1;
+  float near_row, far_row;
+  const uint8_t *plane_data = part->plane_data;
+
+  if (wide_from < 0) wide_from = 0;
+  if (high_from < 0) high_from = 0;
+  if (wide_upto > part->wide_size - 1) wide_upto = part->wide_size - 1;
+  if (high_upto > part->high_size - 1) high_upto = part->high_size - 1;
+  if (wide_from > wide_upto) wide_from = wide_upto;
+  if (high_from > high_upto) high_from = high_upto;
+  {
+    const uint8_t *near_data = plane_data + (size_t)high_from * (size_t)part->line_bytes;
+    const uint8_t *far_data = plane_data + (size_t)high_upto * (size_t)part->line_bytes;
+    near_row = (float)near_data[wide_from] +
+               ((float)near_data[wide_upto] - (float)near_data[wide_from]) * wide_part;
+    far_row = (float)far_data[wide_from] +
+              ((float)far_data[wide_upto] - (float)far_data[wide_from]) * wide_part;
+  }
+  return near_row + (far_row - near_row) * high_part;
+}
+
+static app_code jpeg_read(const uint8_t *file_data, size_t file_size, flat_grid *grid_out) {
+  jpeg_tree dc_list[JPEG_TREE_LIMIT], ac_list[JPEG_TREE_LIMIT];
+  uint16_t quant_list[JPEG_QUANT_LIMIT][64];
+  jpeg_part part_list[JPEG_PART_LIMIT];
+  float basis_list[64];
+  int wide_count = 0, high_count = 0, part_count = 0;
+  int wide_peak = 1, high_peak = 1, mcu_wide = 0, mcu_high = 0;
+  int rest_span = 0, frame_flag = 0, scan_flag = 0, band_count;
+  int quant_have[JPEG_QUANT_LIMIT];
+  int part_index, wide_index, high_index, slot_index;
+  size_t walk = 2;
+  app_code code = APP_FAIL_FORMAT;
+
+  memset(grid_out, 0, sizeof(*grid_out));
+  memset(dc_list, 0, sizeof(dc_list));
+  memset(ac_list, 0, sizeof(ac_list));
+  memset(quant_list, 0, sizeof(quant_list));
+  memset(quant_have, 0, sizeof(quant_have));
+  memset(part_list, 0, sizeof(part_list));
+  jpeg_basis_fill(basis_list);
+  if (file_size < 4 || file_data[0] != 0xFF || file_data[1] != 0xD8) return APP_FAIL_FORMAT;
+
+  while (walk + 1 < file_size) {
+    int mark_value;
+    size_t body_size, body_from;
+    if (file_data[walk] != 0xFF) { walk += 1; continue; } /* fill between segments */
+    mark_value = file_data[walk + 1];
+    if (mark_value == 0xFF) { walk += 1; continue; }
+    if (mark_value == 0xD8 || (mark_value >= 0xD0 && mark_value <= 0xD7) || mark_value == 0x01) {
+      walk += 2;
+      continue;
+    }
+    if (mark_value == 0xD9) break; /* end of image */
+    if (walk + 4 > file_size) goto jpeg_done;
+    body_size = ((size_t)file_data[walk + 2] << 8) | (size_t)file_data[walk + 3];
+    if (body_size < 2 || walk + 2 + body_size > file_size) goto jpeg_done;
+    body_from = walk + 4;
+    body_size -= 2;
+
+    if (mark_value == 0xDB) { /* quantization tables */
+      size_t step = body_from;
+      while (step < body_from + body_size) {
+        int wide_flag = file_data[step] >> 4, slot_want = file_data[step] & 15;
+        step += 1;
+        if (slot_want >= JPEG_QUANT_LIMIT) goto jpeg_done;
+        if (step + (wide_flag ? 128u : 64u) > body_from + body_size) goto jpeg_done;
+        for (slot_index = 0; slot_index < 64; ++slot_index)
+          quant_list[slot_want][slot_index] =
+              wide_flag ? (uint16_t)(((int)file_data[step + (size_t)slot_index * 2] << 8) |
+                                     file_data[step + (size_t)slot_index * 2 + 1])
+                        : (uint16_t)file_data[step + (size_t)slot_index];
+        quant_have[slot_want] = 1;
+        step += wide_flag ? 128u : 64u;
+      }
+    } else if (mark_value == 0xC4) { /* Huffman tables */
+      size_t step = body_from;
+      while (step < body_from + body_size) {
+        int class_mark = file_data[step] >> 4, slot_want = file_data[step] & 15;
+        jpeg_tree *tree;
+        int total_count = 0;
+        step += 1;
+        if (class_mark > 1 || slot_want >= JPEG_TREE_LIMIT) goto jpeg_done;
+        if (step + 16 > body_from + body_size) goto jpeg_done;
+        tree = class_mark ? &ac_list[slot_want] : &dc_list[slot_want];
+        memset(tree, 0, sizeof(*tree));
+        for (slot_index = 1; slot_index <= 16; ++slot_index) {
+          tree->count_list[slot_index] = (short)file_data[step + (size_t)slot_index - 1];
+          total_count += tree->count_list[slot_index];
+        }
+        step += 16;
+        if (total_count > 256 || step + (size_t)total_count > body_from + body_size)
+          goto jpeg_done;
+        for (slot_index = 0; slot_index < total_count; ++slot_index)
+          tree->sign_list[slot_index] = (short)file_data[step + (size_t)slot_index];
+        tree->have_flag = 1;
+        step += (size_t)total_count;
+      }
+    } else if (mark_value == 0xDD) { /* restart interval */
+      if (body_size < 2) goto jpeg_done;
+      rest_span = ((int)file_data[body_from] << 8) | file_data[body_from + 1];
+    } else if (mark_value == 0xC0 || mark_value == 0xC1) { /* baseline, extended sequential */
+      if (frame_flag || body_size < 6) goto jpeg_done;
+      if (file_data[body_from] != 8) { code = APP_FAIL_SUPPORT; goto jpeg_done; }
+      high_count = ((int)file_data[body_from + 1] << 8) | file_data[body_from + 2];
+      wide_count = ((int)file_data[body_from + 3] << 8) | file_data[body_from + 4];
+      part_count = file_data[body_from + 5];
+      if (wide_count < 1 || high_count < 1) goto jpeg_done;
+      if (wide_count > MEDIA_SIDE_LIMIT || high_count > MEDIA_SIDE_LIMIT) {
+        code = APP_FAIL_SUPPORT;
+        goto jpeg_done;
+      }
+      /* One band or three.  A four component file is CMYK or YCCK, which needs
+       * an inversion rule this reader has no way to check, so it is refused
+       * rather than guessed at. */
+      if (part_count != 1 && part_count != 3) { code = APP_FAIL_SUPPORT; goto jpeg_done; }
+      if (body_size < 6u + 3u * (size_t)part_count) goto jpeg_done;
+      for (part_index = 0; part_index < part_count; ++part_index) {
+        const uint8_t *note_data = file_data + body_from + 6 + (size_t)part_index * 3;
+        jpeg_part *part = &part_list[part_index];
+        part->id_mark = note_data[0];
+        part->wide_share = note_data[1] >> 4;
+        part->high_share = note_data[1] & 15;
+        part->quant_slot = note_data[2];
+        if (part->wide_share < 1 || part->wide_share > 4 || part->high_share < 1 ||
+            part->high_share > 4 || part->quant_slot >= JPEG_QUANT_LIMIT) {
+          code = APP_FAIL_SUPPORT;
+          goto jpeg_done;
+        }
+        if (part->wide_share > wide_peak) wide_peak = part->wide_share;
+        if (part->high_share > high_peak) high_peak = part->high_share;
+      }
+      mcu_wide = (wide_count + wide_peak * 8 - 1) / (wide_peak * 8);
+      mcu_high = (high_count + high_peak * 8 - 1) / (high_peak * 8);
+      for (part_index = 0; part_index < part_count; ++part_index) {
+        jpeg_part *part = &part_list[part_index];
+        part->wide_size = (wide_count * part->wide_share + wide_peak - 1) / wide_peak;
+        part->high_size = (high_count * part->high_share + high_peak - 1) / high_peak;
+        part->line_bytes = mcu_wide * part->wide_share * 8;
+        part->high_room = mcu_high * part->high_share * 8;
+        part->plane_data =
+            (uint8_t *)mem_clear((size_t)part->line_bytes * (size_t)part->high_room);
+        if (!part->plane_data) { code = APP_FAIL_MEMORY; goto jpeg_done; }
+      }
+      frame_flag = 1;
+    } else if (mark_value >= 0xC2 && mark_value <= 0xCF && mark_value != 0xC4 &&
+               mark_value != 0xC8 && mark_value != 0xCC) {
+      /* Progressive, lossless, arithmetic coded, hierarchical: each of them is
+       * another decoder rather than another branch of this one. */
+      code = APP_FAIL_SUPPORT;
+      goto jpeg_done;
+    } else if (mark_value == 0xDA) { /* start of scan */
+      jpeg_scan scan;
+      int scan_count, unit_wide, unit_high, unit_index, unit_total, rest_left;
+      int scan_slot[JPEG_PART_LIMIT];
+      if (!frame_flag || body_size < 1) goto jpeg_done;
+      scan_count = file_data[body_from];
+      if (scan_count < 1 || scan_count > part_count) goto jpeg_done;
+      if (body_size < 1u + 2u * (size_t)scan_count + 3u) goto jpeg_done;
+      for (slot_index = 0; slot_index < scan_count; ++slot_index) {
+        const uint8_t *note_data = file_data + body_from + 1 + (size_t)slot_index * 2;
+        int found_slot = -1;
+        for (part_index = 0; part_index < part_count; ++part_index)
+          if (part_list[part_index].id_mark == note_data[0]) found_slot = part_index;
+        if (found_slot < 0) goto jpeg_done;
+        scan_slot[slot_index] = found_slot;
+        part_list[found_slot].dc_slot = note_data[1] >> 4;
+        part_list[found_slot].ac_slot = note_data[1] & 15;
+        if (part_list[found_slot].dc_slot >= JPEG_TREE_LIMIT ||
+            part_list[found_slot].ac_slot >= JPEG_TREE_LIMIT)
+          goto jpeg_done;
+      }
+      {
+        const uint8_t *tail_data = file_data + body_from + 1 + (size_t)scan_count * 2;
+        /* A sequential scan carries the whole spectrum at full precision.
+         * Anything else is a progressive scan under a baseline frame header. */
+        if (tail_data[0] != 0 || tail_data[1] != 63 || tail_data[2] != 0) {
+          code = APP_FAIL_SUPPORT;
+          goto jpeg_done;
+        }
+      }
+      memset(&scan, 0, sizeof(scan));
+      scan.from_data = file_data;
+      scan.from_size = file_size;
+      scan.from_walk = body_from + body_size;
+      /* An interleaved scan walks minimum coded units, each holding a
+       * component's sampling factors worth of blocks; a scan of one component
+       * walks that component's own blocks, which is what a file that sends its
+       * planes one after another means. */
+      if (scan_count == 1) {
+        jpeg_part *part = &part_list[scan_slot[0]];
+        unit_wide = (part->wide_size + 7) / 8;
+        unit_high = (part->high_size + 7) / 8;
+      } else {
+        unit_wide = mcu_wide;
+        unit_high = mcu_high;
+      }
+      unit_total = unit_wide * unit_high;
+      rest_left = rest_span;
+      for (slot_index = 0; slot_index < scan_count; ++slot_index)
+        part_list[scan_slot[slot_index]].last_dc = 0;
+      for (unit_index = 0; unit_index < unit_total; ++unit_index) {
+        int unit_x = unit_index % unit_wide, unit_y = unit_index / unit_wide;
+        if (rest_span > 0 && rest_left == 0) {
+          if (!jpeg_restart(&scan, part_list, part_count)) goto jpeg_done;
+          rest_left = rest_span;
+        }
+        /* Feeding zeros with more than the last unit to go means the entropy
+         * stream ended early rather than tidily. */
+        if (scan.mark_flag && unit_index + 1 < unit_total) goto jpeg_done;
+        for (slot_index = 0; slot_index < scan_count; ++slot_index) {
+          jpeg_part *part = &part_list[scan_slot[slot_index]];
+          const jpeg_tree *dc_tree = &dc_list[part->dc_slot];
+          const jpeg_tree *ac_tree = &ac_list[part->ac_slot];
+          int wide_span = scan_count == 1 ? 1 : part->wide_share;
+          int high_span = scan_count == 1 ? 1 : part->high_share;
+          int block_x, block_y;
+          if (!dc_tree->have_flag || !ac_tree->have_flag) goto jpeg_done;
+          if (!quant_have[part->quant_slot]) goto jpeg_done;
+          for (block_y = 0; block_y < high_span; ++block_y)
+            for (block_x = 0; block_x < wide_span; ++block_x) {
+              int into_x = (unit_x * wide_span + block_x) * 8;
+              int into_y = (unit_y * high_span + block_y) * 8;
+              if (into_x + 8 > part->line_bytes || into_y + 8 > part->high_room) goto jpeg_done;
+              if (!jpeg_block_read(&scan, part, dc_tree, ac_tree, quant_list[part->quant_slot],
+                                   basis_list,
+                                   part->plane_data + (size_t)into_y * (size_t)part->line_bytes +
+                                       (size_t)into_x,
+                                   part->line_bytes))
+                goto jpeg_done;
+            }
+        }
+        rest_left -= 1;
+      }
+      /* The entropy stream is not length prefixed, so the walk resumes at the
+       * next marker the reader can find rather than at a recorded offset. */
+      scan_flag = 1;
+      walk = scan.from_walk;
+      while (walk + 1 < file_size &&
+             !(file_data[walk] == 0xFF && file_data[walk + 1] != 0x00 &&
+               file_data[walk + 1] != 0xFF))
+        walk += 1;
+      continue;
+    }
+    walk = body_from + body_size; /* the segment's length counted its own two bytes */
+  }
+
+  if (!frame_flag || !scan_flag) goto jpeg_done;
+  band_count = part_count == 3 ? 3 : 1;
+  code = grid_open(grid_out, wide_count, high_count, band_count);
+  if (code != APP_OKAY) goto jpeg_done;
+  for (high_index = 0; high_index < high_count; ++high_index)
+    for (wide_index = 0; wide_index < wide_count; ++wide_index) {
+      float *out_data = grid_at(grid_out, high_index, wide_index);
+      if (band_count == 1) {
+        out_data[0] = jpeg_part_at(&part_list[0], wide_peak, high_peak, wide_index, high_index) /
+                      255.0f;
+        continue;
+      }
+      {
+        /* The colour transform the format's own conversion clause names, with
+         * the chroma pair centred on zero first. */
+        float bright = jpeg_part_at(&part_list[0], wide_peak, high_peak, wide_index, high_index);
+        float blue_off =
+            jpeg_part_at(&part_list[1], wide_peak, high_peak, wide_index, high_index) - 128.0f;
+        float red_off =
+            jpeg_part_at(&part_list[2], wide_peak, high_peak, wide_index, high_index) - 128.0f;
+        float band_list[3];
+        int band_index;
+        band_list[0] = bright + 1.402f * red_off;
+        band_list[1] = bright - 0.344136f * blue_off - 0.714136f * red_off;
+        band_list[2] = bright + 1.772f * blue_off;
+        for (band_index = 0; band_index < 3; ++band_index) {
+          float level = band_list[band_index] / 255.0f;
+          out_data[band_index] = level < 0.0f ? 0.0f : (level > 1.0f ? 1.0f : level);
+        }
+      }
+    }
+  code = APP_OKAY;
+
+jpeg_done:
+  for (part_index = 0; part_index < JPEG_PART_LIMIT; ++part_index)
+    mem_free(part_list[part_index].plane_data);
+  if (code != APP_OKAY) grid_free(grid_out);
+  return code;
+}
+
 /* Picks the reader from the leading bytes rather than the file name, because a
  * checkpoint's own sample images are as likely to be misnamed as anything. */
 static app_code image_read(const char *path_text, flat_grid *grid_out) {
@@ -3107,6 +3639,9 @@ static app_code image_read(const char *path_text, flat_grid *grid_out) {
     code = pnm_read(map.base_data, map.byte_count, grid_out);
   else if (map.byte_count >= 2 && map.base_data[0] == 'B' && map.base_data[1] == 'M')
     code = bmp_read(map.base_data, map.byte_count, grid_out);
+  else if (map.byte_count >= 3 && map.base_data[0] == 0xFF && map.base_data[1] == 0xD8 &&
+           map.base_data[2] == 0xFF)
+    code = jpeg_read(map.base_data, map.byte_count, grid_out);
   else
     code = APP_FAIL_SUPPORT;
   file_close(&map);
@@ -6909,6 +7444,7 @@ struct app_session {
   int lift_stride;
   int quant_stride;
   int head_stride;
+  int score_stride;
   int gate_stride;
   int rise_stride;
   int ple_stride;
@@ -6921,7 +7457,8 @@ struct app_session {
   float *key_room;
   float *value_room;
   float *blend_room;
-  float *score_room;
+  float *score_room;   /* one row of scores a head of the widest group */
+  float *cache_room;   /* one block of cached rows, decoded */
   float *gate_room;
   float *rise_room;
   float *cos_room;
@@ -6983,6 +7520,7 @@ static void session_free_rooms(app_session *session) {
   mem_free(session->value_room);
   mem_free(session->blend_room);
   mem_free(session->score_room);
+  mem_free(session->cache_room);
   mem_free(session->gate_room);
   mem_free(session->rise_room);
   mem_free(session->cos_room);
@@ -7177,6 +7715,42 @@ static void cache_add(const uint8_t *code_list, const float *grid, float weight_
     blend_data[slot] += weight_value * grid[code_list[slot]];
 }
 
+/* A run of cached rows for one key-value head, laid out as floats.
+ *
+ * A side held as bytes is decoded through the layer's table, which hands back
+ * exactly the float the float cache held; a side held as floats is copied,
+ * which only arises where an export calibrates one of the two and not the
+ * other.  Either way what lands here is what a head would have read for
+ * itself, so nothing downstream can tell which side it came from.
+ *
+ * The run is small on purpose: `CACHE_BLOCK_BYTES` of floats, so every head of
+ * the group reads it out of the first level cache rather than out of the
+ * store. */
+#define CACHE_BLOCK_BYTES 8192
+
+static void cache_block(const void *store_data, const float *grid, int cache_span, int place_first,
+                        int row_count, int kv_index, int head_size, int kv_width, float *out_data) {
+  int row_index;
+  for (row_index = 0; row_index < row_count; ++row_index) {
+    size_t slot_first = (size_t)((place_first + row_index) % cache_span) * (size_t)kv_width +
+                        (size_t)kv_index * (size_t)head_size;
+    float *row_out = out_data + (size_t)row_index * (size_t)head_size;
+    if (grid) {
+      const uint8_t *code_list = (const uint8_t *)store_data + slot_first;
+      int slot;
+      for (slot = 0; slot < head_size; ++slot) row_out[slot] = grid[code_list[slot]];
+    } else {
+      memcpy(row_out, (const float *)store_data + slot_first, sizeof(float) * (size_t)head_size);
+    }
+  }
+}
+
+/* How many rows one block holds, given how wide a row is. */
+static int cache_block_rows(int head_size) {
+  int row_count = (int)(CACHE_BLOCK_BYTES / (sizeof(float) * (size_t)head_size));
+  return row_count < 1 ? 1 : row_count;
+}
+
 /* Lay one row into the key or value cache.
  *
  * The export calibrates a static range a layer for each of them — a single
@@ -7214,6 +7788,91 @@ static void cache_lay(app_session *session, int layer_index, size_t slot_first, 
      * where the read runs over the whole span, and the divide is what the float
      * round trip through the grid did, so the two storages agree to the bit. */
     for (index = 0; index < width; ++index) code_list[index] = cache_code8(row[index] / scale);
+  }
+}
+
+/* Whether a layer reads its cache blocked by row rather than by head.
+ *
+ * The one thing that has to hold is that more than one head reads the same
+ * cached row; where a head has its own row there is nothing to divide and the
+ * block would be a copy for its own sake.  It was written for the byte cache,
+ * where a read is a table lookup and the block spends one per row instead of
+ * one per row per head, but a cache held as floats gains by it too — the block
+ * is a run the heads read out of the first level cache where the store is a
+ * sweep of hundreds of kilobytes per head — so it is not asked which storage
+ * the layer is on. */
+static int session_attend_wide(const layer_wing *wing) { return wing->group_share >= 2; }
+
+/* One lane's heads, blocked by cached row rather than by head.
+ *
+ * This export ships one key-value head against eight attention heads, so
+ * `group_share` is eight: all eight score against the same cached key row and
+ * blend the same cached value row.  Taken head by head, as the loop below this
+ * one takes them, a byte cache decodes every one of those bytes eight times —
+ * eight table reads where one would do.  Taken this way round a run of rows is
+ * decoded once into a block that stays in the first level cache and every head
+ * of the group reads it there, which divides the decode work by the share
+ * without giving back any of the storage the byte cache collects, and which
+ * serves every backend rather than only the one whose table read is a gather.
+ *
+ * The block hands each head exactly the floats it would have looked up for
+ * itself, and the dot and the blend here are the kernels the float cache always
+ * used, so a score and a blend come out bit for bit what they were.  What it
+ * costs is a score row per head of the group rather than one, which is what
+ * `score_stride` sizes.  A layer whose share is one has nothing to divide and
+ * does not come here. */
+static void session_attend_group(app_session *session, int layer_index, const float *query_lane,
+                                 float *blend_lane, int place_start, int span_count) {
+  app_model *model = session->model;
+  layer_wing *wing = &model->wing_list[layer_index];
+  int owner_slot = wing->share_flag ? wing->source_slot : layer_index;
+  layer_wing *owner = &model->wing_list[owner_slot];
+  const float *key_grid = session->key_grid[owner_slot];
+  const float *value_grid = session->value_grid[owner_slot];
+  int head_size = wing->head_size;
+  int kv_width = wing->kv_count * head_size;
+  int block_rows = cache_block_rows(head_size);
+  int kv_index, head_local, row_index, span_from, value_index;
+
+  for (kv_index = 0; kv_index < wing->kv_count; ++kv_index) {
+    int head_first = kv_index * wing->group_share;
+    for (span_from = 0; span_from < span_count; span_from += block_rows) {
+      int block_count = span_count - span_from < block_rows ? span_count - span_from : block_rows;
+      cache_block(session->key_store[owner_slot], key_grid, owner->cache_span,
+                  place_start + span_from, block_count, kv_index, head_size, kv_width,
+                  session->cache_room);
+      for (head_local = 0; head_local < wing->group_share; ++head_local) {
+        const float *query_head = query_lane + (size_t)(head_first + head_local) * head_size;
+        float *score_head = session->score_room + (size_t)head_local * session->score_stride;
+        for (row_index = 0; row_index < block_count; ++row_index)
+          score_head[span_from + row_index] =
+              kern_dot_real(session->cache_room + (size_t)row_index * head_size, STORE_F32,
+                            query_head, head_size);
+      }
+    }
+    for (head_local = 0; head_local < wing->group_share; ++head_local) {
+      float *blend_head = blend_lane + (size_t)(head_first + head_local) * head_size;
+      model->desk.soft_max(&model->desk,
+                           session->score_room + (size_t)head_local * session->score_stride,
+                           span_count);
+      for (value_index = 0; value_index < head_size; ++value_index) blend_head[value_index] = 0.0f;
+    }
+    for (span_from = 0; span_from < span_count; span_from += block_rows) {
+      int block_count = span_count - span_from < block_rows ? span_count - span_from : block_rows;
+      cache_block(session->value_store[owner_slot], value_grid, owner->cache_span,
+                  place_start + span_from, block_count, kv_index, head_size, kv_width,
+                  session->cache_room);
+      for (head_local = 0; head_local < wing->group_share; ++head_local) {
+        float *blend_head = blend_lane + (size_t)(head_first + head_local) * head_size;
+        const float *score_head = session->score_room + (size_t)head_local * session->score_stride;
+        for (row_index = 0; row_index < block_count; ++row_index) {
+          const float *value_row = session->cache_room + (size_t)row_index * head_size;
+          float weight_value = score_head[span_from + row_index];
+          for (value_index = 0; value_index < head_size; ++value_index)
+            blend_head[value_index] += weight_value * value_row[value_index];
+        }
+      }
+    }
   }
 }
 
@@ -7279,6 +7938,14 @@ static void session_attend(app_session *session, int layer_index, int place_from
     if (wing->kind_mark == MODEL_KIND_SLIDE) {
       place_start = place_index - form->slide_span + 1;
       if (place_start < 0) place_start = 0;
+    }
+    /* Blocked by cached row where a group of heads shares one, and head by
+     * head where each head has its own.  The two reach the same numbers to the
+     * bit; `session_attend_group` says why the first is the cheaper read. */
+    if (session_attend_wide(wing)) {
+      session_attend_group(session, layer_index, query_lane, blend_lane, place_start,
+                           place_index - place_start + 1);
+      continue;
     }
     for (head_index = 0; head_index < form->head_count; ++head_index) {
       const float *query_head = query_lane + (size_t)head_index * head_size;
@@ -8187,6 +8854,7 @@ app_code session_open(app_model *model, app_session **session_out) {
   model_form *form;
   int layer_index;
   int head_peak = 0, inner_peak = 0, half_peak = 0, wide_peak;
+  int group_peak = 1, block_peak;
   int setup_bits;
 
   if (!model || !session_out) return APP_FAIL_ARGUMENT;
@@ -8201,6 +8869,7 @@ app_code session_open(app_model *model, app_session **session_out) {
     layer_wing *wing = &model->wing_list[layer_index];
     if (wing->head_size > head_peak) head_peak = wing->head_size;
     if (wing->inner_size > inner_peak) inner_peak = wing->inner_size;
+    if (wing->group_share > group_peak) group_peak = wing->group_share;
   }
   if (form->moe_flag && 2 * form->expert_inner > inner_peak) inner_peak = 2 * form->expert_inner;
   half_peak = head_peak / 2 + 1;
@@ -8254,6 +8923,11 @@ app_code session_open(app_model *model, app_session **session_out) {
   session->lift_stride = wide_peak;
   session->quant_stride = wide_peak + inner_peak;
   session->head_stride = form->head_count * head_peak;
+  /* One row of scores a head of the widest group, because the blocked read
+   * scores a whole group against one decoded block before any of them is
+   * softmaxed.  A session that never blocks keeps one row and the rest is a
+   * few megabytes beside a cache measured in gigabytes. */
+  session->score_stride = form->window_limit + 1;
   session->gate_stride = inner_peak + form->ple_size + 1;
   session->rise_stride = inner_peak + 1;
   session->ple_stride = form->layer_count * form->ple_size + 1;
@@ -8266,7 +8940,10 @@ app_code session_open(app_model *model, app_session **session_out) {
   session->key_room = LANE_ROOM(session->head_stride);
   session->value_room = LANE_ROOM(session->head_stride);
   session->blend_room = LANE_ROOM(session->head_stride);
-  session->score_room = (float *)mem_clear(sizeof(float) * (size_t)(form->window_limit + 1));
+  session->score_room =
+      (float *)mem_clear(sizeof(float) * (size_t)session->score_stride * (size_t)group_peak);
+  block_peak = cache_block_rows(head_peak) * head_peak;
+  session->cache_room = (float *)mem_clear(sizeof(float) * (size_t)block_peak);
   session->gate_room = LANE_ROOM(session->gate_stride);
   session->rise_room = LANE_ROOM(session->rise_stride);
   session->cos_room = (float *)mem_clear(sizeof(float) * (size_t)half_peak);
@@ -8294,7 +8971,7 @@ app_code session_open(app_model *model, app_session **session_out) {
 
   if (!session->state_room || !session->scrap_room || !session->lift_room || !session->quant_room ||
       !session->query_room || !session->key_room || !session->value_room || !session->blend_room ||
-      !session->score_room || !session->gate_room || !session->rise_room || !session->cos_room ||
+      !session->score_room || !session->cache_room || !session->gate_room || !session->rise_room || !session->cos_room ||
       !session->sin_room || !session->ple_seed || !session->ple_room || !session->logit_room ||
       !session->pick_room || !session->echo_room) {
     session_close(session);

@@ -336,8 +336,15 @@ floats or a run of samples.
   forms, non-interlaced. All five line filters are undone. Alpha is dropped
   rather than composited: inventing a background is a preprocessing choice
   this layer has no business making.
+- `jpeg_read` — baseline and extended sequential jpeg: the marker walk, a
+  canonical Huffman decode per component, dequantization, an eight by eight
+  inverse cosine transform, chroma upsampling at whatever the sampling factors
+  say, and YCbCr to RGB. Restart markers are stepped over. Progressive files
+  are refused the way the png reader refuses interlacing, because coefficients
+  arriving across several scans is a second decoder rather than a branch of
+  this one.
 - `pnm_read`, `bmp_read` — binary `P5`/`P6`, and uncompressed 24 or 32 bit
-  bitmaps. `image_read` picks between the three from the leading bytes rather
+  bitmaps. `image_read` picks between the four from the leading bytes rather
   than the file name.
 - `grid_scale` — a separable bicubic, the `a = -0.5` member of the family.
   The support widens with the reduction factor, so shrinking an image averages
@@ -710,6 +717,18 @@ it, which is what the reference does. Values carry a norm without a scale.
 When `attention_k_eq_v` is set, a full-attention layer has no `v_proj` and
 uses the raw pre-norm key projection as its values.
 
+The cache is read blocked by row rather than by head wherever a group of
+heads shares one — `session_attend_wide` is the question and
+`session_attend_group` is the read. This export ships one key-value head
+against eight attention heads, so all eight score against the same cached key
+row and blend the same cached value row; taken head by head that row is read
+eight times, and on a byte cache decoded eight times. Taken this way round a
+run of rows is laid into `cache_room` once, small enough to stay in the first
+level cache, and every head of the group reads it there. It costs a row of
+scores per head of the group rather than one, which is what `score_stride`
+sizes, and it hands each head exactly the floats it would have looked up for
+itself, so the scores and the blends are unchanged to the bit.
+
 When `enable_moe_block` is set, the dense MLP above is the shared expert and
 a routed branch runs beside it. `session_route` normalizes the pre-MLP
 residual without a scale, multiplies by `router.scale * hidden_size^-0.5`,
@@ -808,7 +827,7 @@ path.
 | `tokenizer.json`          | vocabulary, merges, special tokens              |
 | `preprocessor_config.json` | the audio analysis window, when present        |
 | `processor_config.json`   | the clip's soft token budget, when present      |
-| `.png`, `.pnm`, `.bmp`    | a picture for the vision tower                  |
+| `.png`, `.jpg`, `.pnm`, `.bmp` | a picture for the vision tower             |
 | `.wav`                    | a clip for the audio tower                      |
 
 ## 6. Testing
@@ -827,14 +846,24 @@ miniature checkpoint — config, tokenizer, and every tensor the loader binds,
 once dense and once with a mixture block — and asserts that a batched prefill
 reaches exactly the logits produced by feeding the same tokens one at a time.
 
-`test_puff`, `test_image`, `test_scale`, `test_wave` and `test_mel` cover the
-media layer. The inflate reader is held against a stored block assembled in the
+`test_puff`, `test_image`, `test_jpeg`, `test_scale`, `test_wave` and
+`test_mel` cover the media layer. The inflate reader is held against a stored block assembled in the
 test and against a dynamic Huffman block produced by an independent compressor
 over four hundred bytes the test can regenerate from a formula; a truncated
 stream and one that would overrun its room are both required to be refused. The
 png fixture is a twelve by eight picture written by an independent encoder with
 the five line filters used in turn, and the same picture is written again as a
-pnm and as a bottom-up bitmap, so the three readers are held to one answer. The
+pnm and as a bottom-up bitmap, so the three readers are held to one answer.
+`test_jpeg` carries a baseline encoder of its own — its own forward transform
+in double precision, its own canonical code assignment, its own bit writer —
+and quantizes with tables of ones, so a round trip loses only what the two
+transforms round and the pixels can be held to within a level or two of the
+pixels that went in. Its Huffman table is deliberately not the specification's:
+eight to twelve bits over all 256 symbols, an incomplete code no encoder in the
+wild produces. A grey file, a three component file, a file whose chroma is at
+half the horizontal sampling, and a file broken by a restart marker after every
+unit all have to come back as the same picture; a progressive frame header and
+a truncated entropy stream both have to be refused. The
 resize is checked four ways: a constant survives in both directions, a ramp
 stays a straight line where the taps fit, the separable implementation matches a
 direct two dimensional gather, and folding three bands onto one takes the luma
