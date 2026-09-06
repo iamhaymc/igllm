@@ -218,6 +218,16 @@ float        session_cache_peak(const app_session *session, int layer_index, int
  * native, and it is refused rather than restored where the shapes it was
  * written from disagree with the session reading it.
  *
+ * `kind_mark` says which of two things the file is, because a session cannot
+ * tell from the cache alone and the two are resumed differently.  A prompt is
+ * saved before its first token is sampled, so it is one id short of the prompt
+ * it holds — the id `session_step` was about to be fed — and what it is for is
+ * to be matched against the front of a later prompt and primed onto.  A
+ * conversation is saved after an answer, holds every id of it, and what it is
+ * for is to have the next turn framed onto it.  A caller that read one where it
+ * wanted the other would drop an id or repeat a turn, so `session_load` hands
+ * the mark back and the caller checks it.
+ *
  * `stamp_value` is written beside the cache and handed back unread.  The ids
  * alone cannot say that a picture in a prompt is the same picture — two
  * pictures lay down the same placeholder ids — so what identifies the rest of
@@ -226,8 +236,12 @@ float        session_cache_peak(const app_session *session, int layer_index, int
  * `session_ids` hands back the ids a session holds, which is how a caller finds
  * out whether the prompt it is about to run begins with the one in the file.
  * It returns the count it needs when the room given is too small. */
-app_code    session_save(const app_session *session, const char *path_text, uint64_t stamp_value);
-app_code    session_load(app_session *session, const char *path_text, uint64_t *stamp_out);
+#define APP_KEEP_PROMPT 0 /* a prompt primed and not yet answered */
+#define APP_KEEP_TALK   1 /* a conversation the model has answered in */
+app_code    session_save(const app_session *session, const char *path_text, uint64_t stamp_value,
+                         int kind_mark);
+app_code    session_load(app_session *session, const char *path_text, uint64_t *stamp_out,
+                         int *kind_out);
 int         session_ids(const app_session *session, int32_t *id_list, int id_limit);
 
 size_t       session_cache_room(const app_session *session);
@@ -1367,6 +1381,19 @@ static int64_t whole_read(const void *base_data, store_type type_kind, size_t sl
   }
 }
 
+/* This engine is little-endian by decision rather than by accident.  The
+ * checkpoint is mapped and read where it lies: `real_read` casts the mapped
+ * bytes to a `float` or a `uint16_t`, and the packed code stream below is a
+ * dense little-endian bit field the kernels index directly.  A big-endian host
+ * would not read the weights wrongly in one place but in every one of them, so
+ * there is nothing for a kernel to gain by being careful about it on its own.
+ * Where the compiler will say which it is, this says so before anything is
+ * built against the wrong assumption. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#  error "igllm maps the checkpoint where it lies and wants a little-endian host"
+#endif
+
 /* Reads one element from a dense little-endian bit stream of `bit_count` fields. */
 static uint32_t pack_read(const uint8_t *code_data, size_t element_index, int bit_count) {
   size_t bit_start = element_index * (size_t)bit_count;
@@ -1725,20 +1752,35 @@ static const float kern_code_two[256][4] = {KERN_CODE_TWO_64(0), KERN_CODE_TWO_6
  * seven bytes and eight shifts, against `pack_read`'s walk per code — and it
  * leaves the codes in the shape every other width's vector path wants.
  *
- * The word is assembled a byte at a time rather than read as one: the packing
- * is defined by the bit stream, and reading it as an integer would be defined
- * by the host's byte order. */
-static uint64_t kern_code_word(const uint8_t *word_head, int bit_count) {
+ * The word is one load where the run still has eight bytes ahead of it.  The
+ * packing is a dense little-endian bit stream and the host is little-endian —
+ * which is stated once, beside `pack_read`, rather than worked around here —
+ * so the eight bytes are the word already, and the bits above the block's own
+ * `bit_count` of them are never reached by a shift a block takes.  Assembling
+ * it a byte at a time was costing a fifth of the loop at three bits and rather
+ * more of it at seven.
+ *
+ * The tail is the exception, and the reason `run_end` is carried at all: a
+ * block at the end of a row has as few as three bytes behind it, and the five
+ * beyond them may be past the end of the mapping rather than merely past the
+ * end of the row.  There the word is assembled from its own bytes as it always
+ * was, which is a handful of blocks a row against the thousands that are
+ * not. */
+static uint64_t kern_code_word(const uint8_t *word_head, const uint8_t *run_end, int bit_count) {
   uint64_t word_value = 0;
   int part_index;
+  if (word_head + 8 <= run_end) {
+    memcpy(&word_value, word_head, sizeof(word_value));
+    return word_value;
+  }
   for (part_index = 0; part_index < bit_count; ++part_index)
     word_value |= (uint64_t)word_head[part_index] << (8 * part_index);
   return word_value;
 }
 
-static void kern_code_eight(const uint8_t *word_head, int bit_count, uint32_t code_mask,
-                            int code_flip, int32_t *code_out) {
-  uint64_t word_value = kern_code_word(word_head, bit_count);
+static void kern_code_eight(const uint8_t *word_head, const uint8_t *run_end, int bit_count,
+                            uint32_t code_mask, int code_flip, int32_t *code_out) {
+  uint64_t word_value = kern_code_word(word_head, run_end, bit_count);
   int part_index;
   for (part_index = 0; part_index < 8; ++part_index)
     code_out[part_index] = (int32_t)((((uint32_t)(word_value >> (bit_count * part_index))) &
@@ -2009,6 +2051,9 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
    * against 3.97 tuned and 1.62 default. */
   if (kern_code_odd(bit_count, from_index)) {
     const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
+    /* The bytes this run is certainly inside: the codes begin on a byte
+     * boundary, so the whole ones of them are the run's own. */
+    const uint8_t *run_end = byte_head + (size_t)span_count * (size_t)bit_count / 8u;
     const uint32_t code_mask = (1u << bit_count) - 1u;
 #if defined(APP_SIMD_AVX2)
     {
@@ -2030,7 +2075,7 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
         int part_index;
         for (part_index = 0; part_index < 2; ++part_index) {
           __m256i base_data = _mm256_set1_epi64x(
-              (long long)kern_code_word(word_head + part_index * bit_count, bit_count));
+              (long long)kern_code_word(word_head + part_index * bit_count, run_end, bit_count));
           __m256i part_low = _mm256_and_si256(_mm256_srlv_epi64(base_data, shift_low), mask_wide);
           __m256i part_high = _mm256_and_si256(_mm256_srlv_epi64(base_data, shift_high), mask_wide);
           /* Four codes a vector sit in the low half of each sixty-four bit
@@ -2062,8 +2107,9 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
       for (; slot + 16 <= span_count; slot += 16) {
         const uint8_t *word_head = byte_head + (size_t)(slot / 8) * (size_t)bit_count;
         int part_index;
-        kern_code_eight(word_head, bit_count, code_mask, code_flip, code_room);
-        kern_code_eight(word_head + bit_count, bit_count, code_mask, code_flip, code_room + 8);
+        kern_code_eight(word_head, run_end, bit_count, code_mask, code_flip, code_room);
+        kern_code_eight(word_head + bit_count, run_end, bit_count, code_mask, code_flip,
+                        code_room + 8);
         for (part_index = 0; part_index < 16; part_index += 2) {
           sum_a += (float)code_room[part_index] * act_data[slot + part_index];
           sum_b += (float)code_room[part_index + 1] * act_data[slot + part_index + 1];
@@ -2241,12 +2287,13 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
 
   if (kern_code_odd(bit_count, from_index)) {
     const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
+    const uint8_t *run_end = byte_head + (size_t)span_count * (size_t)bit_count / 8u;
     const uint32_t code_mask = (1u << bit_count) - 1u;
     int32_t code_room[8];
     int part_index;
     for (; slot + 8 <= span_count; slot += 8) {
-      kern_code_eight(byte_head + (size_t)(slot / 8) * (size_t)bit_count, bit_count, code_mask,
-                      code_flip, code_room);
+      kern_code_eight(byte_head + (size_t)(slot / 8) * (size_t)bit_count, run_end, bit_count,
+                      code_mask, code_flip, code_room);
       for (part_index = 0; part_index < 8; ++part_index)
         out_data[slot + part_index] = (float)code_room[part_index];
     }
@@ -2545,20 +2592,264 @@ static void kern_gelu_gate(float *gate_list, const float *rise_list, int value_c
     gate_list[value_index] = kern_gelu_tanh(gate_list[value_index]) * rise_list[value_index];
 }
 
+/* The exponential a softmax needs, to within a bit of the last, without a call
+ * into libm.
+ *
+ * A picture's attention is a billion of these — a patch pair a head a layer, at
+ * the full patch budget — and a call a value is what left the softmax the
+ * largest thing in a picture that is not a matrix product.  What replaces the
+ * call is the definition.  `e^x` is `2^k` times `e^r`, where `k` is the whole
+ * number nearest `x / ln 2` and `r` is what is left over, never further from
+ * zero than half of `ln 2`.  Over that range the series for `e^r` is finished
+ * after eight terms — the ninth is five parts in a thousand million of the
+ * value, an eighth of the last bit a float carries — and `2^k` is an exponent
+ * field written straight into the word.
+ *
+ * `ln 2` is taken off in two pieces because `k * ln2` in one piece rounds away
+ * the low bits of `x` that the remainder is made of.  The first piece is exact
+ * in a float — its significand is eleven bits — so `x - k * high` is exact too,
+ * and the second piece carries the rest of the constant.
+ *
+ * Only a softmax reaches this, and a softmax has already taken its own peak off
+ * every value, so every argument is at most zero and the total is at least one.
+ * An argument below where a float stops being normal is therefore floored
+ * rather than allowed to reach a subnormal: either way it is a part in ten to
+ * the thirty-eighth of a total of at least one.
+ *
+ * The four paths agree to the last bit except where one of them has a fused
+ * multiply-add and another does not, which is the same difference the dot
+ * product kernels already carry. */
+#define KERN_EXP_FLOOR (-87.0f) /* below this `e^x` is under the smallest normal */
+#define KERN_EXP_LOG2E 1.4426950408889634f
+#define KERN_EXP_LN2_HIGH 0.693359375f /* 1419/2048, exact in a float */
+#define KERN_EXP_LN2_LOW (-2.1219444005469057e-4f)
+
+/* The series in Horner's order, over the eight terms the half-`ln 2` range
+ * needs.  Written as reciprocals of the factorials the definition names rather
+ * than as a fitted set, so there is nothing here to have copied wrong. */
+#define KERN_EXP_TERM_7 (1.0f / 5040.0f)
+#define KERN_EXP_TERM_6 (1.0f / 720.0f)
+#define KERN_EXP_TERM_5 (1.0f / 120.0f)
+#define KERN_EXP_TERM_4 (1.0f / 24.0f)
+#define KERN_EXP_TERM_3 (1.0f / 6.0f)
+#define KERN_EXP_TERM_2 (1.0f / 2.0f)
+
+static float kern_exp_near(float value_now) {
+  float step_value, whole_value, rest_value, poly_value, scale_value;
+  uint32_t word_value;
+  if (value_now < KERN_EXP_FLOOR) value_now = KERN_EXP_FLOOR;
+  step_value = value_now * KERN_EXP_LOG2E + 0.5f;
+  /* A floor without a call: truncation gives the ceiling of a negative, so the
+   * one that overshot steps back.  The argument is never above a half here, so
+   * the whole part always fits an int. */
+  whole_value = (float)(int)step_value;
+  if (whole_value > step_value) whole_value -= 1.0f;
+  rest_value = value_now - whole_value * KERN_EXP_LN2_HIGH;
+  rest_value -= whole_value * KERN_EXP_LN2_LOW;
+  poly_value = KERN_EXP_TERM_7;
+  poly_value = poly_value * rest_value + KERN_EXP_TERM_6;
+  poly_value = poly_value * rest_value + KERN_EXP_TERM_5;
+  poly_value = poly_value * rest_value + KERN_EXP_TERM_4;
+  poly_value = poly_value * rest_value + KERN_EXP_TERM_3;
+  poly_value = poly_value * rest_value + KERN_EXP_TERM_2;
+  poly_value = poly_value * rest_value + 1.0f;
+  poly_value = poly_value * rest_value + 1.0f;
+  word_value = (uint32_t)((int)whole_value + 127) << 23;
+  memcpy(&scale_value, &word_value, sizeof(scale_value));
+  return poly_value * scale_value;
+}
+
+#if defined(APP_SIMD_AVX2)
+static __m256 kern_exp_wide(__m256 wide_value) {
+  __m256 step_value, whole_value, rest_value, poly_value, scale_value;
+  wide_value = _mm256_max_ps(wide_value, _mm256_set1_ps(KERN_EXP_FLOOR));
+  step_value = _mm256_fmadd_ps(wide_value, _mm256_set1_ps(KERN_EXP_LOG2E), _mm256_set1_ps(0.5f));
+  whole_value = _mm256_cvtepi32_ps(_mm256_cvttps_epi32(step_value));
+  whole_value = _mm256_sub_ps(
+      whole_value, _mm256_and_ps(_mm256_cmp_ps(whole_value, step_value, _CMP_GT_OQ),
+                                 _mm256_set1_ps(1.0f)));
+  rest_value = _mm256_fnmadd_ps(whole_value, _mm256_set1_ps(KERN_EXP_LN2_HIGH), wide_value);
+  rest_value = _mm256_fnmadd_ps(whole_value, _mm256_set1_ps(KERN_EXP_LN2_LOW), rest_value);
+  poly_value = _mm256_set1_ps(KERN_EXP_TERM_7);
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(KERN_EXP_TERM_6));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(KERN_EXP_TERM_5));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(KERN_EXP_TERM_4));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(KERN_EXP_TERM_3));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(KERN_EXP_TERM_2));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(1.0f));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(1.0f));
+  scale_value = _mm256_castsi256_ps(_mm256_slli_epi32(
+      _mm256_add_epi32(_mm256_cvttps_epi32(whole_value), _mm256_set1_epi32(127)), 23));
+  return _mm256_mul_ps(poly_value, scale_value);
+}
+#elif defined(APP_SIMD_SSE2)
+static __m128 kern_exp_wide(__m128 wide_value) {
+  __m128 step_value, whole_value, rest_value, poly_value, scale_value;
+  wide_value = _mm_max_ps(wide_value, _mm_set1_ps(KERN_EXP_FLOOR));
+  step_value = _mm_add_ps(_mm_mul_ps(wide_value, _mm_set1_ps(KERN_EXP_LOG2E)), _mm_set1_ps(0.5f));
+  whole_value = _mm_cvtepi32_ps(_mm_cvttps_epi32(step_value));
+  whole_value = _mm_sub_ps(
+      whole_value, _mm_and_ps(_mm_cmpgt_ps(whole_value, step_value), _mm_set1_ps(1.0f)));
+  rest_value =
+      _mm_sub_ps(wide_value, _mm_mul_ps(whole_value, _mm_set1_ps(KERN_EXP_LN2_HIGH)));
+  rest_value =
+      _mm_sub_ps(rest_value, _mm_mul_ps(whole_value, _mm_set1_ps(KERN_EXP_LN2_LOW)));
+  poly_value = _mm_set1_ps(KERN_EXP_TERM_7);
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(KERN_EXP_TERM_6));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(KERN_EXP_TERM_5));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(KERN_EXP_TERM_4));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(KERN_EXP_TERM_3));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(KERN_EXP_TERM_2));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(1.0f));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(1.0f));
+  scale_value = _mm_castsi128_ps(
+      _mm_slli_epi32(_mm_add_epi32(_mm_cvttps_epi32(whole_value), _mm_set1_epi32(127)), 23));
+  return _mm_mul_ps(poly_value, scale_value);
+}
+#elif defined(APP_SIMD_NEON)
+static float32x4_t kern_exp_wide(float32x4_t wide_value) {
+  float32x4_t step_value, whole_value, rest_value, poly_value, scale_value;
+  wide_value = vmaxq_f32(wide_value, vdupq_n_f32(KERN_EXP_FLOOR));
+  step_value = vaddq_f32(vmulq_f32(wide_value, vdupq_n_f32(KERN_EXP_LOG2E)), vdupq_n_f32(0.5f));
+  whole_value = vcvtq_f32_s32(vcvtq_s32_f32(step_value));
+  whole_value = vsubq_f32(
+      whole_value, vreinterpretq_f32_u32(vandq_u32(vcgtq_f32(whole_value, step_value),
+                                                   vreinterpretq_u32_f32(vdupq_n_f32(1.0f)))));
+  rest_value = vmlsq_f32(wide_value, whole_value, vdupq_n_f32(KERN_EXP_LN2_HIGH));
+  rest_value = vmlsq_f32(rest_value, whole_value, vdupq_n_f32(KERN_EXP_LN2_LOW));
+  poly_value = vdupq_n_f32(KERN_EXP_TERM_7);
+  poly_value = vmlaq_f32(vdupq_n_f32(KERN_EXP_TERM_6), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(KERN_EXP_TERM_5), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(KERN_EXP_TERM_4), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(KERN_EXP_TERM_3), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(KERN_EXP_TERM_2), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(1.0f), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(1.0f), poly_value, rest_value);
+  scale_value = vreinterpretq_f32_s32(
+      vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(whole_value), vdupq_n_s32(127)), 23));
+  return vmulq_f32(poly_value, scale_value);
+}
+#endif
+
+/* The peak, the exponentials and their total, and the scaling: three passes,
+ * each of them a lane at a time where the host has lanes.  The total is
+ * gathered in as many accumulators as the widest load, so a long row's sum is
+ * associated differently from the scalar path's — which is the same trade the
+ * dot product kernels make, and below what the last bit of a float carries. */
 static void kern_soft_max(float *value_list, int value_count) {
   float peak_value = -FLT_MAX;
   float total_value = 0.0f;
-  int value_index;
-  for (value_index = 0; value_index < value_count; ++value_index)
+  int value_index = 0;
+#if defined(APP_SIMD_AVX2)
+  if (value_count >= 8) {
+    __m256 wide_peak = _mm256_loadu_ps(value_list);
+    __m256 wide_total = _mm256_setzero_ps();
+    for (value_index = 8; value_index + 8 <= value_count; value_index += 8)
+      wide_peak = _mm256_max_ps(wide_peak, _mm256_loadu_ps(value_list + value_index));
+    {
+      __m128 half_peak = _mm_max_ps(_mm256_castps256_ps128(wide_peak),
+                                    _mm256_extractf128_ps(wide_peak, 1));
+      half_peak = _mm_max_ps(half_peak, _mm_movehl_ps(half_peak, half_peak));
+      half_peak = _mm_max_ss(half_peak, _mm_shuffle_ps(half_peak, half_peak, 0x55));
+      peak_value = _mm_cvtss_f32(half_peak);
+    }
+    for (; value_index < value_count; ++value_index)
+      if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+    wide_peak = _mm256_set1_ps(peak_value);
+    for (value_index = 0; value_index + 8 <= value_count; value_index += 8) {
+      __m256 wide_step =
+          kern_exp_wide(_mm256_sub_ps(_mm256_loadu_ps(value_list + value_index), wide_peak));
+      _mm256_storeu_ps(value_list + value_index, wide_step);
+      wide_total = _mm256_add_ps(wide_total, wide_step);
+    }
+    total_value = kern_wide_total(wide_total);
+  } else {
+    for (; value_index < value_count; ++value_index)
+      if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+    value_index = 0;
+  }
+#elif defined(APP_SIMD_SSE2) || defined(APP_SIMD_NEON)
+  if (value_count >= 4) {
+#  if defined(APP_SIMD_SSE2)
+    __m128 wide_peak = _mm_loadu_ps(value_list);
+    __m128 wide_total = _mm_setzero_ps();
+    for (value_index = 4; value_index + 4 <= value_count; value_index += 4)
+      wide_peak = _mm_max_ps(wide_peak, _mm_loadu_ps(value_list + value_index));
+    {
+      __m128 half_peak = _mm_max_ps(wide_peak, _mm_movehl_ps(wide_peak, wide_peak));
+      half_peak = _mm_max_ss(half_peak, _mm_shuffle_ps(half_peak, half_peak, 0x55));
+      peak_value = _mm_cvtss_f32(half_peak);
+    }
+    for (; value_index < value_count; ++value_index)
+      if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+    wide_peak = _mm_set1_ps(peak_value);
+    for (value_index = 0; value_index + 4 <= value_count; value_index += 4) {
+      __m128 wide_step =
+          kern_exp_wide(_mm_sub_ps(_mm_loadu_ps(value_list + value_index), wide_peak));
+      _mm_storeu_ps(value_list + value_index, wide_step);
+      wide_total = _mm_add_ps(wide_total, wide_step);
+    }
+    total_value = kern_wide_total(wide_total);
+#  else
+    float32x4_t wide_peak = vld1q_f32(value_list);
+    float32x4_t wide_total = vdupq_n_f32(0.0f);
+    for (value_index = 4; value_index + 4 <= value_count; value_index += 4)
+      wide_peak = vmaxq_f32(wide_peak, vld1q_f32(value_list + value_index));
+    peak_value = vgetq_lane_f32(wide_peak, 0);
+    if (vgetq_lane_f32(wide_peak, 1) > peak_value) peak_value = vgetq_lane_f32(wide_peak, 1);
+    if (vgetq_lane_f32(wide_peak, 2) > peak_value) peak_value = vgetq_lane_f32(wide_peak, 2);
+    if (vgetq_lane_f32(wide_peak, 3) > peak_value) peak_value = vgetq_lane_f32(wide_peak, 3);
+    for (; value_index < value_count; ++value_index)
+      if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+    wide_peak = vdupq_n_f32(peak_value);
+    for (value_index = 0; value_index + 4 <= value_count; value_index += 4) {
+      float32x4_t wide_step =
+          kern_exp_wide(vsubq_f32(vld1q_f32(value_list + value_index), wide_peak));
+      vst1q_f32(value_list + value_index, wide_step);
+      wide_total = vaddq_f32(wide_total, wide_step);
+    }
+    total_value = kern_wide_total(wide_total);
+#  endif
+  } else {
+    for (; value_index < value_count; ++value_index)
+      if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+    value_index = 0;
+  }
+#else
+  for (; value_index < value_count; ++value_index)
     if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
-  for (value_index = 0; value_index < value_count; ++value_index) {
-    value_list[value_index] = expf(value_list[value_index] - peak_value);
+  value_index = 0;
+#endif
+  for (; value_index < value_count; ++value_index) {
+    value_list[value_index] = kern_exp_near(value_list[value_index] - peak_value);
     total_value += value_list[value_index];
   }
   if (total_value > 0.0f) {
     float shrink_value = 1.0f / total_value;
-    for (value_index = 0; value_index < value_count; ++value_index)
-      value_list[value_index] *= shrink_value;
+    value_index = 0;
+#if defined(APP_SIMD_AVX2)
+    {
+      __m256 wide_shrink = _mm256_set1_ps(shrink_value);
+      for (; value_index + 8 <= value_count; value_index += 8)
+        _mm256_storeu_ps(value_list + value_index,
+                         _mm256_mul_ps(_mm256_loadu_ps(value_list + value_index), wide_shrink));
+    }
+#elif defined(APP_SIMD_SSE2)
+    {
+      __m128 wide_shrink = _mm_set1_ps(shrink_value);
+      for (; value_index + 4 <= value_count; value_index += 4)
+        _mm_storeu_ps(value_list + value_index,
+                      _mm_mul_ps(_mm_loadu_ps(value_list + value_index), wide_shrink));
+    }
+#elif defined(APP_SIMD_NEON)
+    {
+      float32x4_t wide_shrink = vdupq_n_f32(shrink_value);
+      for (; value_index + 4 <= value_count; value_index += 4)
+        vst1q_f32(value_list + value_index,
+                  vmulq_f32(vld1q_f32(value_list + value_index), wide_shrink));
+    }
+#endif
+    for (; value_index < value_count; ++value_index) value_list[value_index] *= shrink_value;
   }
 }
 
@@ -3325,13 +3616,23 @@ static app_code bmp_read(const uint8_t *file_data, size_t file_size, flat_grid *
 
 /* -- jpeg ----------------------------------------------------------------- */
 
-/* A baseline jpeg reader: the marker walk, a canonical Huffman decode per
- * component, dequantization against the tables `DQT` carried, an eight by eight
- * inverse cosine transform, chroma upsampling at whatever the sampling factors
- * say, and YCbCr to RGB.  Restart markers are handled; progressive files are
- * refused the way the png reader refuses interlacing, because coefficients
- * arriving across several scans with successive approximation is a second
- * decoder rather than a fourth branch of this one.
+/* A jpeg reader: the marker walk, a canonical Huffman decode per component,
+ * dequantization against the tables `DQT` carried, an eight by eight inverse
+ * cosine transform, chroma upsampling at whatever the sampling factors say, and
+ * the colour transform the frame's components and its `APP14` segment name.
+ * Baseline, extended sequential and progressive frames are read, at eight or
+ * twelve bits of precision, over one, three or four components.  Restart
+ * markers are handled in every one of them.
+ *
+ * Sequential and progressive are two decoders sharing this marker walk.  A
+ * sequential block is final when its scan has read it, so it is dequantized and
+ * transformed where it is read and nothing outlives it.  A progressive block
+ * arrives across several scans with successive approximation, so the frame's
+ * whole coefficient store is held in `coef_data` until the last scan lands and
+ * the transform is one pass over the store at the end.  What the two share
+ * besides the walk is the Huffman decode, the bit reader, the transform, the
+ * upsampling and the colour transform; what is progressive's alone is the
+ * store, the four scan kinds and the end-of-band run.
  *
  * Nothing here is borrowed.  `stb_image.h` was read for where a decoder has to
  * make a choice rather than follow the specification — what to do with a marker
@@ -3366,7 +3667,12 @@ typedef struct jpeg_tree {
 } jpeg_tree;
 
 /* The entropy stream: bits most significant first, `FF 00` standing for a
- * literal `FF`, and any other `FF` being the marker that ends the run. */
+ * literal `FF`, and any other `FF` being the marker that ends the run.
+ *
+ * `band_left` is the end-of-band run a progressive scan is inside — how many
+ * more blocks the last end-of-band code stands for.  It is a property of the
+ * scan rather than of a component because a run carries across the blocks of
+ * the one component a band scan walks, and a restart marker ends it. */
 typedef struct jpeg_scan {
   const uint8_t *from_data;
   size_t         from_size;
@@ -3374,18 +3680,23 @@ typedef struct jpeg_scan {
   uint32_t       bit_room;
   int            bit_count;
   int            mark_flag; /* the run reached a marker and is feeding zeros */
+  int32_t        band_left;
 } jpeg_scan;
 
 typedef struct jpeg_part {
-  int      id_mark;
-  int      wide_share, high_share; /* sampling factors */
-  int      quant_slot;
-  int      dc_slot, ac_slot;
-  int      wide_size, high_size;   /* samples this component actually carries */
-  int      line_bytes;             /* stride of the plane below */
-  int      high_room;              /* rows of the plane below */
-  int      last_dc;                /* the running dc predictor */
-  uint8_t *plane_data;
+  int       id_mark;
+  int       wide_share, high_share; /* sampling factors */
+  int       quant_slot;
+  int       dc_slot, ac_slot;
+  int       wide_size, high_size;   /* samples this component actually carries */
+  int       wide_blocks, high_blocks; /* blocks the frame holds, edge padding in */
+  int       line_step;              /* stride in samples of the plane below */
+  int       high_room;              /* rows of the plane below */
+  int       last_dc;                /* the running dc predictor */
+  uint16_t *plane_data;
+  int32_t  *coef_data;              /* progressive only, in the sent order */
+  uint16_t  quant_own[64];          /* the table as it stood when a scan claimed it */
+  int       quant_kept;
 } jpeg_part;
 
 /* One bit, or a zero once the run has reached its marker.
@@ -3472,8 +3783,10 @@ static void jpeg_basis_fill(float *basis_data) {
   }
 }
 
-static void jpeg_block_turn(const float *basis_data, const float *coef_data, uint8_t *into_data,
-                            int line_bytes) {
+/* The level shift is half the range the frame's precision names, so the same
+ * transform serves an eight bit frame and a twelve bit one. */
+static void jpeg_block_turn(const float *basis_data, const float *coef_data, uint16_t *into_data,
+                            int line_step, int level_mid, int peak_value) {
   float mid_list[64];
   int row_index, slot_index, freq_index;
   for (row_index = 0; row_index < 8; ++row_index)
@@ -3489,21 +3802,23 @@ static void jpeg_block_turn(const float *basis_data, const float *coef_data, uin
       int level_value;
       for (freq_index = 0; freq_index < 8; ++freq_index)
         total += basis_data[freq_index * 8 + row_index] * mid_list[freq_index * 8 + slot_index];
-      level_value = (int)(total + 128.5f); /* the level shift and the one rounding */
+      level_value = (int)(total + (float)level_mid + 0.5f); /* the level shift and the one rounding */
       if (level_value < 0) level_value = 0;
-      if (level_value > 255) level_value = 255;
-      into_data[(size_t)row_index * (size_t)line_bytes + (size_t)slot_index] =
-          (uint8_t)level_value;
+      if (level_value > peak_value) level_value = peak_value;
+      into_data[(size_t)row_index * (size_t)line_step + (size_t)slot_index] =
+          (uint16_t)level_value;
     }
 }
 
-/* One block: the dc difference against the component's running predictor, then
- * the ac coefficients as run-length pairs, dequantized where they land and
- * transformed straight into the component's plane.  Sequential means a block is
- * final when its scan has read it, so no coefficient buffer outlives this. */
+/* One sequential block: the dc difference against the component's running
+ * predictor, then the ac coefficients as run-length pairs, dequantized where
+ * they land and transformed straight into the component's plane.  Sequential
+ * means a block is final when its scan has read it, so no coefficient buffer
+ * outlives this. */
 static int jpeg_block_read(jpeg_scan *scan, jpeg_part *part, const jpeg_tree *dc_tree,
                            const jpeg_tree *ac_tree, const uint16_t *quant_list,
-                           const float *basis_data, uint8_t *into_data, int line_bytes) {
+                           const float *basis_data, uint16_t *into_data, int line_step,
+                           int level_mid, int peak_value) {
   float coef_list[64];
   int sign_value, slot_index;
 
@@ -3531,17 +3846,152 @@ static int jpeg_block_read(jpeg_scan *scan, jpeg_part *part, const jpeg_tree *dc
         (float)jpeg_wide(jpeg_take(scan, size_value), size_value) * (float)quant_list[slot_index];
     slot_index += 1;
   }
-  jpeg_block_turn(basis_data, coef_list, into_data, line_bytes);
+  jpeg_block_turn(basis_data, coef_list, into_data, line_step, level_mid, peak_value);
   return 1;
 }
 
+/* The four progressive scan kinds, each over one block of the coefficient
+ * store, which holds the coefficients in the order the stream sends them —
+ * the same order the quantization table is stored in, so the two are indexed
+ * alike and the zigzag is undone once, at the transform.
+ *
+ * A first scan of a band writes the bits it carries at the position the scan
+ * header names; a refining scan of the same band adds one bit below what is
+ * already there.  Which of the two a scan is, is the scan header's `Ah`: zero
+ * for the first, the position the last scan wrote for a refinement. */
+
+static int jpeg_wave_dc_first(jpeg_scan *scan, jpeg_part *part, const jpeg_tree *dc_tree,
+                              int32_t *block_data, int low_bit) {
+  int size_value = jpeg_sign(scan, dc_tree);
+  if (size_value < 0 || size_value > 16) return 0;
+  part->last_dc += jpeg_wide(jpeg_take(scan, size_value), size_value);
+  block_data[0] = (int32_t)((uint32_t)part->last_dc << low_bit);
+  return 1;
+}
+
+static void jpeg_wave_dc_next(jpeg_scan *scan, int32_t *block_data, int low_bit) {
+  if (jpeg_bit(scan)) block_data[0] |= (int32_t)(1u << low_bit);
+}
+
+/* A band's first scan.  Runs of zeros and a coefficient, as a sequential block
+ * sends them, except that the run of zeros can also stand for a run of whole
+ * blocks — the end-of-band code, whose length is the two to the power of its
+ * run field plus that many appended bits. */
+static int jpeg_wave_ac_first(jpeg_scan *scan, const jpeg_tree *ac_tree, int32_t *block_data,
+                              int from_slot, int upto_slot, int low_bit) {
+  int slot_index = from_slot;
+  if (scan->band_left > 0) {
+    scan->band_left -= 1;
+    return 1;
+  }
+  while (slot_index <= upto_slot) {
+    int sign_value = jpeg_sign(scan, ac_tree), run_value, size_value;
+    if (sign_value < 0) return 0;
+    run_value = (sign_value >> 4) & 15;
+    size_value = sign_value & 15;
+    if (size_value != 0) {
+      slot_index += run_value;
+      if (slot_index > upto_slot) return 0;
+      block_data[slot_index] =
+          (int32_t)((uint32_t)jpeg_wide(jpeg_take(scan, size_value), size_value) << low_bit);
+      slot_index += 1;
+    } else if (run_value != 15) {
+      scan->band_left = (int32_t)(1u << run_value);
+      if (run_value) scan->band_left += (int32_t)jpeg_take(scan, run_value);
+      scan->band_left -= 1; /* this block is the first member of the run */
+      break;
+    } else {
+      slot_index += 16;
+    }
+  }
+  return 1;
+}
+
+/* A band's refinement.  Every coefficient the earlier scans left nonzero
+ * carries one correction bit, in band order, wherever the walk passes it; the
+ * run field counts only the coefficients they left zero, and a newly nonzero
+ * coefficient lands after that many of them.  The magnitude a refinement can
+ * introduce is one bit, so a size field other than one is a broken file. */
+static int jpeg_wave_ac_next(jpeg_scan *scan, const jpeg_tree *ac_tree, int32_t *block_data,
+                             int from_slot, int upto_slot, int low_bit) {
+  int32_t step_up = (int32_t)(1u << low_bit);
+  int slot_index = from_slot;
+  if (scan->band_left == 0) {
+    while (slot_index <= upto_slot) {
+      int sign_value = jpeg_sign(scan, ac_tree), run_value, size_value;
+      int32_t new_value = 0;
+      if (sign_value < 0) return 0;
+      run_value = (sign_value >> 4) & 15;
+      size_value = sign_value & 15;
+      if (size_value != 0) {
+        if (size_value != 1) return 0;
+        new_value = jpeg_bit(scan) ? step_up : -step_up;
+      } else if (run_value != 15) {
+        scan->band_left = (int32_t)(1u << run_value);
+        if (run_value) scan->band_left += (int32_t)jpeg_take(scan, run_value);
+        break; /* the tail below carries this block's corrections and counts it */
+      }
+      while (slot_index <= upto_slot) {
+        if (block_data[slot_index] != 0) {
+          if (jpeg_bit(scan) && (block_data[slot_index] & step_up) == 0)
+            block_data[slot_index] += block_data[slot_index] >= 0 ? step_up : -step_up;
+        } else {
+          if (run_value == 0) break;
+          run_value -= 1;
+        }
+        slot_index += 1;
+      }
+      if (new_value != 0) {
+        if (slot_index > upto_slot) return 0;
+        block_data[slot_index] = new_value;
+      }
+      slot_index += 1;
+    }
+  }
+  if (scan->band_left > 0) {
+    while (slot_index <= upto_slot) {
+      if (block_data[slot_index] != 0) {
+        if (jpeg_bit(scan) && (block_data[slot_index] & step_up) == 0)
+          block_data[slot_index] += block_data[slot_index] >= 0 ? step_up : -step_up;
+      }
+      slot_index += 1;
+    }
+    scan->band_left -= 1;
+  }
+  return 1;
+}
+
+/* The pass a progressive frame ends with: every block of the store dequantized
+ * against the table its component claimed, and transformed into the plane the
+ * upsampler reads. */
+static void jpeg_part_send(const jpeg_part *part, const float *basis_data, int level_mid,
+                           int peak_value) {
+  int block_x, block_y, slot_index;
+  for (block_y = 0; block_y < part->high_blocks; ++block_y)
+    for (block_x = 0; block_x < part->wide_blocks; ++block_x) {
+      const int32_t *coef_from =
+          part->coef_data +
+          ((size_t)block_y * (size_t)part->wide_blocks + (size_t)block_x) * 64u;
+      float coef_list[64];
+      for (slot_index = 0; slot_index < 64; ++slot_index)
+        coef_list[jpeg_zig_list[slot_index]] =
+            (float)coef_from[slot_index] * (float)part->quant_own[slot_index];
+      jpeg_block_turn(basis_data, coef_list,
+                      part->plane_data + (size_t)block_y * 8u * (size_t)part->line_step +
+                          (size_t)block_x * 8u,
+                      part->line_step, level_mid, peak_value);
+    }
+}
+
 /* Steps over a restart marker: the run is byte aligned again, the predictors
- * start from zero, and the two bytes must be `FF D0` through `FF D7`. */
+ * and any end-of-band run start from zero, and the two bytes must be `FF D0`
+ * through `FF D7`. */
 static int jpeg_restart(jpeg_scan *scan, jpeg_part *part_list, int part_count) {
   size_t walk = scan->from_walk;
   int part_index;
   scan->bit_count = 0;
   scan->mark_flag = 0;
+  scan->band_left = 0;
   while (walk + 1 < scan->from_size && scan->from_data[walk] == 0xFF &&
          scan->from_data[walk + 1] == 0xFF)
     walk += 1; /* fill bytes before the marker */
@@ -3570,7 +4020,7 @@ static float jpeg_part_at(const jpeg_part *part, int wide_peak, int high_peak, i
   float high_part = high_spot - (float)high_from;
   int wide_upto = wide_from + 1, high_upto = high_from + 1;
   float near_row, far_row;
-  const uint8_t *plane_data = part->plane_data;
+  const uint16_t *plane_data = part->plane_data;
 
   if (wide_from < 0) wide_from = 0;
   if (high_from < 0) high_from = 0;
@@ -3579,8 +4029,8 @@ static float jpeg_part_at(const jpeg_part *part, int wide_peak, int high_peak, i
   if (wide_from > wide_upto) wide_from = wide_upto;
   if (high_from > high_upto) high_from = high_upto;
   {
-    const uint8_t *near_data = plane_data + (size_t)high_from * (size_t)part->line_bytes;
-    const uint8_t *far_data = plane_data + (size_t)high_upto * (size_t)part->line_bytes;
+    const uint16_t *near_data = plane_data + (size_t)high_from * (size_t)part->line_step;
+    const uint16_t *far_data = plane_data + (size_t)high_upto * (size_t)part->line_step;
     near_row = (float)near_data[wide_from] +
                ((float)near_data[wide_upto] - (float)near_data[wide_from]) * wide_part;
     far_row = (float)far_data[wide_from] +
@@ -3597,6 +4047,9 @@ static app_code jpeg_read(const uint8_t *file_data, size_t file_size, flat_grid 
   int wide_count = 0, high_count = 0, part_count = 0;
   int wide_peak = 1, high_peak = 1, mcu_wide = 0, mcu_high = 0;
   int rest_span = 0, frame_flag = 0, scan_flag = 0, band_count;
+  int wave_flag = 0;                        /* the frame is progressive */
+  int deep_count = 8, level_mid = 128, peak_value = 255;
+  int adobe_flag = 0, adobe_turn = 0, turn_mark = 1;
   int quant_have[JPEG_QUANT_LIMIT];
   int part_index, wide_index, high_index, slot_index;
   size_t walk = 2;
@@ -3669,9 +4122,23 @@ static app_code jpeg_read(const uint8_t *file_data, size_t file_size, flat_grid 
     } else if (mark_value == 0xDD) { /* restart interval */
       if (body_size < 2) goto jpeg_done;
       rest_span = ((int)file_data[body_from] << 8) | file_data[body_from + 1];
-    } else if (mark_value == 0xC0 || mark_value == 0xC1) { /* baseline, extended sequential */
+    } else if (mark_value == 0xEE) { /* Adobe APP14: which colour space the bands are in */
+      /* `Adobe`, a version, two flag words and the transform byte.  It is the
+       * only thing in the file that says whether three bands are YCbCr or RGB
+       * and whether four are CMYK or YCCK, and it is also what says the four
+       * are written inverted, because every writer that emits it inverts. */
+      if (body_size >= 12 && memcmp(file_data + body_from, "Adobe", 5) == 0) {
+        adobe_flag = 1;
+        adobe_turn = file_data[body_from + 11];
+      }
+    } else if (mark_value == 0xC0 || mark_value == 0xC1 || mark_value == 0xC2) {
+      /* baseline, extended sequential, progressive — all Huffman coded */
       if (frame_flag || body_size < 6) goto jpeg_done;
-      if (file_data[body_from] != 8) { code = APP_FAIL_SUPPORT; goto jpeg_done; }
+      deep_count = file_data[body_from];
+      if (deep_count != 8 && deep_count != 12) { code = APP_FAIL_SUPPORT; goto jpeg_done; }
+      level_mid = 1 << (deep_count - 1);
+      peak_value = (1 << deep_count) - 1;
+      wave_flag = mark_value == 0xC2;
       high_count = ((int)file_data[body_from + 1] << 8) | file_data[body_from + 2];
       wide_count = ((int)file_data[body_from + 3] << 8) | file_data[body_from + 4];
       part_count = file_data[body_from + 5];
@@ -3680,10 +4147,13 @@ static app_code jpeg_read(const uint8_t *file_data, size_t file_size, flat_grid 
         code = APP_FAIL_SUPPORT;
         goto jpeg_done;
       }
-      /* One band or three.  A four component file is CMYK or YCCK, which needs
-       * an inversion rule this reader has no way to check, so it is refused
-       * rather than guessed at. */
-      if (part_count != 1 && part_count != 3) { code = APP_FAIL_SUPPORT; goto jpeg_done; }
+      /* One band, three, or four.  Four is CMYK or YCCK, which is read through
+       * whatever `APP14` said and refused where it said nothing this reader
+       * can act on. */
+      if (part_count != 1 && part_count != 3 && part_count != 4) {
+        code = APP_FAIL_SUPPORT;
+        goto jpeg_done;
+      }
       if (body_size < 6u + 3u * (size_t)part_count) goto jpeg_done;
       for (part_index = 0; part_index < part_count; ++part_index) {
         const uint8_t *note_data = file_data + body_from + 6 + (size_t)part_index * 3;
@@ -3706,22 +4176,30 @@ static app_code jpeg_read(const uint8_t *file_data, size_t file_size, flat_grid 
         jpeg_part *part = &part_list[part_index];
         part->wide_size = (wide_count * part->wide_share + wide_peak - 1) / wide_peak;
         part->high_size = (high_count * part->high_share + high_peak - 1) / high_peak;
-        part->line_bytes = mcu_wide * part->wide_share * 8;
-        part->high_room = mcu_high * part->high_share * 8;
-        part->plane_data =
-            (uint8_t *)mem_clear((size_t)part->line_bytes * (size_t)part->high_room);
+        part->wide_blocks = mcu_wide * part->wide_share;
+        part->high_blocks = mcu_high * part->high_share;
+        part->line_step = part->wide_blocks * 8;
+        part->high_room = part->high_blocks * 8;
+        part->plane_data = (uint16_t *)mem_clear(sizeof(uint16_t) * (size_t)part->line_step *
+                                                 (size_t)part->high_room);
         if (!part->plane_data) { code = APP_FAIL_MEMORY; goto jpeg_done; }
+        if (wave_flag) {
+          part->coef_data = (int32_t *)mem_clear(sizeof(int32_t) * (size_t)part->wide_blocks *
+                                                 (size_t)part->high_blocks * 64u);
+          if (!part->coef_data) { code = APP_FAIL_MEMORY; goto jpeg_done; }
+        }
       }
       frame_flag = 1;
-    } else if (mark_value >= 0xC2 && mark_value <= 0xCF && mark_value != 0xC4 &&
+    } else if (mark_value >= 0xC3 && mark_value <= 0xCF && mark_value != 0xC4 &&
                mark_value != 0xC8 && mark_value != 0xCC) {
-      /* Progressive, lossless, arithmetic coded, hierarchical: each of them is
+      /* Lossless, differential, arithmetic coded, hierarchical: each of them is
        * another decoder rather than another branch of this one. */
       code = APP_FAIL_SUPPORT;
       goto jpeg_done;
     } else if (mark_value == 0xDA) { /* start of scan */
       jpeg_scan scan;
       int scan_count, unit_wide, unit_high, unit_index, unit_total, rest_left;
+      int band_from, band_upto, high_bit, low_bit;
       int scan_slot[JPEG_PART_LIMIT];
       if (!frame_flag || body_size < 1) goto jpeg_done;
       scan_count = file_data[body_from];
@@ -3742,13 +4220,41 @@ static app_code jpeg_read(const uint8_t *file_data, size_t file_size, flat_grid 
       }
       {
         const uint8_t *tail_data = file_data + body_from + 1 + (size_t)scan_count * 2;
-        /* A sequential scan carries the whole spectrum at full precision.
-         * Anything else is a progressive scan under a baseline frame header. */
-        if (tail_data[0] != 0 || tail_data[1] != 63 || tail_data[2] != 0) {
-          code = APP_FAIL_SUPPORT;
-          goto jpeg_done;
+        band_from = tail_data[0];
+        band_upto = tail_data[1];
+        high_bit = tail_data[2] >> 4;
+        low_bit = tail_data[2] & 15;
+        if (!wave_flag) {
+          /* A sequential scan carries the whole spectrum at full precision.
+           * Anything else is a progressive scan under a sequential frame
+           * header, which is a file this reader has no frame shape for. */
+          if (band_from != 0 || band_upto != 63 || tail_data[2] != 0) {
+            code = APP_FAIL_SUPPORT;
+            goto jpeg_done;
+          }
+        } else {
+          if (band_upto > 63 || band_from > band_upto || low_bit > 13) goto jpeg_done;
+          if (high_bit != 0 && high_bit != low_bit + 1) goto jpeg_done;
+          /* The dc scan is the only one that may interleave components; a band
+           * above it walks one component's own blocks. */
+          if (band_from == 0) {
+            if (band_upto != 0) goto jpeg_done;
+          } else if (scan_count != 1) {
+            goto jpeg_done;
+          }
         }
       }
+      /* A progressive component's coefficients are dequantized at the end of
+       * the file rather than where they are read, so which table stood when its
+       * first scan claimed it is the one that has to be kept. */
+      if (wave_flag)
+        for (slot_index = 0; slot_index < scan_count; ++slot_index) {
+          jpeg_part *part = &part_list[scan_slot[slot_index]];
+          if (part->quant_kept) continue;
+          if (!quant_have[part->quant_slot]) goto jpeg_done;
+          memcpy(part->quant_own, quant_list[part->quant_slot], sizeof(part->quant_own));
+          part->quant_kept = 1;
+        }
       memset(&scan, 0, sizeof(scan));
       scan.from_data = file_data;
       scan.from_size = file_size;
@@ -3785,19 +4291,45 @@ static app_code jpeg_read(const uint8_t *file_data, size_t file_size, flat_grid 
           int wide_span = scan_count == 1 ? 1 : part->wide_share;
           int high_span = scan_count == 1 ? 1 : part->high_share;
           int block_x, block_y;
-          if (!dc_tree->have_flag || !ac_tree->have_flag) goto jpeg_done;
           if (!quant_have[part->quant_slot]) goto jpeg_done;
+          if (!wave_flag && (!dc_tree->have_flag || !ac_tree->have_flag)) goto jpeg_done;
+          if (wave_flag && band_from == 0 && high_bit == 0 && !dc_tree->have_flag) goto jpeg_done;
+          if (wave_flag && band_from != 0 && !ac_tree->have_flag) goto jpeg_done;
           for (block_y = 0; block_y < high_span; ++block_y)
             for (block_x = 0; block_x < wide_span; ++block_x) {
               int into_x = (unit_x * wide_span + block_x) * 8;
               int into_y = (unit_y * high_span + block_y) * 8;
-              if (into_x + 8 > part->line_bytes || into_y + 8 > part->high_room) goto jpeg_done;
-              if (!jpeg_block_read(&scan, part, dc_tree, ac_tree, quant_list[part->quant_slot],
-                                   basis_list,
-                                   part->plane_data + (size_t)into_y * (size_t)part->line_bytes +
-                                       (size_t)into_x,
-                                   part->line_bytes))
-                goto jpeg_done;
+              if (into_x + 8 > part->line_step || into_y + 8 > part->high_room) goto jpeg_done;
+              if (!wave_flag) {
+                if (!jpeg_block_read(&scan, part, dc_tree, ac_tree, quant_list[part->quant_slot],
+                                     basis_list,
+                                     part->plane_data + (size_t)into_y * (size_t)part->line_step +
+                                         (size_t)into_x,
+                                     part->line_step, level_mid, peak_value))
+                  goto jpeg_done;
+                continue;
+              }
+              {
+                int32_t *block_data =
+                    part->coef_data +
+                    ((size_t)(into_y / 8) * (size_t)part->wide_blocks + (size_t)(into_x / 8)) * 64u;
+                if (band_from == 0) {
+                  if (high_bit == 0) {
+                    if (!jpeg_wave_dc_first(&scan, part, dc_tree, block_data, low_bit))
+                      goto jpeg_done;
+                  } else {
+                    jpeg_wave_dc_next(&scan, block_data, low_bit);
+                  }
+                } else if (high_bit == 0) {
+                  if (!jpeg_wave_ac_first(&scan, ac_tree, block_data, band_from, band_upto,
+                                          low_bit))
+                    goto jpeg_done;
+                } else {
+                  if (!jpeg_wave_ac_next(&scan, ac_tree, block_data, band_from, band_upto,
+                                         low_bit))
+                    goto jpeg_done;
+                }
+              }
             }
         }
         rest_left -= 1;
@@ -3816,41 +4348,83 @@ static app_code jpeg_read(const uint8_t *file_data, size_t file_size, flat_grid 
   }
 
   if (!frame_flag || !scan_flag) goto jpeg_done;
-  band_count = part_count == 3 ? 3 : 1;
+  if (wave_flag)
+    for (part_index = 0; part_index < part_count; ++part_index) {
+      jpeg_part *part = &part_list[part_index];
+      /* A component no scan ever named has no coefficients and no claim on a
+       * table; the frame is incomplete rather than grey. */
+      if (!part->quant_kept) goto jpeg_done;
+      jpeg_part_send(part, basis_list, level_mid, peak_value);
+    }
+
+  /* Which colour space the bands are in.  Three bands are YCbCr unless `APP14`
+   * or the component ids say otherwise; four are CMYK or YCCK and only `APP14`
+   * can say which, so a four band file without one is refused rather than
+   * guessed at — and so is a transform value this reader has no rule for. */
+  if (part_count == 3) {
+    turn_mark = adobe_flag ? adobe_turn
+                           : ((part_list[0].id_mark == 'R' && part_list[1].id_mark == 'G' &&
+                               part_list[2].id_mark == 'B')
+                                  ? 0
+                                  : 1);
+    if (turn_mark != 0 && turn_mark != 1) { code = APP_FAIL_SUPPORT; goto jpeg_done; }
+  } else if (part_count == 4) {
+    if (!adobe_flag) { code = APP_FAIL_SUPPORT; goto jpeg_done; }
+    turn_mark = adobe_turn;
+    if (turn_mark != 0 && turn_mark != 2) { code = APP_FAIL_SUPPORT; goto jpeg_done; }
+  }
+
+  band_count = part_count == 1 ? 1 : 3;
   code = grid_open(grid_out, wide_count, high_count, band_count);
   if (code != APP_OKAY) goto jpeg_done;
   for (high_index = 0; high_index < high_count; ++high_index)
     for (wide_index = 0; wide_index < wide_count; ++wide_index) {
       float *out_data = grid_at(grid_out, high_index, wide_index);
+      float band_list[4];
+      int band_index;
       if (band_count == 1) {
         out_data[0] = jpeg_part_at(&part_list[0], wide_peak, high_peak, wide_index, high_index) /
-                      255.0f;
+                      (float)peak_value;
         continue;
       }
-      {
+      for (part_index = 0; part_index < part_count; ++part_index)
+        band_list[part_index] =
+            jpeg_part_at(&part_list[part_index], wide_peak, high_peak, wide_index, high_index);
+      if (turn_mark != 0) {
         /* The colour transform the format's own conversion clause names, with
-         * the chroma pair centred on zero first. */
-        float bright = jpeg_part_at(&part_list[0], wide_peak, high_peak, wide_index, high_index);
-        float blue_off =
-            jpeg_part_at(&part_list[1], wide_peak, high_peak, wide_index, high_index) - 128.0f;
-        float red_off =
-            jpeg_part_at(&part_list[2], wide_peak, high_peak, wide_index, high_index) - 128.0f;
-        float band_list[3];
-        int band_index;
+         * the chroma pair centred on zero first.  Under YCCK the three it
+         * turns are the ink bands rather than the picture's own. */
+        float bright = band_list[0];
+        float blue_off = band_list[1] - (float)level_mid;
+        float red_off = band_list[2] - (float)level_mid;
         band_list[0] = bright + 1.402f * red_off;
         band_list[1] = bright - 0.344136f * blue_off - 0.714136f * red_off;
         band_list[2] = bright + 1.772f * blue_off;
+      }
+      if (part_count == 4) {
+        /* Four bands are ink, and every writer that ships the `APP14` this
+         * reader insisted on writes them inverted — a band at its peak is no
+         * ink at all — so the picture is the product of the three with the
+         * black, and no separate inversion is needed. */
         for (band_index = 0; band_index < 3; ++band_index) {
-          float level = band_list[band_index] / 255.0f;
-          out_data[band_index] = level < 0.0f ? 0.0f : (level > 1.0f ? 1.0f : level);
+          float level = band_list[band_index];
+          if (level < 0.0f) level = 0.0f;
+          if (level > (float)peak_value) level = (float)peak_value;
+          band_list[band_index] = level * band_list[3] / (float)peak_value;
         }
+      }
+      for (band_index = 0; band_index < 3; ++band_index) {
+        float level = band_list[band_index] / (float)peak_value;
+        out_data[band_index] = level < 0.0f ? 0.0f : (level > 1.0f ? 1.0f : level);
       }
     }
   code = APP_OKAY;
 
 jpeg_done:
-  for (part_index = 0; part_index < JPEG_PART_LIMIT; ++part_index)
+  for (part_index = 0; part_index < JPEG_PART_LIMIT; ++part_index) {
     mem_free(part_list[part_index].plane_data);
+    mem_free(part_list[part_index].coef_data);
+  }
   if (code != APP_OKAY) grid_free(grid_out);
   return code;
 }
@@ -9091,8 +9665,20 @@ static int token_frame_inner(const app_model *model, const app_part *part_list, 
  * handed back by `session_load`.  The engine never reads it: the ids alone
  * cannot say that a picture in the prompt is the same picture, because two
  * pictures lay down the same placeholder ids, and the caller is the one that
- * knows what it fed. */
-#define KEEP_MARK_TEXT "igllm cache 1\n\0\0"
+ * knows what it fed.
+ *
+ * `kind_mark` is written beside it and is read, at least far enough to hand it
+ * back.  What it distinguishes is not two file layouts but two moments: a
+ * prompt saved before its answer is one id short of what it holds and is meant
+ * to be primed onto, and a conversation saved after one holds every id and is
+ * meant to be framed onto.  The cache is the same either way, which is why
+ * nothing but this word tells them apart and why a caller that reads the wrong
+ * one gets a turn that drops an id rather than an error.
+ *
+ * The mark text carries a version because this word was not in the first
+ * layout: a file written before it is refused rather than read as a prompt it
+ * might not be. */
+#define KEEP_MARK_TEXT "igllm cache 2\n\0\0"
 #define KEEP_MARK_SIZE 16
 
 static uint64_t keep_mix(uint64_t mark_value, uint64_t value_now) {
@@ -9135,12 +9721,14 @@ static int keep_row_count(const app_session *session, const layer_wing *wing) {
   return fill_count < wing->cache_span ? fill_count : wing->cache_span;
 }
 
-app_code session_save(const app_session *session, const char *path_text, uint64_t stamp_value) {
+app_code session_save(const app_session *session, const char *path_text, uint64_t stamp_value,
+                      int kind_mark) {
   FILE *handle;
-  uint64_t head_list[6];
+  uint64_t head_list[7];
   int layer_index;
   app_code code = APP_OKAY;
   if (!session || !path_text) return APP_FAIL_ARGUMENT;
+  if (kind_mark != APP_KEEP_PROMPT && kind_mark != APP_KEEP_TALK) return APP_FAIL_ARGUMENT;
   handle = fopen(path_text, "wb");
   if (!handle) return APP_FAIL_MISSING;
   head_list[0] = keep_mark(session);
@@ -9149,8 +9737,9 @@ app_code session_save(const app_session *session, const char *path_text, uint64_
   head_list[3] = (uint64_t)session->echo_count;
   head_list[4] = (uint64_t)session->model->form.layer_count;
   head_list[5] = (uint64_t)session->model->setup.cache_bits;
+  head_list[6] = (uint64_t)kind_mark;
   if (fwrite(KEEP_MARK_TEXT, 1, KEEP_MARK_SIZE, handle) != KEEP_MARK_SIZE ||
-      fwrite(head_list, sizeof(uint64_t), 6, handle) != 6)
+      fwrite(head_list, sizeof(uint64_t), 7, handle) != 7)
     code = APP_FAIL_FORMAT;
   if (code == APP_OKAY && session->echo_count > 0 &&
       fwrite(session->echo_room, sizeof(int32_t), (size_t)session->echo_count, handle) !=
@@ -9183,19 +9772,25 @@ app_code session_save(const app_session *session, const char *path_text, uint64_
   return code;
 }
 
-app_code session_load(app_session *session, const char *path_text, uint64_t *stamp_out) {
+app_code session_load(app_session *session, const char *path_text, uint64_t *stamp_out,
+                      int *kind_out) {
   FILE *handle;
   char mark_room[KEEP_MARK_SIZE];
-  uint64_t head_list[6];
+  uint64_t head_list[7];
   int layer_index, fill_count, echo_count;
   app_code code = APP_OKAY;
   if (!session || !path_text) return APP_FAIL_ARGUMENT;
   if (stamp_out) *stamp_out = 0;
+  if (kind_out) *kind_out = APP_KEEP_PROMPT;
   handle = fopen(path_text, "rb");
   if (!handle) return APP_FAIL_MISSING;
   if (fread(mark_room, 1, KEEP_MARK_SIZE, handle) != KEEP_MARK_SIZE ||
       memcmp(mark_room, KEEP_MARK_TEXT, KEEP_MARK_SIZE) != 0 ||
-      fread(head_list, sizeof(uint64_t), 6, handle) != 6) {
+      fread(head_list, sizeof(uint64_t), 7, handle) != 7) {
+    fclose(handle);
+    return APP_FAIL_FORMAT;
+  }
+  if (head_list[6] != APP_KEEP_PROMPT && head_list[6] != APP_KEEP_TALK) {
     fclose(handle);
     return APP_FAIL_FORMAT;
   }
@@ -9251,6 +9846,7 @@ app_code session_load(app_session *session, const char *path_text, uint64_t *sta
   }
   session->echo_count = echo_count;
   if (stamp_out) *stamp_out = head_list[1];
+  if (kind_out) *kind_out = (int)head_list[6];
   return APP_OKAY;
 }
 
