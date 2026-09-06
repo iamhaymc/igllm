@@ -747,6 +747,14 @@ blends them. The two branches carry `post_feedforward_layernorm_1` and
 rather than copying it. The mixture branch stays one lane wide, because each
 token picks its own experts.
 
+`token_frame_next` is the same frame for a turn that follows one the model has
+already answered. What a session has been fed stays in its cache, so a later
+turn lays down only what comes after it: the id that closed the model's turn —
+which the sampler stopped on and never fed back — and then the same user turn
+and the same opening the model answers into. Feeding a session two turns in two
+calls reaches, to the bit, what feeding one session the whole transcript in one
+call reaches, which is what `test_turn` asserts.
+
 `session_prime` consumes every prompt token but the last in batches of
 `KERN_LANE_LIMIT`, skipping the output head for each, because those logits
 are never read. Batching turns each projection into a matrix product: a group
@@ -821,6 +829,13 @@ An image or a clip enters as a bracketed run of placeholder ids with one
 embedding row laid against each placeholder; everything after that is the text
 path.
 
+A turn is one pass of that diagram. `chat --loop` runs it again on the same
+session — `main_talk_turn` frames the next turn with `token_frame_next`, primes
+it onto the cache the last turn left, and answers — and holds up to sixteen
+sessions on the one loaded model, which `/new`, `/talk` and `/drop` move
+between. They run one at a time: the sessions are independent, and the fork and
+join pool the kernels underneath them reach is not.
+
 ## 5. Formats read
 
 | file                      | needed for                                     |
@@ -850,6 +865,12 @@ parameter lands on the right rows, and `test_wing` writes a complete
 miniature checkpoint — config, tokenizer, and every tensor the loader binds,
 once dense and once with a mixture block — and asserts that a batched prefill
 reaches exactly the logits produced by feeding the same tokens one at a time.
+
+`test_turn` covers the turn after the first: that the later frame is the first
+frame with the document's opening traded for the close of the model's turn, that
+a session fed two turns in two calls reaches to the bit what one fed the whole
+transcript in one call reaches, and that a conversation reaches the same place
+whatever ran beside it on the same model.
 
 `test_puff`, `test_image`, `test_png_wide`, `test_jpeg`, `test_scale`,
 `test_wave` and `test_mel` cover the media layer. The inflate reader is held against a stored block assembled in the

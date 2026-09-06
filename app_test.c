@@ -3612,6 +3612,129 @@ static void test_tower(void) {
   mem_free(pack);
 }
 
+/* Turns after the first, and conversations beside each other on one model. */
+static void test_turn(void) {
+  app_setup setup = app_setup_plain();
+  app_model *model = NULL;
+  app_part part;
+  int32_t first_list[64], next_list[64], both_list[128];
+  int first_count, next_count, slot_index;
+  test_open("turn");
+  setup.thread_count = 2;
+  if (!test_wing_write(0)) {
+    test_true(0, "the synthetic checkpoint is written");
+    return;
+  }
+  if (model_load(test_yard_path, &setup, &model) != APP_OKAY || !model) {
+    test_true(0, "the checkpoint loads");
+    return;
+  }
+
+  part.kind_mark = APP_PART_TEXT;
+  part.text_ref = "hello world";
+  part.span_index = -1;
+  first_count = token_frame_parts(model, &part, 1, NULL, 0, first_list, 64);
+  next_count = token_frame_next(model, &part, 1, NULL, 0, next_list, 64);
+  test_true(first_count > 2, "a first turn lays a frame down");
+  test_true(next_count > 2, "a later turn lays a frame down");
+
+  /* The two frames say the same thing about the turn; what they differ in is
+   * what comes before it.  A first turn opens the document, a later one closes
+   * the model's turn — the id the sampler stopped on and never fed back. */
+  if (first_count > 2 && next_count > 2) {
+    int lead_count = next_count - (first_count - 1);
+    test_true(first_list[0] == 1, "a first turn opens the document");
+    test_true(next_list[0] == 4, "a later turn closes the model's turn first");
+    test_true(lead_count >= 1, "the close is what a later turn adds");
+    test_true(lead_count >= 1 && memcmp(next_list + lead_count, first_list + 1,
+                                        sizeof(int32_t) * (size_t)(first_count - 1)) == 0,
+              "past the close, a later turn is the first turn without its opening");
+  }
+
+  /* Continuing a conversation is the same arithmetic as having asked for the
+   * whole transcript at once: the cache holds the turns before, and a session
+   * that has been fed two turns in two calls reaches what one fed both in one
+   * call reaches, to the bit. */
+  if (first_count > 2 && next_count > 2 && first_count + next_count <= 128) {
+    app_session *step_session = NULL, *whole_session = NULL;
+    const float *logit_list;
+    float *keep_list = (float *)mem_clear(sizeof(float) * (size_t)model->head_sheet.row_count);
+    int okay_flag = 1;
+    memcpy(both_list, first_list, sizeof(int32_t) * (size_t)first_count);
+    memcpy(both_list + first_count, next_list, sizeof(int32_t) * (size_t)next_count);
+    test_true(session_open(model, &step_session) == APP_OKAY, "a conversation opens");
+    test_true(session_open(model, &whole_session) == APP_OKAY, "a second one opens beside it");
+    if (keep_list && step_session && whole_session) {
+      test_true(session_prime(step_session, first_list, first_count) == APP_OKAY,
+                "the first turn primes");
+      logit_list = session_step(step_session, first_list[first_count - 1]);
+      test_true(logit_list != NULL, "the first turn reaches the head");
+      test_true(session_fill(step_session) == first_count,
+                "a conversation holds the ids it was fed");
+      test_true(session_prime(step_session, next_list, next_count) == APP_OKAY,
+                "the second turn primes onto the first");
+      logit_list = session_step(step_session, next_list[next_count - 1]);
+      if (logit_list)
+        memcpy(keep_list, logit_list, sizeof(float) * (size_t)model->head_sheet.row_count);
+      test_true(logit_list != NULL, "the second turn reaches the head");
+
+      test_true(session_prime(whole_session, both_list, first_count + next_count) == APP_OKAY,
+                "the whole transcript primes at once");
+      logit_list = session_step(whole_session, both_list[first_count + next_count - 1]);
+      for (slot_index = 0; logit_list && slot_index < model->head_sheet.row_count; ++slot_index)
+        if (logit_list[slot_index] != keep_list[slot_index]) okay_flag = 0;
+      test_true(logit_list && okay_flag,
+                "two turns fed in turn reach what the whole transcript reaches");
+      test_true(session_fill(step_session) == session_fill(whole_session),
+                "and the two conversations hold the same number of ids");
+    }
+    mem_free(keep_list);
+
+    /* A conversation beside another is its own: what one is fed does not reach
+     * the other, which is the whole point of a model that many sessions share.
+     * They run one at a time, because the kernels underneath them reach one
+     * fork and join pool. */
+    if (step_session && whole_session) {
+      app_session *third_session = NULL;
+      const float *third_list;
+      float *keep_third = (float *)mem_clear(sizeof(float) * (size_t)model->head_sheet.row_count);
+      int same_flag = 1;
+      session_reset(whole_session);
+      test_true(session_prime(whole_session, first_list, first_count) == APP_OKAY,
+                "a reset conversation takes the first turn again");
+      third_list = session_step(whole_session, first_list[first_count - 1]);
+      if (keep_third && third_list)
+        memcpy(keep_third, third_list, sizeof(float) * (size_t)model->head_sheet.row_count);
+      test_true(session_open(model, &third_session) == APP_OKAY, "a third conversation opens");
+      if (third_session) {
+        int32_t other_list[4];
+        other_list[0] = 1;
+        other_list[1] = 7;
+        other_list[2] = 8;
+        other_list[3] = 9;
+        test_true(session_prime(third_session, other_list, 4) == APP_OKAY,
+                  "the third takes something else entirely");
+        session_step(third_session, other_list[3]);
+        test_true(session_fill(whole_session) == first_count && session_fill(third_session) == 4,
+                  "each conversation counts only what it was fed");
+        session_close(third_session);
+      }
+      session_reset(whole_session);
+      session_prime(whole_session, first_list, first_count);
+      third_list = session_step(whole_session, first_list[first_count - 1]);
+      for (slot_index = 0; keep_third && third_list && slot_index < model->head_sheet.row_count;
+           ++slot_index)
+        if (third_list[slot_index] != keep_third[slot_index]) same_flag = 0;
+      test_true(third_list && same_flag,
+                "a conversation reaches the same place whatever ran beside it");
+      mem_free(keep_third);
+    }
+    session_close(step_session);
+    session_close(whole_session);
+  }
+  model_free(model);
+}
+
 static void test_face(void) {
   app_setup setup = app_setup_plain();
   app_taste taste = app_taste_plain();
@@ -3889,6 +4012,7 @@ int main(void) {
   test_mel();
   test_wing();
   test_tower();
+  test_turn();
   test_face();
   test_shot();
 

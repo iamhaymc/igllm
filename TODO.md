@@ -86,8 +86,16 @@ third behind on one of them.
   twelve bits, which the extended sequential frame header allows, needs the
   tables and the level shift widened.
 
-- Support more than one concurrent session per model in the CLI, and add a
-  multi-turn chat loop rather than a single turn.
+- Run two conversations at the same time rather than one after the other. 0.8.5
+  gives the CLI several sessions on one model and a loop that takes turns in any
+  of them, and they take those turns one at a time: the sessions are
+  independent, but every kernel underneath them reaches the model's one
+  `pool_group`, which is a fork and join with no queue in it and one caller's to
+  be inside at a time. Two of them stepping at once would be two callers in that
+  fork. What it wants is either a pool a session owns — which costs a thread a
+  session and gives the host's cores to whoever asks first — or a queue in front
+  of the one pool, which is the shape a server wants anyway and is the larger
+  change. Neither is worth guessing at without a caller that needs it.
 - Persist and restore a session cache, so a long prompt need not be primed
   twice.
 - Widen `kern_dot_code` for the odd bit widths. Two, four and eight bits are

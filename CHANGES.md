@@ -2570,7 +2570,7 @@ before. That is an argument, not a run, and it is worth saying which.
 
 ---
 
-## 0.8.5 — the cache is read once for the heads that share it, and the pictures
+## 0.8.5 — the cache is read once for the heads that share it, the pictures, and the turns after the first
 
 ### Scope
 
@@ -2578,13 +2578,15 @@ before. That is an argument, not a run, and it is worth saying which.
 restructuring 0.8.4 arrived at while measuring the byte cache: eight heads read
 the same cached row and the loop read it eight times. The second was the reader
 that was missing — most pictures a caller actually has are jpeg, and `--image`
-refused all of them. The item under it, the range of png the reader would not
-take, is done here too.
+refused all of them. The two items under that one — the range of png the reader
+would not take, and the single turn the CLI would not go past — are done here
+too.
 
 The first moves no bit of any result and takes back almost all of what the byte
 cache cost. The second is a new decoder of about four hundred lines, and the
 third turns out to be one loop rather than two features; both have an encoder of
-their own beside them in the tests.
+their own beside them in the tests. The fourth needed one function in the engine
+and the rest in the front end.
 
 ### Reading a cached row once for all the heads that share it
 
@@ -2791,12 +2793,63 @@ the first two fixtures the suite wrote. The cross-check runs the other way round
 now: the suite's own fixtures are read back by libpng, thirteen of them
 interlaced, and the two readers agree on all of them.
 
+
+### More than one turn, and more than one conversation
+
+The `chat` task took one turn and closed the session. `chat --loop` keeps it
+open and reads more turns from standard input, and holds up to sixteen
+conversations on the one loaded model.
+
+The engine needed one thing for it. `token_frame_parts` frames a first turn:
+the document's opening, then the user's turn, then the opening the model answers
+into. A turn that follows one the model has already answered needs the same
+frame with a different beginning — the id that closed the model's turn, which
+the sampler stopped on and never fed back, because a session's cache already
+holds everything before it. That is `token_frame_next`, and it is
+`token_frame_inner` with a flag rather than a second framer: past the close, a
+later turn is the first turn without its opening, which is what `test_turn`
+asserts by comparing the two arrays.
+
+What makes a loop a conversation rather than a series of prompts is that the
+cache carries. `test_turn` states that as an equality: a session fed two turns
+in two calls reaches, to the last bit, what a session fed the whole transcript
+in one call reaches. It also opens a third conversation, feeds it something
+else, and requires the first to reach exactly where it did before — which is the
+property the split between `app_model` and `app_session` exists for, and which
+no test stated until now.
+
+The loop's own commands are `/image` and `/audio` — a picture or a clip in front
+of the next turn, which makes the multi-modal path reachable mid-conversation
+rather than only from the command line — `/new`, `/talk n`, `/list`, `/drop`,
+`/help` and `/quit`. A turn goes through `main_reel_build` whichever turn it is,
+so a later turn carries attachments exactly the way the first one does.
+
+`/list` reports what each conversation holds because it is worth knowing: a
+conversation costs a cache at the window's full span, which on the shipped
+export at the default window is 1803 MiB and at `--window 4096` is 67. Opening
+one that will not fit says so and leaves the loop where it was, and so does a
+turn that will not fit the window — `session_prime_media` checks before it
+consumes a single id, so the conversation is exactly where it was and `/new` or
+`/drop` is the way on.
+
+The conversations take their turns one at a time, and `TODO.md` carries the
+reason as a task of its own: the sessions are independent, but every kernel
+underneath them reaches the model's one `pool_group`, which is a fork and join
+with no queue in it. Two sessions stepping at once would be two callers inside
+that fork. A pool a session owns or a queue in front of the one pool are the two
+answers, and neither is worth guessing at without a caller that needs it.
+
+The single turn path is untouched: `logits` and forty-eight greedy tokens of
+`chat` on the shipped export are byte identical to what they were, at both cache
+settings.
+
 ### Everything else
 
 The engine end to end on the shipped export, one scene written as a png, as a
 4:4:4 jpeg and as a 4:2:0 jpeg: three descriptions of the same building, sky,
 sun and grass. `--image` takes jpeg everywhere it takes png, including in the
-media parity workflows.
+media parity workflows, and `chat --loop` will take one mid-conversation and
+answer questions about it two turns later out of the cache.
 
-The suite is 434 tests from 390, clean on the scalar, SSE2 and AVX2 backends and
+The suite is 455 tests from 390, clean on the scalar, SSE2 and AVX2 backends and
 under the address and undefined behaviour sanitizers.

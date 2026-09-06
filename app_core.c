@@ -153,6 +153,13 @@ typedef struct app_part {
 /* The same chat frame around an ordered list of parts.  `token_frame_media` is
  * this with every span first and the words last, which is the common case and
  * the only one the command line could express before. */
+/* The same frame for a turn that follows one the model has already answered.
+ * A session carries the turns before it in its cache, so this lays down the
+ * close of the model's turn and then the new one, without opening the document
+ * a second time. */
+int  token_frame_next(const app_model *model, const app_part *part_list, int part_count,
+                      app_media_span *span_list, int span_count, int32_t *id_list, int id_limit);
+
 int  token_frame_parts(const app_model *model, const app_part *part_list, int part_count,
                        app_media_span *span_list, int span_count,
                        int32_t *id_list, int id_limit);
@@ -8875,14 +8882,22 @@ static int token_body_parts(const app_model *model, const token_book *book,
 /* Wraps one user turn in the instruction-tuned chat frame. */
 static int token_frame_inner(const app_model *model, const app_part *part_list, int part_count,
                              const char *plain_text, app_media_span *span_list, int span_count,
-                             int32_t *id_list, int id_limit) {
+                             int32_t *id_list, int id_limit, int first_flag) {
   const token_book *book;
   int id_count = 0;
   int wrote_count;
   if (!model || !model->book_ref || !id_list) return -1;
   if (!part_list && !plain_text) return -1;
   book = model->book_ref;
-  if (book->start_id >= 0 && id_count < id_limit) id_list[id_count++] = book->start_id;
+  /* A first turn opens the document; a later one closes the model's turn
+   * instead, because the id the sampler stopped on was never fed back. */
+  if (first_flag) {
+    if (book->start_id >= 0 && id_count < id_limit) id_list[id_count++] = book->start_id;
+  } else if (book->turn_open_id >= 0) {
+    if (book->turn_shut_id >= 0 && id_count < id_limit) id_list[id_count++] = book->turn_shut_id;
+    wrote_count = token_encode_book(book, "\n", 1, id_list + id_count, id_limit - id_count);
+    if (wrote_count > 0) id_count += wrote_count;
+  }
   if (book->turn_open_id >= 0) {
     if (id_count < id_limit) id_list[id_count++] = book->turn_open_id;
     wrote_count = token_encode_book(book, "user\n", 1, id_list + id_count, id_limit - id_count);
@@ -8912,14 +8927,26 @@ static int token_frame_inner(const app_model *model, const app_part *part_list, 
 int token_frame_media(const app_model *model, const char *user_text, app_media_span *span_list,
                       int span_count, int32_t *id_list, int id_limit) {
   if (!user_text) return -1;
-  return token_frame_inner(model, NULL, 0, user_text, span_list, span_count, id_list, id_limit);
+  return token_frame_inner(model, NULL, 0, user_text, span_list, span_count, id_list, id_limit, 1);
+}
+
+/* The frame for a turn that is not the first.  Everything a session has already
+ * been fed stays in its cache, so what this lays down is only what comes after
+ * it: the id that closed the model's turn — which the sampler stopped on and
+ * never fed back — and then the same user turn and the same opening the model
+ * answers into. */
+int token_frame_next(const app_model *model, const app_part *part_list, int part_count,
+                     app_media_span *span_list, int span_count, int32_t *id_list, int id_limit) {
+  if (!part_list || part_count < 0) return -1;
+  return token_frame_inner(model, part_list, part_count, NULL, span_list, span_count, id_list,
+                           id_limit, 0);
 }
 
 int token_frame_parts(const app_model *model, const app_part *part_list, int part_count,
                       app_media_span *span_list, int span_count, int32_t *id_list, int id_limit) {
   if (!part_list || part_count < 0) return -1;
   return token_frame_inner(model, part_list, part_count, NULL, span_list, span_count, id_list,
-                           id_limit);
+                           id_limit, 1);
 }
 
 int token_frame(const app_model *model, const char *user_text, int32_t *id_list, int id_limit) {

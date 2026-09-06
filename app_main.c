@@ -38,6 +38,7 @@ typedef struct main_flag {
   int         verbose_level;
   int         cache_bits;   /* 0 keeps the key and value cache in float, 8 quantizes it */
   int         raw_flag;
+  int         loop_flag;
   app_taste   taste;
 } main_flag;
 
@@ -90,7 +91,7 @@ static void main_usage(void) {
   printf("%s %s - Gemma 4 E2B IT QAT inference engine\n\n", APP_NAME, APP_VERSION);
   printf("usage: igllm <task> --model <folder> [options]\n\n");
   printf("tasks:\n");
-  printf("  chat       one instruction-tuned turn, chat framed\n");
+  printf("  chat       one instruction-tuned turn, chat framed; --loop for more\n");
   printf("  complete   raw continuation of the prompt text\n");
   printf("  bench      timed prefill and decode report\n");
   printf("  tokens     print the token ids of the prompt\n");
@@ -112,6 +113,7 @@ static void main_usage(void) {
   printf("  --top-p <value>     top-p cutoff\n");
   printf("  --echo-penalty <v>  repetition penalty\n");
   printf("  --seed <value>      sampler seed\n");
+  printf("  --loop              keep the chat task open for more turns\n");
   printf("  --raw               skip the chat frame in the chat task\n");
   printf("  --verbose           print progress detail\n");
 }
@@ -155,6 +157,7 @@ static int main_flags(int argc, char **argv, main_flag *flag_out) {
     else if (strcmp(name_text, "--top-p") == 0 && value_text) flag_out->taste.top_portion = (float)atof(argv[++argument_index]);
     else if (strcmp(name_text, "--echo-penalty") == 0 && value_text) flag_out->taste.echo_penalty = (float)atof(argv[++argument_index]);
     else if (strcmp(name_text, "--seed") == 0 && value_text) flag_out->taste.seed_value = strtoull(argv[++argument_index], NULL, 10);
+    else if (strcmp(name_text, "--loop") == 0) flag_out->loop_flag = 1;
     else if (strcmp(name_text, "--raw") == 0) flag_out->raw_flag = 1;
     else if (strcmp(name_text, "--verbose") == 0) flag_out->verbose_level = 1;
     else if (strcmp(name_text, "--help") == 0 || strcmp(name_text, "-h") == 0) return 0;
@@ -212,7 +215,8 @@ static int main_media_load(app_model *model, const main_flag *flag, app_media *m
  * A media run sits between the turn opener and the user's text, bracketed the
  * way the processor brackets it, and the rows the towers produced are laid down
  * on the placeholders inside that bracket. */
-static int main_reel_build(app_model *model, const main_flag *flag, main_reel *reel) {
+static int main_reel_build(app_model *model, const main_flag *flag, main_reel *reel,
+                           int first_flag) {
   app_media media_list[MAIN_MEDIA_LIMIT];
   app_media_span span_list[MAIN_MEDIA_LIMIT];
   app_part part_list[MAIN_MEDIA_LIMIT + 1];
@@ -253,8 +257,12 @@ static int main_reel_build(app_model *model, const main_flag *flag, main_reel *r
   }
 
   if (frame_flag) {
-    reel->id_count = token_frame_parts(model, part_list, part_count, span_list, span_count,
-                                       reel->id_list, MAIN_PROMPT_LIMIT);
+    /* A turn that follows one the model has answered picks the frame up where
+     * the last one stopped rather than opening the document again. */
+    reel->id_count = first_flag ? token_frame_parts(model, part_list, part_count, span_list,
+                                                   span_count, reel->id_list, MAIN_PROMPT_LIMIT)
+                                : token_frame_next(model, part_list, part_count, span_list,
+                                                   span_count, reel->id_list, MAIN_PROMPT_LIMIT);
   } else {
     int id_count = 0;
     int start_id = token_start_id(model);
@@ -293,12 +301,28 @@ static void main_emit(app_model *model, int32_t id_value) {
   }
 }
 
+/* Samples until the model closes its turn or the caller's budget runs out,
+ * printing each piece as it lands.  The state row belongs to the prompt's last
+ * id and only that id can have one, because only a prompt's ids come from a
+ * tower. */
+static void main_answer(app_model *model, const main_flag *flag, app_session *session,
+                        int32_t id_value, const float *state_data, int quiet_flag) {
+  int serve_index;
+  for (serve_index = 0; serve_index < flag->serve_limit; ++serve_index) {
+    const float *logit_list = session_step_state(session, id_value, state_data);
+    state_data = NULL;
+    if (!logit_list) break;
+    id_value = session_pick(session, logit_list, &flag->taste);
+    if (token_is_close(model, id_value)) break;
+    if (!quiet_flag) main_emit(model, id_value);
+  }
+}
+
 static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
   app_session *session = NULL;
   main_reel reel;
-  int serve_index, last_index;
+  int last_index;
   int32_t id_value;
-  const float *logit_list;
   const float *state_data;
   app_code code;
 
@@ -307,7 +331,7 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
     fprintf(stderr, "session: %s\n", app_code_text(code));
     return 1;
   }
-  if (!main_reel_build(model, flag, &reel)) {
+  if (!main_reel_build(model, flag, &reel, 1)) {
     session_close(session);
     return 1;
   }
@@ -325,14 +349,7 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
   state_data = reel.state_flag[last_index]
                    ? reel.state_list + (size_t)last_index * (size_t)reel.state_size
                    : NULL;
-  for (serve_index = 0; serve_index < flag->serve_limit; ++serve_index) {
-    logit_list = session_step_state(session, id_value, state_data);
-    state_data = NULL; /* only the prompt's last id can have come from a tower */
-    if (!logit_list) break;
-    id_value = session_pick(session, logit_list, &flag->taste);
-    if (token_is_close(model, id_value)) break;
-    if (!quiet_flag) main_emit(model, id_value);
-  }
+  main_answer(model, flag, session, id_value, state_data, quiet_flag);
   if (!quiet_flag) printf("\n");
 
   {
@@ -363,6 +380,219 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
   return 0;
 }
 
+/* -- the talk loop -------------------------------------------------------- */
+
+/* Several conversations against one loaded model.
+ *
+ * This is the property the split between `app_model` and `app_session` exists
+ * for, and the single turn tasks never showed it: the weights are mapped once
+ * and every conversation costs only its own cache and scratch.  What a
+ * conversation costs is what `/list` reports.
+ *
+ * The turns run one at a time.  A model's kernels reach the same thread pool,
+ * which is a fork and join rather than a queue, so two conversations stepping
+ * at once would be two callers inside it — the sessions are independent, the
+ * pool underneath them is not. */
+#define MAIN_TALK_LIMIT 16
+#define MAIN_LINE_LIMIT 8192
+
+typedef struct main_talk {
+  app_session *session;
+  int          turn_count;
+  int          open_flag;  /* whether the model has already answered in it */
+  /* What `/image` and `/audio` have put in front of the next turn, and the room
+   * their paths are kept in, because the line they were typed on is read over. */
+  main_show    show_list[MAIN_MEDIA_LIMIT];
+  int          show_count;
+  char         path_room[MAIN_MEDIA_LIMIT][1024];
+} main_talk;
+
+/* One line of standard input, with the newline dropped.  Returns 0 at the end
+ * of the input, which is what ends the loop. */
+static int main_line_read(char *line_out, int line_limit) {
+  int fill_count = 0;
+  int letter;
+  for (;;) {
+    letter = fgetc(stdin);
+    if (letter == EOF) return fill_count > 0;
+    if (letter == '\n') break;
+    if (fill_count + 1 < line_limit) line_out[fill_count++] = (char)letter;
+  }
+  line_out[fill_count] = '\0';
+  return 1;
+}
+
+/* Whether a line is only spaces, which is not a turn. */
+static int main_line_bare(const char *line_text) {
+  while (*line_text) {
+    if (*line_text != ' ' && *line_text != '\t' && *line_text != '\r') return 0;
+    ++line_text;
+  }
+  return 1;
+}
+
+static void main_talk_help(void) {
+  printf("  /image <path> put a picture in front of the next turn\n");
+  printf("  /audio <path> put a clip in front of the next turn\n");
+  printf("  /new          start another conversation on the same model\n");
+  printf("  /talk <n>     switch to conversation n\n");
+  printf("  /list         the conversations, their turns and what they hold\n");
+  printf("  /drop         close the current conversation\n");
+  printf("  /quit         leave\n");
+  printf("  anything else is a turn in the current conversation\n");
+}
+
+/* One turn of a conversation: the pieces the caller has put in front of it and
+ * the words they typed, framed, primed and answered.  A turn that is not the
+ * first picks the frame up where the last one stopped. */
+static void main_talk_turn(app_model *model, const main_flag *flag, main_talk *talk,
+                           const char *word_text) {
+  main_flag turn_flag = *flag;
+  main_reel reel;
+  app_code code;
+  const float *state_data;
+
+  turn_flag.prompt_text = word_text;
+  turn_flag.prompt_flag = 1;
+  turn_flag.text_count = 0;
+  turn_flag.show_count = talk->show_count;
+  memcpy(turn_flag.show_list, talk->show_list, sizeof(turn_flag.show_list));
+  if (!main_reel_build(model, &turn_flag, &reel, !talk->open_flag)) return;
+
+  /* A conversation that has filled its window is refused before a single id is
+   * consumed, so saying so and staying open is safe: the conversation is
+   * exactly where it was, and `/new` or `/drop` is the way on. */
+  code = session_prime_media(talk->session, reel.id_list, reel.id_count, reel.state_list,
+                             reel.state_flag);
+  if (code != APP_OKAY) {
+    fprintf(stderr, "prime: %s\n", app_code_text(code));
+    main_reel_free(&reel);
+    return;
+  }
+  state_data = reel.state_flag[reel.id_count - 1]
+                   ? reel.state_list + (size_t)(reel.id_count - 1) * (size_t)reel.state_size
+                   : NULL;
+  main_answer(model, flag, talk->session, reel.id_list[reel.id_count - 1], state_data, 0);
+  printf("\n");
+  fflush(stdout);
+  main_reel_free(&reel);
+  talk->turn_count += 1;
+  talk->open_flag = 1;
+  talk->show_count = 0;
+}
+
+static int main_loop(app_model *model, const main_flag *flag) {
+  main_talk talk_list[MAIN_TALK_LIMIT];
+  char line_text[MAIN_LINE_LIMIT];
+  int talk_slot = 0, talk_index;
+
+  memset(talk_list, 0, sizeof(talk_list));
+  if (session_open(model, &talk_list[0].session) != APP_OKAY) {
+    fprintf(stderr, "session: %s\n", app_code_text(APP_FAIL_MEMORY));
+    return 1;
+  }
+
+  /* Whatever the command line carried — words, pictures, clips — is the first
+   * turn, so a loop is the single turn task with more turns after it. */
+  if (flag->prompt_flag || flag->show_count > 0) {
+    talk_list[0].show_count = flag->show_count;
+    memcpy(talk_list[0].show_list, flag->show_list, sizeof(talk_list[0].show_list));
+    main_talk_turn(model, flag, &talk_list[0], flag->prompt_text);
+  } else {
+    printf("%s %s - a conversation on a loaded model; /help for the rest\n", APP_NAME,
+           APP_VERSION);
+  }
+
+  for (;;) {
+    printf("%d> ", talk_slot + 1);
+    fflush(stdout);
+    if (!main_line_read(line_text, (int)sizeof(line_text))) break;
+    if (main_line_bare(line_text)) continue;
+
+    /* A line that opens with a slash is an instruction to the loop; everything
+     * else is a turn. */
+    if (line_text[0] == '/') {
+      if (strcmp(line_text, "/quit") == 0 || strcmp(line_text, "/exit") == 0) break;
+      if (strcmp(line_text, "/help") == 0) {
+        main_talk_help();
+        continue;
+      }
+      if (strcmp(line_text, "/new") == 0) {
+        int free_slot = -1;
+        for (talk_index = 0; talk_index < MAIN_TALK_LIMIT; ++talk_index)
+          if (!talk_list[talk_index].session) { free_slot = talk_index; break; }
+        if (free_slot < 0) {
+          printf("at most %d conversations at once\n", MAIN_TALK_LIMIT);
+          continue;
+        }
+        /* Every conversation carries a cache of its own at the window's full
+         * span, which is what `/list` reports and what `--window` sizes. */
+        if (session_open(model, &talk_list[free_slot].session) != APP_OKAY) {
+          printf("no room for another conversation; try a smaller --window\n");
+          continue;
+        }
+        talk_slot = free_slot;
+        printf("conversation %d\n", talk_slot + 1);
+        continue;
+      }
+      if (strncmp(line_text, "/talk ", 6) == 0) {
+        int want_slot = atoi(line_text + 6) - 1;
+        if (want_slot < 0 || want_slot >= MAIN_TALK_LIMIT || !talk_list[want_slot].session) {
+          printf("no conversation %d\n", want_slot + 1);
+          continue;
+        }
+        talk_slot = want_slot;
+        continue;
+      }
+      if (strcmp(line_text, "/list") == 0) {
+        for (talk_index = 0; talk_index < MAIN_TALK_LIMIT; ++talk_index) {
+          app_session *other = talk_list[talk_index].session;
+          if (!other) continue;
+          printf("%s%d  %d turns, %d ids, %.1f MiB of cache\n",
+                 talk_index == talk_slot ? "* " : "  ", talk_index + 1,
+                 talk_list[talk_index].turn_count, session_fill(other),
+                 (double)session_cache_room(other) / (1024.0 * 1024.0));
+        }
+        continue;
+      }
+      if (strcmp(line_text, "/drop") == 0) {
+        int next_slot = -1;
+        session_close(talk_list[talk_slot].session);
+        memset(&talk_list[talk_slot], 0, sizeof(talk_list[talk_slot]));
+        for (talk_index = 0; talk_index < MAIN_TALK_LIMIT; ++talk_index)
+          if (talk_list[talk_index].session) { next_slot = talk_index; break; }
+        if (next_slot < 0) break; /* the last one closed is the end of the loop */
+        talk_slot = next_slot;
+        continue;
+      }
+      if (strncmp(line_text, "/image ", 7) == 0 || strncmp(line_text, "/audio ", 7) == 0) {
+        main_talk *talk = &talk_list[talk_slot];
+        if (talk->show_count >= MAIN_MEDIA_LIMIT) {
+          printf("at most %d pieces in one turn\n", MAIN_MEDIA_LIMIT);
+          continue;
+        }
+        /* The path is kept rather than copied, so it has to outlive the turn:
+         * the line it points into is not read again until the turn is done. */
+        talk->show_list[talk->show_count].kind_mark =
+            line_text[1] == 'i' ? MAIN_SHOW_IMAGE : MAIN_SHOW_AUDIO;
+        talk->show_list[talk->show_count].path_text = talk->path_room[talk->show_count];
+        text_fill(talk->path_room[talk->show_count], sizeof(talk->path_room[0]), line_text + 7);
+        talk->show_count += 1;
+        printf("%d in front of the next turn\n", talk->show_count);
+        continue;
+      }
+      printf("unknown: %s, /help for what there is\n", line_text);
+      continue;
+    }
+
+    main_talk_turn(model, flag, &talk_list[talk_slot], line_text);
+  }
+
+  for (talk_index = 0; talk_index < MAIN_TALK_LIMIT; ++talk_index)
+    if (talk_list[talk_index].session) session_close(talk_list[talk_index].session);
+  return 0;
+}
+
 static int main_logits(app_model *model, const main_flag *flag) {
   app_session *session = NULL;
   main_reel reel;
@@ -376,7 +606,7 @@ static int main_logits(app_model *model, const main_flag *flag) {
     fprintf(stderr, "session: %s\n", app_code_text(code));
     return 1;
   }
-  if (!main_reel_build(model, flag, &reel)) {
+  if (!main_reel_build(model, flag, &reel, 1)) {
     session_close(session);
     return 1;
   }
@@ -441,7 +671,7 @@ static int main_logits(app_model *model, const main_flag *flag) {
 static int main_tokens(app_model *model, const main_flag *flag) {
   main_reel reel;
   int id_index;
-  if (!main_reel_build(model, flag, &reel)) return 1;
+  if (!main_reel_build(model, flag, &reel, 1)) return 1;
   for (id_index = 0; id_index < reel.id_count; ++id_index) {
     char text_room[64];
     token_decode(model, reel.id_list[id_index], text_room, (int)sizeof(text_room));
@@ -471,7 +701,7 @@ static int main_cache(app_model *model, const main_flag *flag) {
     fprintf(stderr, "session: %s\n", app_code_text(code));
     return 1;
   }
-  if (!main_reel_build(model, flag, &reel)) {
+  if (!main_reel_build(model, flag, &reel, 1)) {
     session_close(session);
     return 1;
   }
@@ -575,7 +805,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (strcmp(flag.task_text, "chat") == 0 || strcmp(flag.task_text, "complete") == 0)
+  if (strcmp(flag.task_text, "chat") == 0 && flag.loop_flag)
+    result_code = main_loop(model, &flag);
+  else if (strcmp(flag.task_text, "chat") == 0 || strcmp(flag.task_text, "complete") == 0)
     result_code = main_serve(model, &flag, 0);
   else if (strcmp(flag.task_text, "bench") == 0)
     result_code = main_serve(model, &flag, 1);

@@ -45,7 +45,7 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 
 | task       | purpose                                       |
 | ---------- | --------------------------------------------- |
-| `chat`     | one instruction-tuned turn, chat framed       |
+| `chat`     | an instruction-tuned turn, chat framed; `--loop` for more |
 | `complete` | raw continuation of the prompt text           |
 | `bench`    | timed prefill and decode report               |
 | `tokens`   | print the token ids of the prompt             |
@@ -55,8 +55,20 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 
 Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
 `--threads`, `--window`, `--cache`, `--heat`, `--top-k`, `--top-p`,
-`--echo-penalty`, `--seed`, `--raw`, `--verbose`. Run `igllm --help` for the
-full list.
+`--echo-penalty`, `--seed`, `--loop`, `--raw`, `--verbose`. Run `igllm --help`
+for the full list.
+
+`chat --loop` keeps the turn open and reads more from standard input, so a
+conversation carries: what the model answered stays in the session's cache and
+the next turn is framed onto it rather than replacing it. A line beginning with
+a slash is an instruction rather than a turn — `/image` and `/audio` put a
+picture or a clip in front of the next one, `/new` starts another conversation
+on the same loaded model, `/talk n` switches between them, `/list` says what
+each is holding, `/drop` closes one, `/help` lists them all.
+
+Several conversations at once is the point of the split between a model and a
+session: the weights are mapped once and each conversation costs only its own
+cache, which `--window` sizes and `/list` reports.
 
 `--cache 8` holds the key and value cache as bytes, on the eight bit float grid
 the export calibrates static ranges for. It is off by default. On the shipped
