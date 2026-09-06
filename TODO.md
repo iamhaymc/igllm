@@ -6,6 +6,24 @@ read by the reference's own code — so it belongs on a host that has `model/`
 beside it. The second group can be written and judged anywhere, on synthetic
 weights or on none. Most consequential first within each group.
 
+`RESEARCH.md` is a separate list, written on the assumption that this one is
+finished, and it is not a queue this file feeds into. Where it touches an entry
+here the entry says so. What it changed about this file is one item, closed
+below: the eight lane block's open question was whether to reassociate a sum for
+16%, and the answer is that reassociation is worth spending somewhere else.
+
+It also puts a ceiling on the first group that is worth stating once, because
+every entry in it is a decode or prefill entry and none of them can pass it. A
+fourth host — four cores of a Xeon at 2.8 GHz, AVX-512 and VNNI, the wide build
+— gives a bare sweep of about 20 GiB/s at four threads and decodes at 10.04
+tokens a second, reading 7.48 GiB/s of the 763.3 MiB a token it reports. So the
+memory is 37% used and there is a little under three times left in the kernels,
+and a kernel that spent no instructions at all would decode at about 27 tokens a
+second on this host. That is the whole of what the first group can be worth. A
+token that costs one sweep of the weights cannot be made to cost less than the
+sweep, and every entry below is about the sweep. Whether to go past it is the
+question `RESEARCH.md` opens rather than one this file can answer.
+
 ## On the shipped export
 
 - Spend fewer instructions in the two bit decode path, which is the one still
@@ -19,6 +37,19 @@ weights or on none. Most consequential first within each group.
   it. The two bit path keeps 94% and 78%, and is 366 MiB of the 727.5 a step
   sweeps, which makes it the one width where instructions are still most of the
   cost and the only one worth another kernel.
+
+  What shape that kernel should be is the one place `RESEARCH.md` has something
+  to say about this list rather than past it. The path spreads codes into floats
+  and dots them — `kern_code_spread` then `kern_dot_real_many` — and four passes
+  have now been spent making that pair quicker. Its ideas 2 and 3 are the two
+  ways to stop doing it at all: hold the calibrated activation levels as
+  integers and accumulate integer products, or index activation tables with the
+  packed bits and never spread them. Both are a different kernel rather than a
+  wider one, both are measurable against the current path on a single plane
+  before anything else changes, and the fourth host has the VNNI instructions
+  the first of them wants. Neither reads fewer bytes, so the ceiling above holds
+  over both; what they are for is closing the distance to it in one step instead
+  of four.
 
   What that reading also says is that the kernels are no longer where a token
   goes at four threads. Streamed through the rates above, the mix a step sweeps
@@ -46,20 +77,14 @@ weights or on none. Most consequential first within each group.
   lanes of a batch now share the row's load rather than each loading it again,
   which is 8% of the projections and 23% of prefill on the default build.
 
-  What is left of that loop is the eight lane block, and what stands in its way
-  is not what it looks like. Eight lanes with two accumulators apiece is
-  seventeen live vectors against sixteen, so the eight lane form that measures
-  16% quicker — 30.13 G multiply-adds a second against 27.15 — is the one with a
-  single accumulator a lane, which reassociates every sum in the engine. The
-  wide tier has thirty-two vector registers and could hold eight lanes and both
-  accumulators, and written that way it measures 24.04 against the four lane
-  form's 27.15: slower, so the register count was never the obstacle. The open
-  question is therefore whether 16% of this kernel is worth moving every logit,
-  not how to fit the exact form into a host that has room for it.
-
-  Past that the tower's own attention is what is left: the scoring at 6.5 s and
-  the blend at 5.0, neither touched since they were written, both already
-  vectorized by the compiler, and together a third of a tower.
+  What is left of that loop is the tower's own attention: the scoring at 6.5 s
+  and the blend at 5.0, neither touched since they were written, both already
+  vectorized by the compiler, and together a third of a tower. `RESEARCH.md`
+  idea 11 says what to do with them, and it is a schedule rather than a kernel —
+  score a tile, carry the running normalizer, accumulate the blend, and never
+  hold the whole score matrix. That moves the summation order too, which is the
+  same price the eight lane block was asked to pay and a better thing to spend
+  it on: it is 30% of a tower rather than 16% of one loop.
 
 - The other half of a picture is the text stack, and nothing has been asked of
   it. A picture at the full budget lays 256 soft tokens down, and prefilling
@@ -68,6 +93,19 @@ weights or on none. Most consequential first within each group.
   taken before 0.8.8. It is the ordinary prefill path, so the item above is most
   of what would move it, but it is worth stating that a tower made free would
   halve a picture rather than remove it.
+
+One item is closed rather than carried here. The eight lane block asked whether
+16% of the batch loop was worth reassociating every sum in the engine — the
+seventeenth live vector meant the quick form is the one with a single
+accumulator a lane, at 30.13 G multiply-adds a second against the four lane
+form's 27.15, and the wide tier's thirty-two registers held eight lanes and both
+accumulators and measured 24.04, so the register count was never the obstacle
+and there is no exact eight lane form to reach for. The answer is that it is
+not. Once reassociation is on the table at all, the tower's attention above
+wants it for a third of a tower and `RESEARCH.md` idea 2 wants it for an integer
+accumulator that changes the arithmetic anyway, and both are larger than 16% of
+one loop. The engine's last bit is only worth moving once, so it should be moved
+for whichever of those two measures out, not here.
 
 Two items were closed rather than carried in 0.8.4. The per-group gain mirror — a
 per-plane float copy of the group gains, traded against the conversions it
@@ -101,7 +139,11 @@ layers behind it and amplifies a last bit either way.
   of the one pool, which is the shape a server wants anyway and is the larger
   change. Neither is worth guessing at without a caller that needs it.
 - Add a device handle beside `plane` and a second `back_open`, so an
-  accelerator backend can be dropped in without touching the loader.
+  accelerator backend can be dropped in without touching the loader. This is
+  also the hook every kernel experiment in `RESEARCH.md` wants: an integer or
+  table backend that packs a plane its own way at open needs somewhere to hold
+  that packing, and `desk.mat_mat` behind a second `back_open` is that place. It
+  was written here as an accelerator item and is a portability one first.
 - Build under MSVC. The suite builds clean and passes on a Windows host with
   MinGW gcc, on the scalar, SSE2 and AVX2 backends; `cl` and its `/arch:AVX2`
   path have still only been read.
