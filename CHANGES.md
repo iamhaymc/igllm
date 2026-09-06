@@ -2567,3 +2567,394 @@ measured on has no `transformers`, and every distribution the engine produces on
 the shipped export is byte for byte what the previous build produced, so a
 comparison against the reference would be comparing the same numbers it compared
 before. That is an argument, not a run, and it is worth saying which.
+
+---
+
+## 0.8.5 — the cache read once for the heads that share it, the pictures, the turns after the first, the prompt that need not be primed twice, and the odd widths
+
+### Scope
+
+`TODO.md` put one item at the head of each of its two groups. The first was the
+restructuring 0.8.4 arrived at while measuring the byte cache: eight heads read
+the same cached row and the loop read it eight times. The second was the reader
+that was missing — most pictures a caller actually has are jpeg, and `--image`
+refused all of them. The four items under that one — the range of png the reader
+would not take, the single turn the CLI would not go past, the long prompt it
+primed again every run, and the bit widths that had no vector path — are done
+here too.
+
+The first moves no bit of any result and takes back almost all of what the byte
+cache cost. The second is a new decoder of about four hundred lines, and the
+third turns out to be one loop rather than two features; both have an encoder of
+their own beside them in the tests. The fourth needed one function in the engine
+and the rest in the front end, the fifth three, and the sixth is arithmetic
+about where a byte boundary falls rather than a kernel at all.
+
+### Reading a cached row once for all the heads that share it
+
+This export ships `num_key_value_heads` of one against eight attention heads, so
+`group_share` is eight: every head of a layer scores against the same cached key
+row and blends the same cached value row. `session_attend` walked head by head,
+which reads every cached byte eight times and, on a byte cache, decodes it eight
+times.
+
+`session_attend_group` walks the other way round. A run of cached rows is laid
+into `cache_room` once — `CACHE_BLOCK_BYTES` of floats, small enough to stay in
+the first level cache — and then every head of the group reads it there. On a
+byte cache that is one table lookup a row instead of one a row a head. On a
+float cache it is one sweep of the store instead of eight.
+
+What it costs is a row of scores per head of the group rather than one, because
+a group is scored before any of it is softmaxed. That is `score_stride` in the
+session's rooms: a few megabytes beside a cache measured in gigabytes.
+
+**It is the same arithmetic.** The block hands each head exactly the floats
+`cache_dot` would have looked up for it, and the dot and the blend it then runs
+are `kern_dot_real` and the blend loop the float cache always used — which
+0.8.3 had already made term for term identical to `cache_dot` and `cache_add`.
+The `logits` distribution and forty-eight greedy tokens of `chat` are byte
+identical to 0.8.4's on both builds and at both cache settings.
+
+Six hundred and seventy-nine ids, sixty-four tokens, four threads, three
+adjacent pairs a configuration on the quiet virtual machine 0.8.4 used:
+
+| build, cache | decode before | after | | prefill before | after |
+| --- | --- | --- | --- | --- | --- |
+| tuned, bytes | 5.91 tok/s | **7.22** | +22% | 14.85 tok/s | **18.94** | +28% |
+| tuned, floats | 6.96 | **7.32** | +5% | 19.52 | **19.69** | +1% |
+| default, bytes | 5.18 | **5.87** | +13% | 10.22 | **11.77** | +15% |
+| default, floats | 5.70 | **6.03** | +6% | 11.82 | **12.15** | +3% |
+
+Every pair is of one sign and the three runs of a configuration never overlap
+the three of its pair.
+
+The headline is the first row against the second. 0.8.4 measured the byte cache
+a third behind the float cache on the tuned build and a ninth behind on the
+default, and said the flag was a footprint option rather than a speed one. On
+this host that gap was 15% and 9%; it is now 1.4% and 2.7%. **`--cache 8` is
+now very nearly free**, and it still takes the cache at full span from 1803.0
+MiB to 450.8. It stays off by default because of what it costs in accuracy —
+greedy decoding still diverges at the first genuinely close call — and not any
+more because of what it costs in time.
+
+The float cache gaining 5% is the part that was not asked for. The block was
+written for the table lookup and it turns out the sweep is worth something too:
+eight heads reading a shared key plane of hundreds of kilobytes read it out of
+the second or third level cache eight times, where the block reads it once and
+is read out of the first. So `session_attend_wide` does not ask which storage
+the layer is on. It asks only whether more than one head shares a row, because
+where a head has its own there is nothing to divide and the block would be a
+copy for its own sake.
+
+Prefill gains more than decode on the byte cache because a prefill lane attends
+over the whole run behind it, so the rows are more of what it does.
+
+### Reading jpeg
+
+`image_read` sniffed three magics. It sniffs four now, and `FF D8 FF` reaches a
+baseline decoder: the marker walk, a canonical Huffman decode per component,
+dequantization against the tables `DQT` carried, an eight by eight inverse
+cosine transform, chroma upsampling at whatever the sampling factors say, and
+YCbCr to RGB. Restart markers are stepped over, and a scan of one component is
+walked as that component's own blocks, so a file that sends its planes one after
+another reads as well as an interleaved one.
+
+Refused, each in the shape the png reader refuses interlacing: progressive
+(`SOF2`), lossless, arithmetic coded and hierarchical frames, four component
+files — CMYK and YCCK need an inversion rule this reader cannot check — and a
+precision other than eight. Progressive is the one that will be missed, and it
+is a second decoder rather than a fourth branch of this one: coefficients
+arriving across several scans with successive approximation need the whole
+picture's coefficients held until the last scan lands.
+
+Three decisions worth naming.
+
+**The transform is float and rounds once.** Two eight by eight products through
+an orthonormal basis built once per picture, and a single round to nearest at
+the level shift. A fixed point transform would round twice and land within a
+step of this.
+
+**Chroma is blended, not repeated.** A component below the peak sampling is
+sampled at the picture's pixel centres and interpolated linearly between the two
+nearest samples in each axis. On the two-to-one factors every real file uses,
+that is exactly the three-quarters-and-a-quarter blend libjpeg calls fancy
+upsampling. Repetition would cost the same and put a step on every chroma edge.
+
+**A marker inside the entropy stream feeds zeros rather than failing.** An
+encoder ends a run on a byte boundary and a decoder that needed the last few
+bits of a block would otherwise refuse files every other reader accepts. What
+keeps that from swallowing a truncated file is that the scan refuses one that is
+still fabricating bits with more than its last unit to go.
+
+The canonical decoder beside deflate's was not widened to serve both, which
+`TODO.md` had floated. `DHT` ships the table in exactly the form `puff_tree`
+holds — a count per code length, then the symbols in code order — so there is
+nothing to build; and the walk over it reads bits the other way round, most
+significant first, out of a stream where `FF 00` means a literal `FF`. What
+could have been shared is four lines of arithmetic over a bit reader that could
+not be.
+
+#### What it is checked against
+
+`test_jpeg` carries a baseline encoder of its own: its own forward transform in
+double precision, its own canonical code assignment, its own bit writer, and the
+coefficient order derived from the diagonals of the block rather than copied
+from the reader's table. It quantizes with tables of ones, so a round trip loses
+only what the two transforms round. Its Huffman table is deliberately not the
+specification's — eight to twelve bits over all 256 symbols, an incomplete code
+no encoder in the wild produces — so the reader's walk is exercised rather than
+a table it might have been written around.
+
+Six pictures have to come back as the picture that went in: grey, three
+component, chroma at half the horizontal sampling, chroma at half the sampling
+in both directions, a file broken by a restart marker after every unit, and one
+held constant over each eight by eight tile. The last two are the ones with
+teeth. The tile constant file has nothing in it but dc coefficients, so the
+transform round trip is exact and the colour transform is the only thing between
+the samples and the pixels — half a level is the floor there, which catches a
+coefficient a percent wrong or a pair the wrong way round. The plane file has a
+chroma pair that is linear in both directions, where averaging a block gives its
+centre and interpolating between centres gives the plane back exactly, so a
+reader that repeated the nearest sample instead is caught by a floor a real file
+could not be held to. A progressive frame header and a truncated entropy stream
+both have to be refused.
+
+Every one of those floors was checked by breaking the reader on purpose: the
+colour coefficients moved by a percent, the two chroma bands swapped, the
+vertical blend dropped, the horizontal blend dropped, the restart predictors
+left unreset, and two entries of the coefficient order transposed. Each fault
+fails the test that is meant to catch it, and the first pass of the suite caught
+none of them, which is why the floors are where they are now rather than where
+they started.
+
+Against libjpeg, which is the comparison that matters and is not in the suite
+because it is not in the repository: seven files written by Pillow at four
+qualities, three sampling factors, with and without restart markers and with and
+without optimized Huffman tables. Grey agrees to within a single level. Colour
+agrees to within 2.8 levels of 255 at the worst pixel and 0.4 on average, which
+is the two decoders' rounding and their transforms, not a disagreement about
+what the file says. Odd sizes down to one pixel by one, an 800 by 600, a CMYK
+file and a progressive file all do what they should. Four hundred mutations of
+a real file — bytes flipped, streams truncated — produce no fault under the
+address and undefined behaviour sanitizers, and neither does the suite.
+
+#### The question the harness was going to have to answer
+
+`TODO.md` asked which way `app_diff.py` should handle a jpeg, given that the
+harness opens the picture with libjpeg where the engine would open it with its
+own transform: feed both sides the same decoded pixels, or hold the jpeg cases
+to a looser floor and say so.
+
+Neither, as it turns out, because the harness already does the first. `diff_tower`
+feeds the reference `tower_seed_rows` — the normalized patches the engine says it
+read, out of the activation dump — and the seam's graph half is fed the same. The
+only thing either half reads from the picture file itself is its width and height,
+in `seam_reference_count`, and the two decoders agree about those exactly. So the
+decoder is not in the comparison at all, and a jpeg case is held to the same floor
+as a png one without any change to the harness. The item is closed rather than
+carried.
+
+
+### Reading the rest of png
+
+The png reader took eight and sixteen bit samples and non-interlaced files. It
+takes every depth the format defines now — grey at one, two, four, eight and
+sixteen, palette at one through eight, RGB and the two alpha forms at eight and
+sixteen — and it reads interlaced files.
+
+The two turned out to be one change. An interlaced file is seven lattices, each
+a picture of its own in the stream: its own rows, its own filter byte a row, and
+its filters looking back only within the lattice. A file that is not interlaced
+is the same walk with one lattice that catches every pixel. So `png_read` grew a
+pass loop with one shape rather than two paths, `png_pass_bytes` rounds a row up
+to the byte where a depth packs more than one sample into one, and `png_sample`
+reads a sample at whatever the depth packs it — two bytes big endian at sixteen,
+one at eight, and the high bits of a byte before the low ones below that. The
+filter still walks whole bytes with a step of one where a pixel is narrower than
+a byte, which is what the format says.
+
+The one place a lattice is not simply a smaller picture is where it catches no
+pixel at all. A lattice with rows but no columns contributes nothing to the
+stream, and counting it as a filter byte a row makes the reader expect more
+bytes than the file carries. That is a picture narrower than the lattice — three
+pixels across, or one — and it is the case `test_png_wide` writes on purpose.
+
+`test_png_wide` carries a writer of its own: its own chunk framing and check
+values, its own line filters applied forward from the definitions, its own bit
+packing, and a deflate stream of stored blocks, which is a compressor the test
+does not need to have. Every depth of grey and of palette, interlaced and not,
+the wider kinds interlaced, a picture smaller than the lattice and a picture of
+one pixel — twenty-six fixtures, each held to the samples it was built from
+exactly rather than to a tolerance, because nothing in a png is lossy.
+
+The empty lattice is the reason those fixtures exist. Pillow does not write
+interlaced png at all — it accepts the flag and ignores it — so the hundred and
+ninety-two files this reader was first checked against libpng with were every
+one of them non-interlaced, and the bug lived through all of them. It failed on
+the first two fixtures the suite wrote. The cross-check runs the other way round
+now: the suite's own fixtures are read back by libpng, thirteen of them
+interlaced, and the two readers agree on all of them.
+
+
+### More than one turn, and more than one conversation
+
+The `chat` task took one turn and closed the session. `chat --loop` keeps it
+open and reads more turns from standard input, and holds up to sixteen
+conversations on the one loaded model.
+
+The engine needed one thing for it. `token_frame_parts` frames a first turn:
+the document's opening, then the user's turn, then the opening the model answers
+into. A turn that follows one the model has already answered needs the same
+frame with a different beginning — the id that closed the model's turn, which
+the sampler stopped on and never fed back, because a session's cache already
+holds everything before it. That is `token_frame_next`, and it is
+`token_frame_inner` with a flag rather than a second framer: past the close, a
+later turn is the first turn without its opening, which is what `test_turn`
+asserts by comparing the two arrays.
+
+What makes a loop a conversation rather than a series of prompts is that the
+cache carries. `test_turn` states that as an equality: a session fed two turns
+in two calls reaches, to the last bit, what a session fed the whole transcript
+in one call reaches. It also opens a third conversation, feeds it something
+else, and requires the first to reach exactly where it did before — which is the
+property the split between `app_model` and `app_session` exists for, and which
+no test stated until now.
+
+The loop's own commands are `/image` and `/audio` — a picture or a clip in front
+of the next turn, which makes the multi-modal path reachable mid-conversation
+rather than only from the command line — `/new`, `/talk n`, `/list`, `/drop`,
+`/help` and `/quit`. A turn goes through `main_reel_build` whichever turn it is,
+so a later turn carries attachments exactly the way the first one does.
+
+`/list` reports what each conversation holds because it is worth knowing: a
+conversation costs a cache at the window's full span, which on the shipped
+export at the default window is 1803 MiB and at `--window 4096` is 67. Opening
+one that will not fit says so and leaves the loop where it was, and so does a
+turn that will not fit the window — `session_prime_media` checks before it
+consumes a single id, so the conversation is exactly where it was and `/new` or
+`/drop` is the way on.
+
+The conversations take their turns one at a time, and `TODO.md` carries the
+reason as a task of its own: the sessions are independent, but every kernel
+underneath them reaches the model's one `pool_group`, which is a fork and join
+with no queue in it. Two sessions stepping at once would be two callers inside
+that fork. A pool a session owns or a queue in front of the one pool are the two
+answers, and neither is worth guessing at without a caller that needs it.
+
+The single turn path is untouched: `logits` and forty-eight greedy tokens of
+`chat` on the shipped export are byte identical to what they were, at both cache
+settings.
+
+
+### A prompt need not be primed twice
+
+`session_save` writes a session's cache to a file and `session_load` reads it
+back, and `--keep <path>` is the front end over them. On the shipped export a
+687 id prompt takes 39 seconds to prime and 2.7 seconds to read back, and the
+answer that follows is the same to the byte.
+
+What goes in the file is what the session actually holds: the ids it was fed,
+and the rows of each layer's key and value cache that carry anything. A layer
+sized for a hundred and thirty thousand positions and holding six hundred writes
+six hundred, so the file is the size of the prompt rather than of the window —
+21 MiB for that prompt, and 5 MiB with `--cache 8`, which is the same quarter
+the byte cache collects in memory. A ring that has turned over writes its whole
+span, because every slot of one is live.
+
+The file is host native: the same floats and the same bytes the cache holds, in
+the order the machine holds them, as the mapped checkpoint is. It is a thing to
+keep beside a run rather than a thing to send anywhere. `keep_mark` mixes every
+shape the layout depends on — the layer count, the head counts, the window, the
+cache storage, each layer's span and width — with the checkpoint's own mapped
+size, and a file that disagrees with it is refused rather than restored.
+
+Two things the ids cannot say for themselves.
+
+**A picture is not its placeholders.** Two different pictures lay down the same
+run of placeholder ids, so a cache matched on ids alone would be restored for
+the wrong picture. `session_save` takes a `stamp_value` from the caller and
+hands it back unread; the front end puts a hash of the embedding rows the towers
+made there. Running the same prompt with a png and then with a jpeg of the same
+picture is the case: same ids, different rows, and the second run primes from
+nothing.
+
+**A prefix is not a match.** The file is reused where its ids *begin* the prompt
+about to run, and the difference is primed onto it. What that does not stretch
+to is a prefix shorter than the file, because a sliding layer's ring cannot be
+trimmed back: it holds the last `slide_span` rows written, and the rows a
+shorter prompt would need behind them are the ones it overwrote.
+
+The file holds a prompt rather than a conversation, and `TODO.md` carries the
+difference as its own item. It is written before the first token is sampled, so
+a rerun starts where the last run started — which also means the session that
+wrote it is one id short of the prompt, the id `session_step` was about to be
+fed, and a turn framed onto it would drop that id.
+
+`test_keep` states the point as an equality: a session that reads the file
+reaches the same logits as the session that wrote it, bit for bit, without
+priming a single id. It also requires the ids, the peaks and the stamp to come
+back, and requires a truncated file, a file that is not one of these, a file
+whose mark disagrees and a file that is not there each to be refused with the
+session left cleared rather than half fed.
+
+### The odd bit widths stop walking the bit stream
+
+Two, four and eight bits had vector paths in the fused dot and in
+`kern_code_spread` beside it. Three, five, six and seven read one code at a time
+through `pack_read`, which walks the stream per code, and they were between
+twenty and thirty times slower than the widths beside them.
+
+What they have in common is arithmetic rather than a kernel: at three, five, six
+and seven bits, eight codes occupy exactly `bit_count` bytes. So a run of eight
+always begins where the run before it ended, on a byte boundary, and a block of
+eight is one word of at most seven bytes and eight shifts. `kern_code_word`
+assembles that word a byte at a time — the packing is defined by the bit stream,
+and reading it as an integer would be defined by the host's byte order, which is
+the rule `pack_read` already follows — and `kern_code_eight` shifts the eight
+codes out of it.
+
+Best of seven on a row of 12288, one thread, in codes a second:
+
+| width | dot, AVX2 | | dot, SSE2 | | spread, AVX2 | |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3 bit | 0.68 G → **5.57** | 8.2× | 0.85 → **1.57** | 1.9× | 0.72 → **2.43** | 3.4× |
+| 5 bit | 0.58 → **4.29** | 7.4× | 0.75 → **1.55** | 2.1× | 0.62 → **2.22** | 3.6× |
+| 6 bit | 0.58 → **3.76** | 6.5× | 0.74 → **1.43** | 1.9× | 0.61 → **2.06** | 3.4× |
+| 7 bit | 0.50 → **3.55** | 7.1× | 0.67 → **1.21** | 1.8× | 0.53 → **2.00** | 3.8× |
+
+Two and four bits are untouched and measure untouched: 15.93 against 15.96 and
+15.80 against 15.82.
+
+The two builds take different paths and the measurement is why. Writing the
+block to scratch and reading it back as one thirty-two byte vector is eight four
+byte stores feeding one wide load, which is a store forwarding stall, and it
+costs nearly half the loop: 0.94 G codes a second against 3.97 on a five bit
+row. AVX2 can avoid the scratch entirely — `_mm256_srlv_epi64` shifts each lane
+by its own amount, so the eight codes come out of the word inside the vector —
+and it does. SSE2 has no variable shift, and reading the scratch back as a
+vector there was measured at nothing over the bit stream walk, where reading it
+back a value at a time is worth twice: 1.62 against 0.75. So everything that is
+not AVX2 takes the scalar read, and that includes NEON, which has the variable
+shift AVX2 uses and might do better still with it — unmeasured, on no host here,
+so it is not guessed at.
+
+The shipped export has no rows at these widths and not a bit of it moves. What
+this is for is a checkpoint that does, and `test_kernel` now holds the dot and
+the spread against the bit stream at every width the format allows, at spans
+that end mid-block, at leads that are and are not where a block begins, and with
+the code flip on and off — four hundred and forty-eight cases a width where
+there were six.
+
+### Everything else
+
+The engine end to end on the shipped export, one scene written as a png, as a
+4:4:4 jpeg and as a 4:2:0 jpeg: three descriptions of the same building, sky,
+sun and grass. `--image` takes jpeg everywhere it takes png, including in the
+media parity workflows, and `chat --loop` will take one mid-conversation and
+answer questions about it two turns later out of the cache.
+
+The suite is 460 tests from 390 — 477 before the packed kernel's twenty-four
+separate assertions became seven that cover four hundred and forty-eight cases
+each — clean on the scalar, SSE2 and AVX2 backends and under the address and
+undefined behaviour sanitizers. Every floor the new tests hold to was checked by
+breaking the thing it covers on purpose.

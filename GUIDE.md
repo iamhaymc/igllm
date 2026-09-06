@@ -332,12 +332,24 @@ floats or a run of samples.
 - `puff_run` — an inflate reader: stored, fixed and dynamic Huffman blocks,
   with the zlib wrapper skipped when one is present. It is here because a PNG
   cannot be read without one and a third party decoder is not an option.
-- `png_read` — eight and sixteen bit grey, RGB, palette, and the two alpha
-  forms, non-interlaced. All five line filters are undone. Alpha is dropped
-  rather than composited: inventing a background is a preprocessing choice
-  this layer has no business making.
+- `png_read` — grey at one, two, four, eight and sixteen bits, palette at one
+  to eight, RGB and the two alpha forms at eight and sixteen, interlaced or
+  not. All five line filters are undone. An interlaced file is seven lattices,
+  each a picture of its own in the stream with its own rows and its own filter
+  byte a row, and one that catches no pixel is not in the stream at all; a file
+  that is not interlaced is the same walk with one lattice that catches
+  everything, which is why there is one path rather than two. Alpha is dropped
+  rather than composited: inventing a background is a preprocessing choice this
+  layer has no business making.
+- `jpeg_read` — baseline and extended sequential jpeg: the marker walk, a
+  canonical Huffman decode per component, dequantization, an eight by eight
+  inverse cosine transform, chroma upsampling at whatever the sampling factors
+  say, and YCbCr to RGB. Restart markers are stepped over. Progressive files
+  are refused the way the png reader refuses interlacing, because coefficients
+  arriving across several scans is a second decoder rather than a branch of
+  this one.
 - `pnm_read`, `bmp_read` — binary `P5`/`P6`, and uncompressed 24 or 32 bit
-  bitmaps. `image_read` picks between the three from the leading bytes rather
+  bitmaps. `image_read` picks between the four from the leading bytes rather
   than the file name.
 - `grid_scale` — a separable bicubic, the `a = -0.5` member of the family.
   The support widens with the reduction factor, so shrinking an image averages
@@ -710,6 +722,18 @@ it, which is what the reference does. Values carry a norm without a scale.
 When `attention_k_eq_v` is set, a full-attention layer has no `v_proj` and
 uses the raw pre-norm key projection as its values.
 
+The cache is read blocked by row rather than by head wherever a group of
+heads shares one — `session_attend_wide` is the question and
+`session_attend_group` is the read. This export ships one key-value head
+against eight attention heads, so all eight score against the same cached key
+row and blend the same cached value row; taken head by head that row is read
+eight times, and on a byte cache decoded eight times. Taken this way round a
+run of rows is laid into `cache_room` once, small enough to stay in the first
+level cache, and every head of the group reads it there. It costs a row of
+scores per head of the group rather than one, which is what `score_stride`
+sizes, and it hands each head exactly the floats it would have looked up for
+itself, so the scores and the blends are unchanged to the bit.
+
 When `enable_moe_block` is set, the dense MLP above is the shared expert and
 a routed branch runs beside it. `session_route` normalizes the pre-MLP
 residual without a scale, multiplies by `router.scale * hidden_size^-0.5`,
@@ -722,6 +746,14 @@ blends them. The two branches carry `post_feedforward_layernorm_1` and
 `[experts, ...]` parameter; `plane_bind_part` slices an expert out as a view
 rather than copying it. The mixture branch stays one lane wide, because each
 token picks its own experts.
+
+`token_frame_next` is the same frame for a turn that follows one the model has
+already answered. What a session has been fed stays in its cache, so a later
+turn lays down only what comes after it: the id that closed the model's turn —
+which the sampler stopped on and never fed back — and then the same user turn
+and the same opening the model answers into. Feeding a session two turns in two
+calls reaches, to the bit, what feeding one session the whole transcript in one
+call reaches, which is what `test_turn` asserts.
 
 `session_prime` consumes every prompt token but the last in batches of
 `KERN_LANE_LIMIT`, skipping the output head for each, because those logits
@@ -762,6 +794,22 @@ the first level cache. A layer holding floats never reaches them — it keeps
 `kern_dot_real` and the blend loop it always had, so `--cache 8` off is the
 arithmetic it was before any of this existed.
 
+`session_save` and `session_load` write a session's cache out and read it back,
+so a prompt that took a long time to prime need not be primed again. What goes
+in the file is the ids the session was fed and the rows of each layer's cache
+that carry anything — `keep_row_count` — so the file is the size of the
+conversation rather than of the window, and a ring that has turned over writes
+its whole span because every slot of it is live. The file is host native, the
+same floats and bytes the cache holds, and `keep_mark` mixes every shape the
+layout depends on with the checkpoint's own size so that a file written from
+other shapes is refused rather than made to fit. The `stamp_value` a caller
+hands `session_save` is written beside it and handed back unread: the ids alone
+cannot say that a picture in a prompt is the same picture, because two pictures
+lay down the same placeholder ids, so what identifies the rest of a prompt is
+the caller's to decide. `session_ids` hands the ids back, which is how the front
+end finds out whether the prompt it is about to run begins with the one in the
+file and primes only the difference.
+
 `session_cache_room_at` says what the cache costs at either storage, and
 `session_cache_bytes` asks the layer rather than assuming a float, so what
 `bench` reports a token reads falls with the storage.
@@ -797,6 +845,13 @@ An image or a clip enters as a bracketed run of placeholder ids with one
 embedding row laid against each placeholder; everything after that is the text
 path.
 
+A turn is one pass of that diagram. `chat --loop` runs it again on the same
+session — `main_talk_turn` frames the next turn with `token_frame_next`, primes
+it onto the cache the last turn left, and answers — and holds up to sixteen
+sessions on the one loaded model, which `/new`, `/talk` and `/drop` move
+between. They run one at a time: the sessions are independent, and the fork and
+join pool the kernels underneath them reach is not.
+
 ## 5. Formats read
 
 | file                      | needed for                                     |
@@ -808,7 +863,7 @@ path.
 | `tokenizer.json`          | vocabulary, merges, special tokens              |
 | `preprocessor_config.json` | the audio analysis window, when present        |
 | `processor_config.json`   | the clip's soft token budget, when present      |
-| `.png`, `.pnm`, `.bmp`    | a picture for the vision tower                  |
+| `.png`, `.jpg`, `.pnm`, `.bmp` | a picture for the vision tower             |
 | `.wav`                    | a clip for the audio tower                      |
 
 ## 6. Testing
@@ -827,14 +882,51 @@ miniature checkpoint — config, tokenizer, and every tensor the loader binds,
 once dense and once with a mixture block — and asserts that a batched prefill
 reaches exactly the logits produced by feeding the same tokens one at a time.
 
-`test_puff`, `test_image`, `test_scale`, `test_wave` and `test_mel` cover the
-media layer. The inflate reader is held against a stored block assembled in the
+`test_keep` covers the cache written out and read back: that a restored session
+reaches the same logits as the one that wrote it, bit for bit and without
+priming an id; that the ids, the peaks and the caller's stamp all come back;
+and that a file that stops short, one that is not a cache at all, one whose mark
+disagrees, and one that is not there are each refused, leaving the session
+cleared rather than half fed.
+
+`test_kernel` holds the packed dot and the packed spread against a plain
+bit-stream loop at every width the format allows, at spans that end mid-block,
+at leads that are and are not where a block of eight begins — which is what
+decides whether a width's own path is taken or the walk it falls back to — and
+with the code flip on and off.
+
+`test_turn` covers the turn after the first: that the later frame is the first
+frame with the document's opening traded for the close of the model's turn, that
+a session fed two turns in two calls reaches to the bit what one fed the whole
+transcript in one call reaches, and that a conversation reaches the same place
+whatever ran beside it on the same model.
+
+`test_puff`, `test_image`, `test_png_wide`, `test_jpeg`, `test_scale`,
+`test_wave` and `test_mel` cover the media layer. The inflate reader is held against a stored block assembled in the
 test and against a dynamic Huffman block produced by an independent compressor
 over four hundred bytes the test can regenerate from a formula; a truncated
 stream and one that would overrun its room are both required to be refused. The
 png fixture is a twelve by eight picture written by an independent encoder with
 the five line filters used in turn, and the same picture is written again as a
-pnm and as a bottom-up bitmap, so the three readers are held to one answer. The
+pnm and as a bottom-up bitmap, so the three readers are held to one answer.
+`test_png_wide` carries a writer of its own for the range the reader grew into:
+its own chunk framing and check values, its own line filters applied forward
+from the definitions, its own bit packing, and a deflate stream of stored blocks
+— which is a compressor the test does not need to have. Every depth of grey and
+of palette, interlaced and not, and the wider kinds interlaced, have to come
+back exactly; so do a picture smaller than the lattice and a picture of one
+pixel, which are the cases that tell a lattice with no columns apart from one
+that is simply absent.
+`test_jpeg` carries a baseline encoder of its own — its own forward transform
+in double precision, its own canonical code assignment, its own bit writer —
+and quantizes with tables of ones, so a round trip loses only what the two
+transforms round and the pixels can be held to within a level or two of the
+pixels that went in. Its Huffman table is deliberately not the specification's:
+eight to twelve bits over all 256 symbols, an incomplete code no encoder in the
+wild produces. A grey file, a three component file, a file whose chroma is at
+half the horizontal sampling, and a file broken by a restart marker after every
+unit all have to come back as the same picture; a progressive frame header and
+a truncated entropy stream both have to be refused. The
 resize is checked four ways: a constant survives in both directions, a ramp
 stays a straight line where the taps fit, the separable implementation matches a
 direct two dimensional gather, and folding three bands onto one takes the luma

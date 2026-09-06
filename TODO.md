@@ -8,23 +8,10 @@ weights or on none. Most consequential first within each group.
 
 ## On the shipped export
 
-- Read a cached key row once for all eight heads. This export ships
-  `num_key_value_heads` of one against eight attention heads, so `group_share`
-  is eight and every head of a layer scores against the same cached key row and
-  blends the same cached value row. `session_layer` decodes each of them once
-  per head, which is eight reads of every byte where one would do. Blocking the
-  loop the other way — a run of rows decoded once into scratch, then all eight
-  heads over the floats — cuts the decode work by eight without giving back any
-  of the storage the byte cache collects, and it serves every backend rather
-  than only the one with the gather. 0.8.4 measured what that gather costs: the
-  byte cache is 33% behind the float cache on the tuned build and 11% behind on
-  the default, six pairs of one sign on a quiet host, and with it the tuned
-  build is slower than the default build. This is the answer to that, and it is
-  a restructuring of the attention loop rather than a kernel swap.
 - Spend fewer instructions in the decode kernels, further. 0.8.4 took the two
   bit path from two broadcasts a sixteen codes to one and got 21% of decode at
   one thread, 9% at four; the narrowing is the shape of a build walking towards
-  the memory. It is not there yet: at four threads the tuned build reads 5.33
+  the memory. It is not there yet: at four threads the tuned build reads 5.72
   GiB/s of the 27.24 a bare sweep gives on that host, so four fifths of the
   machine is still unused. What is left is the four bit path, which is 335 MiB
   of the 727.5 a step sweeps and did not answer to either candidate 0.8.4 tried,
@@ -61,7 +48,7 @@ weights or on none. Most consequential first within each group.
   projections themselves, which already run through the packed kernels, and the
   softmax above.
 
-Two items are closed rather than carried. The per-group gain mirror — a
+Two items were closed rather than carried in 0.8.4. The per-group gain mirror — a
 per-plane float copy of the group gains, traded against the conversions it
 saves — has nothing to convert on this export: all 548 `weight_scale` tensors
 are `F32` of shape `[rows, 1]`, so `plane_gain` is already a plain indexed float
@@ -72,50 +59,63 @@ does not. And vectorizing the conformer's score loop was measured at nothing on
 the shipped export — the window is thirteen keys wide — at the cost of moving
 the tower's logits in the third decimal, so it was not taken.
 
+A third is off this list because it is done. Reading a cached key row once for
+all eight heads arrives in 0.8.5. It took decode on the byte cache from 5.91 to 7.22 tokens a second
+and prefill from 14.85 to 18.94, moved no bit of any result, and was worth 5%
+of decode on the float cache too, which was not the reason for it. `--cache 8`
+is within a percent or two of the float cache on both builds now rather than a
+third behind on one of them.
+
 ## Anywhere
 
-- Read jpeg. This is the gap that shows: most pictures a caller actually has are
-  jpeg, and `--image` refuses all of them. The wiring is small — `image_read`
-  sniffs three magics and hands off to `png_read`, `pnm_read` or `bmp_read`, each
-  of which fills a `flat_grid` of floats, so a fourth branch on `FF D8 FF` and a
-  `jpeg_read` beside them is the whole of it. What sits behind that branch is a
-  baseline decoder: the marker walk (SOI, APPn, DQT, SOF0, DHT, SOS, DRI, EOI), a
-  Huffman decode per component, dequantization against the tables DQT carried, an
-  eight by eight inverse DCT, chroma upsampling at whatever the sampling factors
-  say, and YCbCr to RGB. Restart markers are a page more. Progressive jpeg — SOF2,
-  coefficients arriving across several scans with successive approximation — is a
-  second job of its own size and should be scoped as one; refusing it the way the
-  png reader refuses interlacing is a fair first version.
+- Read progressive jpeg. Baseline and extended sequential arrive in 0.8.5;
+  `SOF2` is refused there the way the png reader refuses interlacing. It is a
+  second decoder rather than a branch of the first: the coefficients arrive
+  across several scans with successive approximation, so the whole picture's
+  coefficients have to be held until the last scan lands, where a sequential
+  block is final when its scan has read it. The marker walk, the Huffman decode,
+  the transform, the upsampling and the colour transform are all already there
+  and unchanged by it; what is new is the coefficient store, the four scan kinds
+  — dc first, dc refine, ac first, ac refine — and the end-of-band run.
+  Progressive is a fair share of what a browser is served, so it is worth
+  having; it is not what a caller with a photograph on disk usually has.
 
-  `stb_image.h` is the reference to read for it: one header, public domain or MIT
-  at the reader's choice, baseline and progressive both, and its decisions about
-  where to round and how to lay the IDCT out are the ones worth understanding
-  before writing another. It is a
-  reference and not a source — nothing in this repository is borrowed, and
-  vendoring it would cost the claim on the front page. Some of the hard part is
-  already here in another guise: `puff_tree_build` and `puff_sign` are a canonical
-  Huffman decoder, and DHT hands over code lengths in much the shape deflate's
-  dynamic block does, so the tree builder may want widening rather than a second
-  copy beside it.
-
-  One thing to settle before the parity harness sees a jpeg. `app_diff.py` opens
-  the picture with `Image.open`, which is libjpeg, while the engine would open it
-  with its own IDCT. On png both sides start from identical pixels and the
-  comparison is of the tower alone; on jpeg they would start a bit or two apart
-  per pixel, and the tower's disagreement would be measured on top of the
-  decoder's. Either the harness feeds both sides the same decoded pixels, or the
-  jpeg cases are held to a looser floor than the png ones and the release says
-  which. The second is easier and the first is more honest.
-- Read a wider range of png. The reader refuses interlaced files and bit depths
-  under eight.
-- Support more than one concurrent session per model in the CLI, and add a
-  multi-turn chat loop rather than a single turn.
-- Persist and restore a session cache, so a long prompt need not be primed
-  twice.
-- Widen `kern_dot_code` for the odd bit widths. Two, four and eight bits are
-  vectorized, in the fused dot and in `kern_code_spread` beside it; three,
-  five, six, and seven still walk the bit stream in both. Synthetic weights
-  reach every width, which the shipped export does not.
+  Two smaller gaps beside it: a four component file, CMYK or YCCK, needs the
+  Adobe `APP14` transform flag read and an inversion rule for the ones written
+  inverted, and neither can be guessed from the pixels; and a precision of
+  twelve bits, which the extended sequential frame header allows, needs the
+  tables and the level shift widened.
+- Run two conversations at the same time rather than one after the other. 0.8.5
+  gives the CLI several sessions on one model and a loop that takes turns in any
+  of them, and they take those turns one at a time: the sessions are
+  independent, but every kernel underneath them reaches the model's one
+  `pool_group`, which is a fork and join with no queue in it and one caller's to
+  be inside at a time. Two of them stepping at once would be two callers in that
+  fork. What it wants is either a pool a session owns — which costs a thread a
+  session and gives the host's cores to whoever asks first — or a queue in front
+  of the one pool, which is the shape a server wants anyway and is the larger
+  change. Neither is worth guessing at without a caller that needs it.
+- Persist and restore a conversation, not only a prompt. 0.8.5 gives
+  `session_save` and `session_load` and the `--keep` flag over them, and what
+  they hold is a prompt: the file is written before the first token is sampled,
+  so a rerun of the same prompt starts where the last run started. A file
+  written that way cannot be picked up as a conversation, because the session
+  that wrote it is one id short of the prompt — the id `session_step` was about
+  to be fed — and a turn framed onto it would drop that id. What resuming a
+  conversation wants is a save taken after an answer, and a way to say which of
+  the two a file is; the loop's `/save` and `/open` are the shape of it.
+- Close what is left of the gap at the odd bit widths. 0.8.5 took three, five,
+  six and seven bits off the bit stream walk and onto a block of eight codes,
+  which is a byte boundary at every one of those widths: the fused dot is 6.5 to
+  8.2 times what it was on AVX2 and about twice on SSE2, and `kern_code_spread`
+  beside it 3.4 to 3.8. They are still a quarter of what two and four bits
+  reach, and the reason is the block's word, which is assembled a byte at a time
+  because the packing is defined by the bit stream rather than by the host's
+  byte order. What would close it is an unpack in the shape the two bit path
+  has — a shuffle over a wider load, thirty-two codes at a time — and a way to
+  read the word wide that does not assume the host is little-endian, or a stated
+  decision that it is. Synthetic weights reach every width, which the shipped
+  export does not, so none of this moves a token on the checkpoint that ships.
 - Add an AVX-512 path beside AVX2, selected by the same macro layer. On the
   evidence it would have something to show rather than nothing: the tuned build
   used 42% of what the memory gives on the 2017 desktop and 20% on the virtual
@@ -128,3 +128,19 @@ the tower's logits in the third decimal, so it was not taken.
 - Build under MSVC. The suite builds clean and passes on a Windows host with
   MinGW gcc, on the scalar, SSE2 and AVX2 backends; `cl` and its `/arch:AVX2`
   path have still only been read.
+
+Four items are off this list because 0.8.5 did them: baseline jpeg, the wider
+range of png, the multi-turn chat loop with several conversations on one model,
+and the session cache written out and read back. The png reader now takes grey
+at one, two and four bits, palette at one to eight, and interlaced files of
+every kind, so there is no legal pairing of depth and colour kind left that it
+refuses; what jpeg still refuses is a decoder of its own and is carried above,
+and so are the two halves of the other three that 0.8.5 did not reach.
+
+A fifth is closed rather than carried. How `app_diff.py` should treat a picture
+the two sides decode differently — the question the jpeg item raised — turns out
+to be answered already: `diff_tower` feeds the reference the patches the engine
+says it read, out of the activation dump, and the seam's graph half is fed the
+same, so the only thing either half reads from the picture file is its width and
+height. The decoder is not in the comparison, and a jpeg case is held to the
+same floor as a png one.
