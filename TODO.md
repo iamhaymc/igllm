@@ -8,25 +8,25 @@ weights or on none. Most consequential first within each group.
 
 ## On the shipped export
 
-- Spend fewer instructions in the decode kernels, further. 0.8.4 took the two
-  bit path from two broadcasts a sixteen codes to one and got 21% of decode at
-  one thread, 9% at four; the narrowing is the shape of a build walking towards
-  the memory. It is not there yet: at four threads the tuned build reads 5.72
-  GiB/s of the 27.24 a bare sweep gives on that host, so four fifths of the
-  machine is still unused. What is left is the four bit path, which is 335 MiB
-  of the 727.5 a step sweeps and did not answer to either candidate 0.8.4 tried,
-  and the eight bit path at 26 MiB. Both want a reading of what they are
-  actually waiting on rather than another guess.
+- Spend fewer instructions in the two bit decode path, which is the one still
+  spending them. 0.8.8 read what each width waits on at four threads, on rows
+  streamed from memory against the same rows held in cache, and the three
+  answers differ. The eight bit path keeps half of its resident rate and lands
+  on the memory's own number — 23.95 GiB/s of the 26.27 a bare sweep gives on
+  the tuned build, 27.66 on the wide one — so it is done, and a quicker kernel
+  there buys nothing. The four bit path keeps 83% of its resident rate tuned and
+  68% wide: the memory is part of what it waits on and there is a little left in
+  it. The two bit path keeps 94% and 78%, and is 366 MiB of the 727.5 a step
+  sweeps, which makes it the one width where instructions are still most of the
+  cost and the only one worth another kernel.
 
-  0.8.7 answers part of it and leaves the rest. On a host with AVX-512 the four
-  bit fused dot is 54% quicker and the eight bit one 36%, for no change but a
-  wider vector, and decode gains 21% at one thread — which says these paths were
-  spending instructions rather than waiting on the memory, and settles the
-  question for a wide host. It does not settle it for an AVX2 one, where both
-  paths are what they were, and it does not settle what they wait on at four
-  threads: the same wide build gains only 6% there, so past one thread the
-  memory is a real part of the cost and a narrower reading of it is what is
-  still missing.
+  What that reading also says is that the kernels are no longer where a token
+  goes at four threads. Streamed through the rates above, the mix a step sweeps
+  is 38.9 ms of kernel a token, and the token is 63.7 ms on the wide build now
+  that the fork and the join are 4.8 ms of it rather than 33. The 25 ms outside
+  the kernels — the attention, the norms, the sampler, the bands that do not
+  divide evenly — have never been measured a part at a time, and on this host
+  they are now larger than anything left inside them.
 - Hold the seam open as the prompt grows. All nine cases are judged on the
   shipped export now, each in a process of its own, and the longest is 664 ids
   with two pictures and a clip in it. What has not been tried is a prompt long
@@ -39,19 +39,35 @@ weights or on none. Most consequential first within each group.
   is a footprint question rather than a decode one, as 0.8.1 established, and it
   is worth having on a small host. It is not a decode win and should not be
   scoped as one.
-- Speed up the towers further, where the time is. 0.8.4 profiled a picture at
-  the full patch budget — a 48 by 48 grid, 2304 patches, sixteen layers of
-  twelve heads — and of the 148 s a single threaded run takes, the scoring is
-  9.6 s, the softmax 6.6, the blend 7.9 and the projection out of attention 2.6.
-  The softmax is 0.8.6's: the kernel is a fifth of what it was on the tuned
-  build and half of it on the default one, which took a picture from 122.8 s to
-  113.2 on the host 0.8.6 measured. What is left of the twenty-four seconds is
-  the scoring and the blend, which the compiler was already vectorizing, and
-  what is left of the picture is the six hundred billion multiply-adds of the
-  projections themselves, which already run through the packed kernels. So the
-  next reading here is of those kernels rather than of the tower, which is the
-  item at the head of this list — and it wants a fresh profile, because the one
-  quoted above is 0.8.4's and the softmax line of it is gone.
+- Speed up the towers further, and the batch under them. 0.8.8 profiled a
+  picture again — the tower is 39.1 s single threaded at the full patch budget,
+  of which the projections are 24.0, the scoring 6.5, the blend 5.0 and the
+  softmax 0.83 — and then took the one change that reading pointed at: four
+  lanes of a batch now share the row's load rather than each loading it again,
+  which is 8% of the projections and 23% of prefill on the default build.
+
+  What is left of that loop is the eight lane block, and what stands in its way
+  is not what it looks like. Eight lanes with two accumulators apiece is
+  seventeen live vectors against sixteen, so the eight lane form that measures
+  16% quicker — 30.13 G multiply-adds a second against 27.15 — is the one with a
+  single accumulator a lane, which reassociates every sum in the engine. The
+  wide tier has thirty-two vector registers and could hold eight lanes and both
+  accumulators, and written that way it measures 24.04 against the four lane
+  form's 27.15: slower, so the register count was never the obstacle. The open
+  question is therefore whether 16% of this kernel is worth moving every logit,
+  not how to fit the exact form into a host that has room for it.
+
+  Past that the tower's own attention is what is left: the scoring at 6.5 s and
+  the blend at 5.0, neither touched since they were written, both already
+  vectorized by the compiler, and together a third of a tower.
+
+- The other half of a picture is the text stack, and nothing has been asked of
+  it. A picture at the full budget lays 256 soft tokens down, and prefilling
+  those through the text stack costs 40.1 s single threaded against the tower's
+  39.1 — half of what a picture costs, and outside every reading of a picture
+  taken before 0.8.8. It is the ordinary prefill path, so the item above is most
+  of what would move it, but it is worth stating that a tower made free would
+  halve a picture rather than remove it.
 
 Two items were closed rather than carried in 0.8.4. The per-group gain mirror — a
 per-plane float copy of the group gains, traded against the conversions it
@@ -95,6 +111,21 @@ layers behind it and amplifies a last bit either way.
   of them is what a caller with a photograph on disk has, and arithmetic coding
   in particular is what nothing in the wild produces, so this is a completeness
   item rather than a useful one.
+
+Two items are off this list because 0.8.8 answered them, and the first two items
+above are what is left of them. The second is the towers: the fresh profile that
+entry asked for is in `CHANGES.md` 0.8.8, and it moved the question from the
+tower to the batch every tower and every prefill shares.
+
+The first is the head one. What the four bit and eight bit paths wait on at four threads is
+answered — the eight bit path waits on the memory, the four bit one partly — and
+the larger half of the answer was in neither. Between the kernels sat 277 forks
+and joins a token, 120 microseconds apiece at four threads, a third of the
+token; both sides of the pool now spin briefly before they sleep, and decode at
+four threads went from 10.51 tokens a second to 15.69 on the wide build, 8.37 to
+11.21 on the tuned one and 6.19 to 7.26 on the default one, without moving a bit
+of any result. A pool with more threads than the host has cores does not spin,
+which was measured as well and is the other half of that finding.
 
 Two items are off this list because 0.8.7 did them, one from each group as it
 stood.

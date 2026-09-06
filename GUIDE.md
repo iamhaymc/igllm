@@ -72,6 +72,18 @@ Thin shims, no third party code:
   `pool_close`. `pool_run` hands the same function to every worker with a
   slice index, waits, and returns. There is no queue and no allocation in
   the token loop.
+
+  Both sides of it spin before they sleep. A decode token issues 277 of these
+  jobs — one a projection — so a fork and a join that costs 120 microseconds of
+  scheduler at four threads costs a third of the token, which is what
+  `CHANGES.md` 0.8.8 measured. Each waiter therefore reads the counter it is
+  waiting on directly for a bounded spell, `POOL_SPIN_LIMIT` pauses, before it
+  takes the lock and sleeps on it as it always did. The counter is a hint and
+  the lock is still what orders the memory either side of a job.
+
+  `pool_open` sets the group's spin to zero when the pool has more threads than
+  the host has cores. There the core a spinner holds is the one another worker
+  needs, and spinning costs nearly half of decode rather than gaining it.
 - `slice_span` — divides a range into bands, spreading the remainder over
   the leading bands so no worker is more than one element behind.
 
@@ -336,12 +348,31 @@ in isolation and slower in the engine, and taken out again — see
   of a wider array and the head size where they have been gathered into a run.
 - `kern_fma_row` — `into[v] += left[v] * right[v]`, which is what the
   conformer's depthwise convolution becomes once its kernel is held tap-major.
+- `kern_dot_real_many` — one row of floats against four activation vectors at
+  once, which is what the batch's inner loop became in 0.8.8. Taken a lane at a
+  time it loaded the spread's scratch again for every lane: two loads for every
+  multiply-add, on a host that issues two loads and two multiply-adds a cycle,
+  so the loop got one multiply-add a cycle whatever its vector was. Four lanes
+  sharing the row's load make that ten loads for eight multiply-adds — 25.93 G
+  multiply-adds a second against 17.11 on the span the batch uses.
+
+  Every lane's sum is `kern_dot_real`'s own float, bit for bit: the same two
+  accumulators taking the same slots in the same order, the same reduction
+  (`kern_dot_total`, factored out so the two cannot drift), and the scalar tail
+  folded in before the total reaches the caller's accumulator. Lanes past the
+  last block of four, and every backend without a vector path here, go through
+  `kern_dot_real` itself. Four lanes and not eight because eight needs
+  seventeen live vectors against sixteen, and the only way to eight is one
+  accumulator a lane, which would reassociate every sum in the engine for two
+  per cent of a token. The wide tier's thirty-two registers do hold eight lanes
+  and both accumulators, and measured there that form is slower than four
+  lanes — so the register count was never what stood in the way.
 - `kern_row_code_many` — the same row against several activation vectors at
   once. A group of codes is spread into a small float scratch and dotted
-  against every lane, so a batch pays the decode cost of a single vector. When
-  that spread was a scalar walk of the bit stream, a sixteen lane batch cost
-  three and a half times what the same sixteen lanes cost one at a time, and
-  batching lost to the thing it exists to beat.
+  against every lane through the kernel above, so a batch pays the decode cost
+  of a single vector. When that spread was a scalar walk of the bit stream, a
+  sixteen lane batch cost three and a half times what the same sixteen lanes
+  cost one at a time, and batching lost to the thing it exists to beat.
 
   This is the one caller of `kern_code_spread`, and it is why that function has
   no wide path. The spread is a small part of what this loop does and the
@@ -354,6 +385,11 @@ in isolation and slower in the engine, and taken out again — see
 - `kern_mat_vec_band` — one band of rows, the unit of work given to the pool.
   It carries a lane count, so the same band function serves a matrix-vector
   product and a matrix-matrix product.
+
+  It is also the whole of what the pool is asked to do, and a decode token asks
+  277 times — nine planes a layer, the output head, the per-layer projection.
+  At four threads that made the fork and the join around it a third of a token
+  until 0.8.8 spun before sleeping; see `pool_group` above.
 - `kern_norm_rms` — `x * rsqrt(mean(x²) + eps) * weight`. Gemma 4 uses the
   weight directly, **not** `1 + weight`.
 - `kern_gelu_tanh`, `kern_gelu_gate` — the tanh approximation, and the gated
@@ -600,6 +636,19 @@ host that measured it. It moves the numbers, and the measure of how much is
 that reassociating the old summation, the same `expf` with the total in two
 accumulators, moves them as far: 35 routed layers stand behind a picture and
 amplify a last bit either way.
+
+0.8.8 profiled it again on a host with AVX-512, with a timer around each part
+rather than a sampling profiler, and the balance has moved. Of the 39.1 s the
+tower takes single threaded at the full patch budget, the projections are 24.0,
+the scoring 6.5, the blend 5.0, the softmax 0.83 — the series arriving where it
+was aimed — and everything else 3.3. So the attention is 32% of a tower and the
+projections 61%, and the next thing to read is the batch they run on, which is
+`kern_row_code_many` and is also every prefill batch. Three ways of hurrying it
+are measured and refused in `CHANGES.md` 0.8.8.
+
+Half of what a picture costs is not in the tower at all: its 256 soft tokens are
+prefilled through the text stack like any other ids, which is 40.1 s against the
+tower's 39.1.
 
 **The audio tower is a conformer**, not a transformer, and the difference is
 worth stating because the two look alike from a distance. A layer is

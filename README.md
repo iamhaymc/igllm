@@ -263,3 +263,32 @@ with `--cache 8` and 6.96 to 7.32 with floats, prefill 14.85 to 18.94 and 19.52
 to 19.69; on the default build decode 5.18 to 5.87 and 5.70 to 6.03. Not one bit
 of any result moves. What it takes back is most of what the byte cache cost:
 `--cache 8` was 15% behind floats on this host and is now 1%.
+
+The fifth pass is 0.8.8's, on a third machine, and it is not a kernel at all.
+Asking the four thread question the way `TODO.md` posed it — what are the decode
+paths waiting on — turned up an answer between the kernels rather than in them.
+Each path measured on its own streams the bytes a token needs in 38.9 ms at four
+threads, and the token took 95.1: the missing 56 ms were the fork and the join
+around every projection, of which decode issues 277 a token, at 120 microseconds
+apiece on that host. Both sides of the pool now spin briefly before they sleep,
+which takes the fork and join to 17.4 microseconds and decode at four threads
+from 10.51 tokens a second to 15.69 on the wide build, 8.37 to 11.21 on the
+tuned one and 6.19 to 7.26 on the default one. A pool with more threads than the
+host has cores does not spin, because there the core a spinner holds is one
+another worker needs. Not a bit of any result moves.
+
+0.8.8 also profiled a picture again, which is the other thing `TODO.md` asked
+for. At the export's full patch budget the tower takes 39.1 s single threaded —
+24.0 of projections, 6.5 of scoring, 5.0 of blend and 0.83 of softmax, the last
+being 0.8.6's series where 0.8.4 measured 6.6 — and the 256 soft tokens it
+produces cost another 40.1 s to prefill through the text stack, which is half of
+what a picture costs and was in no reading of one before. Three ways of hurrying
+the projections were measured and none taken, and a fourth was: the batch's
+inner loop read the spread's scratch again for every one of its sixteen lanes,
+which is two loads for every multiply-add on a host that issues two of each a
+cycle. Four lanes now share the row's load, and prefill on an 1800 id prompt
+goes from 9.28 tokens a second to 11.40 on the default build, 16.75 to 17.80 on
+the tuned one and 17.75 to 18.41 on the wide one — the order being the argument,
+since the default build has no fused multiply-add and so the loads are the
+largest share of what it does. Every lane's sum is the float it was, bit for
+bit. `CHANGES.md` says which three were refused and why.

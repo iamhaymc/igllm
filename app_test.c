@@ -152,6 +152,25 @@ static void test_platform(void) {
     pool_run(&pool, test_pool_band, tally_list);
     for (slot = 0; slot < 1000; ++slot) sum_value += tally_list[slot];
     test_true(sum_value == 2000, "pool_run covers every element exactly once per pass");
+    test_true(pool.spin_limit == (4 <= host_thread_count() ? POOL_SPIN_LIMIT : 0),
+              "a pool spins only where every thread has a core");
+    pool_close(&pool);
+    mem_free(tally_list);
+  }
+
+  {
+    /* Oversubscribed: the waiters sleep on the first look rather than spin,
+     * because the core a spinner holds is one another worker is waiting for.
+     * The bands are the same bands either way, which is what this checks. */
+    pool_group pool;
+    int wide_count = host_thread_count() * 2 + 1;
+    int *tally_list = (int *)mem_clear(sizeof(int) * 1000);
+    int slot, sum_value = 0;
+    test_true(pool_open(&pool, wide_count) == APP_OKAY, "pool_open succeeds oversubscribed");
+    test_true(pool.spin_limit == 0, "an oversubscribed pool does not spin");
+    pool_run(&pool, test_pool_band, tally_list);
+    for (slot = 0; slot < 1000; ++slot) sum_value += tally_list[slot];
+    test_true(sum_value == 1000, "pool_run covers every element once without the spin");
     pool_close(&pool);
     mem_free(tally_list);
   }
@@ -655,6 +674,44 @@ static void test_kernel(void) {
     mem_free(act_list);
     mem_free(row_list);
     mem_free(half_list);
+  }
+
+  { /* The batch's dot against the one it blocks.  Four lanes at a time share
+     * the row's load, and the claim the loop rests on is that this is the same
+     * arithmetic and not merely close: every lane's sum has to be the float
+     * `kern_dot_real` returns, bit for bit, at every span and lane count where
+     * the block, its vector tail and its scalar tail all land differently.
+     *
+     * The lanes are strided as the batch strides them, wider than the span, so
+     * a path that read the wrong lane would read a different vector rather
+     * than a neighbouring one. */
+    int lane_limit = 9, span_limit = 40;
+    int lane_stride = 71;
+    float *act_list = (float *)mem_clear(sizeof(float) * (size_t)lane_limit * (size_t)lane_stride);
+    float *row_list = (float *)mem_clear(sizeof(float) * (size_t)lane_stride);
+    int slot, lane_count, span_count, okay_flag = 1;
+    for (slot = 0; slot < lane_limit * lane_stride; ++slot)
+      act_list[slot] = (float)sin((double)slot * 0.29);
+    for (slot = 0; slot < lane_stride; ++slot) row_list[slot] = (float)cos((double)slot * 0.13);
+    for (lane_count = 1; lane_count <= lane_limit && okay_flag; ++lane_count) {
+      for (span_count = 1; span_count <= span_limit && okay_flag; ++span_count) {
+        float many_room[16], one_room[16];
+        int lane_index;
+        for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+          many_room[lane_index] = (float)lane_index * 0.5f; /* a live accumulator */
+          one_room[lane_index] = many_room[lane_index];
+        }
+        kern_dot_real_many(row_list, act_list, lane_stride, lane_count, span_count, many_room);
+        for (lane_index = 0; lane_index < lane_count; ++lane_index)
+          one_room[lane_index] += kern_dot_real(
+              row_list, STORE_F32, act_list + (size_t)lane_index * (size_t)lane_stride, span_count);
+        for (lane_index = 0; lane_index < lane_count; ++lane_index)
+          if (many_room[lane_index] != one_room[lane_index]) okay_flag = 0;
+      }
+    }
+    test_true(okay_flag, "kern_dot_real_many reaches kern_dot_real's own float, every lane");
+    mem_free(act_list);
+    mem_free(row_list);
   }
 
   { /* The two bit table against the bit stream it stands in for.  It is built
