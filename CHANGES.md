@@ -3322,19 +3322,26 @@ wide build the largest logit gap of the four prompts is 1.74 against a bar of
 
 ---
 
-## 0.8.8 — what four threads were actually waiting on
+## 0.8.8 — what four threads were actually waiting on, and where a picture goes
 
 ### Scope
 
-One item off `TODO.md`, and it is the head one: what the four bit and eight bit
-decode paths wait on once four threads pull on them. 0.8.7 could say that a
-wide fused dot was worth 21% of decode at one thread and 6% at four, and could
-say that the memory was more of the cost at four than at one, but it could not
-say how much more. That was the question, and it is answered here.
+Two items off `TODO.md`. The head one is what the four bit and eight bit decode
+paths wait on once four threads pull on them; the other is the fresh profile of
+a picture that "speed up the towers further" asked for before anything else is
+tried there.
 
-The answer is that at four threads the kernels were not the cost and neither was
-the memory. Between the two there was a third thing nobody had measured, and it
-was a third of the token: the fork and the join around every projection.
+On the first: 0.8.7 could say that a wide fused dot was worth 21% of decode at
+one thread and 6% at four, and could say that the memory was more of the cost at
+four than at one, but it could not say how much more. That was the question, and
+it is answered here. The answer is that at four threads the kernels were not the
+cost and neither was the memory. Between the two there was a third thing nobody
+had measured, and it was a third of the token: the fork and the join around
+every projection.
+
+On the second: the profile is here, three of its candidates are measured, and
+none of the three is taken. That half of the release changes no code and is
+worth as much as the half that does.
 
 ### The host
 
@@ -3483,6 +3490,73 @@ task functions are untouched; what changed is how a thread waits between two
 jobs. The suite is 493 tests, clean on the default, tuned and wide builds and
 under the address and undefined sanitizers. The reference comparison passes on
 the shipped export on the wide build, with the same logits it reached before.
+
+### The picture, profiled again
+
+The other item this release touches asked for a fresh reading of where a
+picture's time goes, because the one it carried was 0.8.4's and the softmax line
+of it had since been removed. Here it is, on the same host, single threaded, on
+the wide build, at the export's full patch budget — a 48 by 48 grid, 2304
+patches, sixteen layers of twelve heads — with a timer around each part rather
+than a sampling profiler, because `gprof` divides a callee's time among its
+callers by call count and every call here is a different size:
+
+| part of the tower | 0.8.4, its host | 0.8.8, this host |
+| --- | --- | --- |
+| the projections | not separated | **24.0 s** |
+| the scoring | 9.6 s | 6.5 |
+| the softmax | 6.6 | **0.83** |
+| the blend | 7.9 | 5.0 |
+| everything else in it | | 3.3 |
+| the tower, end to end | | 39.1 s |
+
+Three things in that. The softmax line is gone, which is 0.8.6's series arriving
+where it was aimed: eight tenths of a second where the call cost six and a half.
+The projections are 61% of the tower and the attention 32%, so the balance
+0.8.4 described — attention conspicuous, projections the rest — has tipped
+further towards the projections than it names. And the scoring and the blend are
+what they were, within the difference between two hosts.
+
+The third thing is not in the tower at all. A picture at this budget lays down
+256 soft tokens, and those are prefilled through the text stack like any other
+ids: 40.1 s of it, against the tower's 39.1. **Half of what a picture costs is
+the text stack reading what the tower produced**, which no reading of this
+before had separated. At four threads the two are 13.8 s and 13.6 s.
+
+### Three ways to hurry the projections, measured and not taken
+
+The projections are `kern_row_code_many`: a group of codes spread into a float
+scratch once, then dotted against each of sixteen lanes through `kern_dot_real`,
+which is the single hottest function in the engine — 65% of the self time of a
+picture's whole run. Three candidates, each quicker where it was measured on its
+own and none of them quicker in the engine:
+
+**A sixteen lane `kern_dot_real`.** On the 256 element span the batch hands it,
+27.08 G multiply-adds a second against 17.97 for the eight lane path it would
+replace. Put the spread that fills its row in the same loop, which is where it
+actually sits, and that narrows to 20.64 against 16.71. In the engine it is
+worth 5% of the tower's projections — 22.79 s against 23.88 — and costs prefill
+2%, 17.08 tokens a second against 17.49 on an 1800 id prompt. A wash on one half
+and a loss on the other, so it is not in.
+
+**Four eight lane accumulators instead of two.** The multiply-add is four cycles
+deep and the host retires two a cycle, so two chains leave the units half fed:
+24.88 G multiply-adds a second against 17.94, a 39% gain measured on the span
+the batch uses. In the engine, prefill on the tuned build is 15.10 tokens a
+second against 16.66 — 9% slower — which is the same shape of answer 0.8.7 got
+from the wide spread and worth writing down twice.
+
+**Thirty-two lanes a batch rather than sixteen**, which halves the number of
+passes a prompt makes over the codes and halves the spreads with it: prefill
+17.29 against 17.31, which is nothing, and sixty-four lanes 16.11, which is
+worse. So the codes are not what the batch is waiting on either.
+
+Between them those three say what the next attempt should not be. The batch is
+not waiting on the width of its multiply-add, nor on the depth of its dependency
+chain, nor on the codes it streams. What is left is the shape of the loop — a
+scratch written and then read sixteen times, with the loads for the row and the
+loads for the lane competing for the same ports — and changing that is a
+restructuring of `kern_row_code_many` rather than a wider kernel inside it.
 
 ### What is left of the four thread question
 

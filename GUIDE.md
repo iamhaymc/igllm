@@ -618,6 +618,19 @@ that reassociating the old summation, the same `expf` with the total in two
 accumulators, moves them as far: 35 routed layers stand behind a picture and
 amplify a last bit either way.
 
+0.8.8 profiled it again on a host with AVX-512, with a timer around each part
+rather than a sampling profiler, and the balance has moved. Of the 39.1 s the
+tower takes single threaded at the full patch budget, the projections are 24.0,
+the scoring 6.5, the blend 5.0, the softmax 0.83 — the series arriving where it
+was aimed — and everything else 3.3. So the attention is 32% of a tower and the
+projections 61%, and the next thing to read is the batch they run on, which is
+`kern_row_code_many` and is also every prefill batch. Three ways of hurrying it
+are measured and refused in `CHANGES.md` 0.8.8.
+
+Half of what a picture costs is not in the tower at all: its 256 soft tokens are
+prefilled through the text stack like any other ids, which is 40.1 s against the
+tower's 39.1.
+
 **The audio tower is a conformer**, not a transformer, and the difference is
 worth stating because the two look alike from a distance. A layer is
 

@@ -276,3 +276,11 @@ from 10.51 tokens a second to 15.69 on the wide build, 8.37 to 11.21 on the
 tuned one and 6.19 to 7.26 on the default one. A pool with more threads than the
 host has cores does not spin, because there the core a spinner holds is one
 another worker needs. Not a bit of any result moves.
+
+0.8.8 also profiled a picture again, which is the other thing `TODO.md` asked
+for. At the export's full patch budget the tower takes 39.1 s single threaded —
+24.0 of projections, 6.5 of scoring, 5.0 of blend and 0.83 of softmax, the last
+being 0.8.6's series where 0.8.4 measured 6.6 — and the 256 soft tokens it
+produces cost another 40.1 s to prefill through the text stack, which is half of
+what a picture costs and was in no reading of one before. Three ways of hurrying
+the projections were measured and none taken; `CHANGES.md` says which and why.

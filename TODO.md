@@ -39,19 +39,36 @@ weights or on none. Most consequential first within each group.
   is a footprint question rather than a decode one, as 0.8.1 established, and it
   is worth having on a small host. It is not a decode win and should not be
   scoped as one.
-- Speed up the towers further, where the time is. 0.8.4 profiled a picture at
-  the full patch budget — a 48 by 48 grid, 2304 patches, sixteen layers of
-  twelve heads — and of the 148 s a single threaded run takes, the scoring is
-  9.6 s, the softmax 6.6, the blend 7.9 and the projection out of attention 2.6.
-  The softmax is 0.8.6's: the kernel is a fifth of what it was on the tuned
-  build and half of it on the default one, which took a picture from 122.8 s to
-  113.2 on the host 0.8.6 measured. What is left of the twenty-four seconds is
-  the scoring and the blend, which the compiler was already vectorizing, and
-  what is left of the picture is the six hundred billion multiply-adds of the
-  projections themselves, which already run through the packed kernels. So the
-  next reading here is of those kernels rather than of the tower, which is the
-  item at the head of this list — and it wants a fresh profile, because the one
-  quoted above is 0.8.4's and the softmax line of it is gone.
+- Restructure the batch that the towers and prefill both run on. 0.8.8 profiled
+  a picture again, at the export's full patch budget on a host with AVX-512, and
+  the tower's own 39.1 s single threaded is 24.0 of projections, 6.5 of scoring,
+  5.0 of blend, 0.83 of softmax — 0.8.6's series, where 0.8.4 measured 6.6 — and
+  3.3 of everything else. So the projections are 61% of a tower and the question
+  is theirs.
+
+  Three ways of hurrying them were measured and none taken: a sixteen lane
+  `kern_dot_real` (5% of the projections, and prefill 2% slower), four eight
+  lane accumulators instead of two (prefill 9% slower on the tuned build), and
+  thirty-two lanes a batch instead of sixteen, which halves the passes over the
+  codes and changed prefill by nothing. Each was quicker on its own — the first
+  by 51%, the second by 39% — so what the batch waits on is none of the width of
+  its multiply-add, the depth of its chain, or the codes it streams.
+
+  What is left is the shape of `kern_row_code_many` itself: a scratch of 256
+  floats written by the spread and then read once per lane, with the row's loads
+  and the lane's loads competing for the same ports. Holding the lanes'
+  accumulators across a block of codes instead — so the spread is read from
+  registers rather than from memory sixteen times — is the change that is left,
+  and it is a restructuring rather than a kernel. It is also worth more than a
+  tower: the same loop is every prefill batch.
+
+- The other half of a picture is the text stack, and nothing has been asked of
+  it. A picture at the full budget lays 256 soft tokens down, and prefilling
+  those through the text stack costs 40.1 s single threaded against the tower's
+  39.1 — half of what a picture costs, and outside every reading of a picture
+  taken before 0.8.8. It is the ordinary prefill path, so the item above is most
+  of what would move it, but it is worth stating that a tower made free would
+  halve a picture rather than remove it.
 
 Two items were closed rather than carried in 0.8.4. The per-group gain mirror — a
 per-plane float copy of the group gains, traded against the conversions it
@@ -96,8 +113,12 @@ layers behind it and amplifies a last bit either way.
   in particular is what nothing in the wild produces, so this is a completeness
   item rather than a useful one.
 
-One item is off this list because 0.8.8 did it, and the head item above is what
-is left of it. What the four bit and eight bit paths wait on at four threads is
+Two items are off this list because 0.8.8 answered them, and the first two items
+above are what is left of them. The second is the towers: the fresh profile that
+entry asked for is in `CHANGES.md` 0.8.8, and it moved the question from the
+tower to the batch every tower and every prefill shares.
+
+The first is the head one. What the four bit and eight bit paths wait on at four threads is
 answered — the eight bit path waits on the memory, the four bit one partly — and
 the larger half of the answer was in neither. Between the kernels sat 277 forks
 and joins a token, 120 microseconds apiece at four threads, a third of the
