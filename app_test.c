@@ -152,6 +152,25 @@ static void test_platform(void) {
     pool_run(&pool, test_pool_band, tally_list);
     for (slot = 0; slot < 1000; ++slot) sum_value += tally_list[slot];
     test_true(sum_value == 2000, "pool_run covers every element exactly once per pass");
+    test_true(pool.spin_limit == (4 <= host_thread_count() ? POOL_SPIN_LIMIT : 0),
+              "a pool spins only where every thread has a core");
+    pool_close(&pool);
+    mem_free(tally_list);
+  }
+
+  {
+    /* Oversubscribed: the waiters sleep on the first look rather than spin,
+     * because the core a spinner holds is one another worker is waiting for.
+     * The bands are the same bands either way, which is what this checks. */
+    pool_group pool;
+    int wide_count = host_thread_count() * 2 + 1;
+    int *tally_list = (int *)mem_clear(sizeof(int) * 1000);
+    int slot, sum_value = 0;
+    test_true(pool_open(&pool, wide_count) == APP_OKAY, "pool_open succeeds oversubscribed");
+    test_true(pool.spin_limit == 0, "an oversubscribed pool does not spin");
+    pool_run(&pool, test_pool_band, tally_list);
+    for (slot = 0; slot < 1000; ++slot) sum_value += tally_list[slot];
+    test_true(sum_value == 1000, "pool_run covers every element once without the spin");
     pool_close(&pool);
     mem_free(tally_list);
   }
