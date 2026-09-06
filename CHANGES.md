@@ -3314,4 +3314,8 @@ one.
 The suite is 493 tests from 492, clean on the default, tuned, wide and scalar
 backends, and under the address and undefined sanitizers on the tuned and wide
 ones. The reference comparison passes on the shipped export with no check
-failed.
+failed, on the default build and on the wide one — the second of which it could
+not do before this release, because `check` rebuilt the engine without the
+flags it was given and compared a default binary whatever was asked for. On the
+wide build the largest logit gap of the four prompts is 1.74 against a bar of
+2.24, which is twice how far the reference moves against itself.
