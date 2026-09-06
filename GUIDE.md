@@ -889,6 +889,12 @@ and that a file that stops short, one that is not a cache at all, one whose mark
 disagrees, and one that is not there are each refused, leaving the session
 cleared rather than half fed.
 
+`test_kernel` holds the packed dot and the packed spread against a plain
+bit-stream loop at every width the format allows, at spans that end mid-block,
+at leads that are and are not where a block of eight begins — which is what
+decides whether a width's own path is taken or the walk it falls back to — and
+with the code flip on and off.
+
 `test_turn` covers the turn after the first: that the later frame is the first
 frame with the document's opening traded for the close of the model's turn, that
 a session fed two turns in two calls reaches to the bit what one fed the whole

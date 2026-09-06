@@ -2570,7 +2570,7 @@ before. That is an argument, not a run, and it is worth saying which.
 
 ---
 
-## 0.8.5 — the cache is read once for the heads that share it, the pictures, the turns after the first, and the prompt that need not be primed twice
+## 0.8.5 — the cache read once for the heads that share it, the pictures, the turns after the first, the prompt that need not be primed twice, and the odd widths
 
 ### Scope
 
@@ -2578,15 +2578,17 @@ before. That is an argument, not a run, and it is worth saying which.
 restructuring 0.8.4 arrived at while measuring the byte cache: eight heads read
 the same cached row and the loop read it eight times. The second was the reader
 that was missing — most pictures a caller actually has are jpeg, and `--image`
-refused all of them. The three items under that one — the range of png the
-reader would not take, the single turn the CLI would not go past, and the long
-prompt it primed again every run — are done here too.
+refused all of them. The four items under that one — the range of png the reader
+would not take, the single turn the CLI would not go past, the long prompt it
+primed again every run, and the bit widths that had no vector path — are done
+here too.
 
 The first moves no bit of any result and takes back almost all of what the byte
 cache cost. The second is a new decoder of about four hundred lines, and the
 third turns out to be one loop rather than two features; both have an encoder of
 their own beside them in the tests. The fourth needed one function in the engine
-and the rest in the front end, and the fifth three.
+and the rest in the front end, the fifth three, and the sixth is arithmetic
+about where a byte boundary falls rather than a kernel at all.
 
 ### Reading a cached row once for all the heads that share it
 
@@ -2895,6 +2897,54 @@ back, and requires a truncated file, a file that is not one of these, a file
 whose mark disagrees and a file that is not there each to be refused with the
 session left cleared rather than half fed.
 
+### The odd bit widths stop walking the bit stream
+
+Two, four and eight bits had vector paths in the fused dot and in
+`kern_code_spread` beside it. Three, five, six and seven read one code at a time
+through `pack_read`, which walks the stream per code, and they were between
+twenty and thirty times slower than the widths beside them.
+
+What they have in common is arithmetic rather than a kernel: at three, five, six
+and seven bits, eight codes occupy exactly `bit_count` bytes. So a run of eight
+always begins where the run before it ended, on a byte boundary, and a block of
+eight is one word of at most seven bytes and eight shifts. `kern_code_word`
+assembles that word a byte at a time — the packing is defined by the bit stream,
+and reading it as an integer would be defined by the host's byte order, which is
+the rule `pack_read` already follows — and `kern_code_eight` shifts the eight
+codes out of it.
+
+Best of seven on a row of 12288, one thread, in codes a second:
+
+| width | dot, AVX2 | | dot, SSE2 | | spread, AVX2 | |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3 bit | 0.68 G → **5.57** | 8.2× | 0.85 → **1.57** | 1.9× | 0.72 → **2.43** | 3.4× |
+| 5 bit | 0.58 → **4.29** | 7.4× | 0.75 → **1.55** | 2.1× | 0.62 → **2.22** | 3.6× |
+| 6 bit | 0.58 → **3.76** | 6.5× | 0.74 → **1.43** | 1.9× | 0.61 → **2.06** | 3.4× |
+| 7 bit | 0.50 → **3.55** | 7.1× | 0.67 → **1.21** | 1.8× | 0.53 → **2.00** | 3.8× |
+
+Two and four bits are untouched and measure untouched: 15.93 against 15.96 and
+15.80 against 15.82.
+
+The two builds take different paths and the measurement is why. Writing the
+block to scratch and reading it back as one thirty-two byte vector is eight four
+byte stores feeding one wide load, which is a store forwarding stall, and it
+costs nearly half the loop: 0.94 G codes a second against 3.97 on a five bit
+row. AVX2 can avoid the scratch entirely — `_mm256_srlv_epi64` shifts each lane
+by its own amount, so the eight codes come out of the word inside the vector —
+and it does. SSE2 has no variable shift, and reading the scratch back as a
+vector there was measured at nothing over the bit stream walk, where reading it
+back a value at a time is worth twice: 1.62 against 0.75. So everything that is
+not AVX2 takes the scalar read, and that includes NEON, which has the variable
+shift AVX2 uses and might do better still with it — unmeasured, on no host here,
+so it is not guessed at.
+
+The shipped export has no rows at these widths and not a bit of it moves. What
+this is for is a checkpoint that does, and `test_kernel` now holds the dot and
+the spread against the bit stream at every width the format allows, at spans
+that end mid-block, at leads that are and are not where a block begins, and with
+the code flip on and off — four hundred and forty-eight cases a width where
+there were six.
+
 ### Everything else
 
 The engine end to end on the shipped export, one scene written as a png, as a
@@ -2903,6 +2953,8 @@ sun and grass. `--image` takes jpeg everywhere it takes png, including in the
 media parity workflows, and `chat --loop` will take one mid-conversation and
 answer questions about it two turns later out of the cache.
 
-The suite is 477 tests from 390, clean on the scalar, SSE2 and AVX2 backends and
-under the address and undefined behaviour sanitizers. Every floor the new tests
-hold to was checked by breaking the thing it covers on purpose.
+The suite is 460 tests from 390 — 477 before the packed kernel's twenty-four
+separate assertions became seven that cover four hundred and forty-eight cases
+each — clean on the scalar, SSE2 and AVX2 backends and under the address and
+undefined behaviour sanitizers. Every floor the new tests hold to was checked by
+breaking the thing it covers on purpose.

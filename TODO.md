@@ -105,10 +105,18 @@ third behind on one of them.
   to be fed — and a turn framed onto it would drop that id. What resuming a
   conversation wants is a save taken after an answer, and a way to say which of
   the two a file is; the loop's `/save` and `/open` are the shape of it.
-- Widen `kern_dot_code` for the odd bit widths. Two, four and eight bits are
-  vectorized, in the fused dot and in `kern_code_spread` beside it; three,
-  five, six, and seven still walk the bit stream in both. Synthetic weights
-  reach every width, which the shipped export does not.
+- Close what is left of the gap at the odd bit widths. 0.8.5 took three, five,
+  six and seven bits off the bit stream walk and onto a block of eight codes,
+  which is a byte boundary at every one of those widths: the fused dot is 6.5 to
+  8.2 times what it was on AVX2 and about twice on SSE2, and `kern_code_spread`
+  beside it 3.4 to 3.8. They are still a quarter of what two and four bits
+  reach, and the reason is the block's word, which is assembled a byte at a time
+  because the packing is defined by the bit stream rather than by the host's
+  byte order. What would close it is an unpack in the shape the two bit path
+  has — a shuffle over a wider load, thirty-two codes at a time — and a way to
+  read the word wide that does not assume the host is little-endian, or a stated
+  decision that it is. Synthetic weights reach every width, which the shipped
+  export does not, so none of this moves a token on the checkpoint that ships.
 - Add an AVX-512 path beside AVX2, selected by the same macro layer. On the
   evidence it would have something to show rather than nothing: the tuned build
   used 42% of what the memory gives on the 2017 desktop and 20% on the virtual

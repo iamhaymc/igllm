@@ -673,35 +673,59 @@ static void test_kernel(void) {
     test_true(okay_flag, "the two bit table is the bit stream it stands in for");
   }
 
-  { /* Packed dot against a plain bit-stream loop, over every widened width. */
-    int bit_list[4] = {2, 3, 4, 8};
-    int span_list[6] = {1, 3, 15, 16, 31, 64};
-    int bit_slot, span_slot;
-    for (bit_slot = 0; bit_slot < 4; ++bit_slot) {
+  { /* Packed dot and packed spread against a plain bit-stream loop, over every
+     * width the format allows, at spans that end mid-block and at leads that
+     * are and are not where a block of eight begins — which is what decides
+     * whether a width's own path is taken or the walk it falls back to. */
+    int bit_list[7] = {2, 3, 4, 5, 6, 7, 8};
+    int span_list[8] = {1, 3, 7, 8, 15, 16, 31, 60};
+    int lead_list[4] = {0, 8, 24, 5};
+    int bit_slot, span_slot, lead_slot, flip_slot;
+    for (bit_slot = 0; bit_slot < 7; ++bit_slot) {
       int bit_count = bit_list[bit_slot];
       int element_count = 128;
       uint32_t mask_value = (uint32_t)((1u << bit_count) - 1u);
       uint8_t *code_data = (uint8_t *)mem_clear((size_t)(element_count * bit_count + 7) / 8 + 8);
       float *act_list = (float *)mem_clear(sizeof(float) * (size_t)element_count);
-      int element_index;
+      float *out_list = (float *)mem_clear(sizeof(float) * (size_t)element_count);
+      int element_index, okay_flag = 1;
       for (element_index = 0; element_index < element_count; ++element_index) {
         test_pack_write(code_data, (size_t)element_index, bit_count,
                         (uint32_t)(element_index * 11 + bit_slot * 5) & mask_value);
         act_list[element_index] = (float)sin((double)element_index * 0.19);
       }
-      for (span_slot = 0; span_slot < 6; ++span_slot) {
-        int span_count = span_list[span_slot];
-        int from_index = span_slot * 8; /* a byte boundary in every widened width */
-        double want_value = 0.0;
-        int slot;
-        for (slot = 0; slot < span_count; ++slot)
-          want_value += (double)pack_read(code_data, (size_t)(from_index + slot), bit_count) *
-                        (double)act_list[from_index + slot];
-        test_near(kern_dot_code(code_data, from_index, span_count, act_list + from_index, bit_count, 0),
-                  want_value, 1e-3, "kern_dot_code matches the bit-stream reference");
-      }
+      for (span_slot = 0; span_slot < 8; ++span_slot)
+        for (lead_slot = 0; lead_slot < 4; ++lead_slot)
+          for (flip_slot = 0; flip_slot < 2; ++flip_slot) {
+            int span_count = span_list[span_slot];
+            int from_index = lead_list[lead_slot];
+            int code_flip = flip_slot ? (int)mask_value : 0;
+            double want_value = 0.0;
+            int slot;
+            if (from_index + span_count > element_count) continue;
+            for (slot = 0; slot < span_count; ++slot)
+              want_value +=
+                  (double)(pack_read(code_data, (size_t)(from_index + slot), bit_count) ^
+                           (uint32_t)code_flip) *
+                  (double)act_list[from_index + slot];
+            if (fabs((double)kern_dot_code(code_data, from_index, span_count,
+                                           act_list + from_index, bit_count, code_flip) -
+                     want_value) > 1e-3)
+              okay_flag = 0;
+            /* The spread has to lay down the same codes the dot summed, value
+             * for value: it is the same decode with the multiply left out. */
+            kern_code_spread(code_data, from_index, span_count, bit_count, code_flip, out_list);
+            for (slot = 0; slot < span_count; ++slot)
+              if (out_list[slot] !=
+                  (float)(pack_read(code_data, (size_t)(from_index + slot), bit_count) ^
+                          (uint32_t)code_flip))
+                okay_flag = 0;
+          }
+      test_true(okay_flag,
+                "the packed dot and the packed spread are the bit stream, at every width");
       mem_free(code_data);
       mem_free(act_list);
+      mem_free(out_list);
     }
   }
 

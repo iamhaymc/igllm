@@ -1716,6 +1716,43 @@ static const float kern_code_two[256][4] = {KERN_CODE_TWO_64(0), KERN_CODE_TWO_6
  * Every path carries two accumulators rather than one.  A single chain stalls
  * on the latency of its own add: the arithmetic here is cheap enough that the
  * dependency, not the work, was setting the pace. */
+/* Eight codes of an odd width, out of one word rather than out of eight walks
+ * of the bit stream.
+ *
+ * Three, five, six and seven bits share the property that eight codes occupy
+ * exactly `bit_count` bytes, so a run of eight always begins on a byte boundary
+ * where the run before it did.  That makes a block of eight one load of at most
+ * seven bytes and eight shifts, against `pack_read`'s walk per code — and it
+ * leaves the codes in the shape every other width's vector path wants.
+ *
+ * The word is assembled a byte at a time rather than read as one: the packing
+ * is defined by the bit stream, and reading it as an integer would be defined
+ * by the host's byte order. */
+static uint64_t kern_code_word(const uint8_t *word_head, int bit_count) {
+  uint64_t word_value = 0;
+  int part_index;
+  for (part_index = 0; part_index < bit_count; ++part_index)
+    word_value |= (uint64_t)word_head[part_index] << (8 * part_index);
+  return word_value;
+}
+
+static void kern_code_eight(const uint8_t *word_head, int bit_count, uint32_t code_mask,
+                            int code_flip, int32_t *code_out) {
+  uint64_t word_value = kern_code_word(word_head, bit_count);
+  int part_index;
+  for (part_index = 0; part_index < 8; ++part_index)
+    code_out[part_index] = (int32_t)((((uint32_t)(word_value >> (bit_count * part_index))) &
+                                      code_mask) ^
+                                     (uint32_t)code_flip);
+}
+
+/* Whether a width is one of those, and whether the run starts where a block
+ * of eight does. */
+static int kern_code_odd(int bit_count, int from_index) {
+  if (bit_count != 3 && bit_count != 5 && bit_count != 6 && bit_count != 7) return 0;
+  return (from_index & 7) == 0;
+}
+
 static float kern_dot_code(const uint8_t *code_row, int from_index, int span_count,
                            const float *act_data, int bit_count, int code_flip) {
   float total = 0.0f;
@@ -1965,6 +2002,83 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
     return total;
   }
 
+  /* Three, five, six and seven bits.  Eight codes are exactly `bit_count`
+   * bytes, so a run of them comes out of one word rather than out of eight
+   * walks of the bit stream, and the width stops deciding how the loop is
+   * shaped.  On a five bit row of 12288, one thread: 0.55 G codes a second
+   * against 3.97 tuned and 1.62 default. */
+  if (kern_code_odd(bit_count, from_index)) {
+    const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
+    const uint32_t code_mask = (1u << bit_count) - 1u;
+#if defined(APP_SIMD_AVX2)
+    {
+      /* The codes are shifted out of the word inside the vector rather than
+       * written to scratch and read back: eight four byte stores feeding one
+       * thirty-two byte load is a forwarding stall, and it costs nearly half of
+       * this loop — 0.94 G codes a second against 3.97 on that row.  A variable
+       * shift per lane is what makes it possible, and it is what SSE2 has not
+       * got. */
+      const __m256i shift_low = _mm256_setr_epi64x(0, bit_count, 2 * bit_count, 3 * bit_count);
+      const __m256i shift_high =
+          _mm256_setr_epi64x(4 * bit_count, 5 * bit_count, 6 * bit_count, 7 * bit_count);
+      const __m256i mask_wide = _mm256_set1_epi64x((long long)code_mask);
+      const __m256i flip_wide = _mm256_set1_epi32(code_flip);
+      const __m256i pick_data = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+      __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
+      for (; slot + 16 <= span_count; slot += 16) {
+        const uint8_t *word_head = byte_head + (size_t)(slot / 8) * (size_t)bit_count;
+        int part_index;
+        for (part_index = 0; part_index < 2; ++part_index) {
+          __m256i base_data = _mm256_set1_epi64x(
+              (long long)kern_code_word(word_head + part_index * bit_count, bit_count));
+          __m256i part_low = _mm256_and_si256(_mm256_srlv_epi64(base_data, shift_low), mask_wide);
+          __m256i part_high = _mm256_and_si256(_mm256_srlv_epi64(base_data, shift_high), mask_wide);
+          /* Four codes a vector sit in the low half of each sixty-four bit
+           * lane; gathering the eight into one is two permutes and a join. */
+          __m256i code_wide = _mm256_xor_si256(
+              _mm256_permute2x128_si256(_mm256_permutevar8x32_epi32(part_low, pick_data),
+                                        _mm256_permutevar8x32_epi32(part_high, pick_data), 0x20),
+              flip_wide);
+          __m256 act_wide = _mm256_loadu_ps(act_data + slot + part_index * 8);
+          if (part_index == 0)
+            part_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(code_wide), act_wide, part_a);
+          else
+            part_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(code_wide), act_wide, part_b);
+        }
+      }
+      total = kern_wide_total(_mm256_add_ps(part_a, part_b));
+    }
+#else
+    {
+      /* Everywhere else the block is written to scratch and summed from it a
+       * value at a time.  Reading it back a vector at a time was measured on
+       * SSE2 and is worth nothing — the same forwarding stall — where reading
+       * it scalar is worth twice the bit stream walk: 1.62 G codes a second
+       * against 0.75 on that row.  A NEON host has the variable shift the AVX2
+       * path uses and might do better still with it; that is unmeasured and so
+       * it takes this path with the rest. */
+      int32_t code_room[16];
+      float sum_a = 0.0f, sum_b = 0.0f;
+      for (; slot + 16 <= span_count; slot += 16) {
+        const uint8_t *word_head = byte_head + (size_t)(slot / 8) * (size_t)bit_count;
+        int part_index;
+        kern_code_eight(word_head, bit_count, code_mask, code_flip, code_room);
+        kern_code_eight(word_head + bit_count, bit_count, code_mask, code_flip, code_room + 8);
+        for (part_index = 0; part_index < 16; part_index += 2) {
+          sum_a += (float)code_room[part_index] * act_data[slot + part_index];
+          sum_b += (float)code_room[part_index + 1] * act_data[slot + part_index + 1];
+        }
+      }
+      total = sum_a + sum_b;
+    }
+#endif
+    /* What is left of a row is under eight codes, which is under one block. */
+    for (; slot < span_count; ++slot)
+      total += (float)(pack_read(code_row, (size_t)(from_index + slot), bit_count) ^
+                       (uint32_t)code_flip) * act_data[slot];
+    return total;
+  }
+
   for (; slot < span_count; ++slot)
     total += (float)(pack_read(code_row, (size_t)(from_index + slot), bit_count) ^
                      (uint32_t)code_flip) * act_data[slot];
@@ -2125,6 +2239,18 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
     return;
   }
 
+  if (kern_code_odd(bit_count, from_index)) {
+    const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
+    const uint32_t code_mask = (1u << bit_count) - 1u;
+    int32_t code_room[8];
+    int part_index;
+    for (; slot + 8 <= span_count; slot += 8) {
+      kern_code_eight(byte_head + (size_t)(slot / 8) * (size_t)bit_count, bit_count, code_mask,
+                      code_flip, code_room);
+      for (part_index = 0; part_index < 8; ++part_index)
+        out_data[slot + part_index] = (float)code_room[part_index];
+    }
+  }
   for (; slot < span_count; ++slot)
     out_data[slot] = (float)(pack_read(code_row, (size_t)(from_index + slot), bit_count) ^
                              (uint32_t)code_flip);
