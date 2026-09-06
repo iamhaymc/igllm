@@ -8,25 +8,25 @@ weights or on none. Most consequential first within each group.
 
 ## On the shipped export
 
-- Spend fewer instructions in the decode kernels, further. 0.8.4 took the two
-  bit path from two broadcasts a sixteen codes to one and got 21% of decode at
-  one thread, 9% at four; the narrowing is the shape of a build walking towards
-  the memory. It is not there yet: at four threads the tuned build reads 5.72
-  GiB/s of the 27.24 a bare sweep gives on that host, so four fifths of the
-  machine is still unused. What is left is the four bit path, which is 335 MiB
-  of the 727.5 a step sweeps and did not answer to either candidate 0.8.4 tried,
-  and the eight bit path at 26 MiB. Both want a reading of what they are
-  actually waiting on rather than another guess.
+- Spend fewer instructions in the two bit decode path, which is the one still
+  spending them. 0.8.8 read what each width waits on at four threads, on rows
+  streamed from memory against the same rows held in cache, and the three
+  answers differ. The eight bit path keeps half of its resident rate and lands
+  on the memory's own number — 23.95 GiB/s of the 26.27 a bare sweep gives on
+  the tuned build, 27.66 on the wide one — so it is done, and a quicker kernel
+  there buys nothing. The four bit path keeps 83% of its resident rate tuned and
+  68% wide: the memory is part of what it waits on and there is a little left in
+  it. The two bit path keeps 94% and 78%, and is 366 MiB of the 727.5 a step
+  sweeps, which makes it the one width where instructions are still most of the
+  cost and the only one worth another kernel.
 
-  0.8.7 answers part of it and leaves the rest. On a host with AVX-512 the four
-  bit fused dot is 54% quicker and the eight bit one 36%, for no change but a
-  wider vector, and decode gains 21% at one thread — which says these paths were
-  spending instructions rather than waiting on the memory, and settles the
-  question for a wide host. It does not settle it for an AVX2 one, where both
-  paths are what they were, and it does not settle what they wait on at four
-  threads: the same wide build gains only 6% there, so past one thread the
-  memory is a real part of the cost and a narrower reading of it is what is
-  still missing.
+  What that reading also says is that the kernels are no longer where a token
+  goes at four threads. Streamed through the rates above, the mix a step sweeps
+  is 38.9 ms of kernel a token, and the token is 63.7 ms on the wide build now
+  that the fork and the join are 4.8 ms of it rather than 33. The 25 ms outside
+  the kernels — the attention, the norms, the sampler, the bands that do not
+  divide evenly — have never been measured a part at a time, and on this host
+  they are now larger than anything left inside them.
 - Hold the seam open as the prompt grows. All nine cases are judged on the
   shipped export now, each in a process of its own, and the longest is 664 ids
   with two pictures and a clip in it. What has not been tried is a prompt long
@@ -95,6 +95,17 @@ layers behind it and amplifies a last bit either way.
   of them is what a caller with a photograph on disk has, and arithmetic coding
   in particular is what nothing in the wild produces, so this is a completeness
   item rather than a useful one.
+
+One item is off this list because 0.8.8 did it, and the head item above is what
+is left of it. What the four bit and eight bit paths wait on at four threads is
+answered — the eight bit path waits on the memory, the four bit one partly — and
+the larger half of the answer was in neither. Between the kernels sat 277 forks
+and joins a token, 120 microseconds apiece at four threads, a third of the
+token; both sides of the pool now spin briefly before they sleep, and decode at
+four threads went from 10.51 tokens a second to 15.69 on the wide build, 8.37 to
+11.21 on the tuned one and 6.19 to 7.26 on the default one, without moving a bit
+of any result. A pool with more threads than the host has cores does not spin,
+which was measured as well and is the other half of that finding.
 
 Two items are off this list because 0.8.7 did them, one from each group as it
 stood.

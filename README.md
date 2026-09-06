@@ -263,3 +263,16 @@ with `--cache 8` and 6.96 to 7.32 with floats, prefill 14.85 to 18.94 and 19.52
 to 19.69; on the default build decode 5.18 to 5.87 and 5.70 to 6.03. Not one bit
 of any result moves. What it takes back is most of what the byte cache cost:
 `--cache 8` was 15% behind floats on this host and is now 1%.
+
+The fifth pass is 0.8.8's, on a third machine, and it is not a kernel at all.
+Asking the four thread question the way `TODO.md` posed it — what are the decode
+paths waiting on — turned up an answer between the kernels rather than in them.
+Each path measured on its own streams the bytes a token needs in 38.9 ms at four
+threads, and the token took 95.1: the missing 56 ms were the fork and the join
+around every projection, of which decode issues 277 a token, at 120 microseconds
+apiece on that host. Both sides of the pool now spin briefly before they sleep,
+which takes the fork and join to 17.4 microseconds and decode at four threads
+from 10.51 tokens a second to 15.69 on the wide build, 8.37 to 11.21 on the
+tuned one and 6.19 to 7.26 on the default one. A pool with more threads than the
+host has cores does not spin, because there the core a spinner holds is one
+another worker needs. Not a bit of any result moves.

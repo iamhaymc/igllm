@@ -3319,3 +3319,183 @@ not do before this release, because `check` rebuilt the engine without the
 flags it was given and compared a default binary whatever was asked for. On the
 wide build the largest logit gap of the four prompts is 1.74 against a bar of
 2.24, which is twice how far the reference moves against itself.
+
+---
+
+## 0.8.8 — what four threads were actually waiting on
+
+### Scope
+
+One item off `TODO.md`, and it is the head one: what the four bit and eight bit
+decode paths wait on once four threads pull on them. 0.8.7 could say that a
+wide fused dot was worth 21% of decode at one thread and 6% at four, and could
+say that the memory was more of the cost at four than at one, but it could not
+say how much more. That was the question, and it is answered here.
+
+The answer is that at four threads the kernels were not the cost and neither was
+the memory. Between the two there was a third thing nobody had measured, and it
+was a third of the token: the fork and the join around every projection.
+
+### The host
+
+Four cores of a virtual machine, an Intel Xeon at 2.8 GHz with AVX-512, a
+mebibyte of L2 a core, 33 MiB of L3 between them and 15 GiB of memory. The
+weights are the shipped export, mapped and warm in the page cache. A read only
+sweep of a 2.4 GiB buffer, three passes, best of four:
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| sequential read | 9.38 GiB/s | 18.70 | 20.97 | **26.27** |
+
+That is 0.8.4's host almost exactly at four threads — 26.27 against 27.24 — and
+rather slower at one.
+
+### The kernels, against a working set that fits and one that does not
+
+The same `kern_dot_code` over the same 12288 wide rows, twice: once over half a
+mebibyte of codes read four thousand times, which never leaves the cache, and
+once over two gibibytes read once, which never stays in it. The gap between the
+two is what the memory costs the loop; the resident column is what the loop
+costs by itself. In GiB/s of codes read, best of four:
+
+| build | width | resident, 1 | streaming, 1 | resident, 4 | streaming, 4 |
+| --- | --- | --- | --- | --- | --- |
+| tuned | 2 bits | 3.00 | 2.81 | 11.63 | 10.98 |
+| tuned | 4 bits | 4.80 | 4.17 | 17.99 | 14.86 |
+| tuned | 8 bits | 12.06 | 7.38 | 47.45 | 23.95 |
+| wide | 2 bits | 5.16 | 4.37 | 19.97 | 15.61 |
+| wide | 4 bits | 8.16 | 5.64 | 31.94 | 21.69 |
+| wide | 8 bits | 18.23 | 8.39 | 72.17 | 27.66 |
+
+Read across, at four threads: the eight bit path keeps half of its resident rate
+and lands at 23.95 GiB/s on the tuned build against the 26.27 the sweep gives,
+and at 27.66 on the wide one, which is the sweep's own number handed back. That
+path waits on the memory and has for a while. The four bit path keeps 83% of its
+resident rate on the tuned build and 68% on the wide one: the memory is part of
+what it waits on and not all of it. The two bit path keeps 94% and 78% — it is
+still spending instructions, which is what 0.8.4 said of it and what the wide
+build's 42% gain over the tuned one at that width says again.
+
+So each path on its own has an answer, and it is the one the item guessed at.
+What the item did not ask, and what turns out to matter more, is whether those
+three answers add up to the engine.
+
+### They do at one thread and they do not at four
+
+A step sweeps 366 MiB of two bit codes, 335.25 of four bit and 26.25 of eight —
+0.8.4's census, unchanged. Through the streaming rates above, at one thread on
+the wide build, that is 143 ms of kernel. The engine's token was 177 ms. So the
+kernels are 81% of a single threaded token, which is what a profile says
+independently: on an `-O2 -pg` build of the same source, 80% of decode is inside
+`kern_mat_vec_band`, where `kern_row_code` and the fused dot are inlined.
+
+At four threads the same arithmetic gives 38.9 ms of kernel. The engine's token
+was 95.1 ms. The kernels are 41% of it, and the other 56 ms are somewhere the
+memory is not, because the memory hands the same bytes to the same loop in
+38.9 ms when it is asked for them without stopping.
+
+### It is the fork and the join, and there are 277 of them a token
+
+Every projection is a `pool_run`: the caller publishes a task, broadcasts,
+takes a band itself, and then waits for the workers to count themselves done.
+Counted on the shipped export, decode issues **277 of them a token**, and not
+one of them takes the single threaded path the 64 row bar keeps small planes on.
+
+A fork and a join of a task that does nothing, on this host:
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| before | — | 23.38 us | 59.77 | **119.95** |
+
+At four threads that is 33 ms a token of publishing and waiting, against the
+56 ms the kernels do not account for. The rest is the attention, the norms, the
+sampler, and bands that do not divide evenly — but the fork and the join are
+the larger half of it, and they were nobody's kernel.
+
+The shape of the cost is the scheduler rather than the mutex. A worker that has
+finished its band sleeps on a condition variable; the next projection is tens of
+microseconds later; waking it is a trip through the kernel on a core that has
+three other threads' work queued behind it. Four threads cost more than two
+because four wakes contend where two do not.
+
+### Spin before sleeping, where every thread has a core
+
+Both waits — the worker's for a task and the caller's for the workers — now read
+the counter they are waiting on directly for a bounded spell before they take
+the lock and sleep on it. Nothing else changes: the counter is a hint, the lock
+is still what orders the memory either side of a job, and a waiter that spins
+past its bound sleeps exactly as it did before.
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| before | — | 23.38 us | 59.77 | 119.95 |
+| after | — | **0.71** | **3.82** | **17.39** |
+
+Which on the shipped export is, best of three interleaved runs a cell,
+`bench --serve 16` on a seven id prompt:
+
+| build | | 1 thread | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- | --- |
+| wide | decode, before | 5.32 tok/s | 8.84 | 9.92 | 10.51 |
+| wide | decode, after | 5.66 | 9.44 | **12.61** | **15.69** |
+| wide | prefill, before | 6.29 | 11.39 | 15.07 | 18.13 |
+| wide | prefill, after | 6.44 | 11.51 | 15.81 | **19.63** |
+| tuned | decode, before | 4.04 | 6.23 | 8.07 | 8.37 |
+| tuned | decode, after | 4.18 | 7.06 | **9.62** | **11.21** |
+| tuned | prefill, before | 5.92 | 10.69 | 14.91 | 17.43 |
+| tuned | prefill, after | 5.97 | 10.87 | 15.29 | 18.42 |
+| default | decode, before | 2.27 | 4.02 | 5.43 | 6.19 |
+| default | decode, after | 2.24 | 4.25 | 5.97 | **7.26** |
+| default | prefill, before | 3.15 | 5.66 | 8.31 | 10.32 |
+| default | prefill, after | 3.12 | 5.86 | 8.32 | 9.95 |
+
+Decode at four threads is 49% quicker on the wide build, 34% on the tuned one
+and 17% on the default one, and the order of those three is the argument itself:
+the quicker the kernel, the larger the share the waiting held. At one thread
+there is no pool and no fork, and the three rows say so.
+
+Prefill gains far less because it does not fork nearly as often: sixteen tokens
+go through a projection in one job, so a batch of ids pays one fork where
+sixteen decode steps pay sixteen.
+
+The scaling is the plainest reading. From one thread to four the memory hands
+over 2.8 times as much, and decode on the wide build produced 1.98 times as many
+tokens before this and 2.77 times as many after.
+
+### A spin is only right where the core is spare
+
+Eight threads on four cores decode 6.88 tokens a second, and spinning made that
+3.95. The core a spinner holds is exactly the one a worker with real work on it
+is waiting for, so the wait is no longer a wait for the other side but a delay
+to it.
+
+So `pool_open` asks whether every thread of the pool has a core of its own and
+gives the group a spin of zero where they do not — which is the behaviour this
+had before, sleeping on the first look. Re-measured at eight threads on four
+cores: 6.68 before, 7.01 after, which is the spin gone rather than the spin
+helping. The default thread count is the host's core count, so the common case
+spins and a deliberately oversubscribed pool does not.
+
+### Not a bit of any result moves
+
+The pool hands the same slices to the same workers in the same order and the
+task functions are untouched; what changed is how a thread waits between two
+jobs. The suite is 493 tests, clean on the default, tuned and wide builds and
+under the address and undefined sanitizers. The reference comparison passes on
+the shipped export on the wide build, with the same logits it reached before.
+
+### What is left of the four thread question
+
+At four threads the wide build now reads 761 MiB a token at 15.69 tokens a
+second, which is 11.65 GiB/s of the 26.27 the sweep gives — 44%, where before
+this it was 30%. The kernel floor for that mix is 38.9 ms and the token is
+63.7 ms, so about 25 ms a token is still outside the kernels: 4.8 of it is the
+277 forks and joins that remain, and the rest is the attention, the norms, the
+sampler and the bands.
+
+The next reading of the head item is therefore two questions rather than one.
+The kernels themselves want the eight bit path left alone — it is against the
+memory and has been measured there — and the two bit path, which is more than
+half of what a step sweeps and still spending instructions. And the 25 ms
+outside them want the same treatment this release gave the fork: measured
+rather than guessed at.

@@ -72,6 +72,18 @@ Thin shims, no third party code:
   `pool_close`. `pool_run` hands the same function to every worker with a
   slice index, waits, and returns. There is no queue and no allocation in
   the token loop.
+
+  Both sides of it spin before they sleep. A decode token issues 277 of these
+  jobs — one a projection — so a fork and a join that costs 120 microseconds of
+  scheduler at four threads costs a third of the token, which is what
+  `CHANGES.md` 0.8.8 measured. Each waiter therefore reads the counter it is
+  waiting on directly for a bounded spell, `POOL_SPIN_LIMIT` pauses, before it
+  takes the lock and sleeps on it as it always did. The counter is a hint and
+  the lock is still what orders the memory either side of a job.
+
+  `pool_open` sets the group's spin to zero when the pool has more threads than
+  the host has cores. There the core a spinner holds is the one another worker
+  needs, and spinning costs nearly half of decode rather than gaining it.
 - `slice_span` — divides a range into bands, spreading the remainder over
   the leading bands so no worker is more than one element behind.
 
@@ -354,6 +366,11 @@ in isolation and slower in the engine, and taken out again — see
 - `kern_mat_vec_band` — one band of rows, the unit of work given to the pool.
   It carries a lane count, so the same band function serves a matrix-vector
   product and a matrix-matrix product.
+
+  It is also the whole of what the pool is asked to do, and a decode token asks
+  277 times — nine planes a layer, the output head, the per-layer projection.
+  At four threads that made the fork and the join around it a third of a token
+  until 0.8.8 spun before sleeping; see `pool_group` above.
 - `kern_norm_rms` — `x * rsqrt(mean(x²) + eps) * weight`. Gemma 4 uses the
   weight directly, **not** `1 + weight`.
 - `kern_gelu_tanh`, `kern_gelu_gate` — the tanh approximation, and the gated
