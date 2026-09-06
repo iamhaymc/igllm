@@ -363,7 +363,10 @@ in isolation and slower in the engine, and taken out again — see
   last block of four, and every backend without a vector path here, go through
   `kern_dot_real` itself. Four lanes and not eight because eight needs
   seventeen live vectors against sixteen, and the only way to eight is one
-  accumulator a lane, which would reassociate every sum in the engine.
+  accumulator a lane, which would reassociate every sum in the engine for two
+  per cent of a token. The wide tier's thirty-two registers do hold eight lanes
+  and both accumulators, and measured there that form is slower than four
+  lanes — so the register count was never what stood in the way.
 - `kern_row_code_many` — the same row against several activation vectors at
   once. A group of codes is spread into a small float scratch and dotted
   against every lane through the kernel above, so a batch pays the decode cost

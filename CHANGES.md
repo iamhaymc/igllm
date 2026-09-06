@@ -3611,11 +3611,19 @@ Single threaded on the same host, the wide build's prefill goes 6.76 to 7.07
 tokens a second, and a picture's projections — the 24 s this release measured —
 go to 21.90, which takes the tower from 39.50 s to 37.61.
 
-**Four lanes and not eight**, though eight measures quicker: 30.07 G
-multiply-adds a second against 25.93. Eight lanes with two accumulators apiece
-is seventeen vectors live and the host has sixteen, so it can only be done by
-dropping to one accumulator a lane — which reassociates every sum in the engine
-for about two per cent more. Bit-exactness is worth more than that.
+**Four lanes and not eight**, though eight measures quicker: 30.13 G
+multiply-adds a second against 27.15. Eight lanes with two accumulators apiece
+is seventeen vectors live and the host has sixteen, so the quicker form is the
+one with a single accumulator a lane — which reassociates every sum in the
+engine for about two per cent of a token. Bit-exactness is worth more than that.
+
+The obvious answer to the register count was measured and is not one. A host
+with the wide tier has thirty-two vector registers, which is room for eight
+lanes and both accumulators and therefore for an eight lane block that is still
+exact; written that way it reaches 24.04 G multiply-adds a second, behind the
+four lane form's 27.15. So what the eight lane block gains, it gains from having
+half as many accumulators to keep and not from the lanes, and there is no
+version of it that is both quicker and the same arithmetic.
 
 ### What is left of the four thread question
 

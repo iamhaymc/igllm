@@ -46,14 +46,16 @@ weights or on none. Most consequential first within each group.
   lanes of a batch now share the row's load rather than each loading it again,
   which is 8% of the projections and 23% of prefill on the default build.
 
-  What is left of that loop is the eight lane block it cannot have. Four lanes
-  is what sixteen vector registers hold with two accumulators apiece, and the
-  eight lane form measures 16% quicker but needs seventeen, so it can only be
-  had by dropping to one accumulator a lane and reassociating every sum in the
-  engine. A host with thirty-two vector registers — which is any host with the
-  wide tier — could hold eight lanes and both accumulators and stay bit exact,
-  and that is a wide path with something real to gain, unlike the two 0.8.8
-  measured and refused.
+  What is left of that loop is the eight lane block, and what stands in its way
+  is not what it looks like. Eight lanes with two accumulators apiece is
+  seventeen live vectors against sixteen, so the eight lane form that measures
+  16% quicker — 30.13 G multiply-adds a second against 27.15 — is the one with a
+  single accumulator a lane, which reassociates every sum in the engine. The
+  wide tier has thirty-two vector registers and could hold eight lanes and both
+  accumulators, and written that way it measures 24.04 against the four lane
+  form's 27.15: slower, so the register count was never the obstacle. The open
+  question is therefore whether 16% of this kernel is worth moving every logit,
+  not how to fit the exact form into a host that has room for it.
 
   Past that the tower's own attention is what is left: the scoring at 6.5 s and
   the blend at 5.0, neither touched since they were written, both already
