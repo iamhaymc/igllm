@@ -1667,6 +1667,28 @@ static void quant_act(float *value_list, int value_count, const quant_rule *rule
 #define KERN_LANE_LIMIT   16
 #define KERN_SPREAD_LIMIT 256
 
+#if defined(APP_SIMD_AVX2) || defined(APP_SIMD_SSE2)
+/* The horizontal sum the float dot ends with.  It is named rather than written
+ * out twice because `kern_dot_real_many` below has to reach the same float as
+ * `kern_dot_real` does, and two copies of a reduction are two chances to
+ * reassociate one of them by accident. */
+#  if defined(APP_SIMD_AVX2)
+static float kern_dot_total(__m256 wide_total) {
+  __m128 half_total =
+      _mm_add_ps(_mm256_castps256_ps128(wide_total), _mm256_extractf128_ps(wide_total, 1));
+  half_total = _mm_hadd_ps(half_total, half_total);
+  half_total = _mm_hadd_ps(half_total, half_total);
+  return _mm_cvtss_f32(half_total);
+}
+#  else
+static float kern_dot_total(__m128 wide_total) {
+  __m128 half_total = _mm_add_ps(wide_total, _mm_movehl_ps(wide_total, wide_total));
+  half_total = _mm_add_ss(half_total, _mm_shuffle_ps(half_total, half_total, 0x55));
+  return _mm_cvtss_f32(half_total);
+}
+#  endif
+#endif
+
 static float kern_dot_real(const void *row_data, store_type row_type, const float *act_data,
                            int span_count) {
   int slot;
@@ -1689,13 +1711,7 @@ static float kern_dot_real(const void *row_data, store_type row_type, const floa
       part_a = _mm256_fmadd_ps(_mm256_loadu_ps(row_real + slot),
                                _mm256_loadu_ps(act_data + slot), part_a);
     wide_total = _mm256_add_ps(part_a, part_b);
-    {
-      __m128 half_total = _mm_add_ps(_mm256_castps256_ps128(wide_total),
-                                     _mm256_extractf128_ps(wide_total, 1));
-      half_total = _mm_hadd_ps(half_total, half_total);
-      half_total = _mm_hadd_ps(half_total, half_total);
-      total = _mm_cvtss_f32(half_total);
-    }
+    total = kern_dot_total(wide_total);
 #elif defined(APP_SIMD_SSE2)
     __m128 part_a = _mm_setzero_ps(), part_b = _mm_setzero_ps();
     __m128 wide_total;
@@ -1709,11 +1725,7 @@ static float kern_dot_real(const void *row_data, store_type row_type, const floa
       part_a = _mm_add_ps(
           part_a, _mm_mul_ps(_mm_loadu_ps(row_real + slot), _mm_loadu_ps(act_data + slot)));
     wide_total = _mm_add_ps(part_a, part_b);
-    {
-      __m128 half_total = _mm_add_ps(wide_total, _mm_movehl_ps(wide_total, wide_total));
-      half_total = _mm_add_ss(half_total, _mm_shuffle_ps(half_total, half_total, 0x55));
-      total = _mm_cvtss_f32(half_total);
-    }
+    total = kern_dot_total(wide_total);
 #elif defined(APP_SIMD_NEON)
     float32x4_t part_a = vdupq_n_f32(0.0f), part_b = vdupq_n_f32(0.0f);
     float32x4_t wide_total;
@@ -2610,6 +2622,133 @@ typedef struct kern_job {
   int          lane_count;
 } kern_job;
 
+/* One row of floats against four activation vectors at once.
+ *
+ * The batch's inner loop is a dot per lane against a scratch the spread has
+ * just filled, and taken a lane at a time it loads that scratch again for every
+ * one of them: two loads for every multiply-add, where the host will issue two
+ * loads and two multiply-adds a cycle.  That is the loop's limit and not the
+ * width of its vector, which is what three measurements said in 0.8.8 — a
+ * sixteen lane dot, four accumulators instead of two, and twice as many lanes a
+ * batch all left the engine where they found it.
+ *
+ * Four lanes together share the row's load: ten loads for eight multiply-adds
+ * rather than sixteen, and 25.93 G multiply-adds a second on a 256 element span
+ * against 17.11 for a lane at a time.
+ *
+ * Every lane's sum is the sum it was to the last bit.  The two accumulators are
+ * the two `kern_dot_real` keeps, taking the same slots in the same order, and
+ * the reduction at the end is the same sequence of instructions; nothing here
+ * reassociates anything.  What is left over — the lanes past the last block of
+ * four, and a span too short for the vector — goes through `kern_dot_real`
+ * itself, which is the same arithmetic by construction. */
+static void kern_dot_real_many(const float *row_data, const float *act_data, int act_stride,
+                               int lane_count, int span_count, float *part_list) {
+  int lane_index = 0;
+#if defined(APP_SIMD_AVX2)
+  for (; lane_index + 4 <= lane_count; lane_index += 4) {
+    const float *lane_a = act_data + (size_t)lane_index * (size_t)act_stride;
+    const float *lane_b = lane_a + act_stride;
+    const float *lane_c = lane_b + act_stride;
+    const float *lane_d = lane_c + act_stride;
+    __m256 part_a0 = _mm256_setzero_ps(), part_a1 = _mm256_setzero_ps();
+    __m256 part_b0 = _mm256_setzero_ps(), part_b1 = _mm256_setzero_ps();
+    __m256 part_c0 = _mm256_setzero_ps(), part_c1 = _mm256_setzero_ps();
+    __m256 part_d0 = _mm256_setzero_ps(), part_d1 = _mm256_setzero_ps();
+    int slot = 0;
+    for (; slot + 16 <= span_count; slot += 16) {
+      __m256 row_low = _mm256_loadu_ps(row_data + slot);
+      __m256 row_high = _mm256_loadu_ps(row_data + slot + 8);
+      part_a0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_a + slot), part_a0);
+      part_a1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_a + slot + 8), part_a1);
+      part_b0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_b + slot), part_b0);
+      part_b1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_b + slot + 8), part_b1);
+      part_c0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_c + slot), part_c0);
+      part_c1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_c + slot + 8), part_c1);
+      part_d0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_d + slot), part_d0);
+      part_d1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_d + slot + 8), part_d1);
+    }
+    for (; slot + 8 <= span_count; slot += 8) {
+      __m256 row_low = _mm256_loadu_ps(row_data + slot);
+      part_a0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_a + slot), part_a0);
+      part_b0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_b + slot), part_b0);
+      part_c0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_c + slot), part_c0);
+      part_d0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_d + slot), part_d0);
+    }
+    {
+      /* The span's last few elements, folded into each lane's total in the
+       * order the one lane path folds them, before the total reaches the
+       * caller's accumulator. */
+      float total_a = kern_dot_total(_mm256_add_ps(part_a0, part_a1));
+      float total_b = kern_dot_total(_mm256_add_ps(part_b0, part_b1));
+      float total_c = kern_dot_total(_mm256_add_ps(part_c0, part_c1));
+      float total_d = kern_dot_total(_mm256_add_ps(part_d0, part_d1));
+      for (; slot < span_count; ++slot) {
+        total_a += row_data[slot] * lane_a[slot];
+        total_b += row_data[slot] * lane_b[slot];
+        total_c += row_data[slot] * lane_c[slot];
+        total_d += row_data[slot] * lane_d[slot];
+      }
+      part_list[lane_index] += total_a;
+      part_list[lane_index + 1] += total_b;
+      part_list[lane_index + 2] += total_c;
+      part_list[lane_index + 3] += total_d;
+    }
+  }
+#elif defined(APP_SIMD_SSE2)
+  for (; lane_index + 4 <= lane_count; lane_index += 4) {
+    const float *lane_a = act_data + (size_t)lane_index * (size_t)act_stride;
+    const float *lane_b = lane_a + act_stride;
+    const float *lane_c = lane_b + act_stride;
+    const float *lane_d = lane_c + act_stride;
+    __m128 part_a0 = _mm_setzero_ps(), part_a1 = _mm_setzero_ps();
+    __m128 part_b0 = _mm_setzero_ps(), part_b1 = _mm_setzero_ps();
+    __m128 part_c0 = _mm_setzero_ps(), part_c1 = _mm_setzero_ps();
+    __m128 part_d0 = _mm_setzero_ps(), part_d1 = _mm_setzero_ps();
+    int slot = 0;
+    for (; slot + 8 <= span_count; slot += 8) {
+      __m128 row_low = _mm_loadu_ps(row_data + slot);
+      __m128 row_high = _mm_loadu_ps(row_data + slot + 4);
+      part_a0 = _mm_add_ps(part_a0, _mm_mul_ps(row_low, _mm_loadu_ps(lane_a + slot)));
+      part_a1 = _mm_add_ps(part_a1, _mm_mul_ps(row_high, _mm_loadu_ps(lane_a + slot + 4)));
+      part_b0 = _mm_add_ps(part_b0, _mm_mul_ps(row_low, _mm_loadu_ps(lane_b + slot)));
+      part_b1 = _mm_add_ps(part_b1, _mm_mul_ps(row_high, _mm_loadu_ps(lane_b + slot + 4)));
+      part_c0 = _mm_add_ps(part_c0, _mm_mul_ps(row_low, _mm_loadu_ps(lane_c + slot)));
+      part_c1 = _mm_add_ps(part_c1, _mm_mul_ps(row_high, _mm_loadu_ps(lane_c + slot + 4)));
+      part_d0 = _mm_add_ps(part_d0, _mm_mul_ps(row_low, _mm_loadu_ps(lane_d + slot)));
+      part_d1 = _mm_add_ps(part_d1, _mm_mul_ps(row_high, _mm_loadu_ps(lane_d + slot + 4)));
+    }
+    for (; slot + 4 <= span_count; slot += 4) {
+      __m128 row_low = _mm_loadu_ps(row_data + slot);
+      part_a0 = _mm_add_ps(part_a0, _mm_mul_ps(row_low, _mm_loadu_ps(lane_a + slot)));
+      part_b0 = _mm_add_ps(part_b0, _mm_mul_ps(row_low, _mm_loadu_ps(lane_b + slot)));
+      part_c0 = _mm_add_ps(part_c0, _mm_mul_ps(row_low, _mm_loadu_ps(lane_c + slot)));
+      part_d0 = _mm_add_ps(part_d0, _mm_mul_ps(row_low, _mm_loadu_ps(lane_d + slot)));
+    }
+    {
+      float total_a = kern_dot_total(_mm_add_ps(part_a0, part_a1));
+      float total_b = kern_dot_total(_mm_add_ps(part_b0, part_b1));
+      float total_c = kern_dot_total(_mm_add_ps(part_c0, part_c1));
+      float total_d = kern_dot_total(_mm_add_ps(part_d0, part_d1));
+      for (; slot < span_count; ++slot) {
+        total_a += row_data[slot] * lane_a[slot];
+        total_b += row_data[slot] * lane_b[slot];
+        total_c += row_data[slot] * lane_c[slot];
+        total_d += row_data[slot] * lane_d[slot];
+      }
+      part_list[lane_index] += total_a;
+      part_list[lane_index + 1] += total_b;
+      part_list[lane_index + 2] += total_c;
+      part_list[lane_index + 3] += total_d;
+    }
+  }
+#endif
+  for (; lane_index < lane_count; ++lane_index)
+    part_list[lane_index] += kern_dot_real(row_data, STORE_F32,
+                                           act_data + (size_t)lane_index * (size_t)act_stride,
+                                           span_count);
+}
+
 /* Codes are unpacked once per group and reused by every lane, so a batch pays
  * the decode cost of a single vector and turns the projection into a product. */
 static void kern_row_code_many(const plane *sheet, int row_index, const kern_job *job) {
@@ -2634,11 +2773,8 @@ static void kern_row_code_many(const plane *sheet, int row_index, const kern_job
       if (chunk_count > KERN_SPREAD_LIMIT) chunk_count = KERN_SPREAD_LIMIT;
       kern_code_spread(code_row, from_index + done_count, chunk_count, sheet->bit_count,
                        sheet->code_flip, code_room);
-      for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
-        part_list[lane_index] += kern_dot_real(
-            code_room, STORE_F32,
-            job->act_data + (size_t)lane_index * (size_t)job->act_stride + from_index + done_count,
-            chunk_count);
+      kern_dot_real_many(code_room, job->act_data + from_index + done_count, job->act_stride,
+                         job->lane_count, chunk_count, part_list);
       done_count += chunk_count;
     }
     for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
