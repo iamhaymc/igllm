@@ -1778,6 +1778,9 @@ static uint64_t kern_code_word(const uint8_t *word_head, const uint8_t *run_end,
   return word_value;
 }
 
+#if !defined(APP_SIMD_AVX2)
+/* The block written out into scratch, which is what every host without the
+ * variable shift still reads it through. */
 static void kern_code_eight(const uint8_t *word_head, const uint8_t *run_end, int bit_count,
                             uint32_t code_mask, int code_flip, int32_t *code_out) {
   uint64_t word_value = kern_code_word(word_head, run_end, bit_count);
@@ -1787,6 +1790,100 @@ static void kern_code_eight(const uint8_t *word_head, const uint8_t *run_end, in
                                       code_mask) ^
                                      (uint32_t)code_flip);
 }
+#endif
+
+#if defined(APP_SIMD_AVX2)
+/* The same block of eight, decoded inside the vector rather than through
+ * scratch.  Both readers of a block want exactly this and neither can afford
+ * the other shape: eight four byte stores feeding one thirty-two byte load is a
+ * forwarding stall, and it costs the fused dot nearly half of its loop.
+ *
+ * There are two ways in, and which is taken is decided by how many bytes of the
+ * row are certainly behind the block rather than by the width.
+ *
+ * Where sixteen bytes are, the block is a shuffle over one wide load.  Eight
+ * codes are exactly `bit_count` bytes, so a block always begins on a byte
+ * boundary and every block of a width picks the same bytes at the same shifts:
+ * the tables are the width's own and are built once for a run.  Each lane is
+ * handed the four bytes its code starts in — a code of seven bits or fewer
+ * straddles two of them at most, so four is more than enough — and shifts its
+ * own code down.  The bytes a block reaches are all within the first ten, so
+ * the low half of the load is broadcast to both halves and one `shuffle_epi8`
+ * serves all eight lanes despite picking across what would otherwise be a lane
+ * boundary.
+ *
+ * Where they are not — the last block or two of a row, where the bytes beyond
+ * may be past the mapping rather than merely past the row — the word is
+ * broadcast to four sixty-four bit lanes instead and gathered back into one
+ * vector by two permutes and a join.  That is three ops a block more and is
+ * paid on a handful of blocks a row against the thousands that are not. */
+typedef struct {
+  __m256i byte_pick;  /* the four bytes each code starts in */
+  __m256i step_wide;  /* how far down its own lane shifts it */
+  __m256i mask_slim;  /* the width, thirty-two bits a lane */
+  __m256i flip_wide;
+  __m256i shift_low;  /* the tail's path: the first four codes, one shift a lane */
+  __m256i shift_high; /* the second four */
+  __m256i mask_wide;  /* the width, sixty-four bits a lane */
+  __m256i pick_data;
+} kern_code_plan;
+
+static kern_code_plan kern_code_plan_make(int bit_count, uint32_t code_mask, int code_flip) {
+  kern_code_plan plan;
+  int8_t pick_room[32];
+  int32_t step_room[8];
+  int part_index, byte_index;
+  for (part_index = 0; part_index < 8; ++part_index) {
+    int bit_place = part_index * bit_count;
+    for (byte_index = 0; byte_index < 4; ++byte_index)
+      pick_room[part_index * 4 + byte_index] = (int8_t)(bit_place / 8 + byte_index);
+    step_room[part_index] = bit_place % 8;
+  }
+  plan.byte_pick = _mm256_loadu_si256((const __m256i *)(const void *)pick_room);
+  plan.step_wide = _mm256_loadu_si256((const __m256i *)(const void *)step_room);
+  plan.mask_slim = _mm256_set1_epi32((int)code_mask);
+  plan.flip_wide = _mm256_set1_epi32(code_flip);
+  plan.shift_low = _mm256_setr_epi64x(0, bit_count, 2 * bit_count, 3 * bit_count);
+  plan.shift_high = _mm256_setr_epi64x(4 * bit_count, 5 * bit_count, 6 * bit_count, 7 * bit_count);
+  plan.mask_wide = _mm256_set1_epi64x((long long)code_mask);
+  /* Four codes a vector sit in the low half of each sixty-four bit lane. */
+  plan.pick_data = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+  return plan;
+}
+
+/* How many codes from the head of a run have sixteen bytes of the row behind
+ * every block they fall in, and so can be taken by the shuffle.  The two are
+ * split into two loops rather than branched between a block at a time: the
+ * bound is the same for a whole run, and asking it per block costs the spread
+ * everything the shuffle wins it. */
+static int kern_code_wide_span(const uint8_t *byte_head, const uint8_t *run_end, int bit_count) {
+  ptrdiff_t room = (run_end - byte_head) - 16;
+  if (room < 0) return 0;
+  return ((int)(room / bit_count) + 1) * 8;
+}
+
+static __m256i kern_code_wide(const kern_code_plan *plan, const uint8_t *word_head) {
+  __m256i load_data =
+      _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(const void *)word_head));
+  __m256i lane_data = _mm256_shuffle_epi8(load_data, plan->byte_pick);
+  return _mm256_xor_si256(
+      _mm256_and_si256(_mm256_srlv_epi32(lane_data, plan->step_wide), plan->mask_slim),
+      plan->flip_wide);
+}
+
+static __m256i kern_code_wide_edge(const kern_code_plan *plan, const uint8_t *word_head,
+                                   const uint8_t *run_end, int bit_count) {
+  __m256i base_data = _mm256_set1_epi64x((long long)kern_code_word(word_head, run_end, bit_count));
+  __m256i part_low =
+      _mm256_and_si256(_mm256_srlv_epi64(base_data, plan->shift_low), plan->mask_wide);
+  __m256i part_high =
+      _mm256_and_si256(_mm256_srlv_epi64(base_data, plan->shift_high), plan->mask_wide);
+  return _mm256_xor_si256(
+      _mm256_permute2x128_si256(_mm256_permutevar8x32_epi32(part_low, plan->pick_data),
+                                _mm256_permutevar8x32_epi32(part_high, plan->pick_data), 0x20),
+      plan->flip_wide);
+}
+#endif
 
 /* Whether a width is one of those, and whether the run starts where a block
  * of eight does. */
@@ -2057,40 +2154,31 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
     const uint32_t code_mask = (1u << bit_count) - 1u;
 #if defined(APP_SIMD_AVX2)
     {
-      /* The codes are shifted out of the word inside the vector rather than
-       * written to scratch and read back: eight four byte stores feeding one
-       * thirty-two byte load is a forwarding stall, and it costs nearly half of
-       * this loop — 0.94 G codes a second against 3.97 on that row.  A variable
-       * shift per lane is what makes it possible, and it is what SSE2 has not
-       * got. */
-      const __m256i shift_low = _mm256_setr_epi64x(0, bit_count, 2 * bit_count, 3 * bit_count);
-      const __m256i shift_high =
-          _mm256_setr_epi64x(4 * bit_count, 5 * bit_count, 6 * bit_count, 7 * bit_count);
-      const __m256i mask_wide = _mm256_set1_epi64x((long long)code_mask);
-      const __m256i flip_wide = _mm256_set1_epi32(code_flip);
-      const __m256i pick_data = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+      /* The codes come out of the row inside the vector rather than through
+       * scratch — `kern_code_wide` above, which the spread reads the same
+       * blocks through.  On a five bit row of 12288, one thread, tuned: 6.29 G
+       * codes a second, against 3.34 when the block was a broadcast word and
+       * two permutes and 0.94 when it went through scratch.  Two bits reaches
+       * 10.52 on that row and four 8.32, so the width still shapes this loop,
+       * but it is 60% of them rather than a third. */
+      const kern_code_plan plan = kern_code_plan_make(bit_count, code_mask, code_flip);
+      int wide_count = kern_code_wide_span(byte_head, run_end, bit_count);
       __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
-      for (; slot + 16 <= span_count; slot += 16) {
+      if (wide_count > span_count) wide_count = span_count;
+      for (; slot + 16 <= wide_count; slot += 16) {
         const uint8_t *word_head = byte_head + (size_t)(slot / 8) * (size_t)bit_count;
-        int part_index;
-        for (part_index = 0; part_index < 2; ++part_index) {
-          __m256i base_data = _mm256_set1_epi64x(
-              (long long)kern_code_word(word_head + part_index * bit_count, run_end, bit_count));
-          __m256i part_low = _mm256_and_si256(_mm256_srlv_epi64(base_data, shift_low), mask_wide);
-          __m256i part_high = _mm256_and_si256(_mm256_srlv_epi64(base_data, shift_high), mask_wide);
-          /* Four codes a vector sit in the low half of each sixty-four bit
-           * lane; gathering the eight into one is two permutes and a join. */
-          __m256i code_wide = _mm256_xor_si256(
-              _mm256_permute2x128_si256(_mm256_permutevar8x32_epi32(part_low, pick_data),
-                                        _mm256_permutevar8x32_epi32(part_high, pick_data), 0x20),
-              flip_wide);
-          __m256 act_wide = _mm256_loadu_ps(act_data + slot + part_index * 8);
-          if (part_index == 0)
-            part_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(code_wide), act_wide, part_a);
-          else
-            part_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(code_wide), act_wide, part_b);
-        }
+        part_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(kern_code_wide(&plan, word_head)),
+                                 _mm256_loadu_ps(act_data + slot), part_a);
+        part_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(kern_code_wide(&plan, word_head + bit_count)),
+                                 _mm256_loadu_ps(act_data + slot + 8), part_b);
       }
+      /* The blocks at the end of the row, which have fewer than sixteen bytes
+       * behind them. */
+      for (; slot + 8 <= span_count; slot += 8)
+        part_a = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(kern_code_wide_edge(
+                &plan, byte_head + (size_t)(slot / 8) * (size_t)bit_count, run_end, bit_count)),
+            _mm256_loadu_ps(act_data + slot), part_a);
       total = kern_wide_total(_mm256_add_ps(part_a, part_b));
     }
 #else
@@ -2285,18 +2373,50 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
     return;
   }
 
+  /* Three, five, six and seven bits.  A block of eight is decoded inside the
+   * vector and stored as eight floats — `kern_code_wide` above, which the fused
+   * dot reads its blocks through as well — rather than written to scratch and
+   * read back a value at a time.  That round trip was the whole of what stood
+   * between these widths and the two the checkpoint leans on.  On a five bit
+   * row of 12288, one thread, tuned: 8.90 G codes a second against 1.19 before
+   * it, and against 9.89 at two bits and 9.79 at four on the same row.  The
+   * width no longer decides the rate of the spread either. */
   if (kern_code_odd(bit_count, from_index)) {
     const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
     const uint8_t *run_end = byte_head + (size_t)span_count * (size_t)bit_count / 8u;
     const uint32_t code_mask = (1u << bit_count) - 1u;
-    int32_t code_room[8];
-    int part_index;
-    for (; slot + 8 <= span_count; slot += 8) {
-      kern_code_eight(byte_head + (size_t)(slot / 8) * (size_t)bit_count, run_end, bit_count,
-                      code_mask, code_flip, code_room);
-      for (part_index = 0; part_index < 8; ++part_index)
-        out_data[slot + part_index] = (float)code_room[part_index];
+#if defined(APP_SIMD_AVX2)
+    {
+      const kern_code_plan plan = kern_code_plan_make(bit_count, code_mask, code_flip);
+      int wide_count = kern_code_wide_span(byte_head, run_end, bit_count);
+      if (wide_count > span_count) wide_count = span_count;
+      for (; slot + 16 <= wide_count; slot += 16) {
+        const uint8_t *word_head = byte_head + (size_t)(slot / 8) * (size_t)bit_count;
+        _mm256_storeu_ps(out_data + slot, _mm256_cvtepi32_ps(kern_code_wide(&plan, word_head)));
+        _mm256_storeu_ps(out_data + slot + 8,
+                         _mm256_cvtepi32_ps(kern_code_wide(&plan, word_head + bit_count)));
+      }
+      for (; slot + 8 <= span_count; slot += 8)
+        _mm256_storeu_ps(
+            out_data + slot,
+            _mm256_cvtepi32_ps(kern_code_wide_edge(
+                &plan, byte_head + (size_t)(slot / 8) * (size_t)bit_count, run_end, bit_count)));
     }
+#else
+    {
+      /* Everywhere else the block still goes through scratch, which is what
+       * the width had before either reader hurried it, and is still twice the
+       * bit stream walk below. */
+      int32_t code_room[8];
+      int part_index;
+      for (; slot + 8 <= span_count; slot += 8) {
+        kern_code_eight(byte_head + (size_t)(slot / 8) * (size_t)bit_count, run_end, bit_count,
+                        code_mask, code_flip, code_room);
+        for (part_index = 0; part_index < 8; ++part_index)
+          out_data[slot + part_index] = (float)code_room[part_index];
+      }
+    }
+#endif
   }
   for (; slot < span_count; ++slot)
     out_data[slot] = (float)(pack_read(code_row, (size_t)(from_index + slot), bit_count) ^
