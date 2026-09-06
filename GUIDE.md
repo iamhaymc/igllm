@@ -348,12 +348,28 @@ in isolation and slower in the engine, and taken out again — see
   of a wider array and the head size where they have been gathered into a run.
 - `kern_fma_row` — `into[v] += left[v] * right[v]`, which is what the
   conformer's depthwise convolution becomes once its kernel is held tap-major.
+- `kern_dot_real_many` — one row of floats against four activation vectors at
+  once, which is what the batch's inner loop became in 0.8.8. Taken a lane at a
+  time it loaded the spread's scratch again for every lane: two loads for every
+  multiply-add, on a host that issues two loads and two multiply-adds a cycle,
+  so the loop got one multiply-add a cycle whatever its vector was. Four lanes
+  sharing the row's load make that ten loads for eight multiply-adds — 25.93 G
+  multiply-adds a second against 17.11 on the span the batch uses.
+
+  Every lane's sum is `kern_dot_real`'s own float, bit for bit: the same two
+  accumulators taking the same slots in the same order, the same reduction
+  (`kern_dot_total`, factored out so the two cannot drift), and the scalar tail
+  folded in before the total reaches the caller's accumulator. Lanes past the
+  last block of four, and every backend without a vector path here, go through
+  `kern_dot_real` itself. Four lanes and not eight because eight needs
+  seventeen live vectors against sixteen, and the only way to eight is one
+  accumulator a lane, which would reassociate every sum in the engine.
 - `kern_row_code_many` — the same row against several activation vectors at
   once. A group of codes is spread into a small float scratch and dotted
-  against every lane, so a batch pays the decode cost of a single vector. When
-  that spread was a scalar walk of the bit stream, a sixteen lane batch cost
-  three and a half times what the same sixteen lanes cost one at a time, and
-  batching lost to the thing it exists to beat.
+  against every lane through the kernel above, so a batch pays the decode cost
+  of a single vector. When that spread was a scalar walk of the bit stream, a
+  sixteen lane batch cost three and a half times what the same sixteen lanes
+  cost one at a time, and batching lost to the thing it exists to beat.
 
   This is the one caller of `kern_code_spread`, and it is why that function has
   no wide path. The spread is a small part of what this loop does and the

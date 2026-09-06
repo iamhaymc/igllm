@@ -39,28 +39,25 @@ weights or on none. Most consequential first within each group.
   is a footprint question rather than a decode one, as 0.8.1 established, and it
   is worth having on a small host. It is not a decode win and should not be
   scoped as one.
-- Restructure the batch that the towers and prefill both run on. 0.8.8 profiled
-  a picture again, at the export's full patch budget on a host with AVX-512, and
-  the tower's own 39.1 s single threaded is 24.0 of projections, 6.5 of scoring,
-  5.0 of blend, 0.83 of softmax — 0.8.6's series, where 0.8.4 measured 6.6 — and
-  3.3 of everything else. So the projections are 61% of a tower and the question
-  is theirs.
+- Speed up the towers further, and the batch under them. 0.8.8 profiled a
+  picture again — the tower is 39.1 s single threaded at the full patch budget,
+  of which the projections are 24.0, the scoring 6.5, the blend 5.0 and the
+  softmax 0.83 — and then took the one change that reading pointed at: four
+  lanes of a batch now share the row's load rather than each loading it again,
+  which is 8% of the projections and 23% of prefill on the default build.
 
-  Three ways of hurrying them were measured and none taken: a sixteen lane
-  `kern_dot_real` (5% of the projections, and prefill 2% slower), four eight
-  lane accumulators instead of two (prefill 9% slower on the tuned build), and
-  thirty-two lanes a batch instead of sixteen, which halves the passes over the
-  codes and changed prefill by nothing. Each was quicker on its own — the first
-  by 51%, the second by 39% — so what the batch waits on is none of the width of
-  its multiply-add, the depth of its chain, or the codes it streams.
+  What is left of that loop is the eight lane block it cannot have. Four lanes
+  is what sixteen vector registers hold with two accumulators apiece, and the
+  eight lane form measures 16% quicker but needs seventeen, so it can only be
+  had by dropping to one accumulator a lane and reassociating every sum in the
+  engine. A host with thirty-two vector registers — which is any host with the
+  wide tier — could hold eight lanes and both accumulators and stay bit exact,
+  and that is a wide path with something real to gain, unlike the two 0.8.8
+  measured and refused.
 
-  What is left is the shape of `kern_row_code_many` itself: a scratch of 256
-  floats written by the spread and then read once per lane, with the row's loads
-  and the lane's loads competing for the same ports. Holding the lanes'
-  accumulators across a block of codes instead — so the spread is read from
-  registers rather than from memory sixteen times — is the change that is left,
-  and it is a restructuring rather than a kernel. It is also worth more than a
-  tower: the same loop is every prefill batch.
+  Past that the tower's own attention is what is left: the scoring at 6.5 s and
+  the blend at 5.0, neither touched since they were written, both already
+  vectorized by the compiler, and together a third of a tower.
 
 - The other half of a picture is the text stack, and nothing has been asked of
   it. A picture at the full budget lays 256 soft tokens down, and prefilling

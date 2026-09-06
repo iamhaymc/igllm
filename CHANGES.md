@@ -3339,9 +3339,12 @@ cost and neither was the memory. Between the two there was a third thing nobody
 had measured, and it was a third of the token: the fork and the join around
 every projection.
 
-On the second: the profile is here, three of its candidates are measured, and
-none of the three is taken. That half of the release changes no code and is
-worth as much as the half that does.
+On the second: the profile is here, and it moved the question from the tower to
+the batch that every tower and every prefill shares. Three candidates for that
+batch were measured and refused — a wider dot, a deeper chain, more lanes — and
+the fourth was taken: four lanes now share the row's load rather than each
+loading it again, which is prefill 23% quicker on the default build and a
+picture's projections 8% quicker, without moving a bit of any result.
 
 ### The host
 
@@ -3485,11 +3488,16 @@ spins and a deliberately oversubscribed pool does not.
 
 ### Not a bit of any result moves
 
-The pool hands the same slices to the same workers in the same order and the
-task functions are untouched; what changed is how a thread waits between two
-jobs. The suite is 493 tests, clean on the default, tuned and wide builds and
-under the address and undefined sanitizers. The reference comparison passes on
-the shipped export on the wide build, with the same logits it reached before.
+Neither change moves a number. The pool hands the same slices to the same
+workers in the same order and the task functions are untouched; what changed
+there is how a thread waits between two jobs. The batch's blocking is held to
+the same floor by construction and by a test, as above.
+
+The suite is 498 tests from 493, clean on the default, tuned and wide builds and
+under the address and undefined sanitizers on the default and wide ones. The
+synthetic sweep is unchanged and still passes: eleven configurations, every
+tensor of every layer. The reference comparison passes on the shipped export on
+the wide build, with the same logits it reached before.
 
 ### The picture, profiled again
 
@@ -3523,7 +3531,7 @@ ids: 40.1 s of it, against the tower's 39.1. **Half of what a picture costs is
 the text stack reading what the tower produced**, which no reading of this
 before had separated. At four threads the two are 13.8 s and 13.6 s.
 
-### Three ways to hurry the projections, measured and not taken
+### Three ways to hurry the projections, measured and not taken, and the fourth
 
 The projections are `kern_row_code_many`: a group of codes spread into a float
 scratch once, then dotted against each of sixteen lanes through `kern_dot_real`,
@@ -3553,10 +3561,61 @@ worse. So the codes are not what the batch is waiting on either.
 
 Between them those three say what the next attempt should not be. The batch is
 not waiting on the width of its multiply-add, nor on the depth of its dependency
-chain, nor on the codes it streams. What is left is the shape of the loop — a
-scratch written and then read sixteen times, with the loads for the row and the
-loads for the lane competing for the same ports — and changing that is a
-restructuring of `kern_row_code_many` rather than a wider kernel inside it.
+chain, nor on the codes it streams. What is left is the shape of the loop, and
+that is the last change in this release.
+
+### The batch shares the row's load
+
+**Two loads for every multiply-add is the limit, and one of the two is the same
+load sixteen times.** The batch spreads a group of codes into a scratch and then
+dots that scratch against each of sixteen lanes, a lane at a time. Every lane
+reads the whole scratch again. The host will issue two loads and two
+multiply-adds a cycle, so a loop that needs two loads per multiply-add gets one
+multiply-add a cycle whatever its vector is — which is exactly why a wider
+vector, a deeper chain and more lanes a batch all left it where they found it.
+
+**Four lanes at a time share it.** `kern_dot_real_many` holds four lanes'
+accumulators at once and loads the row once for the four: ten loads for eight
+multiply-adds rather than sixteen. On the 256 element span the batch hands it,
+with the lanes strided as the batch strides them, 25.93 G multiply-adds a second
+against 17.11 for a lane at a time; at the wider stride of the feed-forward,
+20.32 against 14.89.
+
+**Not a bit of any result moves, and that is a property rather than a hope.**
+Each lane keeps the two accumulators `kern_dot_real` keeps, takes the same slots
+into the same one in the same order, ends with the same reduction — factored out
+now as `kern_dot_total`, so the two cannot drift — and folds the span's scalar
+tail in before the total reaches the caller's accumulator, which is where the
+one lane path folds it. Lanes past the last block of four, and every path
+without a vector, go through `kern_dot_real` itself. A test walks every lane
+count from one to nine against every span from one to forty and requires the
+same float, not a near one; and the whole distribution over the vocabulary is
+byte for byte identical on the default, tuned and wide builds over three
+prompts.
+
+**What it is worth**, best of two runs on an 1800 id prompt at four threads:
+
+| build | prefill before | after | |
+| --- | --- | --- | --- |
+| default, SSE2 | 9.28 tok/s | **11.40** | +23% |
+| tuned, AVX2 | 16.75 | **17.80** | +6% |
+| wide, AVX-512 | 17.75 | **18.41** | +4% |
+
+The order is the argument again, and it runs the other way from the pool's. The
+default build has no fused multiply-add: a multiply and an add for every element,
+against the same two loads, so the loads are the largest share of what it does
+and halving them is worth most. The wide build has the most arithmetic per load
+already and gains least.
+
+Single threaded on the same host, the wide build's prefill goes 6.76 to 7.07
+tokens a second, and a picture's projections — the 24 s this release measured —
+go to 21.90, which takes the tower from 39.50 s to 37.61.
+
+**Four lanes and not eight**, though eight measures quicker: 30.07 G
+multiply-adds a second against 25.93. Eight lanes with two accumulators apiece
+is seventeen vectors live and the host has sixteen, so it can only be done by
+dropping to one accumulator a lane — which reassociates every sum in the engine
+for about two per cent more. Bit-exactness is worth more than that.
 
 ### What is left of the four thread question
 

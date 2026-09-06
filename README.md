@@ -283,4 +283,12 @@ for. At the export's full patch budget the tower takes 39.1 s single threaded �
 being 0.8.6's series where 0.8.4 measured 6.6 — and the 256 soft tokens it
 produces cost another 40.1 s to prefill through the text stack, which is half of
 what a picture costs and was in no reading of one before. Three ways of hurrying
-the projections were measured and none taken; `CHANGES.md` says which and why.
+the projections were measured and none taken, and a fourth was: the batch's
+inner loop read the spread's scratch again for every one of its sixteen lanes,
+which is two loads for every multiply-add on a host that issues two of each a
+cycle. Four lanes now share the row's load, and prefill on an 1800 id prompt
+goes from 9.28 tokens a second to 11.40 on the default build, 16.75 to 17.80 on
+the tuned one and 17.75 to 18.41 on the wide one — the order being the argument,
+since the default build has no fused multiply-add and so the loads are the
+largest share of what it does. Every lane's sum is the float it was, bit for
+bit. `CHANGES.md` says which three were refused and why.
