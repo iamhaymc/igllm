@@ -48,7 +48,7 @@ weights or on none. Most consequential first within each group.
   projections themselves, which already run through the packed kernels, and the
   softmax above.
 
-Two items are closed rather than carried. The per-group gain mirror — a
+Two items were closed rather than carried in 0.8.4. The per-group gain mirror — a
 per-plane float copy of the group gains, traded against the conversions it
 saves — has nothing to convert on this export: all 548 `weight_scale` tensors
 are `F32` of shape `[rows, 1]`, so `plane_gain` is already a plain indexed float
@@ -59,8 +59,8 @@ does not. And vectorizing the conformer's score loop was measured at nothing on
 the shipped export — the window is thirteen keys wide — at the cost of moving
 the tower's logits in the third decimal, so it was not taken.
 
-Reading a cached key row once for all eight heads is done, in 0.8.5, and is off
-this list. It took decode on the byte cache from 5.91 to 7.22 tokens a second
+A third is off this list because it is done. Reading a cached key row once for
+all eight heads arrives in 0.8.5. It took decode on the byte cache from 5.91 to 7.22 tokens a second
 and prefill from 14.85 to 18.94, moved no bit of any result, and was worth 5%
 of decode on the float cache too, which was not the reason for it. `--cache 8`
 is within a percent or two of the float cache on both builds now rather than a
@@ -85,7 +85,6 @@ third behind on one of them.
   inverted, and neither can be guessed from the pixels; and a precision of
   twelve bits, which the extended sequential frame header allows, needs the
   tables and the level shift widened.
-
 - Run two conversations at the same time rather than one after the other. 0.8.5
   gives the CLI several sessions on one model and a loop that takes turns in any
   of them, and they take those turns one at a time: the sessions are
@@ -130,14 +129,18 @@ third behind on one of them.
   MinGW gcc, on the scalar, SSE2 and AVX2 backends; `cl` and its `/arch:AVX2`
   path have still only been read.
 
-Three items are closed rather than carried. Baseline jpeg and the wider range of
-png both arrive in 0.8.5: png now reads grey at one, two and four bits, palette
-at one to eight, and interlaced files of every kind, so there is no legal pairing
-of depth and colour kind left that the reader refuses.  What jpeg still refuses
-is a decoder of its own and is carried above. And how `app_diff.py` should treat a picture the two
-sides decode differently — the question the jpeg item raised — turns out to be
-answered already: `diff_tower` feeds the reference the patches the engine says
-it read, out of the activation dump, and the seam's graph half is fed the same,
-so the only thing either half reads from the picture file is its width and
+Four items are off this list because 0.8.5 did them: baseline jpeg, the wider
+range of png, the multi-turn chat loop with several conversations on one model,
+and the session cache written out and read back. The png reader now takes grey
+at one, two and four bits, palette at one to eight, and interlaced files of
+every kind, so there is no legal pairing of depth and colour kind left that it
+refuses; what jpeg still refuses is a decoder of its own and is carried above,
+and so are the two halves of the other three that 0.8.5 did not reach.
+
+A fifth is closed rather than carried. How `app_diff.py` should treat a picture
+the two sides decode differently — the question the jpeg item raised — turns out
+to be answered already: `diff_tower` feeds the reference the patches the engine
+says it read, out of the activation dump, and the seam's graph half is fed the
+same, so the only thing either half reads from the picture file is its width and
 height. The decoder is not in the comparison, and a jpeg case is held to the
 same floor as a png one.
