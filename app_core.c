@@ -486,13 +486,59 @@ static int host_thread_count(void) {
 /* A fork-join pool: every job splits one index range across the workers. */
 typedef void (*pool_task)(void *state, int slice_index, int slice_count);
 
+/* The hint a core gives the one beside it while it waits on a counter rather
+ * than on the kernel.  It is a hint and not a barrier: what orders the memory
+ * either side of a job is the mutex, which every waiter still takes before it
+ * reads anything but the counter. */
+static void pool_pause(void) {
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+  YieldProcessor();
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__))
+  __asm__ __volatile__("pause");
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__aarch64__) || defined(__arm__))
+  __asm__ __volatile__("yield");
+#endif
+}
+
+/* How many of those a waiter spends before it sleeps, where it spends any.
+ *
+ * A job here is one projection of one token, and a decode token issues 277 of
+ * them: barely a millisecond of work apiece at four threads, so what a fork and
+ * a join cost is a real part of what a token costs.  Sleeping
+ * on a condition variable and being woken from it is tens of microseconds on
+ * the host this was measured on — a fork and join of nothing at all takes 120
+ * of them at four threads — because every wake is a trip through the scheduler
+ * on a core that has work queued behind it.
+ *
+ * Spinning first turns that into a few hundred nanoseconds when the other side
+ * is close behind, which it is between two projections of the same token, and
+ * costs nothing but a bounded spin when it is not.  The bound is what keeps a
+ * pool that is genuinely idle — a chat loop waiting on a person to type — off
+ * the cores it is not using: past it, every waiter sleeps as it always did.
+ *
+ * Sixteen thousand pauses is about fifty microseconds on that host, which is
+ * two wakes' worth: past that the sleep is the cheaper of the two.
+ *
+ * None of it holds when the pool has more threads than the host has cores.
+ * Then the core a spinner is holding is the one a worker with real work on it
+ * is waiting for, and the spin is not a wait for the other side but a delay to
+ * it: eight threads on four cores decode 6.88 tokens a second spinning against
+ * 3.95.  So `pool_open` asks whether every thread has a core of its own and
+ * hands the group a spin of zero where they do not, which is the behaviour
+ * this had before — sleep on the first look. */
+#define POOL_SPIN_LIMIT 16000
+
 typedef struct pool_group {
   int        worker_count;
-  int        stop_flag;
+  int        spin_limit; /* pauses before a waiter sleeps; zero when oversubscribed */
   pool_task  task_call;
   void      *task_state;
-  int        task_serial;
-  int        done_count;
+  /* The three a waiter reads outside the lock while it spins, and every writer
+   * writes under it: `volatile` so a compiler cannot hoist the read out of the
+   * spin.  They are a hint there and are read again under the lock. */
+  volatile int stop_flag;
+  volatile int task_serial;
+  volatile int done_count;
 #if defined(APP_HOST_WINDOWS)
   HANDLE            *worker_list;
   CRITICAL_SECTION   guard_lock;
@@ -540,6 +586,10 @@ static void *pool_loop(void *seat_data)
     pool_task task_call;
     void *task_state;
     int slice_count;
+    int spin_left;
+    for (spin_left = group->spin_limit;
+         spin_left > 0 && group->task_serial == seen_serial && !group->stop_flag; --spin_left)
+      pool_pause();
     pool_lock(group);
     while (group->task_serial == seen_serial && !group->stop_flag) {
 #if defined(APP_HOST_WINDOWS)
@@ -580,6 +630,7 @@ static app_code pool_open(pool_group *group, int thread_count) {
   memset(group, 0, sizeof(*group));
   if (thread_count < 1) thread_count = 1;
   group->worker_count = thread_count - 1; /* the caller is worker zero */
+  group->spin_limit = thread_count <= host_thread_count() ? POOL_SPIN_LIMIT : 0;
   if (group->worker_count <= 0) return APP_OKAY;
 
 #if defined(APP_HOST_WINDOWS)
@@ -622,6 +673,7 @@ static int pool_bands(const pool_group *group) {
 
 static void pool_run(pool_group *group, pool_task task_call, void *task_state) {
   int slice_count = pool_bands(group);
+  int spin_left;
   if (group->worker_count <= 0) {
     task_call(task_state, 0, 1);
     return;
@@ -640,6 +692,9 @@ static void pool_run(pool_group *group, pool_task task_call, void *task_state) {
 
   task_call(task_state, 0, slice_count);
 
+  for (spin_left = group->spin_limit; spin_left > 0 && group->done_count < group->worker_count;
+       --spin_left)
+    pool_pause();
   pool_lock(group);
   while (group->done_count < group->worker_count) {
 #if defined(APP_HOST_WINDOWS)
