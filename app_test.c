@@ -729,6 +729,61 @@ static void test_kernel(void) {
     }
   }
 
+  { /* The same, over a row allocated to exactly the bytes it packs into.
+     *
+     * The odd widths read their block of eight codes as one eight byte word
+     * where the run has eight bytes left, which is more bytes than the block
+     * itself is: at three bits a block is three of them.  A row with nothing
+     * allocated behind it is what says whether the bound on that read is real,
+     * because under the sanitizers a read past it is a failure rather than a
+     * value nobody looks at.  The block above pads its row and cannot say.
+     *
+     * It is `malloc` rather than `mem_clear` for the same reason: the engine's
+     * allocator rounds every block up to the alignment its kernels want, so a
+     * row asked for at twenty-four bytes is sixty-four and the reads past it
+     * land inside the allocation.  Here the row is exactly its own bytes and
+     * the sanitizer's guard is the next thing after it.  A weight row is a
+     * mapped one rather than either, and a mapping ends at a page: the same
+     * read is a fault there rather than a value, which is what the bound is
+     * for. */
+    int bit_list[7] = {2, 3, 4, 5, 6, 7, 8};
+    int bit_slot, element_index, span_count, okay_flag = 1;
+    for (bit_slot = 0; bit_slot < 7; ++bit_slot) {
+      int bit_count = bit_list[bit_slot];
+      uint32_t mask_value = (uint32_t)((1u << bit_count) - 1u);
+      int element_count = 64;
+      size_t byte_count = (size_t)(element_count * bit_count + 7) / 8;
+      uint8_t *code_data = (uint8_t *)malloc(byte_count);
+      float *act_list = (float *)mem_clear(sizeof(float) * (size_t)element_count);
+      float *out_list = (float *)mem_clear(sizeof(float) * (size_t)element_count);
+      if (!code_data || !act_list || !out_list) { okay_flag = 0; }
+      if (code_data) memset(code_data, 0, byte_count);
+      for (element_index = 0; code_data && element_index < element_count; ++element_index) {
+        test_pack_write(code_data, (size_t)element_index, bit_count,
+                        (uint32_t)(element_index * 7 + bit_slot) & mask_value);
+        act_list[element_index] = (float)cos((double)element_index * 0.31);
+      }
+      for (span_count = 8; code_data && span_count <= element_count; span_count += 8) {
+        double want_value = 0.0;
+        int slot;
+        for (slot = 0; slot < span_count; ++slot)
+          want_value += (double)pack_read(code_data, (size_t)slot, bit_count) *
+                        (double)act_list[slot];
+        if (fabs((double)kern_dot_code(code_data, 0, span_count, act_list, bit_count, 0) -
+                 want_value) > 1e-3)
+          okay_flag = 0;
+        kern_code_spread(code_data, 0, span_count, bit_count, 0, out_list);
+        for (slot = 0; slot < span_count; ++slot)
+          if (out_list[slot] != (float)pack_read(code_data, (size_t)slot, bit_count))
+            okay_flag = 0;
+      }
+      free(code_data);
+      mem_free(act_list);
+      mem_free(out_list);
+    }
+    test_true(okay_flag, "and stay inside a row that has nothing allocated behind it");
+  }
+
   { /* Quantized matvec against the dense matrix it encodes. */
     int bit_list[3] = {2, 4, 8};
     int trial_index;

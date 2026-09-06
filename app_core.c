@@ -1381,6 +1381,19 @@ static int64_t whole_read(const void *base_data, store_type type_kind, size_t sl
   }
 }
 
+/* This engine is little-endian by decision rather than by accident.  The
+ * checkpoint is mapped and read where it lies: `real_read` casts the mapped
+ * bytes to a `float` or a `uint16_t`, and the packed code stream below is a
+ * dense little-endian bit field the kernels index directly.  A big-endian host
+ * would not read the weights wrongly in one place but in every one of them, so
+ * there is nothing for a kernel to gain by being careful about it on its own.
+ * Where the compiler will say which it is, this says so before anything is
+ * built against the wrong assumption. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#  error "igllm maps the checkpoint where it lies and wants a little-endian host"
+#endif
+
 /* Reads one element from a dense little-endian bit stream of `bit_count` fields. */
 static uint32_t pack_read(const uint8_t *code_data, size_t element_index, int bit_count) {
   size_t bit_start = element_index * (size_t)bit_count;
@@ -1739,20 +1752,35 @@ static const float kern_code_two[256][4] = {KERN_CODE_TWO_64(0), KERN_CODE_TWO_6
  * seven bytes and eight shifts, against `pack_read`'s walk per code — and it
  * leaves the codes in the shape every other width's vector path wants.
  *
- * The word is assembled a byte at a time rather than read as one: the packing
- * is defined by the bit stream, and reading it as an integer would be defined
- * by the host's byte order. */
-static uint64_t kern_code_word(const uint8_t *word_head, int bit_count) {
+ * The word is one load where the run still has eight bytes ahead of it.  The
+ * packing is a dense little-endian bit stream and the host is little-endian —
+ * which is stated once, beside `pack_read`, rather than worked around here —
+ * so the eight bytes are the word already, and the bits above the block's own
+ * `bit_count` of them are never reached by a shift a block takes.  Assembling
+ * it a byte at a time was costing a fifth of the loop at three bits and rather
+ * more of it at seven.
+ *
+ * The tail is the exception, and the reason `run_end` is carried at all: a
+ * block at the end of a row has as few as three bytes behind it, and the five
+ * beyond them may be past the end of the mapping rather than merely past the
+ * end of the row.  There the word is assembled from its own bytes as it always
+ * was, which is a handful of blocks a row against the thousands that are
+ * not. */
+static uint64_t kern_code_word(const uint8_t *word_head, const uint8_t *run_end, int bit_count) {
   uint64_t word_value = 0;
   int part_index;
+  if (word_head + 8 <= run_end) {
+    memcpy(&word_value, word_head, sizeof(word_value));
+    return word_value;
+  }
   for (part_index = 0; part_index < bit_count; ++part_index)
     word_value |= (uint64_t)word_head[part_index] << (8 * part_index);
   return word_value;
 }
 
-static void kern_code_eight(const uint8_t *word_head, int bit_count, uint32_t code_mask,
-                            int code_flip, int32_t *code_out) {
-  uint64_t word_value = kern_code_word(word_head, bit_count);
+static void kern_code_eight(const uint8_t *word_head, const uint8_t *run_end, int bit_count,
+                            uint32_t code_mask, int code_flip, int32_t *code_out) {
+  uint64_t word_value = kern_code_word(word_head, run_end, bit_count);
   int part_index;
   for (part_index = 0; part_index < 8; ++part_index)
     code_out[part_index] = (int32_t)((((uint32_t)(word_value >> (bit_count * part_index))) &
@@ -2023,6 +2051,9 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
    * against 3.97 tuned and 1.62 default. */
   if (kern_code_odd(bit_count, from_index)) {
     const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
+    /* The bytes this run is certainly inside: the codes begin on a byte
+     * boundary, so the whole ones of them are the run's own. */
+    const uint8_t *run_end = byte_head + (size_t)span_count * (size_t)bit_count / 8u;
     const uint32_t code_mask = (1u << bit_count) - 1u;
 #if defined(APP_SIMD_AVX2)
     {
@@ -2044,7 +2075,7 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
         int part_index;
         for (part_index = 0; part_index < 2; ++part_index) {
           __m256i base_data = _mm256_set1_epi64x(
-              (long long)kern_code_word(word_head + part_index * bit_count, bit_count));
+              (long long)kern_code_word(word_head + part_index * bit_count, run_end, bit_count));
           __m256i part_low = _mm256_and_si256(_mm256_srlv_epi64(base_data, shift_low), mask_wide);
           __m256i part_high = _mm256_and_si256(_mm256_srlv_epi64(base_data, shift_high), mask_wide);
           /* Four codes a vector sit in the low half of each sixty-four bit
@@ -2076,8 +2107,9 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
       for (; slot + 16 <= span_count; slot += 16) {
         const uint8_t *word_head = byte_head + (size_t)(slot / 8) * (size_t)bit_count;
         int part_index;
-        kern_code_eight(word_head, bit_count, code_mask, code_flip, code_room);
-        kern_code_eight(word_head + bit_count, bit_count, code_mask, code_flip, code_room + 8);
+        kern_code_eight(word_head, run_end, bit_count, code_mask, code_flip, code_room);
+        kern_code_eight(word_head + bit_count, run_end, bit_count, code_mask, code_flip,
+                        code_room + 8);
         for (part_index = 0; part_index < 16; part_index += 2) {
           sum_a += (float)code_room[part_index] * act_data[slot + part_index];
           sum_b += (float)code_room[part_index + 1] * act_data[slot + part_index + 1];
@@ -2255,12 +2287,13 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
 
   if (kern_code_odd(bit_count, from_index)) {
     const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
+    const uint8_t *run_end = byte_head + (size_t)span_count * (size_t)bit_count / 8u;
     const uint32_t code_mask = (1u << bit_count) - 1u;
     int32_t code_room[8];
     int part_index;
     for (; slot + 8 <= span_count; slot += 8) {
-      kern_code_eight(byte_head + (size_t)(slot / 8) * (size_t)bit_count, bit_count, code_mask,
-                      code_flip, code_room);
+      kern_code_eight(byte_head + (size_t)(slot / 8) * (size_t)bit_count, run_end, bit_count,
+                      code_mask, code_flip, code_room);
       for (part_index = 0; part_index < 8; ++part_index)
         out_data[slot + part_index] = (float)code_room[part_index];
     }
