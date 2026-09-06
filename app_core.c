@@ -2545,20 +2545,264 @@ static void kern_gelu_gate(float *gate_list, const float *rise_list, int value_c
     gate_list[value_index] = kern_gelu_tanh(gate_list[value_index]) * rise_list[value_index];
 }
 
+/* The exponential a softmax needs, to within a bit of the last, without a call
+ * into libm.
+ *
+ * A picture's attention is a billion of these — a patch pair a head a layer, at
+ * the full patch budget — and a call a value is what left the softmax the
+ * largest thing in a picture that is not a matrix product.  What replaces the
+ * call is the definition.  `e^x` is `2^k` times `e^r`, where `k` is the whole
+ * number nearest `x / ln 2` and `r` is what is left over, never further from
+ * zero than half of `ln 2`.  Over that range the series for `e^r` is finished
+ * after eight terms — the ninth is five parts in a thousand million of the
+ * value, an eighth of the last bit a float carries — and `2^k` is an exponent
+ * field written straight into the word.
+ *
+ * `ln 2` is taken off in two pieces because `k * ln2` in one piece rounds away
+ * the low bits of `x` that the remainder is made of.  The first piece is exact
+ * in a float — its significand is eleven bits — so `x - k * high` is exact too,
+ * and the second piece carries the rest of the constant.
+ *
+ * Only a softmax reaches this, and a softmax has already taken its own peak off
+ * every value, so every argument is at most zero and the total is at least one.
+ * An argument below where a float stops being normal is therefore floored
+ * rather than allowed to reach a subnormal: either way it is a part in ten to
+ * the thirty-eighth of a total of at least one.
+ *
+ * The four paths agree to the last bit except where one of them has a fused
+ * multiply-add and another does not, which is the same difference the dot
+ * product kernels already carry. */
+#define KERN_EXP_FLOOR (-87.0f) /* below this `e^x` is under the smallest normal */
+#define KERN_EXP_LOG2E 1.4426950408889634f
+#define KERN_EXP_LN2_HIGH 0.693359375f /* 1419/2048, exact in a float */
+#define KERN_EXP_LN2_LOW (-2.1219444005469057e-4f)
+
+/* The series in Horner's order, over the eight terms the half-`ln 2` range
+ * needs.  Written as reciprocals of the factorials the definition names rather
+ * than as a fitted set, so there is nothing here to have copied wrong. */
+#define KERN_EXP_TERM_7 (1.0f / 5040.0f)
+#define KERN_EXP_TERM_6 (1.0f / 720.0f)
+#define KERN_EXP_TERM_5 (1.0f / 120.0f)
+#define KERN_EXP_TERM_4 (1.0f / 24.0f)
+#define KERN_EXP_TERM_3 (1.0f / 6.0f)
+#define KERN_EXP_TERM_2 (1.0f / 2.0f)
+
+static float kern_exp_near(float value_now) {
+  float step_value, whole_value, rest_value, poly_value, scale_value;
+  uint32_t word_value;
+  if (value_now < KERN_EXP_FLOOR) value_now = KERN_EXP_FLOOR;
+  step_value = value_now * KERN_EXP_LOG2E + 0.5f;
+  /* A floor without a call: truncation gives the ceiling of a negative, so the
+   * one that overshot steps back.  The argument is never above a half here, so
+   * the whole part always fits an int. */
+  whole_value = (float)(int)step_value;
+  if (whole_value > step_value) whole_value -= 1.0f;
+  rest_value = value_now - whole_value * KERN_EXP_LN2_HIGH;
+  rest_value -= whole_value * KERN_EXP_LN2_LOW;
+  poly_value = KERN_EXP_TERM_7;
+  poly_value = poly_value * rest_value + KERN_EXP_TERM_6;
+  poly_value = poly_value * rest_value + KERN_EXP_TERM_5;
+  poly_value = poly_value * rest_value + KERN_EXP_TERM_4;
+  poly_value = poly_value * rest_value + KERN_EXP_TERM_3;
+  poly_value = poly_value * rest_value + KERN_EXP_TERM_2;
+  poly_value = poly_value * rest_value + 1.0f;
+  poly_value = poly_value * rest_value + 1.0f;
+  word_value = (uint32_t)((int)whole_value + 127) << 23;
+  memcpy(&scale_value, &word_value, sizeof(scale_value));
+  return poly_value * scale_value;
+}
+
+#if defined(APP_SIMD_AVX2)
+static __m256 kern_exp_wide(__m256 wide_value) {
+  __m256 step_value, whole_value, rest_value, poly_value, scale_value;
+  wide_value = _mm256_max_ps(wide_value, _mm256_set1_ps(KERN_EXP_FLOOR));
+  step_value = _mm256_fmadd_ps(wide_value, _mm256_set1_ps(KERN_EXP_LOG2E), _mm256_set1_ps(0.5f));
+  whole_value = _mm256_cvtepi32_ps(_mm256_cvttps_epi32(step_value));
+  whole_value = _mm256_sub_ps(
+      whole_value, _mm256_and_ps(_mm256_cmp_ps(whole_value, step_value, _CMP_GT_OQ),
+                                 _mm256_set1_ps(1.0f)));
+  rest_value = _mm256_fnmadd_ps(whole_value, _mm256_set1_ps(KERN_EXP_LN2_HIGH), wide_value);
+  rest_value = _mm256_fnmadd_ps(whole_value, _mm256_set1_ps(KERN_EXP_LN2_LOW), rest_value);
+  poly_value = _mm256_set1_ps(KERN_EXP_TERM_7);
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(KERN_EXP_TERM_6));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(KERN_EXP_TERM_5));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(KERN_EXP_TERM_4));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(KERN_EXP_TERM_3));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(KERN_EXP_TERM_2));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(1.0f));
+  poly_value = _mm256_fmadd_ps(poly_value, rest_value, _mm256_set1_ps(1.0f));
+  scale_value = _mm256_castsi256_ps(_mm256_slli_epi32(
+      _mm256_add_epi32(_mm256_cvttps_epi32(whole_value), _mm256_set1_epi32(127)), 23));
+  return _mm256_mul_ps(poly_value, scale_value);
+}
+#elif defined(APP_SIMD_SSE2)
+static __m128 kern_exp_wide(__m128 wide_value) {
+  __m128 step_value, whole_value, rest_value, poly_value, scale_value;
+  wide_value = _mm_max_ps(wide_value, _mm_set1_ps(KERN_EXP_FLOOR));
+  step_value = _mm_add_ps(_mm_mul_ps(wide_value, _mm_set1_ps(KERN_EXP_LOG2E)), _mm_set1_ps(0.5f));
+  whole_value = _mm_cvtepi32_ps(_mm_cvttps_epi32(step_value));
+  whole_value = _mm_sub_ps(
+      whole_value, _mm_and_ps(_mm_cmpgt_ps(whole_value, step_value), _mm_set1_ps(1.0f)));
+  rest_value =
+      _mm_sub_ps(wide_value, _mm_mul_ps(whole_value, _mm_set1_ps(KERN_EXP_LN2_HIGH)));
+  rest_value =
+      _mm_sub_ps(rest_value, _mm_mul_ps(whole_value, _mm_set1_ps(KERN_EXP_LN2_LOW)));
+  poly_value = _mm_set1_ps(KERN_EXP_TERM_7);
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(KERN_EXP_TERM_6));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(KERN_EXP_TERM_5));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(KERN_EXP_TERM_4));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(KERN_EXP_TERM_3));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(KERN_EXP_TERM_2));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(1.0f));
+  poly_value = _mm_add_ps(_mm_mul_ps(poly_value, rest_value), _mm_set1_ps(1.0f));
+  scale_value = _mm_castsi128_ps(
+      _mm_slli_epi32(_mm_add_epi32(_mm_cvttps_epi32(whole_value), _mm_set1_epi32(127)), 23));
+  return _mm_mul_ps(poly_value, scale_value);
+}
+#elif defined(APP_SIMD_NEON)
+static float32x4_t kern_exp_wide(float32x4_t wide_value) {
+  float32x4_t step_value, whole_value, rest_value, poly_value, scale_value;
+  wide_value = vmaxq_f32(wide_value, vdupq_n_f32(KERN_EXP_FLOOR));
+  step_value = vaddq_f32(vmulq_f32(wide_value, vdupq_n_f32(KERN_EXP_LOG2E)), vdupq_n_f32(0.5f));
+  whole_value = vcvtq_f32_s32(vcvtq_s32_f32(step_value));
+  whole_value = vsubq_f32(
+      whole_value, vreinterpretq_f32_u32(vandq_u32(vcgtq_f32(whole_value, step_value),
+                                                   vreinterpretq_u32_f32(vdupq_n_f32(1.0f)))));
+  rest_value = vmlsq_f32(wide_value, whole_value, vdupq_n_f32(KERN_EXP_LN2_HIGH));
+  rest_value = vmlsq_f32(rest_value, whole_value, vdupq_n_f32(KERN_EXP_LN2_LOW));
+  poly_value = vdupq_n_f32(KERN_EXP_TERM_7);
+  poly_value = vmlaq_f32(vdupq_n_f32(KERN_EXP_TERM_6), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(KERN_EXP_TERM_5), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(KERN_EXP_TERM_4), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(KERN_EXP_TERM_3), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(KERN_EXP_TERM_2), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(1.0f), poly_value, rest_value);
+  poly_value = vmlaq_f32(vdupq_n_f32(1.0f), poly_value, rest_value);
+  scale_value = vreinterpretq_f32_s32(
+      vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(whole_value), vdupq_n_s32(127)), 23));
+  return vmulq_f32(poly_value, scale_value);
+}
+#endif
+
+/* The peak, the exponentials and their total, and the scaling: three passes,
+ * each of them a lane at a time where the host has lanes.  The total is
+ * gathered in as many accumulators as the widest load, so a long row's sum is
+ * associated differently from the scalar path's — which is the same trade the
+ * dot product kernels make, and below what the last bit of a float carries. */
 static void kern_soft_max(float *value_list, int value_count) {
   float peak_value = -FLT_MAX;
   float total_value = 0.0f;
-  int value_index;
-  for (value_index = 0; value_index < value_count; ++value_index)
+  int value_index = 0;
+#if defined(APP_SIMD_AVX2)
+  if (value_count >= 8) {
+    __m256 wide_peak = _mm256_loadu_ps(value_list);
+    __m256 wide_total = _mm256_setzero_ps();
+    for (value_index = 8; value_index + 8 <= value_count; value_index += 8)
+      wide_peak = _mm256_max_ps(wide_peak, _mm256_loadu_ps(value_list + value_index));
+    {
+      __m128 half_peak = _mm_max_ps(_mm256_castps256_ps128(wide_peak),
+                                    _mm256_extractf128_ps(wide_peak, 1));
+      half_peak = _mm_max_ps(half_peak, _mm_movehl_ps(half_peak, half_peak));
+      half_peak = _mm_max_ss(half_peak, _mm_shuffle_ps(half_peak, half_peak, 0x55));
+      peak_value = _mm_cvtss_f32(half_peak);
+    }
+    for (; value_index < value_count; ++value_index)
+      if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+    wide_peak = _mm256_set1_ps(peak_value);
+    for (value_index = 0; value_index + 8 <= value_count; value_index += 8) {
+      __m256 wide_step =
+          kern_exp_wide(_mm256_sub_ps(_mm256_loadu_ps(value_list + value_index), wide_peak));
+      _mm256_storeu_ps(value_list + value_index, wide_step);
+      wide_total = _mm256_add_ps(wide_total, wide_step);
+    }
+    total_value = kern_wide_total(wide_total);
+  } else {
+    for (; value_index < value_count; ++value_index)
+      if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+    value_index = 0;
+  }
+#elif defined(APP_SIMD_SSE2) || defined(APP_SIMD_NEON)
+  if (value_count >= 4) {
+#  if defined(APP_SIMD_SSE2)
+    __m128 wide_peak = _mm_loadu_ps(value_list);
+    __m128 wide_total = _mm_setzero_ps();
+    for (value_index = 4; value_index + 4 <= value_count; value_index += 4)
+      wide_peak = _mm_max_ps(wide_peak, _mm_loadu_ps(value_list + value_index));
+    {
+      __m128 half_peak = _mm_max_ps(wide_peak, _mm_movehl_ps(wide_peak, wide_peak));
+      half_peak = _mm_max_ss(half_peak, _mm_shuffle_ps(half_peak, half_peak, 0x55));
+      peak_value = _mm_cvtss_f32(half_peak);
+    }
+    for (; value_index < value_count; ++value_index)
+      if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+    wide_peak = _mm_set1_ps(peak_value);
+    for (value_index = 0; value_index + 4 <= value_count; value_index += 4) {
+      __m128 wide_step =
+          kern_exp_wide(_mm_sub_ps(_mm_loadu_ps(value_list + value_index), wide_peak));
+      _mm_storeu_ps(value_list + value_index, wide_step);
+      wide_total = _mm_add_ps(wide_total, wide_step);
+    }
+    total_value = kern_wide_total(wide_total);
+#  else
+    float32x4_t wide_peak = vld1q_f32(value_list);
+    float32x4_t wide_total = vdupq_n_f32(0.0f);
+    for (value_index = 4; value_index + 4 <= value_count; value_index += 4)
+      wide_peak = vmaxq_f32(wide_peak, vld1q_f32(value_list + value_index));
+    peak_value = vgetq_lane_f32(wide_peak, 0);
+    if (vgetq_lane_f32(wide_peak, 1) > peak_value) peak_value = vgetq_lane_f32(wide_peak, 1);
+    if (vgetq_lane_f32(wide_peak, 2) > peak_value) peak_value = vgetq_lane_f32(wide_peak, 2);
+    if (vgetq_lane_f32(wide_peak, 3) > peak_value) peak_value = vgetq_lane_f32(wide_peak, 3);
+    for (; value_index < value_count; ++value_index)
+      if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+    wide_peak = vdupq_n_f32(peak_value);
+    for (value_index = 0; value_index + 4 <= value_count; value_index += 4) {
+      float32x4_t wide_step =
+          kern_exp_wide(vsubq_f32(vld1q_f32(value_list + value_index), wide_peak));
+      vst1q_f32(value_list + value_index, wide_step);
+      wide_total = vaddq_f32(wide_total, wide_step);
+    }
+    total_value = kern_wide_total(wide_total);
+#  endif
+  } else {
+    for (; value_index < value_count; ++value_index)
+      if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
+    value_index = 0;
+  }
+#else
+  for (; value_index < value_count; ++value_index)
     if (value_list[value_index] > peak_value) peak_value = value_list[value_index];
-  for (value_index = 0; value_index < value_count; ++value_index) {
-    value_list[value_index] = expf(value_list[value_index] - peak_value);
+  value_index = 0;
+#endif
+  for (; value_index < value_count; ++value_index) {
+    value_list[value_index] = kern_exp_near(value_list[value_index] - peak_value);
     total_value += value_list[value_index];
   }
   if (total_value > 0.0f) {
     float shrink_value = 1.0f / total_value;
-    for (value_index = 0; value_index < value_count; ++value_index)
-      value_list[value_index] *= shrink_value;
+    value_index = 0;
+#if defined(APP_SIMD_AVX2)
+    {
+      __m256 wide_shrink = _mm256_set1_ps(shrink_value);
+      for (; value_index + 8 <= value_count; value_index += 8)
+        _mm256_storeu_ps(value_list + value_index,
+                         _mm256_mul_ps(_mm256_loadu_ps(value_list + value_index), wide_shrink));
+    }
+#elif defined(APP_SIMD_SSE2)
+    {
+      __m128 wide_shrink = _mm_set1_ps(shrink_value);
+      for (; value_index + 4 <= value_count; value_index += 4)
+        _mm_storeu_ps(value_list + value_index,
+                      _mm_mul_ps(_mm_loadu_ps(value_list + value_index), wide_shrink));
+    }
+#elif defined(APP_SIMD_NEON)
+    {
+      float32x4_t wide_shrink = vdupq_n_f32(shrink_value);
+      for (; value_index + 4 <= value_count; value_index += 4)
+        vst1q_f32(value_list + value_index,
+                  vmulq_f32(vld1q_f32(value_list + value_index), wide_shrink));
+    }
+#endif
+    for (; value_index < value_count; ++value_index) value_list[value_index] *= shrink_value;
   }
 }
 
