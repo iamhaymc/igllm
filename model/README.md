@@ -28,8 +28,12 @@ dtype was round-tripped.
 | `generation_config.json`, `tokenizer_config.json`, `chat_template.jinja` | as upstream |
 
 The shards are Git LFS objects; see `.gitattributes` at the repository root. A
-clone without LFS installed will find text pointers here rather than weights, so
-run `git lfs install` before cloning, or `git lfs pull` after.
+clone without LFS installed will find text pointers here rather than weights —
+a few hundred bytes of `version https://git-lfs.github.com/spec/v1` where a
+checkpoint should be. That needs the `git-lfs` program itself, which is a
+separate package on most distributions (`apt install git-lfs`,
+`brew install git-lfs`) and not part of git. With it present, run
+`git lfs install` before cloning, or `git lfs pull` in an existing clone.
 
 ## Licence
 

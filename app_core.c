@@ -1844,21 +1844,31 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
     const uint8_t *byte_head = code_row + (size_t)from_index / 4;
 #if defined(APP_SIMD_AVX2)
     {
-      const __m256i step_data = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+      /* One broadcast of the whole dword rather than one of each half.
+       *
+       * A variable shift reaches bit thirty-one, so the eight codes of the
+       * upper half are the same broadcast shifted by sixteen more places, and
+       * the mask below keeps only the two bits meant either way.  The lanes,
+       * the codes and the order are what they were — this is the same sum to
+       * the last bit — and the loop spends one broadcast per sixteen codes
+       * where it spent two.  On the export's widest two bit row, 12288 by
+       * 1536: 0.0027 s against 0.0019 s. */
+      const __m256i step_low = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+      const __m256i step_high = _mm256_setr_epi32(16, 18, 20, 22, 24, 26, 28, 30);
       const __m256i code_mask = _mm256_set1_epi32(3);
       __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
       for (; slot + 16 <= span_count; slot += 16) {
         uint32_t word_value;
+        __m256i base_data;
         memcpy(&word_value, byte_head + slot / 4, 4);
+        base_data = _mm256_set1_epi32((int)word_value);
         part_a = _mm256_fmadd_ps(
-            _mm256_cvtepi32_ps(_mm256_and_si256(
-                _mm256_srlv_epi32(_mm256_set1_epi32((int)(word_value & 0xFFFFu)), step_data),
-                code_mask)),
+            _mm256_cvtepi32_ps(
+                _mm256_and_si256(_mm256_srlv_epi32(base_data, step_low), code_mask)),
             _mm256_loadu_ps(act_data + slot), part_a);
         part_b = _mm256_fmadd_ps(
-            _mm256_cvtepi32_ps(_mm256_and_si256(
-                _mm256_srlv_epi32(_mm256_set1_epi32((int)(word_value >> 16)), step_data),
-                code_mask)),
+            _mm256_cvtepi32_ps(
+                _mm256_and_si256(_mm256_srlv_epi32(base_data, step_high), code_mask)),
             _mm256_loadu_ps(act_data + slot + 8), part_b);
       }
       total = kern_wide_total(_mm256_add_ps(part_a, part_b));
@@ -2020,21 +2030,21 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
     const uint8_t *byte_head = code_row + (size_t)from_index / 4;
 #if defined(APP_SIMD_AVX2)
     {
-      const __m256i step_data = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+      /* One broadcast of the whole dword, as the fused dot above takes it. */
+      const __m256i step_low = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+      const __m256i step_high = _mm256_setr_epi32(16, 18, 20, 22, 24, 26, 28, 30);
       const __m256i code_mask = _mm256_set1_epi32(3);
       for (; slot + 16 <= span_count; slot += 16) {
         uint32_t word_value;
+        __m256i base_data;
         memcpy(&word_value, byte_head + slot / 4, 4);
-        _mm256_storeu_ps(
-            out_data + slot,
-            _mm256_cvtepi32_ps(_mm256_and_si256(
-                _mm256_srlv_epi32(_mm256_set1_epi32((int)(word_value & 0xFFFFu)), step_data),
-                code_mask)));
+        base_data = _mm256_set1_epi32((int)word_value);
+        _mm256_storeu_ps(out_data + slot,
+                         _mm256_cvtepi32_ps(_mm256_and_si256(
+                             _mm256_srlv_epi32(base_data, step_low), code_mask)));
         _mm256_storeu_ps(out_data + slot + 8,
                          _mm256_cvtepi32_ps(_mm256_and_si256(
-                             _mm256_srlv_epi32(_mm256_set1_epi32((int)(word_value >> 16)),
-                                               step_data),
-                             code_mask)));
+                             _mm256_srlv_epi32(base_data, step_high), code_mask)));
       }
     }
 #elif defined(APP_SIMD_SSE2)
@@ -2202,6 +2212,128 @@ static void kern_group_sum(const plane *sheet, const float *act_data, float *sum
     for (slot = 0; slot < span_count; ++slot) total += act_data[from_index + slot];
     sum_data[group_index] = total;
   }
+}
+
+/* How many values of a blend are held in registers at once.  Thirty-two floats
+ * are four of the widest vector this file uses and eight of the narrowest,
+ * which leaves the narrow paths room for the row being read and the weight
+ * being broadcast without spilling. */
+#define KERN_BLEND_BLOCK 32
+
+/* The weighted sum of `span_count` rows into one: `into[v] = sum_s w[s] * from[s][v]`.
+ *
+ * This is what an attention head does once its scores are softmaxed, and
+ * written the obvious way — a row at a time, folded into the destination — it
+ * reads and writes the destination once a span.  That is three memory
+ * operations for every multiply-add on a loop whose whole content is the
+ * multiply-add.  Blocked by value instead, the running sums stay in registers
+ * across every span and only the rows are read.
+ *
+ * The order of the sum is untouched: value `v` still takes span 0 first and
+ * span `span_count - 1` last, into the same accumulator it always did.  Only
+ * where that accumulator lives has changed, and each path multiplies and adds
+ * the way the loop it replaces did on that build, so the towers reach the same
+ * numbers they reached before.
+ *
+ * `from_stride` is the distance between rows, which is the head width where the
+ * rows are heads of a wider array and the head size where they have been
+ * gathered into a run of their own. */
+static void kern_blend_rows(const float *from_data, int from_stride, const float *weight_list,
+                            int span_count, int value_count, float *into_data) {
+  int base_index;
+  for (base_index = 0; base_index < value_count; base_index += KERN_BLEND_BLOCK) {
+    const float *from_head = from_data + base_index;
+    int chunk_count = value_count - base_index;
+    int span_index, value_index;
+    if (chunk_count > KERN_BLEND_BLOCK) chunk_count = KERN_BLEND_BLOCK;
+#if defined(APP_SIMD_AVX2)
+    if (chunk_count == KERN_BLEND_BLOCK) {
+      __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
+      __m256 part_c = _mm256_setzero_ps(), part_d = _mm256_setzero_ps();
+      for (span_index = 0; span_index < span_count; ++span_index, from_head += from_stride) {
+        __m256 weight_wide = _mm256_broadcast_ss(weight_list + span_index);
+        part_a = _mm256_add_ps(part_a, _mm256_mul_ps(weight_wide, _mm256_loadu_ps(from_head)));
+        part_b = _mm256_add_ps(part_b, _mm256_mul_ps(weight_wide, _mm256_loadu_ps(from_head + 8)));
+        part_c = _mm256_add_ps(part_c, _mm256_mul_ps(weight_wide, _mm256_loadu_ps(from_head + 16)));
+        part_d = _mm256_add_ps(part_d, _mm256_mul_ps(weight_wide, _mm256_loadu_ps(from_head + 24)));
+      }
+      _mm256_storeu_ps(into_data + base_index, part_a);
+      _mm256_storeu_ps(into_data + base_index + 8, part_b);
+      _mm256_storeu_ps(into_data + base_index + 16, part_c);
+      _mm256_storeu_ps(into_data + base_index + 24, part_d);
+      continue;
+    }
+#elif defined(APP_SIMD_SSE2)
+    if (chunk_count == KERN_BLEND_BLOCK) {
+      __m128 part_list[8];
+      int part_index;
+      for (part_index = 0; part_index < 8; ++part_index) part_list[part_index] = _mm_setzero_ps();
+      for (span_index = 0; span_index < span_count; ++span_index, from_head += from_stride) {
+        __m128 weight_wide = _mm_set1_ps(weight_list[span_index]);
+        for (part_index = 0; part_index < 8; ++part_index)
+          part_list[part_index] = _mm_add_ps(
+              part_list[part_index], _mm_mul_ps(weight_wide, _mm_loadu_ps(from_head + part_index * 4)));
+      }
+      for (part_index = 0; part_index < 8; ++part_index)
+        _mm_storeu_ps(into_data + base_index + part_index * 4, part_list[part_index]);
+      continue;
+    }
+#elif defined(APP_SIMD_NEON)
+    if (chunk_count == KERN_BLEND_BLOCK) {
+      float32x4_t part_list[8];
+      int part_index;
+      for (part_index = 0; part_index < 8; ++part_index) part_list[part_index] = vdupq_n_f32(0.0f);
+      for (span_index = 0; span_index < span_count; ++span_index, from_head += from_stride) {
+        float32x4_t weight_wide = vdupq_n_f32(weight_list[span_index]);
+        for (part_index = 0; part_index < 8; ++part_index)
+          part_list[part_index] =
+              vmlaq_f32(part_list[part_index], weight_wide, vld1q_f32(from_head + part_index * 4));
+      }
+      for (part_index = 0; part_index < 8; ++part_index)
+        vst1q_f32(into_data + base_index + part_index * 4, part_list[part_index]);
+      continue;
+    }
+#endif
+    /* The tail, and the whole of it on a build with no vector path.  A block of
+     * scratch rather than the destination keeps this the same arithmetic in the
+     * same order as the paths above. */
+    {
+      float part_list[KERN_BLEND_BLOCK];
+      for (value_index = 0; value_index < chunk_count; ++value_index) part_list[value_index] = 0.0f;
+      for (span_index = 0; span_index < span_count; ++span_index, from_head += from_stride) {
+        float weight_value = weight_list[span_index];
+        for (value_index = 0; value_index < chunk_count; ++value_index)
+          part_list[value_index] += weight_value * from_head[value_index];
+      }
+      for (value_index = 0; value_index < chunk_count; ++value_index)
+        into_data[base_index + value_index] = part_list[value_index];
+    }
+  }
+}
+
+/* `into[v] += left[v] * right[v]`, the element-wise multiply-add a depthwise
+ * convolution reduces to once its kernel is laid out tap-major. */
+static void kern_fma_row(const float *left_data, const float *right_data, int value_count,
+                         float *into_data) {
+  int slot = 0;
+#if defined(APP_SIMD_AVX2)
+  for (; slot + 8 <= value_count; slot += 8)
+    _mm256_storeu_ps(into_data + slot,
+                     _mm256_fmadd_ps(_mm256_loadu_ps(left_data + slot),
+                                     _mm256_loadu_ps(right_data + slot),
+                                     _mm256_loadu_ps(into_data + slot)));
+#elif defined(APP_SIMD_SSE2)
+  for (; slot + 4 <= value_count; slot += 4)
+    _mm_storeu_ps(into_data + slot,
+                  _mm_add_ps(_mm_loadu_ps(into_data + slot),
+                             _mm_mul_ps(_mm_loadu_ps(left_data + slot),
+                                        _mm_loadu_ps(right_data + slot))));
+#elif defined(APP_SIMD_NEON)
+  for (; slot + 4 <= value_count; slot += 4)
+    vst1q_f32(into_data + slot, vmlaq_f32(vld1q_f32(into_data + slot), vld1q_f32(left_data + slot),
+                                          vld1q_f32(right_data + slot)));
+#endif
+  for (; slot < value_count; ++slot) into_data[slot] += left_data[slot] * right_data[slot];
 }
 
 static void kern_norm_rms(const float *value_list, const float *gain_list, int value_count,
@@ -4835,7 +4967,7 @@ typedef struct sound_wing {
   float *enter_norm, *leave_norm, *close_norm;
 
   plane  conv_start_sheet, conv_end_sheet;
-  float *conv_deep; /* the depthwise kernel, one row per channel */
+  float *conv_deep; /* the depthwise kernel, one row per tap */
   float *conv_enter_norm, *conv_norm;
 } sound_wing;
 
@@ -4942,6 +5074,29 @@ static app_code tower_lift_bind(app_model *model, tower_gear *gear) {
   return APP_OKAY;
 }
 
+/* Turns the depthwise kernel tap-major, once, at bind time.
+ *
+ * The checkpoint stores it one row per channel, which is the wrong order to
+ * convolve with: a tap is then a stride of the whole state through the frames
+ * it reads, so the innermost loop walks the kernel per channel per frame and
+ * touches one float of a cache line at a time.  Tap-major, a tap is a
+ * contiguous run over every channel and the convolution is the element-wise
+ * multiply-add every vector path already has.  The taps of one channel are
+ * still summed in the order they were, so the arithmetic is unmoved. */
+static int sound_conv_flip(float *value_data, int state_size, int side_size) {
+  size_t total_count = (size_t)state_size * (size_t)side_size;
+  float *copy_data = (float *)mem_alloc(sizeof(float) * total_count);
+  int value_index, tap_index;
+  if (!copy_data) return 0;
+  memcpy(copy_data, value_data, sizeof(float) * total_count);
+  for (tap_index = 0; tap_index < side_size; ++tap_index)
+    for (value_index = 0; value_index < state_size; ++value_index)
+      value_data[(size_t)tap_index * (size_t)state_size + (size_t)value_index] =
+          copy_data[(size_t)value_index * (size_t)side_size + (size_t)tap_index];
+  mem_free(copy_data);
+  return 1;
+}
+
 /* The conformer's weights.  The layer shape is different enough from the vision
  * tower's that it gets its own binder rather than sharing `tower_bind`'s. */
 static app_code sound_bind(app_model *model, tower_gear *gear) {
@@ -5019,6 +5174,8 @@ static app_code sound_bind(app_model *model, tower_gear *gear) {
     wing->conv_deep = vec_bind(model, SOUND_STEM("lconv1d.depthwise_conv1d"),
                                form->state_size * form->deep_side);
     if (!wing->conv_enter_norm || !wing->conv_norm || !wing->conv_deep) return APP_FAIL_MISSING;
+    if (!sound_conv_flip(wing->conv_deep, form->state_size, form->deep_side))
+      return APP_FAIL_MEMORY;
 
     wing->enter_norm = vec_bind(model, SOUND_STEM("norm_pre_attn"), form->state_size);
     wing->leave_norm = vec_bind(model, SOUND_STEM("norm_post_attn"), form->state_size);
@@ -5436,7 +5593,7 @@ static void tower_attend_band(void *state, int slice_index, int slice_count) {
   int head_size = job->head_size;
   int head_wide = room->head_wide;
   float *score_data = room->score_data + (size_t)slice_index * (size_t)job->lane_count;
-  int from_lane, upto_lane, lane_index, span_index, value_index;
+  int from_lane, upto_lane, lane_index, span_index;
   slice_span(job->lane_count, slice_index, slice_count, &from_lane, &upto_lane);
   for (lane_index = from_lane; lane_index < upto_lane; ++lane_index) {
     const float *query_head = room->query_data + (size_t)lane_index * (size_t)head_wide +
@@ -5449,13 +5606,7 @@ static void tower_attend_band(void *state, int slice_index, int slice_count) {
                         query_head, head_size) *
           job->head_gain;
     job->model->desk.soft_max(&job->model->desk, score_data, job->lane_count);
-    for (value_index = 0; value_index < head_size; ++value_index) blend_head[value_index] = 0.0f;
-    for (span_index = 0; span_index < job->lane_count; ++span_index) {
-      const float *value_head = job->value_pack + (size_t)span_index * (size_t)head_size;
-      float weight_value = score_data[span_index];
-      for (value_index = 0; value_index < head_size; ++value_index)
-        blend_head[value_index] += weight_value * value_head[value_index];
-    }
+    kern_blend_rows(job->value_pack, head_size, score_data, job->lane_count, head_size, blend_head);
   }
 }
 
@@ -6014,6 +6165,10 @@ static void sound_attend(app_model *model, tower_gear *gear, sound_wing *wing, s
                                   (size_t)(half_span - (lane_index - span_index)) *
                                       (size_t)head_wide +
                                   head_index * head_size;
+        /* The conformer's window is thirteen keys wide, so this loop is a
+         * hundredth of what a picture's attention costs and not worth
+         * reassociating: a vector reduction here measured at nothing on the
+         * shipped export and moved the tower's numbers by a last bit. */
         float total_value = 0.0f;
         for (value_index = 0; value_index < head_size; ++value_index)
           total_value += query_head[value_index] * (key_head[value_index] + place_head[value_index]);
@@ -6023,14 +6178,9 @@ static void sound_attend(app_model *model, tower_gear *gear, sound_wing *wing, s
         room->score_data[span_index - from_lane] = total_value;
       }
       model->desk.soft_max(&model->desk, room->score_data, upto_lane - from_lane);
-      for (value_index = 0; value_index < head_size; ++value_index) blend_head[value_index] = 0.0f;
-      for (span_index = from_lane; span_index < upto_lane; ++span_index) {
-        const float *value_head =
-            room->value_data + (size_t)span_index * (size_t)head_wide + head_index * head_size;
-        float weight_value = room->score_data[span_index - from_lane];
-        for (value_index = 0; value_index < head_size; ++value_index)
-          blend_head[value_index] += weight_value * value_head[value_index];
-      }
+      kern_blend_rows(room->value_data + (size_t)from_lane * (size_t)head_wide +
+                          head_index * head_size,
+                      head_wide, room->score_data, upto_lane - from_lane, head_size, blend_head);
     }
   }
   plane_lift_many(model, &wing->exit_sheet, room->blend_data, head_wide, lane_count,
@@ -6060,18 +6210,19 @@ static void sound_convolve(app_model *model, tower_gear *gear, sound_wing *wing,
       out_data[value_index] =
           lane_data[value_index] / (1.0f + expf(-lane_data[state_size + value_index]));
   }
-  /* Depthwise over time, left padded so a frame never reads the future. */
+  /* Depthwise over time, left padded so a frame never reads the future.  The
+   * kernel is held tap-major, so a tap is one contiguous multiply-add over
+   * every channel rather than a strided walk of the kernel per channel; a
+   * channel still takes its taps in the order it took them. */
   for (lane_index = lane_count - 1; lane_index >= 0; --lane_index) {
     float *out_data = room->lift_data + (size_t)lane_index * (size_t)state_size;
-    for (value_index = 0; value_index < state_size; ++value_index) {
-      float total_value = 0.0f;
-      for (tap_index = 0; tap_index < side_size; ++tap_index) {
-        int read_index = lane_index + tap_index - (side_size - 1);
-        if (read_index < 0) continue;
-        total_value += wing->conv_deep[(size_t)value_index * (size_t)side_size + (size_t)tap_index] *
-                       room->scrap_data[(size_t)read_index * (size_t)state_size + (size_t)value_index];
-      }
-      out_data[value_index] = total_value;
+    for (value_index = 0; value_index < state_size; ++value_index) out_data[value_index] = 0.0f;
+    for (tap_index = 0; tap_index < side_size; ++tap_index) {
+      int read_index = lane_index + tap_index - (side_size - 1);
+      if (read_index < 0) continue;
+      kern_fma_row(wing->conv_deep + (size_t)tap_index * (size_t)state_size,
+                   room->scrap_data + (size_t)read_index * (size_t)state_size, state_size,
+                   out_data);
     }
   }
   for (lane_index = 0; lane_index < lane_count; ++lane_index) {

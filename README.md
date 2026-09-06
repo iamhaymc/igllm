@@ -61,10 +61,14 @@ full list.
 the export calibrates static ranges for. It is off by default. On the shipped
 export it takes the cache at full span from 1803.0 MiB to 450.8 MiB — a saving
 larger than the checkpoint's own mapped weights — and a decode step reads a
-quarter of the cache bytes it read as floats. What it costs is accuracy: the
-next token is never in doubt, and greedy decoding diverges at the first
-genuinely close call — around eighty characters in on a short prompt, and inside
-twenty once the context is long enough for the sliding window to turn over.
+quarter of the cache bytes it read as floats. It is a footprint option rather
+than a speed one: 0.8.4 timed six pairs on a quiet host and the byte cache is a
+third behind the float cache on the tuned build and a ninth behind on the
+default, because on AVX2 the table it decodes through is read with a gather.
+What it costs besides is accuracy: the next token is never in doubt, and greedy
+decoding diverges at the first genuinely close call — around eighty characters
+in on a short prompt, and inside twenty once the context is long enough for the
+sliding window to turn over.
 The `cache` task prints the calibrated ranges against the peaks a prompt
 actually reaches, and what the cache costs at full span either way.
 
@@ -187,7 +191,7 @@ On four cores of a 2017 desktop, against the reference's 0.16 tokens a second:
 decode runs at about 9.5 and prefill at about 12.4, and a build tuned for the
 host — `--tuned`, which selects the AVX2 path — reaches 13.2 and 21.2.
 
-The kernels have had two passes over them, and neither build is against the
+The kernels have had three passes over them, and neither build is against the
 memory yet. A decode step reads 759.4 MiB — the projections, the output head,
 and one row of each embedding table, which is what `probe` and `bench` now
 report beside the 2334.8 MiB the export maps. At 14.2 tokens a second that is
@@ -200,3 +204,12 @@ So what is left on both builds is in spending fewer instructions as much as in
 reading fewer bytes, and `TODO.md` says what the candidates are. `CHANGES.md`
 0.8.1 sets out how the earlier reading of this — that decode was at the wall —
 came of dividing by the key and value cache instead of the weights.
+
+The third pass is 0.8.4's, and it is measured on a different machine, so it is
+not folded into the desktop's table above. The two bit decode — 366 MiB of the
+727.5 a step sweeps — now spends one broadcast per sixteen codes where it spent
+two, which is worth 21% of decode at one thread on that machine and 9% at four,
+and does not move a single bit of any result. 0.8.4 also closes two of the
+candidates `TODO.md` was carrying: the per-group gain mirror has nothing to
+convert on an export whose scales are already one `F32` a row, and the byte
+cache's gather is confirmed as the wrong read rather than merely suspected.

@@ -226,6 +226,19 @@ was selected.
   table costs two narrow loads and an insert, against one broadcast, one
   variable shift and one mask, and it measures slower: 0.0018 s against 0.0016 s
   on the same row.
+
+  What the wide path did give up is a broadcast. It read a dword of codes and
+  broadcast each half of it on its own, shifting each by 0, 2 … 14 places. A
+  variable shift reaches bit thirty-one, so the upper eight codes are the same
+  broadcast shifted by sixteen more, and the mask keeps the same two bits either
+  way: one broadcast per sixteen codes rather than two, in the same lanes and
+  the same order, so it is the same sum to the last bit. On the export's widest
+  two bit row, 12288 by 1536, 0.0027 s becomes 0.0019 s, and decode on the
+  shipped export gains 21% at one thread. Two other readings were measured on
+  the same row and not taken: building the float from the code's bits —
+  `0x4B000000 | code` read as a float, less 2^23, exact at these widths and off
+  the shuffle port — is 0.0021 s, behind the broadcast it replaces, and the same
+  trick on the four bit path takes it from 0.0011 s to 0.0014 s.
 - `kern_row_code` — one output row of a quantized matrix, formulated as
 
   ```
@@ -242,6 +255,18 @@ was selected.
   `kern_code_two`, so that width is a sixteen byte copy: 0.0031 s against
   0.0023 s on SSE2, and 0.0092 s against 0.0023 s in the plain loop the
   remainder and a host without a vector path both run.
+- `kern_blend_rows` — the weighted sum of a run of rows into one, which is what
+  an attention head does once its scores are softmaxed. Written the obvious way
+  — a row at a time, folded into the destination — it reads and writes the
+  destination once a span, three memory operations for every multiply-add.
+  Blocked by value instead, thirty-two running sums stay in registers across
+  every span and only the rows are read. A value takes its spans in the order it
+  took them, and each path multiplies and adds the way the loop it replaces did
+  on that build, so the towers reach the numbers they reached before. Both
+  towers use it; the stride argument is the head width where the rows are heads
+  of a wider array and the head size where they have been gathered into a run.
+- `kern_fma_row` — `into[v] += left[v] * right[v]`, which is what the
+  conformer's depthwise convolution becomes once its kernel is held tap-major.
 - `kern_row_code_many` — the same row against several activation vectors at
   once. A group of codes is spread into a small float scratch and dotted
   against every lane, so a batch pays the decode cost of a single vector. When
@@ -437,15 +462,24 @@ scale.
 After the stack, `vision_pool` averages over `pool_size` squared windows and
 scales by the square root of the hidden width.
 
-That attention is the whole cost of an image: at the shipped export's patch
-budget a picture is two thousand three hundred and forty patches scored against
-themselves, sixteen layers over. It is also the one loop in either tower that
-divides cleanly, so it is the one that goes to the pool — and it goes a head at
-a time, because a head's keys are sixty-four floats in every seven hundred and
-sixty-eight where they lie. Gathering one head into a run of its own turns a
-seven megabyte walk per query into six hundred kilobytes that stays in cache.
-The two together took an image from four minutes thirty-seven to one minute
-fifty-two on four cores, without moving a single number.
+That attention is the most conspicuous cost of an image: at the shipped
+export's patch budget a picture is a 48 by 48 grid, two thousand three hundred
+and four patches scored against themselves, sixteen layers over. It is also the
+one loop in either tower that divides cleanly, so it is the one that goes to the
+pool — and it goes a head at a time, because a head's keys are sixty-four floats
+in every seven hundred and sixty-eight where they lie. Gathering one head into a
+run of its own turns a seven megabyte walk per query into six hundred kilobytes
+that stays in cache. The two together took an image from four minutes thirty-
+seven to one minute fifty-two on four cores, without moving a single number.
+
+It is not, though, the whole cost, and 0.8.4 measured how far from it. Of the
+148 s a single threaded run of a picture at the full patch budget takes, the
+scoring is 9.6 s, the softmax over the scores 6.6, the blend 7.9, and the
+projection out of attention 2.6 — twenty-four seconds of a hundred and forty-
+eight. The rest is the projections and the feed-forward, which already run
+through the packed kernels. The largest single thing left in a picture that is
+not a matrix product is the softmax, a scalar `expf` per patch pair per head per
+layer, and it is scalar still.
 
 **The audio tower is a conformer**, not a transformer, and the difference is
 worth stating because the two look alike from a distance. A layer is
@@ -460,7 +494,12 @@ norm
 
 so it carries two feed-forwards rather than one and a convolution module the
 text stack has no equivalent of. `sound_wing` and `sound_bind` are separate from
-the vision tower's for that reason.
+the vision tower's for that reason. The convolution's kernel is turned tap-major
+once, at bind time, by `sound_conv_flip`: the checkpoint stores it one row per
+channel, which makes a tap a stride of the whole state and the innermost loop a
+walk of the kernel per channel per frame. Tap-major, a tap is one contiguous
+`kern_fma_row` over every channel, and a channel still sums its taps in the
+order it did.
 
 The clip is read, resampled to the tower's rate, and turned into a log mel
 spectrogram whose every convention comes from the checkpoint's
