@@ -153,9 +153,11 @@ def work_check(flag):
         line += ["--model", flag.model]
     # The comparison rebuilds the engine for itself, so the build flags have to
     # reach it or it measures a different binary than the one asked for.
+    # Joined with `=`, because a flag value that itself begins with a dash is
+    # read as the next option when it is passed as a separate word.
     for name in ("debug", "tuned", "wide"):
         if getattr(flag, name, False):
-            line += ["--build", "--" + name]
+            line += ["--build=--" + name]
     step_show("check", line)
     return subprocess.call(line)
 
