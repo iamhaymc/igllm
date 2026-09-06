@@ -198,6 +198,21 @@ path chosen at compile time behind one macro layer: `APP_SIMD_AVX2`,
 `APP_SIMD_SSE2`, `APP_SIMD_NEON`, or none. `back_flavor` names the path that
 was selected.
 
+`APP_SIMD_AVX512` is a tier above that chain rather than another arm of it. A
+host with AVX-512 has AVX2, so it sets both names and only the kernels with
+something to gain from sixteen lanes are written twice; every other kernel
+compiles as the AVX2 path it always was. `back_flavor` is asked about the wide
+name first, or a wide build reports itself as the tier it stands on.
+`run.py --wide` selects it, implies `--tuned`, and carries
+`-mprefer-vector-width=256` so that the compiler's own vectorization stays
+narrow while the kernels written for sixteen lanes get them.
+
+Three kernels have a wide path, and they are the fused dot at the two, four and
+eight bit widths the shipped export packs. Which three is a measurement rather
+than a plan: the spread was written wide at two and four bits, measured quicker
+in isolation and slower in the engine, and taken out again — see
+`kern_code_spread` below.
+
 - `kern_dot_real` — dot product against an `f32`, `f16`, or `bf16` row. The
   `f32` case has a vector path on all three targets.
 - `kern_dot_code` — dot product against a packed row, specialized for the
@@ -215,22 +230,41 @@ was selected.
 
   Three, five, six and seven bits share a property the others do not need: eight
   codes are exactly `bit_count` bytes, so a block of eight always begins where
-  the block before it ended and the whole width fits one word. `kern_code_word`
-  reads that word — one eight byte load, because the packing is a dense
-  little-endian bit stream and so is the host, which is stated once beside
-  `pack_read` rather than worked around in the kernel — and `kern_code_eight`
-  shifts the codes out of it. On AVX2 the shifts happen inside the vector, one
-  variable shift per lane, because eight four byte stores feeding one thirty-two
-  byte load is a forwarding stall worth nearly half the loop; everywhere else
-  the block goes to scratch and is summed from it. The tail is the exception
-  that `run_end` exists for: a block at the end of a row has as few as three
-  bytes behind it and the five past them may be past the end of the mapping, so
-  there the word is assembled from its own bytes. With the word read whole, all
-  four widths land on one rate — about 6.0 G codes a second on the tuned build
-  against 3.1 to 4.5 before, and 1.6 on the default build against 1.2 to 1.4 —
-  so the width has stopped shaping the loop. It is still 38% of what two and
-  four bits reach, and what would close the rest is a vector path for the
-  spread at these widths.
+  the block before it ended and the whole width fits one word — and, because a
+  block always begins on a byte boundary, every block of a width picks the same
+  bytes at the same shifts.
+
+  On AVX2 that makes the block one shuffle over a sixteen byte load,
+  `kern_code_wide`: each lane is handed the four bytes its code starts in — a
+  code of seven bits or fewer straddles two of them at most — and shifts its own
+  code down and masks it. The tables are the width's own and are built once for
+  a run by `kern_code_plan_make` rather than a block at a time. The bytes a
+  block reaches are all within the first ten, so the low half of the load is
+  broadcast to both halves and one `shuffle_epi8` serves all eight lanes across
+  what would otherwise be a lane boundary. The packing is a dense little-endian
+  bit stream and so is the host, which is stated once beside `pack_read` rather
+  than worked around here.
+
+  `run_end` is what the two ways in are chosen by, and the choice is made once
+  for a run rather than once a block: `kern_code_wide_span` says how many codes
+  have sixteen bytes of the row behind every block they fall in, and the run is
+  split into two loops there. A block at the end of a row has as few as three
+  bytes behind it and the load would reach past the mapping rather than merely
+  past the row, so those take `kern_code_wide_edge` — the word broadcast to four
+  sixty-four bit lanes and gathered back with two permutes and a join — and
+  everywhere without the variable shift, `kern_code_eight` writes the block to
+  scratch as it always did. Asking the bound per block instead is a branch in
+  the loop and costs the spread nearly all of the win: 3.6 G codes a second
+  rather than 8.9.
+
+  Both readers of a block go through the same decode, so the fused dot and the
+  spread no longer unpack a block two different ways. On a five bit row of
+  12288, one thread, tuned, best of four interleaved runs: the spread 9.08 G
+  codes a second against 1.21 when it went through scratch, within a tenth of
+  the 10.31 at two bits and 10.76 at four, which is that distance closed rather
+  than narrowed; the fused dot 6.45 against 3.36, which is 59% of the two bit
+  rate where it was 38%. None of it moves a token on the shipped export, which
+  packs no odd width.
 
   At two bits the unpacking is read out of `kern_code_two` instead, a four
   kilobyte table of four floats indexed by the byte that holds them, built by
@@ -259,6 +293,21 @@ was selected.
   `0x4B000000 | code` read as a float, less 2^23, exact at these widths and off
   the shuffle port — is 0.0021 s, behind the broadcast it replaces, and the same
   trick on the four bit path takes it from 0.0011 s to 0.0014 s.
+
+  On a host with the wide tier all three of these widths are written a second
+  time, sixteen lanes at a time. Four bits: sixteen packed bytes are thirty-two
+  codes, so the nibble split is done once over twice the bytes and each half is
+  widened in one instruction. Eight bits: thirty-two bytes are thirty-two codes,
+  flipped in one exclusive or before either half is widened. Two bits: a dword
+  is sixteen codes, which is one whole vector, so the two halves the AVX2 path
+  shifts out separately become one shift and the broadcast serves sixteen codes
+  rather than eight. On a 12288 row, one thread, best of four interleaved runs,
+  the fused dot reaches 16.07 G codes a second at two bits against 10.92, 13.18
+  at four against 8.56, and 14.77 at eight against 10.87. On the shipped export
+  that is decode 21% quicker at one thread and 6% at four, and prefill 7% and
+  3%. Sixteen lanes reassociate the sum, so the logits move as they do between
+  any two backends here — on "The capital of France is" the top logit is 27.111
+  on the default build, 27.250 on the wide one and 27.473 on the tuned one.
 - `kern_row_code` — one output row of a quantized matrix, formulated as
 
   ```
@@ -293,6 +342,15 @@ was selected.
   that spread was a scalar walk of the bit stream, a sixteen lane batch cost
   three and a half times what the same sixteen lanes cost one at a time, and
   batching lost to the thing it exists to beat.
+
+  This is the one caller of `kern_code_spread`, and it is why that function has
+  no wide path. The spread is a small part of what this loop does and the
+  per-lane sums beside it are the rest: a sixteen lane store in the middle of
+  them costs those sums more than the wider store saves, and the wide spread
+  measured 29% quicker on its own while leaving prefill 13% slower. Decode never
+  arrives here at all — `kern_mat_vec_band` sends a single lane to
+  `kern_row_code` and its fused dot — which is why the fused dot keeps a wide
+  path and this does not.
 - `kern_mat_vec_band` — one band of rows, the unit of work given to the pool.
   It carries a lane count, so the same band function serves a matrix-vector
   product and a matrix-matrix product.

@@ -154,7 +154,8 @@ python3 run.py run -- chat --model model \
 | `python3 run.py clean`        | remove build products                         |
 
 Add `--debug` for an unoptimized build with the address and behaviour
-sanitizers, `--tuned` to allow host specific instructions, or `--trace` to
+sanitizers, `--tuned` to allow host specific instructions, `--wide` for the
+AVX-512 kernels beside the AVX2 ones (which implies `--tuned`), or `--trace` to
 compile in the activation dump the parity harness reads.
 
 ## Files
@@ -178,8 +179,8 @@ compile in the activation dump the parity harness reads.
 ## Status
 
 The engine builds clean and passes its unit tests on POSIX and Windows, on the
-scalar, SSE2 and AVX2 backends. Text generation, mixture-of-experts blocks,
-batched prefill, and the vision and audio towers are all implemented.
+scalar, SSE2, AVX2 and AVX-512 backends. Text generation, mixture-of-experts
+blocks, batched prefill, and the vision and audio towers are all implemented.
 
 Numerical parity is **verified against the reference implementation on the
 shipped checkpoint**, `google/gemma-4-E2B-it-qat-mobile-transformers`, and on
