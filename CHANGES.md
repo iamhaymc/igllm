@@ -3486,19 +3486,6 @@ cores: 6.68 before, 7.01 after, which is the spin gone rather than the spin
 helping. The default thread count is the host's core count, so the common case
 spins and a deliberately oversubscribed pool does not.
 
-### Not a bit of any result moves
-
-Neither change moves a number. The pool hands the same slices to the same
-workers in the same order and the task functions are untouched; what changed
-there is how a thread waits between two jobs. The batch's blocking is held to
-the same floor by construction and by a test, as above.
-
-The suite is 498 tests from 493, clean on the default, tuned and wide builds and
-under the address and undefined sanitizers on the default and wide ones. The
-synthetic sweep is unchanged and still passes: eleven configurations, every
-tensor of every layer. The reference comparison passes on the shipped export on
-the wide build, with the same logits it reached before.
-
 ### The picture, profiled again
 
 The other item this release touches asked for a fresh reading of where a
@@ -3624,6 +3611,19 @@ exact; written that way it reaches 24.04 G multiply-adds a second, behind the
 four lane form's 27.15. So what the eight lane block gains, it gains from having
 half as many accumulators to keep and not from the lanes, and there is no
 version of it that is both quicker and the same arithmetic.
+
+### Not a bit of any result moves
+
+Neither change moves a number. The pool hands the same slices to the same
+workers in the same order and the task functions are untouched; what changed
+there is how a thread waits between two jobs. The batch's blocking is held to
+the same floor by construction and by a test, as above.
+
+The suite is 498 tests from 493, clean on the default, tuned and wide builds and
+under the address and undefined sanitizers on the default and wide ones. The
+synthetic sweep is unchanged and still passes: eleven configurations, every
+tensor of every layer. The reference comparison passes on the shipped export on
+the wide build, with the same logits it reached before.
 
 ### What is left of the four thread question
 
