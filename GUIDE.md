@@ -201,9 +201,17 @@ was selected.
 `APP_SIMD_AVX512` is a tier above that chain rather than another arm of it. A
 host with AVX-512 has AVX2, so it sets both names and only the kernels with
 something to gain from sixteen lanes are written twice; every other kernel
-compiles as the AVX2 path it always was. `run.py --wide` selects it and implies
-`--tuned`. Five kernels have a wide path — the fused dot and the spread at two,
-four and eight bits — and they are the three widths the shipped export packs.
+compiles as the AVX2 path it always was. `back_flavor` is asked about the wide
+name first, or a wide build reports itself as the tier it stands on.
+`run.py --wide` selects it, implies `--tuned`, and carries
+`-mprefer-vector-width=256` so that the compiler's own vectorization stays
+narrow while the kernels written for sixteen lanes get them.
+
+Three kernels have a wide path, and they are the fused dot at the two, four and
+eight bit widths the shipped export packs. Which three is a measurement rather
+than a plan: the spread was written wide at two and four bits, measured quicker
+in isolation and slower in the engine, and taken out again — see
+`kern_code_spread` below.
 
 - `kern_dot_real` — dot product against an `f32`, `f16`, or `bf16` row. The
   `f32` case has a vector path on all three targets.
@@ -251,12 +259,12 @@ four and eight bits — and they are the three widths the shipped export packs.
 
   Both readers of a block go through the same decode, so the fused dot and the
   spread no longer unpack a block two different ways. On a five bit row of
-  12288, one thread, tuned: the spread 8.90 G codes a second against 1.19 when
-  it went through scratch, which is level with the 9.89 at two bits and 9.79 at
-  four and the whole of that distance closed; the fused dot 6.29 against 3.34,
-  which is 60% of the two bit rate rather than a third. The width no longer
-  shapes either loop much, and none of it moves a token on the shipped export,
-  which packs no odd width.
+  12288, one thread, tuned, best of four interleaved runs: the spread 9.08 G
+  codes a second against 1.21 when it went through scratch, within a tenth of
+  the 10.31 at two bits and 10.76 at four, which is that distance closed rather
+  than narrowed; the fused dot 6.45 against 3.36, which is 59% of the two bit
+  rate where it was 38%. None of it moves a token on the shipped export, which
+  packs no odd width.
 
   At two bits the unpacking is read out of `kern_code_two` instead, a four
   kilobyte table of four floats indexed by the byte that holds them, built by
@@ -290,17 +298,16 @@ four and eight bits — and they are the three widths the shipped export packs.
   time, sixteen lanes at a time. Four bits: sixteen packed bytes are thirty-two
   codes, so the nibble split is done once over twice the bytes and each half is
   widened in one instruction. Eight bits: thirty-two bytes are thirty-two codes,
-  flipped in one exclusive or before either half is widened — and the spread at
-  this width was a scalar loop on every other host, having nothing to unpack.
-  Two bits: a dword is sixteen codes, which is one whole vector, so the two
-  halves the AVX2 path shifts out separately become one shift and the broadcast
-  serves sixteen codes rather than eight. On a row of 12288, one thread, the
-  fused dot reaches 15.20 G codes a second at two bits against 10.94, 12.67 at
-  four against 8.70, and 15.85 at eight against 10.99; the spread 12.45 at two
-  bits against 10.11 and 12.17 at four against 9.66. Sixteen lanes reassociate
-  the sum, so the logits move as they do between any two backends here — on
-  "The capital of France is" the top logit is 27.111 on the default build,
-  27.250 on the wide one and 27.473 on the tuned one.
+  flipped in one exclusive or before either half is widened. Two bits: a dword
+  is sixteen codes, which is one whole vector, so the two halves the AVX2 path
+  shifts out separately become one shift and the broadcast serves sixteen codes
+  rather than eight. On a 12288 row, one thread, best of four interleaved runs,
+  the fused dot reaches 16.07 G codes a second at two bits against 10.92, 13.18
+  at four against 8.56, and 14.77 at eight against 10.87. On the shipped export
+  that is decode 21% quicker at one thread and 6% at four, and prefill 7% and
+  3%. Sixteen lanes reassociate the sum, so the logits move as they do between
+  any two backends here — on "The capital of France is" the top logit is 27.111
+  on the default build, 27.250 on the wide one and 27.473 on the tuned one.
 - `kern_row_code` — one output row of a quantized matrix, formulated as
 
   ```
@@ -335,6 +342,15 @@ four and eight bits — and they are the three widths the shipped export packs.
   that spread was a scalar walk of the bit stream, a sixteen lane batch cost
   three and a half times what the same sixteen lanes cost one at a time, and
   batching lost to the thing it exists to beat.
+
+  This is the one caller of `kern_code_spread`, and it is why that function has
+  no wide path. The spread is a small part of what this loop does and the
+  per-lane sums beside it are the rest: a sixteen lane store in the middle of
+  them costs those sums more than the wider store saves, and the wide spread
+  measured 29% quicker on its own while leaving prefill 13% slower. Decode never
+  arrives here at all — `kern_mat_vec_band` sends a single lane to
+  `kern_row_code` and its fused dot — which is why the fused dot keeps a wide
+  path and this does not.
 - `kern_mat_vec_band` — one band of rows, the unit of work given to the pool.
   It carries a lane count, so the same band function serves a matrix-vector
   product and a matrix-matrix product.

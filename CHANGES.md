@@ -3179,8 +3179,13 @@ carry both the instructions and the headroom to show it: a bare sweep of memory
 gives 33.99 GiB/s at four threads here and the tuned build reads 5.25 of them,
 so the decode kernels are spending instructions rather than waiting.
 
-Neither item changes what the engine computes. The wide tier reassociates a sum
-and moves the last bits, as any two backends here already do against each other.
+The evidence also said where to stop, which is the more useful half of it. Three
+kernels went wide and two were written, measured and taken out again.
+
+Every rate below is the best of four interleaved runs on one host, 0.8.6's build
+and 0.8.7's two measured in the same loop. They are not 0.8.6's numbers and do
+not compare with them: this host is roughly half of that one on the paths both
+tables carry.
 
 ### The odd widths, decoded in one shuffle
 
@@ -3214,62 +3219,88 @@ scratch — and there was never a reason for two. `kern_code_wide` is the one
 decode and `kern_code_eight` is now defined only on the hosts that still read a
 block through scratch.
 
-On a five bit row of 12288, one thread, tuned, in G codes a second — before and
-after, with two and four bits carried as untouched controls:
+On a 12288 row, one thread, tuned, in G codes a second, with two, four and eight
+bits carried as untouched controls:
 
-| path | 5 bits | two bits | four bits |
-| --- | --- | --- | --- |
-| spread | 1.19→8.90 | 9.89 | 9.79 |
-| fused dot | 3.34→6.29 | 10.52 | 8.32 |
+| path | 3 bits | 5 bits | 6 bits | 7 bits | 2 bits | 4 bits | 8 bits |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| spread | 1.22→9.17 | 1.21→9.08 | 1.22→9.37 | 1.21→9.24 | 10.33→10.31 | 8.79→10.76 | 9.48→9.49 |
+| fused dot | 3.36→6.38 | 3.36→6.45 | 3.37→6.39 | 3.36→6.32 | 11.00→10.92 | 8.46→8.56 | 10.78→10.87 |
 
-This is not 0.8.6's host and the two tables should not be read across: every
-path here is about half of what the same path measures there, controls
-included. What carries between them is the ratio. The spread is level with the
-two widths the checkpoint packs, which is the item closed rather than moved.
-The fused dot is 60% of them where 0.8.6 left it at 38% — better than it was,
-and not the same claim as the spread's.
+The spread is between seven and eight times what it was and within a tenth of
+the two widths the checkpoint packs, which is the item closed rather than
+narrowed. The fused dot is nearly twice what it was, at 59% of the two bit rate
+where 0.8.6 left it at 38%. The controls are flat but for the four bit spread,
+which nothing here touched and which moved 22% on code layout alone — worth
+saying, because it is the size of a change one might otherwise claim.
 
 The shipped export packs no odd width, so not a bit of it moves. The bound is
-held by the same test 0.8.6 wrote for it — a row allocated to exactly the bytes
-it packs into, under the sanitizers — which is what says the wider load stays
-inside the row.
+held by 0.8.6's test extended to every row length from eight codes to two
+hundred rather than one, each row allocated to exactly the bytes it packs into:
+the split between the two loops lands at a different block for every width and
+every length, and the sanitizer's guard sits behind the last one. With the bound
+claiming one block more than the row can carry, that case stops and the one
+before it does not.
 
 ### A tier above AVX2
 
 **AVX-512 is a tier, not an alternative.** A host with AVX-512 has AVX2, so the
 macro layer sets both names rather than choosing between them, and only the
 kernels with something to gain from sixteen lanes are written twice. Everything
-else compiles as the AVX2 path it always was. That is what keeps a whole second
-backend down to five kernels and a name for the sixteen lane horizontal sum.
+else compiles as the AVX2 path it always was. `back_flavor` answers the wide
+name first, or a wide build would report itself as the tier it stands on.
 
 The four subsets asked for are `f`, `bw`, `dq` and `vl` — the ones the kernels
 reach for — which keeps the path off the early parts that have `f` alone.
 `run.py --wide` selects it and implies `--tuned`.
 
-**The three widths the export packs are the three written.** Four bits: sixteen
-packed bytes are thirty-two codes, so the nibble split is done once over twice
-the bytes. Eight bits: thirty-two bytes are thirty-two codes, flipped in one
-exclusive or. Two bits: a dword is sixteen codes, which is one whole vector, so
-the two halves the AVX2 path shifts out separately become one shift. The spread
-takes the same three. The odd widths keep the AVX2 shuffle above, which the
-export never reaches and which is already level with two and four bits.
+**The fused dot is what went wide, at the three widths the export packs.** Four
+bits: sixteen packed bytes are thirty-two codes, so the nibble split is done
+once over twice the bytes. Eight bits: thirty-two bytes are thirty-two codes,
+flipped in one exclusive or. Two bits: a dword is sixteen codes, which is one
+whole vector, so the two halves the AVX2 path shifts out separately become one
+shift. On the same row and the same runs, in G codes a second:
 
-On a row of 12288, one thread, in G codes a second, on the same host as the
-table above:
+| path | 2 bits | 4 bits | 8 bits |
+| --- | --- | --- | --- |
+| fused dot, tuned | 10.92 | 8.56 | 10.87 |
+| fused dot, wide | 16.07 | 13.18 | 14.77 |
 
-| width | dot, AVX2 | dot, wide | spread, AVX2 | spread, wide |
-| --- | --- | --- | --- | --- |
-| two | 10.94 | 15.20 | 10.11 | 12.45 |
-| four | 8.70 | 12.67 | 9.66 | 12.17 |
-| eight | 10.99 | 15.85 | 9.27 | 9.77 |
+**Two kernels were written wide and taken out again, and that is the finding.**
+The spread was written for sixteen lanes at two and four bits and is quicker
+measured on its own — 13.16 G codes a second at two bits against 10.19, and
+12.34 at four against 9.98 — and it made the engine slower: prefill on the
+shipped export fell 13% while decode, which never reaches the spread, rose. A
+spread is a small part of what prefill does and the per-lane sums it feeds are
+the rest; a five hundred and twelve bit store in the middle of them costs those
+sums more than the wider store saves. A kernel 29% quicker in isolation that
+leaves the program 13% slower is the whole argument for measuring the program.
 
-**On the shipped export it is a token rate rather than a kernel rate, and the
-two readings differ.** One thread, 24 tokens decoded: 3.9 tok/s against 3.16,
-which is 23%. Four threads, 32 tokens: 7.23 to 7.58 against 6.89 to 7.14, which
-is about 6%. The gap between the two is the point rather than an inconsistency —
-at four threads the memory is more of the cost, which is what 5.6 GiB/s of the
-available 33.99 says. A wider kernel is worth having on this host and is worth
-less the more threads are already pulling.
+The eight bit spread went the same way for a plainer reason: a byte is a code,
+so there is nothing to unpack and the loop is a load, a convert and a store,
+which a compiler vectorizes well on its own. Written out by hand it reaches 9.88
+G codes a second against the 11.13 the compiler's own loop gets under the same
+flags.
+
+**`-mprefer-vector-width=256` is part of the flag set for the same reason.**
+Letting the compiler widen its own vectorization costs both halves: decode 3.84
+tok/s against 4.12 and prefill 4.15 against 4.39. The kernels written for
+sixteen lanes still get them; nothing else does.
+
+**What it is worth on the shipped export**, best of three interleaved runs:
+
+| | tuned | wide | |
+| --- | --- | --- | --- |
+| prefill, one thread | 5.00–5.09 | 5.37–5.40 | +7% |
+| decode, one thread | 3.17–3.18 | 3.85–3.86 | +21% |
+| prefill, four threads | 15.22–15.75 | 15.44–16.22 | +3% |
+| decode, four threads | 7.13–7.21 | 7.55–7.63 | +6% |
+
+Both halves gain and decode gains most, which is what a wide fused dot should
+do. The four thread column is the smaller one because the memory is more of the
+cost once four threads pull on it — 5.6 GiB/s of the available 33.99 — and that
+gap between the two columns is the reading the TODO's head item asked for rather
+than a disappointment.
 
 **Sixteen lanes reassociate the sum.** On "The capital of France is" the top
 logit is 27.111 on the default build, 27.250 on the wide one and 27.473 on the
@@ -3280,6 +3311,7 @@ one.
 
 ### Everything else
 
-The suite is 492 tests, clean on the default, tuned, wide and scalar backends,
-and under the address and undefined sanitizers on the tuned and wide ones. The
-engine end to end on the shipped export answers as it did.
+The suite is 493 tests from 492, clean on the default, tuned, wide and scalar
+backends, and under the address and undefined sanitizers on the tuned and wide
+ones. The reference comparison passes on the shipped export with no check
+failed.

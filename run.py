@@ -62,7 +62,12 @@ def tool_pick():
 # The four AVX-512 subsets the kernels reach for.  `--wide` implies `--tuned`:
 # a host with these has AVX2, and every kernel without a wide path of its own is
 # still the AVX2 one.
-WIDE_FLAGS = ["-mavx512f", "-mavx512bw", "-mavx512dq", "-mavx512vl"]
+# `-mprefer-vector-width=256` keeps the compiler's own vectorization at the
+# narrower width while the kernels written for sixteen lanes still get them.
+# Letting it widen everything costs both halves on the host this was measured
+# on: decode 3.84 tok/s against 4.12 and prefill 4.15 against 4.39.
+WIDE_FLAGS = ["-mavx512f", "-mavx512bw", "-mavx512dq", "-mavx512vl",
+              "-mprefer-vector-width=256"]
 
 
 def tool_line(kind, program, source, target, tuned, debug, trace=False, wide=False):

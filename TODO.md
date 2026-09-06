@@ -19,12 +19,12 @@ weights or on none. Most consequential first within each group.
   actually waiting on rather than another guess.
 
   0.8.7 answers part of it and leaves the rest. On a host with AVX-512 the four
-  bit fused dot is 46% quicker and the eight bit one 44%, for no change but a
-  wider vector, and decode gains 23% at one thread — which says these paths were
+  bit fused dot is 54% quicker and the eight bit one 36%, for no change but a
+  wider vector, and decode gains 21% at one thread — which says these paths were
   spending instructions rather than waiting on the memory, and settles the
   question for a wide host. It does not settle it for an AVX2 one, where both
   paths are what they were, and it does not settle what they wait on at four
-  threads: the same wide build gains only about 6% there, so past one thread the
+  threads: the same wide build gains only 6% there, so past one thread the
   memory is a real part of the cost and a narrower reading of it is what is
   still missing.
 - Hold the seam open as the prompt grows. All nine cases are judged on the
@@ -104,22 +104,24 @@ with it, because both readers of a block now decode it the same way. A block of
 eight always begins on a byte boundary, so every block of a width picks the same
 bytes at the same shifts and the whole decode is one shuffle over a sixteen byte
 load, with the tables built once for a run. On the host 0.8.7 measured, a five
-bit row of 12288 at one thread: the spread 8.90 G codes a second against 1.19,
-level with the 9.89 at two bits and 9.79 at four, which is the distance closed
-rather than narrowed. The fused dot is 6.29 against 3.34, which is 60% of the
-two bit rate where 0.8.6 left it at 38%. The shipped export packs no odd width,
-so none of it moves a token there.
+bit row of 12288 at one thread: the spread 9.08 G codes a second against 1.21,
+within a tenth of the 10.31 at two bits and 10.76 at four, which is the distance
+closed rather than narrowed. The fused dot is 6.45 against 3.36, which is 59% of
+the two bit rate where 0.8.6 left it at 38%. The shipped export packs no odd
+width, so none of it moves a token there.
 
 And AVX-512 is in, as a tier above AVX2 rather than an alternative to it: a host
-with the one has the other, so the macro layer sets both names and only the five
+with the one has the other, so the macro layer sets both names and only the
 kernels with something to gain from sixteen lanes are written twice. The
 evidence the item wanted arrived with a host that has both the instructions and
 the headroom — a bare sweep gives 33.99 GiB/s at four threads there and the
-tuned build reads 5.25 — and it showed something: the fused dot 39% to 46%
-quicker at the three widths the export packs, and decode on the export 23%
-quicker at one thread. At four threads it is about 6%, because the memory is
-more of the cost once four threads pull on it, which is the reading the item
-asked for rather than a disappointment.
+tuned build reads 5.25 — and it showed both what to take and what to leave. The
+fused dot went wide at the three widths the export packs, 36% to 54% quicker,
+and on the export that is decode 21% quicker at one thread and prefill 7%. At
+four threads it is 6% and 3%, because the memory is more of the cost once four
+threads pull on it, which is the reading the head item above asked for rather
+than a disappointment. The spread was written wide as well, measured 29% quicker
+on its own, left prefill 13% slower, and was taken out again.
 
 Four items are off this list because 0.8.5 did them: baseline jpeg, the wider
 range of png, the multi-turn chat loop with several conversations on one model,

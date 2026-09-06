@@ -2302,7 +2302,18 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
 }
 
 /* The same decode `kern_dot_code` performs, written out into floats instead of
- * summed against one activation vector.  A batch pays it once and every lane
+ * summed against one activation vector.
+ *
+ * There is no wide path here, and that is a measurement rather than an
+ * omission.  Written for sixteen lanes this is quicker in isolation — 13.16 G
+ * codes a second at two bits against 10.19, and 12.34 at four against 9.98 —
+ * and it made the engine slower: prefill on the shipped export fell 13% while
+ * decode, which never reaches this function, rose.  A spread is a small part of
+ * what prefill does, and the per-lane sums it feeds are the rest of it; a five
+ * hundred and twelve bit store in the middle of them costs those sums more than
+ * the wider store saves.  The fused dot is the other case and keeps its wide
+ * path, because there the wide vector is the work rather than a step beside
+ * it.  A batch pays it once and every lane
  * reads what it leaves, so the two widths the checkpoint leans on get the same
  * vector paths here that they get there.  Anything else walks the bit stream,
  * which is what the whole of this did before there was a reason to hurry it:
@@ -2316,23 +2327,13 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
   if (bit_count == 8) {
     const uint8_t *byte_head = code_row + (size_t)from_index;
     uint8_t flip_byte = (uint8_t)code_flip;
-#if defined(APP_SIMD_AVX512)
-    {
-      /* The one width whose spread was a scalar loop everywhere: a byte is a
-       * code, so there was nothing to unpack and the loop was the store and the
-       * conversion.  Sixteen at a time is worth having even so. */
-      const __m256i flip_data = _mm256_set1_epi8((char)flip_byte);
-      for (; slot + 32 <= span_count; slot += 32) {
-        __m256i code_byte = _mm256_xor_si256(
-            _mm256_loadu_si256((const __m256i *)(const void *)(byte_head + slot)), flip_data);
-        _mm512_storeu_ps(out_data + slot, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
-                                              _mm256_castsi256_si128(code_byte))));
-        _mm512_storeu_ps(
-            out_data + slot + 16,
-            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm256_extracti128_si256(code_byte, 1))));
-      }
-    }
-#endif
+    /* This one width keeps its scalar loop on every backend, the wide tier
+     * included.  A byte is a code, so there is nothing to unpack and the loop
+     * is a load, a convert and a store — which is the shape a compiler
+     * vectorizes well on its own.  Written out by hand for sixteen lanes it
+     * measures 9.88 G codes a second against the 11.13 the loop below reaches
+     * when the same flags let the compiler have it, so the hand written one was
+     * taken out again. */
     for (; slot < span_count; ++slot)
       out_data[slot] = (float)(uint8_t)(byte_head[slot] ^ flip_byte);
     return;
@@ -2340,22 +2341,7 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
 
   if (bit_count == 4 && code_flip == 0 && (from_index & 1) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 2;
-#if defined(APP_SIMD_AVX512)
-    {
-      const __m128i low_mask = _mm_set1_epi8(0x0F);
-      for (; slot + 32 <= span_count; slot += 32) {
-        __m128i pack_data = _mm_loadu_si128((const __m128i *)(const void *)(byte_head + slot / 2));
-        __m128i low_part = _mm_and_si128(pack_data, low_mask);
-        __m128i high_part = _mm_and_si128(_mm_srli_epi16(pack_data, 4), low_mask);
-        _mm512_storeu_ps(
-            out_data + slot,
-            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(low_part, high_part))));
-        _mm512_storeu_ps(
-            out_data + slot + 16,
-            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpackhi_epi8(low_part, high_part))));
-      }
-    }
-#elif defined(APP_SIMD_AVX2)
+#if defined(APP_SIMD_AVX2)
     {
       const __m128i low_mask = _mm_set1_epi8(0x0F);
       for (; slot + 16 <= span_count; slot += 16) {
@@ -2416,23 +2402,7 @@ static void kern_code_spread(const uint8_t *code_row, int from_index, int span_c
 
   if (bit_count == 2 && code_flip == 0 && (from_index & 3) == 0) {
     const uint8_t *byte_head = code_row + (size_t)from_index / 4;
-#if defined(APP_SIMD_AVX512)
-    {
-      /* One broadcast of the whole dword, as the fused dot above takes it —
-       * and here the dword's sixteen codes are one vector rather than two. */
-      const __m512i step_wide = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24,
-                                                  26, 28, 30);
-      const __m512i code_mask = _mm512_set1_epi32(3);
-      for (; slot + 16 <= span_count; slot += 16) {
-        uint32_t word_value;
-        memcpy(&word_value, byte_head + slot / 4, 4);
-        _mm512_storeu_ps(out_data + slot,
-                         _mm512_cvtepi32_ps(_mm512_and_si512(
-                             _mm512_srlv_epi32(_mm512_set1_epi32((int)word_value), step_wide),
-                             code_mask)));
-      }
-    }
-#elif defined(APP_SIMD_AVX2)
+#if defined(APP_SIMD_AVX2)
     {
       /* One broadcast of the whole dword, as the fused dot above takes it. */
       const __m256i step_low = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
@@ -3206,7 +3176,11 @@ static void back_rope_turn(back_desk *desk, float *value_list, int head_size, co
 }
 
 static const char *back_flavor(void) {
-#if defined(APP_SIMD_AVX2)
+  /* The wide tier is asked about first, because it sets `APP_SIMD_AVX2` too and
+   * would otherwise name itself after the tier it is built on top of. */
+#if defined(APP_SIMD_AVX512)
+  return "cpu/avx512";
+#elif defined(APP_SIMD_AVX2)
   return "cpu/avx2";
 #elif defined(APP_SIMD_SSE2)
   return "cpu/sse2";
