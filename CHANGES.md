@@ -2958,3 +2958,203 @@ separate assertions became seven that cover four hundred and forty-eight cases
 each — clean on the scalar, SSE2 and AVX2 backends and under the address and
 undefined behaviour sanitizers. Every floor the new tests hold to was checked by
 breaking the thing it covers on purpose.
+
+---
+
+## 0.8.6 — jpeg the rest of the way, the softmax without a call, a conversation that keeps, and the odd widths off the byte
+
+### Scope
+
+Four items off `TODO.md`, one of them the head of each group.
+
+The head of "anywhere" was progressive jpeg, which is what a browser is served a
+fair share of and what this reader refused. It arrives here with the two smaller
+gaps named beside it — a four component file, and twelve bits a sample — so
+there is no jpeg this reader turns away now but one that wants another entropy
+coder.
+
+The head of "on the shipped export" was the picture attention softmax, a scalar
+`expf` a patch pair a head a layer and the largest single thing in a picture that
+is not a matrix product. It is a series now, eight lanes at a time.
+
+Beside them, a session file that says whether it holds a prompt or a
+conversation — so the loop can put a conversation down and pick it up in a later
+process — and the last thing the odd bit widths were still paying for, which was
+a word assembled a byte at a time.
+
+### Progressive jpeg
+
+**A second decoder, not a fourth branch.** A sequential block is final when its
+scan has read it, so it is dequantized and transformed where it is read and no
+coefficient buffer outlives it. A progressive block arrives across several scans
+with successive approximation: a band of coefficients at a time, and a bit plane
+at a time within a band. So the frame's whole coefficient store is held in
+`coef_data` until the last scan lands, and the transform is one pass over it at
+the end.
+
+What the two share is the whole of the rest — the marker walk, the canonical
+Huffman decode, the bit reader with its `FF 00`, the eight by eight transform,
+the upsampling and the colour transform, all unchanged. What is progressive's
+alone is the store, the four scan kinds — dc first, dc refine, ac first, ac
+refine — and the end-of-band run, which is a code standing for a run of whole
+blocks rather than a run of zeros inside one.
+
+**The refining scan is the one with the shape.** In a first scan of a band the
+run field of a code counts zeros, as it does in a sequential block. In a
+refining scan it counts only the coefficients the earlier scans left zero: every
+coefficient they left nonzero carries one correction bit wherever the walk
+passes it, and those bits follow the code rather than leading it. A coefficient
+a refinement makes nonzero has a magnitude of exactly one, which is why the size
+field is always one there and the bit after the code is only its sign.
+
+**A component's quantization table is claimed when its first scan names it.**
+A progressive component is dequantized at the end of the file rather than where
+it is read, so which table stood at that moment is the one that has to be kept
+rather than whichever `DQT` was last seen. A component no scan ever names has no
+coefficients and no claim, and the frame is incomplete rather than grey.
+
+**Four bands are ink.** `APP14` is read now, which is the only thing in a file
+that says whether three bands are a luma and a chroma pair or the picture's own,
+and whether four are CMYK or YCCK. Four bands are turned first where the marker
+says YCCK, then multiplied by the black — which is what a file written inverted
+means, and every writer that ships the marker inverts. Four bands with no marker
+to read are still refused: nothing in the pixels says which four they are, and
+guessing would be a picture rather than a decode. Three bands with no marker are
+a luma and a chroma pair unless the component ids are `R`, `G` and `B`.
+
+**Twelve bits a sample** widens the level shift, the plane and the tables. The
+plane is `uint16_t` and the coefficient store `int32_t`, so the same code serves
+both depths and the sequential path came along with it.
+
+**The tests grew an encoder.** `test_jpeg` had a baseline encoder of its own;
+it now has a progressive one beside it, over a scan script that reaches all four
+scan kinds and splits a band across two scans besides — the dc plane sent a bit
+short and then refined, the luma's low frequencies and its high ones as separate
+first scans two bits short, then a refinement of each band in turn. The same
+pictures have to come back through it subsampled, at one component, at twelve
+bits and broken by restarts.
+
+Beyond that, the reader was held against libjpeg over 72 generated files — grey
+and colour, progressive and sequential, three subsampling factors, four sizes,
+three qualities — and agrees within four levels of 255 everywhere, within one on
+CMYK. That is a cross-check rather than a test in the suite, because the suite
+does not have libjpeg and should not need it.
+
+### The softmax exponential
+
+**The call is the cost.** At the full patch budget a picture's attention is
+about a billion exponentials — a patch pair, a head, a layer — and `expf` was
+being called for each. Nothing about them is hard: a softmax has already taken
+its own peak off every value, so every argument is at most zero and the total is
+at least one.
+
+**So it is the definition instead.** `e^x` is `2^k` times `e^r` where `k` is the
+whole number nearest `x / ln 2`, which leaves `r` no further from zero than half
+of `ln 2`. Over that range the series for `e^r` is finished after eight terms:
+the ninth is five parts in a thousand million of the value, an eighth of the
+last bit a float carries. `2^k` is an exponent field written straight into the
+word. `ln 2` comes off in two pieces, the first exact in a float, because in one
+piece `k * ln2` rounds away the low bits of `x` that the remainder is made of.
+The coefficients are the reciprocals of the factorials the definition names
+rather than a fitted set, so there is nothing there to have copied wrong.
+
+**Held against libm**, the worst relative error over the whole range a softmax
+can reach is 1.19e-07 — one unit in the last place — and a whole softmax of 2304
+against a double precision reference is within 6.7e-07. The kernel goes from 3.2
+ns a value to 0.64 on the tuned build and 1.70 on the default one, and its three
+passes — the peak, the exponentials with their total, the scaling — each go a
+lane at a time on all three vector paths, with the scalar helper as the tail and
+as the fourth path.
+
+**On the shipped export** a picture at the full patch budget, single threaded,
+goes from 122.8 s to 113.2 s.
+
+**It moves the numbers, and here is the honest measure of how much.** Take the
+old kernel, keep `expf` exactly, and accumulate the total in two accumulators
+instead of one — a pure reassociation, a last bit either way. Over the top 128
+of a picture prompt that moves the logits by 0.46 of a logit on average and
+drops fifteen of the hundred and twenty-eight; this change moves them 0.53 and
+drops twelve. A picture is amplified that way because 35 routed layers stand
+behind it and a near tie in an expert routing flips. The argmax is the same
+token in every comparison run, and a text only prompt is unchanged to the digit
+the `logits` task prints.
+
+### A conversation, not only a prompt
+
+`--keep` writes its file before the first token is sampled, which is what makes
+it useful — a rerun of the same prompt starts where the last run started — and
+what makes it not a conversation: the session that wrote it is one id short of
+the prompt it holds, the id `session_step` was about to be fed, and a turn
+framed onto it would drop that id.
+
+The cache itself is the same either way, so nothing in it can tell the two
+apart. What tells them apart is now a word in the file. `session_save` takes it
+and `session_load` hands it back; the mark text carries a version, so a file
+written before this is refused rather than read as a prompt it might not be.
+`--keep` writes and reuses only a prompt.
+
+The loop gains `/save <path>` and `/open <path>` over the other one. A
+conversation is written after an answer, holds every id, and is picked up by
+framing the next turn onto it — so a later process carries on from where an
+earlier one stopped and the model remembers what it said. The turns it holds
+ride in the caller's stamp, which the engine still never reads: a conversation
+restored whole has nothing to match a stamp against, and whether the model has
+already answered is what decides how the next turn is framed. A prompt offered
+to `/open` is refused with the reason rather than continued.
+
+On the shipped export: a turn, a `/save`, and in a fresh process an `/open` and
+a follow-up question, answered out of what the first process said.
+
+### The odd bit widths
+
+0.8.5 put three, five, six and seven bits on a block of eight codes — a byte
+boundary at every one of those widths — but assembled the block's word a byte at
+a time, because the packing is defined by a bit stream and reading it as an
+integer is defined by the host's byte order. That was the last thing the width
+still decided.
+
+**So the host is stated rather than worked around.** This engine is
+little-endian by decision: `real_read` casts mapped bytes to a `float` or a
+`uint16_t`, and the code stream is a dense little-endian bit field the kernels
+index directly, so a big-endian host would not read the weights wrongly in one
+kernel but in every one of them. It is said once, beside `pack_read`, and the
+compiler is asked to say so where it knows.
+
+**With that, a block is one load.** The eight bytes are the word already, and
+the bits above the block's own are never reached by a shift the block takes. The
+exception is the tail, which is why `run_end` is carried: a block at the end of
+a row has as few as three bytes behind it, and the five past them may be past the
+end of the mapping rather than merely past the end of the row. There the word is
+assembled as it always was, which is a handful of blocks a row against the
+thousands that are not.
+
+Best of interleaved runs on a 12288 row, one thread, G codes a second, with two
+and four bits carried as untouched controls:
+
+| path | 3 bits | 5 bits | 6 bits | 7 bits | 2 bits | 4 bits |
+| --- | --- | --- | --- | --- | --- | --- |
+| tuned dot | 4.47→6.05 | 3.73→6.04 | 3.34→6.09 | 3.14→5.93 | 16.13→15.61 | 15.99→15.15 |
+| tuned spread | 2.40→2.42 | 2.15→2.49 | 2.03→2.59 | 1.95→2.50 | | |
+| default dot | 1.37→1.60 | 1.32→1.57 | 1.24→1.60 | 1.20→1.56 | 10.70→11.13 | 7.76→7.72 |
+| default spread | 2.27→2.47 | 2.16→2.47 | 2.00→2.46 | 1.94→2.43 | | |
+
+The plainest reading of it is not the percentages but that all four widths now
+land on the same rate where they did not: the width has stopped shaping the
+loop. Against two and four bits the fused dot is 38% of them on the tuned build
+rather than a fifth to a quarter, and what is still missing is a vector path for
+the spread at these widths.
+
+The bound on the wide read is held by a test rather than by padding: a row
+allocated to exactly the bytes it packs into, over every width and every whole
+block of it. It is `malloc`'s row rather than the engine's, because the engine's
+allocator rounds every block up to the alignment its kernels want and a row
+asked for at twenty-four bytes is sixty-four. With the bound taken out, the
+sanitizer build fails on that case, which is what says the test has teeth.
+
+The shipped export still has no rows at these widths and not a bit of it moves.
+
+### Everything else
+
+The suite is 492 tests from 460, clean on the default, tuned and sanitizer
+builds. The engine end to end on the shipped export reads a progressive jpeg
+through the vision tower and describes it.

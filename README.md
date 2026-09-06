@@ -20,7 +20,8 @@ party library, and no build system beyond a C compiler.
 - **vision and audio** — a bidirectional patch encoder at variable resolution
   with two dimensional rotary positions, and a conformer audio encoder with
   chunked local attention, each projecting into the text embedding space
-- **its own decoders** — png at every depth and interlace, baseline jpeg, pnm,
+- **its own decoders** — png at every depth and interlace, jpeg sequential and
+  progressive at eight or twelve bits over one, three or four components, pnm,
   bmp and riff wave readers, a bicubic
   resize, and a mel filterbank, none of them borrowed
 
@@ -110,7 +111,7 @@ sliding window to turn over.
 The `cache` task prints the calibrated ranges against the peaks a prompt
 actually reaches, and what the cache costs at full span either way.
 
-`--image` takes a png, a baseline jpeg, a pnm or a bmp, and `--audio` a riff
+`--image` takes a png, a jpeg, a pnm or a bmp, and `--audio` a riff
 wave. Each is run through its tower and put in front of the prompt, bracketed by the ids the
 reference's processor brackets it with, in the place a multi-modal chat template
 puts it. Either flag may be given more than once, up to eight pieces in one

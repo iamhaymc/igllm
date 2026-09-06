@@ -201,16 +201,36 @@ was selected.
 - `kern_dot_real` — dot product against an `f32`, `f16`, or `bf16` row. The
   `f32` case has a vector path on all three targets.
 - `kern_dot_code` — dot product against a packed row, specialized for the
-  two, four, and eight bit cases and general otherwise. All three have vector
-  paths on all three targets: a nibble unpacks with whole-vector shifts and
-  masks, a quarter byte with those or with the table below, and a whole byte
-  needs only the flip. The two narrow widths require the group to start on a
-  byte boundary and fall back to the bit-stream loop when it does not.
+  two, four, and eight bit cases, for three, five, six and seven, and general
+  otherwise. The first three have vector paths on all three targets: a nibble
+  unpacks with whole-vector shifts and masks, a quarter byte with those or with
+  the table below, and a whole byte needs only the flip. The two narrow widths
+  require the group to start on a byte boundary and fall back to the bit-stream
+  loop when it does not.
 
   Every vector path carries two accumulators rather than one. The arithmetic is
   cheap enough that a single chain waits on the latency of its own add rather
   than on the work: splitting it took a four bit row 1.6 times quicker on SSE2
   and 1.4 on AVX2, for nothing but a second register.
+
+  Three, five, six and seven bits share a property the others do not need: eight
+  codes are exactly `bit_count` bytes, so a block of eight always begins where
+  the block before it ended and the whole width fits one word. `kern_code_word`
+  reads that word — one eight byte load, because the packing is a dense
+  little-endian bit stream and so is the host, which is stated once beside
+  `pack_read` rather than worked around in the kernel — and `kern_code_eight`
+  shifts the codes out of it. On AVX2 the shifts happen inside the vector, one
+  variable shift per lane, because eight four byte stores feeding one thirty-two
+  byte load is a forwarding stall worth nearly half the loop; everywhere else
+  the block goes to scratch and is summed from it. The tail is the exception
+  that `run_end` exists for: a block at the end of a row has as few as three
+  bytes behind it and the five past them may be past the end of the mapping, so
+  there the word is assembled from its own bytes. With the word read whole, all
+  four widths land on one rate — about 6.0 G codes a second on the tuned build
+  against 3.1 to 4.5 before, and 1.6 on the default build against 1.2 to 1.4 —
+  so the width has stopped shaping the loop. It is still 38% of what two and
+  four bits reach, and what would close the rest is a vector path for the
+  spread at these widths.
 
   At two bits the unpacking is read out of `kern_code_two` instead, a four
   kilobyte table of four floats indexed by the byte that holds them, built by
@@ -281,7 +301,14 @@ was selected.
 - `kern_gelu_tanh`, `kern_gelu_gate` — the tanh approximation, and the gated
   form the MLP wants.
 - `kern_soft_max` — streaming maximum then streaming sum, so a long attention
-  row never overflows.
+  row never overflows, each of its three passes a vector lane at a time.
+- `kern_exp_near`, `kern_exp_wide` — the exponential the softmax needs, without
+  a call into libm: `2^k` times `e^r` where `k` is the whole number nearest
+  `x / ln 2`, so `r` stays inside half of `ln 2` and the series is finished
+  after eight terms. Within one unit in the last place of `expf` over the whole
+  range a softmax can reach, and about five times its speed on the tuned build.
+  A picture's attention is a billion of these at the full patch budget, which is
+  what it exists for.
 - `kern_rope_turn` — the rotate-half rotary transform, in place.
 - `kern_add`, `kern_scale` — residual and scalar helpers.
 
@@ -341,13 +368,30 @@ floats or a run of samples.
   everything, which is why there is one path rather than two. Alpha is dropped
   rather than composited: inventing a background is a preprocessing choice this
   layer has no business making.
-- `jpeg_read` — baseline and extended sequential jpeg: the marker walk, a
+- `jpeg_read` — baseline, extended sequential and progressive jpeg, at eight or
+  twelve bits a sample, over one, three or four components: the marker walk, a
   canonical Huffman decode per component, dequantization, an eight by eight
   inverse cosine transform, chroma upsampling at whatever the sampling factors
-  say, and YCbCr to RGB. Restart markers are stepped over. Progressive files
-  are refused the way the png reader refuses interlacing, because coefficients
-  arriving across several scans is a second decoder rather than a branch of
-  this one.
+  say, and the colour transform the components and the `APP14` segment name.
+  Restart markers are stepped over in every kind of scan.
+
+  Sequential and progressive are two decoders sharing the marker walk, the
+  Huffman decode, the bit reader, the transform, the upsampling and the colour
+  transform. A sequential block is final when its scan has read it, so it is
+  dequantized and transformed where it is read and nothing outlives it. A
+  progressive block arrives across several scans with successive approximation,
+  so the frame's whole coefficient store is held in `coef_data` until the last
+  scan lands and the transform is one pass over it at the end; what is
+  progressive's alone is that store, the four scan kinds — dc first, dc refine,
+  ac first, ac refine — and the end-of-band run.
+
+  Three bands are a luma and a chroma pair unless `APP14` or the component ids
+  say they are the picture's own. Four bands are ink, turned first where the
+  marker says YCCK and then multiplied by the black, which is what a file
+  written inverted means; four bands with no `APP14` to read are refused,
+  because nothing in the pixels says which four they are. Lossless,
+  differential, arithmetic coded and hierarchical frames are still refused, each
+  being another decoder rather than another branch of this one.
 - `pnm_read`, `bmp_read` — binary `P5`/`P6`, and uncompressed 24 or 32 bit
   bitmaps. `image_read` picks between the four from the leading bytes rather
   than the file name.
@@ -490,8 +534,14 @@ scoring is 9.6 s, the softmax over the scores 6.6, the blend 7.9, and the
 projection out of attention 2.6 — twenty-four seconds of a hundred and forty-
 eight. The rest is the projections and the feed-forward, which already run
 through the packed kernels. The largest single thing left in a picture that is
-not a matrix product is the softmax, a scalar `expf` per patch pair per head per
-layer, and it is scalar still.
+not a matrix product was the softmax, a scalar `expf` per patch pair per head
+per layer. 0.8.6 took the call out of it — `kern_exp_near` is the series above,
+and the three passes of the softmax each go a lane at a time — and a picture at
+the full patch budget, single threaded, went from 122.8 s to 113.2 s on the
+host that measured it. It moves the numbers, and the measure of how much is
+that reassociating the old summation, the same `expf` with the total in two
+accumulators, moves them as far: 35 routed layers stand behind a picture and
+amplify a last bit either way.
 
 **The audio tower is a conformer**, not a transformer, and the difference is
 worth stating because the two look alike from a distance. A layer is
@@ -897,13 +947,22 @@ reaches the same logits as the one that wrote it, bit for bit and without
 priming an id; that the ids, the peaks and the caller's stamp all come back;
 and that a file that stops short, one that is not a cache at all, one whose mark
 disagrees, and one that is not there are each refused, leaving the session
-cleared rather than half fed.
+cleared rather than half fed. It covers the other of the two things a file can
+be as well: a conversation written after an answer holds every id the session
+was fed rather than one short of them, reads back as a conversation with the
+caller's stamp, and reaches the same logits bit for bit from the next id as the
+session that wrote it.
 
 `test_kernel` holds the packed dot and the packed spread against a plain
 bit-stream loop at every width the format allows, at spans that end mid-block,
 at leads that are and are not where a block of eight begins — which is what
 decides whether a width's own path is taken or the walk it falls back to — and
-with the code flip on and off.
+with the code flip on and off. It does it a second time over a row allocated to
+exactly the bytes it packs into, because the odd widths read their block as one
+eight byte word and a padded row cannot say whether the bound on that read is
+real; the row there is `malloc`'s rather than the engine's, whose allocator
+rounds every block up to the alignment its kernels want. With the bound taken
+out, the sanitizer build fails on that case.
 
 `test_turn` covers the turn after the first: that the later frame is the first
 frame with the document's opening traded for the close of the model's turn, that
@@ -927,16 +986,23 @@ of palette, interlaced and not, and the wider kinds interlaced, have to come
 back exactly; so do a picture smaller than the lattice and a picture of one
 pixel, which are the cases that tell a lattice with no columns apart from one
 that is simply absent.
-`test_jpeg` carries a baseline encoder of its own — its own forward transform
-in double precision, its own canonical code assignment, its own bit writer —
-and quantizes with tables of ones, so a round trip loses only what the two
-transforms round and the pixels can be held to within a level or two of the
-pixels that went in. Its Huffman table is deliberately not the specification's:
-eight to twelve bits over all 256 symbols, an incomplete code no encoder in the
-wild produces. A grey file, a three component file, a file whose chroma is at
-half the horizontal sampling, and a file broken by a restart marker after every
-unit all have to come back as the same picture; a progressive frame header and
-a truncated entropy stream both have to be refused. The
+`test_jpeg` carries an encoder of its own — its own forward transform in double
+precision, its own canonical code assignment, its own bit writer — for both
+kinds of frame, and quantizes with tables of ones, so a round trip loses only
+what the two transforms round and the pixels can be held to within a level or
+two of the pixels that went in. Its Huffman table is deliberately not the
+specification's: eight to twelve bits over all 256 symbols, an incomplete code
+no encoder in the wild produces. A grey file, a three component file, a file
+whose chroma is at half the horizontal sampling, a file broken by a restart
+marker after every unit, a twelve bit frame, three bands marked untransformed
+and four bands of ink under each of the two ink transforms all have to come back
+as the same picture. The progressive encoder writes a scan script that reaches
+all four scan kinds and splits a band across two scans besides — the dc plane
+sent a bit short and then refined, the luma's low frequencies and its high ones
+as separate first scans two bits short, then a refinement of each band in turn —
+and the same pictures have to come back through it, subsampled, one component,
+twelve bit and broken by restarts. Four bands with no `APP14`, an arithmetic
+coded frame header and a truncated entropy stream all have to be refused. The
 resize is checked four ways: a constant survives in both directions, a ramp
 stays a straight line where the taps fit, the separable implementation matches a
 direct two dimensional gather, and folding three bands onto one takes the luma
