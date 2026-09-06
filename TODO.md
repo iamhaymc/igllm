@@ -96,8 +96,15 @@ third behind on one of them.
   session and gives the host's cores to whoever asks first — or a queue in front
   of the one pool, which is the shape a server wants anyway and is the larger
   change. Neither is worth guessing at without a caller that needs it.
-- Persist and restore a session cache, so a long prompt need not be primed
-  twice.
+- Persist and restore a conversation, not only a prompt. 0.8.5 gives
+  `session_save` and `session_load` and the `--keep` flag over them, and what
+  they hold is a prompt: the file is written before the first token is sampled,
+  so a rerun of the same prompt starts where the last run started. A file
+  written that way cannot be picked up as a conversation, because the session
+  that wrote it is one id short of the prompt — the id `session_step` was about
+  to be fed — and a turn framed onto it would drop that id. What resuming a
+  conversation wants is a save taken after an answer, and a way to say which of
+  the two a file is; the loop's `/save` and `/open` are the shape of it.
 - Widen `kern_dot_code` for the odd bit widths. Two, four and eight bits are
   vectorized, in the fused dot and in `kern_code_spread` beside it; three,
   five, six, and seven still walk the bit stream in both. Synthetic weights

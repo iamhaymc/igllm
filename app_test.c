@@ -3735,6 +3735,119 @@ static void test_turn(void) {
   model_free(model);
 }
 
+/* A conversation written out and read back. */
+static void test_keep(void) {
+  app_setup setup = app_setup_plain();
+  app_model *model = NULL;
+  app_session *from_session = NULL, *into_session = NULL;
+  char path_text[1024];
+  int32_t id_list[24], back_list[24];
+  float *keep_list = NULL;
+  const float *logit_list;
+  uint64_t stamp_back = 0;
+  float peak_key = 0.0f, peak_value = 0.0f;
+  int id_count = 12, slot_index, okay_flag = 1;
+  test_open("keep");
+  setup.thread_count = 2;
+  if (!test_wing_write(0)) {
+    test_true(0, "the synthetic checkpoint is written");
+    return;
+  }
+  if (model_load(test_yard_path, &setup, &model) != APP_OKAY || !model) {
+    test_true(0, "the checkpoint loads");
+    return;
+  }
+  path_join(path_text, sizeof(path_text), test_yard_path, "hold.cache");
+  for (slot_index = 0; slot_index < id_count; ++slot_index)
+    id_list[slot_index] = (int32_t)(7 + slot_index % 7);
+
+  test_true(session_open(model, &from_session) == APP_OKAY, "a conversation opens");
+  test_true(session_open(model, &into_session) == APP_OKAY, "a second one opens");
+  keep_list = (float *)mem_clear(sizeof(float) * (size_t)model->head_sheet.row_count);
+  if (!from_session || !into_session || !keep_list) {
+    session_close(from_session);
+    session_close(into_session);
+    mem_free(keep_list);
+    model_free(model);
+    return;
+  }
+
+  test_true(session_prime(from_session, id_list, id_count) == APP_OKAY, "a prompt primes");
+  test_true(session_ids(from_session, NULL, 0) == id_count - 1,
+            "a session holds every id but the one the caller still has");
+  test_true(session_ids(from_session, back_list, 24) == id_count - 1 &&
+                memcmp(back_list, id_list, sizeof(int32_t) * (size_t)(id_count - 1)) == 0,
+            "and hands them back in the order it was fed them");
+  test_true(session_save(from_session, path_text, 0x1234567890ABCDEFull) == APP_OKAY,
+            "the conversation is written out");
+  peak_key = session_cache_peak(from_session, 0, 0);
+  peak_value = session_cache_peak(from_session, 0, 1);
+  test_true(peak_key > 0.0f && peak_value > 0.0f, "the conversation reached a peak in both caches");
+
+  /* What the file is for: the session that reads it reaches the same place as
+   * the session that wrote it, to the bit, without priming a single id. */
+  logit_list = session_step(from_session, id_list[id_count - 1]);
+  if (logit_list)
+    memcpy(keep_list, logit_list, sizeof(float) * (size_t)model->head_sheet.row_count);
+  test_true(logit_list != NULL, "the prompt reaches the head");
+
+  test_true(session_load(into_session, path_text, &stamp_back) == APP_OKAY,
+            "the conversation is read back");
+  test_true(stamp_back == 0x1234567890ABCDEFull, "the caller's stamp comes back unread");
+  test_true(session_fill(into_session) == id_count - 1, "and holds what it was written with");
+  /* The peaks go in the file too: what a range has to cover is a question about
+   * the whole conversation, and half of it would answer it wrongly. */
+  test_true(session_cache_peak(into_session, 0, 0) == peak_key &&
+                session_cache_peak(into_session, 0, 1) == peak_value,
+            "the peaks the conversation reached come back with it");
+  logit_list = session_step(into_session, id_list[id_count - 1]);
+  for (slot_index = 0; logit_list && slot_index < model->head_sheet.row_count; ++slot_index)
+    if (logit_list[slot_index] != keep_list[slot_index]) okay_flag = 0;
+  test_true(logit_list && okay_flag, "a restored conversation reaches the same logits, bit for bit");
+
+  /* A file that is not one of these, or is one that stops short, is refused,
+   * and a session that tried to read it is left cleared rather than half fed. */
+  {
+    uint8_t *file_data;
+    size_t file_size = 0;
+    session_reset(into_session);
+    file_data = (uint8_t *)file_slurp(path_text, &file_size);
+    test_true(file_data != NULL && file_size > 64, "the file is read back to be damaged");
+    if (file_data) {
+      char other_text[1024];
+      path_join(other_text, sizeof(other_text), test_yard_path, "short.cache");
+      test_true(test_file_write("short.cache", file_data, file_size / 2),
+                "a truncated cache is written");
+      test_true(session_load(into_session, other_text, NULL) != APP_OKAY,
+                "a cache that stops short is refused");
+      test_true(session_fill(into_session) == 0, "and leaves the session cleared");
+
+      file_data[3] ^= 0xFF;
+      path_join(other_text, sizeof(other_text), test_yard_path, "wrong.cache");
+      test_true(test_file_write("wrong.cache", file_data, file_size), "a damaged cache is written");
+      test_true(session_load(into_session, other_text, NULL) != APP_OKAY,
+                "a file that is not one of these is refused");
+      file_data[3] ^= 0xFF;
+
+      /* The mark is what says a cache belongs to this model and this storage.
+       * A cache whose mark disagrees is a conversation the model never had. */
+      file_data[KEEP_MARK_SIZE] ^= 0x01;
+      path_join(other_text, sizeof(other_text), test_yard_path, "alien.cache");
+      test_true(test_file_write("alien.cache", file_data, file_size), "an alien cache is written");
+      test_true(session_load(into_session, other_text, NULL) == APP_FAIL_STATE,
+                "a cache written from other shapes is refused");
+      mem_free(file_data);
+    }
+    test_true(session_load(into_session, "no_such_cache_file", NULL) == APP_FAIL_MISSING,
+              "a cache that is not there is refused");
+  }
+
+  mem_free(keep_list);
+  session_close(from_session);
+  session_close(into_session);
+  model_free(model);
+}
+
 static void test_face(void) {
   app_setup setup = app_setup_plain();
   app_taste taste = app_taste_plain();
@@ -4013,6 +4126,7 @@ int main(void) {
   test_wing();
   test_tower();
   test_turn();
+  test_keep();
   test_face();
   test_shot();
 

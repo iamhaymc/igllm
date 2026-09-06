@@ -794,6 +794,22 @@ the first level cache. A layer holding floats never reaches them — it keeps
 `kern_dot_real` and the blend loop it always had, so `--cache 8` off is the
 arithmetic it was before any of this existed.
 
+`session_save` and `session_load` write a session's cache out and read it back,
+so a prompt that took a long time to prime need not be primed again. What goes
+in the file is the ids the session was fed and the rows of each layer's cache
+that carry anything — `keep_row_count` — so the file is the size of the
+conversation rather than of the window, and a ring that has turned over writes
+its whole span because every slot of it is live. The file is host native, the
+same floats and bytes the cache holds, and `keep_mark` mixes every shape the
+layout depends on with the checkpoint's own size so that a file written from
+other shapes is refused rather than made to fit. The `stamp_value` a caller
+hands `session_save` is written beside it and handed back unread: the ids alone
+cannot say that a picture in a prompt is the same picture, because two pictures
+lay down the same placeholder ids, so what identifies the rest of a prompt is
+the caller's to decide. `session_ids` hands the ids back, which is how the front
+end finds out whether the prompt it is about to run begins with the one in the
+file and primes only the difference.
+
 `session_cache_room_at` says what the cache costs at either storage, and
 `session_cache_bytes` asks the layer rather than assuming a float, so what
 `bench` reports a token reads falls with the storage.
@@ -865,6 +881,13 @@ parameter lands on the right rows, and `test_wing` writes a complete
 miniature checkpoint — config, tokenizer, and every tensor the loader binds,
 once dense and once with a mixture block — and asserts that a batched prefill
 reaches exactly the logits produced by feeding the same tokens one at a time.
+
+`test_keep` covers the cache written out and read back: that a restored session
+reaches the same logits as the one that wrote it, bit for bit and without
+priming an id; that the ids, the peaks and the caller's stamp all come back;
+and that a file that stops short, one that is not a cache at all, one whose mark
+disagrees, and one that is not there are each refused, leaving the session
+cleared rather than half fed.
 
 `test_turn` covers the turn after the first: that the later frame is the first
 frame with the document's opening traded for the close of the model's turn, that

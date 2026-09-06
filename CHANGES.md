@@ -2570,7 +2570,7 @@ before. That is an argument, not a run, and it is worth saying which.
 
 ---
 
-## 0.8.5 — the cache is read once for the heads that share it, the pictures, and the turns after the first
+## 0.8.5 — the cache is read once for the heads that share it, the pictures, the turns after the first, and the prompt that need not be primed twice
 
 ### Scope
 
@@ -2578,15 +2578,15 @@ before. That is an argument, not a run, and it is worth saying which.
 restructuring 0.8.4 arrived at while measuring the byte cache: eight heads read
 the same cached row and the loop read it eight times. The second was the reader
 that was missing — most pictures a caller actually has are jpeg, and `--image`
-refused all of them. The two items under that one — the range of png the reader
-would not take, and the single turn the CLI would not go past — are done here
-too.
+refused all of them. The three items under that one — the range of png the
+reader would not take, the single turn the CLI would not go past, and the long
+prompt it primed again every run — are done here too.
 
 The first moves no bit of any result and takes back almost all of what the byte
 cache cost. The second is a new decoder of about four hundred lines, and the
 third turns out to be one loop rather than two features; both have an encoder of
 their own beside them in the tests. The fourth needed one function in the engine
-and the rest in the front end.
+and the rest in the front end, and the fifth three.
 
 ### Reading a cached row once for all the heads that share it
 
@@ -2843,6 +2843,58 @@ The single turn path is untouched: `logits` and forty-eight greedy tokens of
 `chat` on the shipped export are byte identical to what they were, at both cache
 settings.
 
+
+### A prompt need not be primed twice
+
+`session_save` writes a session's cache to a file and `session_load` reads it
+back, and `--keep <path>` is the front end over them. On the shipped export a
+687 id prompt takes 39 seconds to prime and 2.7 seconds to read back, and the
+answer that follows is the same to the byte.
+
+What goes in the file is what the session actually holds: the ids it was fed,
+and the rows of each layer's key and value cache that carry anything. A layer
+sized for a hundred and thirty thousand positions and holding six hundred writes
+six hundred, so the file is the size of the prompt rather than of the window —
+21 MiB for that prompt, and 5 MiB with `--cache 8`, which is the same quarter
+the byte cache collects in memory. A ring that has turned over writes its whole
+span, because every slot of one is live.
+
+The file is host native: the same floats and the same bytes the cache holds, in
+the order the machine holds them, as the mapped checkpoint is. It is a thing to
+keep beside a run rather than a thing to send anywhere. `keep_mark` mixes every
+shape the layout depends on — the layer count, the head counts, the window, the
+cache storage, each layer's span and width — with the checkpoint's own mapped
+size, and a file that disagrees with it is refused rather than restored.
+
+Two things the ids cannot say for themselves.
+
+**A picture is not its placeholders.** Two different pictures lay down the same
+run of placeholder ids, so a cache matched on ids alone would be restored for
+the wrong picture. `session_save` takes a `stamp_value` from the caller and
+hands it back unread; the front end puts a hash of the embedding rows the towers
+made there. Running the same prompt with a png and then with a jpeg of the same
+picture is the case: same ids, different rows, and the second run primes from
+nothing.
+
+**A prefix is not a match.** The file is reused where its ids *begin* the prompt
+about to run, and the difference is primed onto it. What that does not stretch
+to is a prefix shorter than the file, because a sliding layer's ring cannot be
+trimmed back: it holds the last `slide_span` rows written, and the rows a
+shorter prompt would need behind them are the ones it overwrote.
+
+The file holds a prompt rather than a conversation, and `TODO.md` carries the
+difference as its own item. It is written before the first token is sampled, so
+a rerun starts where the last run started — which also means the session that
+wrote it is one id short of the prompt, the id `session_step` was about to be
+fed, and a turn framed onto it would drop that id.
+
+`test_keep` states the point as an equality: a session that reads the file
+reaches the same logits as the session that wrote it, bit for bit, without
+priming a single id. It also requires the ids, the peaks and the stamp to come
+back, and requires a truncated file, a file that is not one of these, a file
+whose mark disagrees and a file that is not there each to be refused with the
+session left cleared rather than half fed.
+
 ### Everything else
 
 The engine end to end on the shipped export, one scene written as a png, as a
@@ -2851,5 +2903,6 @@ sun and grass. `--image` takes jpeg everywhere it takes png, including in the
 media parity workflows, and `chat --loop` will take one mid-conversation and
 answer questions about it two turns later out of the cache.
 
-The suite is 455 tests from 390, clean on the scalar, SSE2 and AVX2 backends and
-under the address and undefined behaviour sanitizers.
+The suite is 477 tests from 390, clean on the scalar, SSE2 and AVX2 backends and
+under the address and undefined behaviour sanitizers. Every floor the new tests
+hold to was checked by breaking the thing it covers on purpose.

@@ -39,6 +39,7 @@ typedef struct main_flag {
   int         cache_bits;   /* 0 keeps the key and value cache in float, 8 quantizes it */
   int         raw_flag;
   int         loop_flag;
+  const char *keep_path;
   app_taste   taste;
 } main_flag;
 
@@ -114,6 +115,7 @@ static void main_usage(void) {
   printf("  --echo-penalty <v>  repetition penalty\n");
   printf("  --seed <value>      sampler seed\n");
   printf("  --loop              keep the chat task open for more turns\n");
+  printf("  --keep <path>       hold the prompt's cache here, and reuse it next time\n");
   printf("  --raw               skip the chat frame in the chat task\n");
   printf("  --verbose           print progress detail\n");
 }
@@ -157,6 +159,7 @@ static int main_flags(int argc, char **argv, main_flag *flag_out) {
     else if (strcmp(name_text, "--top-p") == 0 && value_text) flag_out->taste.top_portion = (float)atof(argv[++argument_index]);
     else if (strcmp(name_text, "--echo-penalty") == 0 && value_text) flag_out->taste.echo_penalty = (float)atof(argv[++argument_index]);
     else if (strcmp(name_text, "--seed") == 0 && value_text) flag_out->taste.seed_value = strtoull(argv[++argument_index], NULL, 10);
+    else if (strcmp(name_text, "--keep") == 0 && value_text) flag_out->keep_path = argv[++argument_index];
     else if (strcmp(name_text, "--loop") == 0) flag_out->loop_flag = 1;
     else if (strcmp(name_text, "--raw") == 0) flag_out->raw_flag = 1;
     else if (strcmp(name_text, "--verbose") == 0) flag_out->verbose_level = 1;
@@ -301,6 +304,78 @@ static void main_emit(app_model *model, int32_t id_value) {
   }
 }
 
+/* What a kept cache is stamped with: the embedding rows a tower filled, which
+ * the ids cannot speak for.  Two pictures lay down the same placeholder ids, so
+ * without this a cache kept for one prompt would be restored for the other. */
+static uint64_t main_keep_stamp(const main_reel *reel, int id_count) {
+  uint64_t stamp_value = 0xCBF29CE484222325ull;
+  int id_index, value_index;
+  for (id_index = 0; id_index < id_count; ++id_index) {
+    if (!reel->state_flag[id_index]) continue;
+    for (value_index = 0; value_index < reel->state_size; ++value_index) {
+      float value_now = reel->state_list[(size_t)id_index * (size_t)reel->state_size +
+                                         (size_t)value_index];
+      uint32_t raw_value;
+      memcpy(&raw_value, &value_now, sizeof(raw_value));
+      stamp_value = (stamp_value ^ raw_value) * 0x100000001B3ull;
+    }
+  }
+  return stamp_value;
+}
+
+/* Primes a prompt, reusing a cache kept from an earlier run where the file
+ * holds a prompt this one begins with.
+ *
+ * What is reused is a prefix and not a match: a kept cache of six hundred ids
+ * in front of a prompt of six hundred and four is six hundred ids that need not
+ * be primed again, and the four are primed onto it.  A file that does not
+ * begin this prompt is a different conversation and is replaced. */
+static app_code main_keep_prime(const main_flag *flag, app_session *session,
+                                const main_reel *reel) {
+  int32_t *held_list = NULL;
+  int held_count = 0, same_count = 0;
+  uint64_t stamp_value = 0, held_stamp = 0;
+  app_code code;
+
+  if (!flag->keep_path) return session_prime_media(session, reel->id_list, reel->id_count,
+                                                   reel->state_list, reel->state_flag);
+  if (session_load(session, flag->keep_path, &held_stamp) == APP_OKAY) {
+    held_count = session_ids(session, NULL, 0);
+    held_list = (int32_t *)calloc((size_t)(held_count > 0 ? held_count : 1), sizeof(int32_t));
+    if (held_list) session_ids(session, held_list, held_count);
+    /* The last id of the prompt is the one `session_step` is fed, so a cache
+     * that holds every id of it has nothing left to prime and is one too far. */
+    while (held_list && same_count < held_count && same_count < reel->id_count - 1 &&
+           held_list[same_count] == reel->id_list[same_count])
+      ++same_count;
+    stamp_value = main_keep_stamp(reel, same_count);
+    if (same_count != held_count || held_stamp != stamp_value) same_count = 0;
+    free(held_list);
+  }
+  if (same_count < 1) {
+    session_reset(session);
+    same_count = 0;
+  } else if (flag->verbose_level) {
+    fprintf(stderr, "[kept %d of %d ids]\n", same_count, reel->id_count);
+  }
+  code = session_prime_media(session, reel->id_list + same_count, reel->id_count - same_count,
+                             reel->state_list
+                                 ? reel->state_list + (size_t)same_count * (size_t)reel->state_size
+                                 : NULL,
+                             reel->state_flag ? reel->state_flag + same_count : NULL);
+  if (code != APP_OKAY) return code;
+  /* The file holds the prompt rather than the answer, so it is written before
+   * a token is sampled and a rerun of the same prompt starts where this one
+   * did. */
+  if (same_count < reel->id_count - 1) {
+    app_code keep_code = session_save(session, flag->keep_path,
+                                      main_keep_stamp(reel, reel->id_count - 1));
+    if (keep_code != APP_OKAY)
+      fprintf(stderr, "keep: %s\n", app_code_text(keep_code));
+  }
+  return APP_OKAY;
+}
+
 /* Samples until the model closes its turn or the caller's budget runs out,
  * printing each piece as it lands.  The state row belongs to the prompt's last
  * id and only that id can have one, because only a prompt's ids come from a
@@ -337,7 +412,7 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
   }
   if (flag->verbose_level) fprintf(stderr, "[prompt %d tokens]\n", reel.id_count);
 
-  code = session_prime_media(session, reel.id_list, reel.id_count, reel.state_list, reel.state_flag);
+  code = main_keep_prime(flag, session, &reel);
   if (code != APP_OKAY) {
     fprintf(stderr, "prime: %s\n", app_code_text(code));
     main_reel_free(&reel);

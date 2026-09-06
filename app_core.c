@@ -211,6 +211,25 @@ float        session_cache_peak(const app_session *session, int layer_index, int
  * it, and what it would occupy at the storage `cache_bits` names.  Eight counts
  * a byte a value for every layer the export ships a scale for and a float for
  * the rest; zero counts floats throughout. */
+/* A session's cache written to a file and read back, so a prompt that took a
+ * long time to prime need not be primed again.  What is written is the ids the
+ * session has been fed and the rows of its cache that carry anything, so the
+ * file is the size of the conversation rather than of the window.  It is host
+ * native, and it is refused rather than restored where the shapes it was
+ * written from disagree with the session reading it.
+ *
+ * `stamp_value` is written beside the cache and handed back unread.  The ids
+ * alone cannot say that a picture in a prompt is the same picture — two
+ * pictures lay down the same placeholder ids — so what identifies the rest of
+ * a prompt is the caller's to decide and to put here.
+ *
+ * `session_ids` hands back the ids a session holds, which is how a caller finds
+ * out whether the prompt it is about to run begins with the one in the file.
+ * It returns the count it needs when the room given is too small. */
+app_code    session_save(const app_session *session, const char *path_text, uint64_t stamp_value);
+app_code    session_load(app_session *session, const char *path_text, uint64_t *stamp_out);
+int         session_ids(const app_session *session, int32_t *id_list, int id_limit);
+
 size_t       session_cache_room(const app_session *session);
 size_t       session_cache_room_at(const app_session *session, int cache_bits);
 app_tally    session_tally(const app_session *session);
@@ -8922,6 +8941,198 @@ static int token_frame_inner(const app_model *model, const app_part *part_list, 
                                  1);
   if (wrote_count < 0) return -1;
   return id_count + wrote_count;
+}
+
+/* -- keeping a conversation ----------------------------------------------- */
+
+/* A session's cache written out and read back, so a prompt that took thirty
+ * seconds to prime need not be primed a second time.
+ *
+ * What goes in the file is what a session actually holds: the ids it has been
+ * fed, and the rows of each layer's key and value cache that have anything in
+ * them.  A layer sized for the whole window but holding six hundred rows writes
+ * six hundred, so the file is the size of the conversation rather than the size
+ * of the window.
+ *
+ * The file is host native — the same floats and the same bytes the cache holds,
+ * in the order the machine holds them, as the mapped checkpoint is — so it is a
+ * thing to keep beside a run rather than a thing to send anywhere.  What guards
+ * against reading one into the wrong session is `keep_mark`, a mix of every
+ * shape the cache's layout depends on and of the checkpoint's own size; a file
+ * that disagrees with it is refused rather than restored.
+ *
+ * The `stamp_value` a caller hands `session_save` is written beside that and
+ * handed back by `session_load`.  The engine never reads it: the ids alone
+ * cannot say that a picture in the prompt is the same picture, because two
+ * pictures lay down the same placeholder ids, and the caller is the one that
+ * knows what it fed. */
+#define KEEP_MARK_TEXT "igllm cache 1\n\0\0"
+#define KEEP_MARK_SIZE 16
+
+static uint64_t keep_mix(uint64_t mark_value, uint64_t value_now) {
+  mark_value ^= value_now + 0x9E3779B97F4A7C15ull + (mark_value << 6) + (mark_value >> 2);
+  return mark_value;
+}
+
+/* Everything about a model and a session that decides how the cache is laid
+ * out, and enough about the checkpoint to tell two of the same shape apart. */
+static uint64_t keep_mark(const app_session *session) {
+  const app_model *model = session->model;
+  const model_form *form = &model->form;
+  uint64_t mark_value = 0x243F6A8885A308D3ull;
+  int layer_index;
+  mark_value = keep_mix(mark_value, (uint64_t)form->layer_count);
+  mark_value = keep_mix(mark_value, (uint64_t)form->head_count);
+  mark_value = keep_mix(mark_value, (uint64_t)form->state_size);
+  mark_value = keep_mix(mark_value, (uint64_t)form->window_limit);
+  mark_value = keep_mix(mark_value, (uint64_t)form->slide_span);
+  mark_value = keep_mix(mark_value, (uint64_t)model->setup.cache_bits);
+  mark_value = keep_mix(mark_value, (uint64_t)model->embed_sheet.row_count);
+  mark_value = keep_mix(mark_value, (uint64_t)model_memory_bytes(model));
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    const layer_wing *wing = &model->wing_list[layer_index];
+    mark_value = keep_mix(mark_value, (uint64_t)wing->cache_span);
+    mark_value = keep_mix(mark_value, (uint64_t)wing->kv_count);
+    mark_value = keep_mix(mark_value, (uint64_t)wing->head_size);
+    mark_value = keep_mix(mark_value, (uint64_t)wing->share_flag);
+    mark_value = keep_mix(mark_value, (uint64_t)cache_slot_bytes(session->key_grid[layer_index]));
+    mark_value = keep_mix(mark_value, (uint64_t)cache_slot_bytes(session->value_grid[layer_index]));
+  }
+  return mark_value;
+}
+
+/* How many of a layer's rows carry anything.  A ring that has turned over holds
+ * its whole span and every slot of it is live; one that has not holds its rows
+ * at the slots it filled, which are the first of them. */
+static int keep_row_count(const app_session *session, const layer_wing *wing) {
+  int fill_count = session->fill_count;
+  return fill_count < wing->cache_span ? fill_count : wing->cache_span;
+}
+
+app_code session_save(const app_session *session, const char *path_text, uint64_t stamp_value) {
+  FILE *handle;
+  uint64_t head_list[6];
+  int layer_index;
+  app_code code = APP_OKAY;
+  if (!session || !path_text) return APP_FAIL_ARGUMENT;
+  handle = fopen(path_text, "wb");
+  if (!handle) return APP_FAIL_MISSING;
+  head_list[0] = keep_mark(session);
+  head_list[1] = stamp_value;
+  head_list[2] = (uint64_t)session->fill_count;
+  head_list[3] = (uint64_t)session->echo_count;
+  head_list[4] = (uint64_t)session->model->form.layer_count;
+  head_list[5] = (uint64_t)session->model->setup.cache_bits;
+  if (fwrite(KEEP_MARK_TEXT, 1, KEEP_MARK_SIZE, handle) != KEEP_MARK_SIZE ||
+      fwrite(head_list, sizeof(uint64_t), 6, handle) != 6)
+    code = APP_FAIL_FORMAT;
+  if (code == APP_OKAY && session->echo_count > 0 &&
+      fwrite(session->echo_room, sizeof(int32_t), (size_t)session->echo_count, handle) !=
+          (size_t)session->echo_count)
+    code = APP_FAIL_FORMAT;
+  for (layer_index = 0; code == APP_OKAY && layer_index < session->model->form.layer_count;
+       ++layer_index) {
+    const layer_wing *wing = &session->model->wing_list[layer_index];
+    size_t row_bytes, keep_bytes;
+    int row_count;
+    if (wing->share_flag || !session->key_store[layer_index]) continue;
+    row_count = keep_row_count(session, wing);
+    row_bytes = (size_t)wing->kv_count * (size_t)wing->head_size;
+    keep_bytes = row_bytes * (size_t)row_count;
+    if (row_count < 1) continue;
+    if (fwrite(session->key_store[layer_index], cache_slot_bytes(session->key_grid[layer_index]),
+               keep_bytes, handle) != keep_bytes ||
+        fwrite(session->value_store[layer_index],
+               cache_slot_bytes(session->value_grid[layer_index]), keep_bytes, handle) !=
+            keep_bytes)
+      code = APP_FAIL_FORMAT;
+  }
+  if (code == APP_OKAY &&
+      (fwrite(session->key_peak, sizeof(float), (size_t)session->model->form.layer_count, handle) !=
+           (size_t)session->model->form.layer_count ||
+       fwrite(session->value_peak, sizeof(float), (size_t)session->model->form.layer_count,
+              handle) != (size_t)session->model->form.layer_count))
+    code = APP_FAIL_FORMAT;
+  if (fclose(handle) != 0) code = APP_FAIL_FORMAT;
+  return code;
+}
+
+app_code session_load(app_session *session, const char *path_text, uint64_t *stamp_out) {
+  FILE *handle;
+  char mark_room[KEEP_MARK_SIZE];
+  uint64_t head_list[6];
+  int layer_index, fill_count, echo_count;
+  app_code code = APP_OKAY;
+  if (!session || !path_text) return APP_FAIL_ARGUMENT;
+  if (stamp_out) *stamp_out = 0;
+  handle = fopen(path_text, "rb");
+  if (!handle) return APP_FAIL_MISSING;
+  if (fread(mark_room, 1, KEEP_MARK_SIZE, handle) != KEEP_MARK_SIZE ||
+      memcmp(mark_room, KEEP_MARK_TEXT, KEEP_MARK_SIZE) != 0 ||
+      fread(head_list, sizeof(uint64_t), 6, handle) != 6) {
+    fclose(handle);
+    return APP_FAIL_FORMAT;
+  }
+  /* A cache belongs to the shapes it was written from.  Reading one into a
+   * session laid out differently would be a conversation the model never had,
+   * so it is refused rather than made to fit. */
+  if (head_list[0] != keep_mark(session) ||
+      head_list[4] != (uint64_t)session->model->form.layer_count ||
+      head_list[5] != (uint64_t)session->model->setup.cache_bits) {
+    fclose(handle);
+    return APP_FAIL_STATE;
+  }
+  fill_count = (int)head_list[2];
+  echo_count = (int)head_list[3];
+  if (fill_count < 0 || fill_count > session->model->form.window_limit || echo_count < 0 ||
+      echo_count > session->echo_limit) {
+    fclose(handle);
+    return APP_FAIL_FORMAT;
+  }
+
+  /* Whatever is read replaces what the session held, and a read that stops
+   * half way leaves it cleared rather than half a conversation. */
+  session_reset(session);
+  if (echo_count > 0 &&
+      fread(session->echo_room, sizeof(int32_t), (size_t)echo_count, handle) != (size_t)echo_count)
+    code = APP_FAIL_FORMAT;
+  session->fill_count = fill_count;
+  for (layer_index = 0; code == APP_OKAY && layer_index < session->model->form.layer_count;
+       ++layer_index) {
+    const layer_wing *wing = &session->model->wing_list[layer_index];
+    size_t keep_bytes;
+    int row_count;
+    if (wing->share_flag || !session->key_store[layer_index]) continue;
+    row_count = keep_row_count(session, wing);
+    keep_bytes = (size_t)wing->kv_count * (size_t)wing->head_size * (size_t)row_count;
+    if (row_count < 1) continue;
+    if (fread(session->key_store[layer_index], cache_slot_bytes(session->key_grid[layer_index]),
+              keep_bytes, handle) != keep_bytes ||
+        fread(session->value_store[layer_index], cache_slot_bytes(session->value_grid[layer_index]),
+              keep_bytes, handle) != keep_bytes)
+      code = APP_FAIL_FORMAT;
+  }
+  if (code == APP_OKAY &&
+      (fread(session->key_peak, sizeof(float), (size_t)session->model->form.layer_count, handle) !=
+           (size_t)session->model->form.layer_count ||
+       fread(session->value_peak, sizeof(float), (size_t)session->model->form.layer_count,
+             handle) != (size_t)session->model->form.layer_count))
+    code = APP_FAIL_FORMAT;
+  fclose(handle);
+  if (code != APP_OKAY) {
+    session_reset(session);
+    return code;
+  }
+  session->echo_count = echo_count;
+  if (stamp_out) *stamp_out = head_list[1];
+  return APP_OKAY;
+}
+
+int session_ids(const app_session *session, int32_t *id_list, int id_limit) {
+  if (!session) return -1;
+  if (!id_list || id_limit < session->echo_count) return session->echo_count;
+  memcpy(id_list, session->echo_room, sizeof(int32_t) * (size_t)session->echo_count);
+  return session->echo_count;
 }
 
 int token_frame_media(const app_model *model, const char *user_text, app_media_span *span_list,

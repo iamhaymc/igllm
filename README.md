@@ -55,8 +55,8 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 
 Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
 `--threads`, `--window`, `--cache`, `--heat`, `--top-k`, `--top-p`,
-`--echo-penalty`, `--seed`, `--loop`, `--raw`, `--verbose`. Run `igllm --help`
-for the full list.
+`--echo-penalty`, `--seed`, `--loop`, `--keep`, `--raw`, `--verbose`. Run
+`igllm --help` for the full list.
 
 `chat --loop` keeps the turn open and reads more from standard input, so a
 conversation carries: what the model answered stays in the session's cache and
@@ -69,6 +69,18 @@ each is holding, `/drop` closes one, `/help` lists them all.
 Several conversations at once is the point of the split between a model and a
 session: the weights are mapped once and each conversation costs only its own
 cache, which `--window` sizes and `/list` reports.
+
+`--keep <path>` holds the prompt's cache in a file and reuses it next time. On
+the shipped export a 687 id prompt takes 39 seconds to prime and 2.7 seconds to
+read back, and the answer is the same to the byte. What is written is the ids
+the session was fed and the rows of the cache that carry anything, so the file
+is the size of the prompt rather than of the window — 21 MiB for that prompt,
+or 5 MiB with `--cache 8`. It is reused where the file's ids begin the prompt
+about to run, and replaced where they do not; a prompt with a picture in it is
+matched on the rows the tower made rather than on the ids, because two pictures
+lay down the same placeholder ids. It holds a prompt rather than a
+conversation: it is written before the first token is sampled, so a rerun starts
+where the last run started.
 
 `--cache 8` holds the key and value cache as bytes, on the eight bit float grid
 the export calibrates static ranges for. It is off by default. On the shipped
