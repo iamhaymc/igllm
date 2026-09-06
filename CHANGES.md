@@ -2570,7 +2570,7 @@ before. That is an argument, not a run, and it is worth saying which.
 
 ---
 
-## 0.8.5 — the cache is read once for the heads that share it, and jpeg
+## 0.8.5 — the cache is read once for the heads that share it, and the pictures
 
 ### Scope
 
@@ -2578,11 +2578,13 @@ before. That is an argument, not a run, and it is worth saying which.
 restructuring 0.8.4 arrived at while measuring the byte cache: eight heads read
 the same cached row and the loop read it eight times. The second was the reader
 that was missing — most pictures a caller actually has are jpeg, and `--image`
-refused all of them.
+refused all of them. The item under it, the range of png the reader would not
+take, is done here too.
 
-Both are done here. The first moves no bit of any result and takes back almost
-all of what the byte cache cost. The second is a new decoder of about four
-hundred lines with an encoder of its own beside it in the tests.
+The first moves no bit of any result and takes back almost all of what the byte
+cache cost. The second is a new decoder of about four hundred lines, and the
+third turns out to be one loop rather than two features; both have an encoder of
+their own beside them in the tests.
 
 ### Reading a cached row once for all the heads that share it
 
@@ -2748,9 +2750,53 @@ decoder is not in the comparison at all, and a jpeg case is held to the same flo
 as a png one without any change to the harness. The item is closed rather than
 carried.
 
+
+### Reading the rest of png
+
+The png reader took eight and sixteen bit samples and non-interlaced files. It
+takes every depth the format defines now — grey at one, two, four, eight and
+sixteen, palette at one through eight, RGB and the two alpha forms at eight and
+sixteen — and it reads interlaced files.
+
+The two turned out to be one change. An interlaced file is seven lattices, each
+a picture of its own in the stream: its own rows, its own filter byte a row, and
+its filters looking back only within the lattice. A file that is not interlaced
+is the same walk with one lattice that catches every pixel. So `png_read` grew a
+pass loop with one shape rather than two paths, `png_pass_bytes` rounds a row up
+to the byte where a depth packs more than one sample into one, and `png_sample`
+reads a sample at whatever the depth packs it — two bytes big endian at sixteen,
+one at eight, and the high bits of a byte before the low ones below that. The
+filter still walks whole bytes with a step of one where a pixel is narrower than
+a byte, which is what the format says.
+
+The one place a lattice is not simply a smaller picture is where it catches no
+pixel at all. A lattice with rows but no columns contributes nothing to the
+stream, and counting it as a filter byte a row makes the reader expect more
+bytes than the file carries. That is a picture narrower than the lattice — three
+pixels across, or one — and it is the case `test_png_wide` writes on purpose.
+
+`test_png_wide` carries a writer of its own: its own chunk framing and check
+values, its own line filters applied forward from the definitions, its own bit
+packing, and a deflate stream of stored blocks, which is a compressor the test
+does not need to have. Every depth of grey and of palette, interlaced and not,
+the wider kinds interlaced, a picture smaller than the lattice and a picture of
+one pixel — twenty-six fixtures, each held to the samples it was built from
+exactly rather than to a tolerance, because nothing in a png is lossy.
+
+The empty lattice is the reason those fixtures exist. Pillow does not write
+interlaced png at all — it accepts the flag and ignores it — so the hundred and
+ninety-two files this reader was first checked against libpng with were every
+one of them non-interlaced, and the bug lived through all of them. It failed on
+the first two fixtures the suite wrote. The cross-check runs the other way round
+now: the suite's own fixtures are read back by libpng, thirteen of them
+interlaced, and the two readers agree on all of them.
+
 ### Everything else
 
 The engine end to end on the shipped export, one scene written as a png, as a
 4:4:4 jpeg and as a 4:2:0 jpeg: three descriptions of the same building, sky,
 sun and grass. `--image` takes jpeg everywhere it takes png, including in the
 media parity workflows.
+
+The suite is 434 tests from 390, clean on the scalar, SSE2 and AVX2 backends and
+under the address and undefined behaviour sanitizers.

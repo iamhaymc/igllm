@@ -2861,6 +2861,49 @@ static void png_unfilter(uint8_t *raw_data, int high_count, size_t line_bytes, i
   }
 }
 
+/* The Adam7 lattice: where each of the seven passes of an interlaced file
+ * starts, and how far apart the samples it carries are.  A file that is not
+ * interlaced is one pass whose lattice is every pixel, which is why the walk
+ * below has one shape rather than two. */
+static const uint8_t png_pass_from_x[7] = {0, 4, 0, 2, 0, 1, 0};
+static const uint8_t png_pass_from_y[7] = {0, 0, 4, 0, 2, 0, 1};
+static const uint8_t png_pass_step_x[7] = {8, 8, 4, 4, 2, 2, 1};
+static const uint8_t png_pass_step_y[7] = {8, 8, 8, 4, 4, 2, 2};
+
+static void png_pass_shape(int weave_mark, int pass_index, int *from_x, int *from_y, int *step_x,
+                           int *step_y) {
+  *from_x = weave_mark ? png_pass_from_x[pass_index] : 0;
+  *from_y = weave_mark ? png_pass_from_y[pass_index] : 0;
+  *step_x = weave_mark ? png_pass_step_x[pass_index] : 1;
+  *step_y = weave_mark ? png_pass_step_y[pass_index] : 1;
+}
+
+/* How many of a lattice's samples fall inside the picture, in each direction. */
+static int png_pass_span(int total_count, int from_index, int step_count) {
+  int span = (total_count - from_index + step_count - 1) / step_count;
+  return span > 0 ? span : 0;
+}
+
+/* The bytes one row of a lattice occupies, rounded up to the byte where the
+ * depth packs more than one sample into one. */
+static size_t png_pass_bytes(int wide_count, int lane_count, int deep_count) {
+  return ((size_t)wide_count * (size_t)lane_count * (size_t)deep_count + 7u) / 8u;
+}
+
+/* One sample out of an unfiltered row, at whatever the depth packs it: two
+ * bytes big endian at sixteen, one byte at eight, and below that the high bits
+ * of a byte before the low ones. */
+static int png_sample(const uint8_t *line_data, int slot_index, int deep_count) {
+  if (deep_count == 16)
+    return ((int)line_data[(size_t)slot_index * 2] << 8) | line_data[(size_t)slot_index * 2 + 1];
+  if (deep_count == 8) return line_data[slot_index];
+  {
+    int per_byte = 8 / deep_count;
+    int shift_count = 8 - deep_count * (slot_index % per_byte + 1);
+    return (line_data[slot_index / per_byte] >> shift_count) & ((1 << deep_count) - 1);
+  }
+}
+
 static app_code png_read(const uint8_t *file_data, size_t file_size, flat_grid *grid_out) {
   static const uint8_t mark_list[8] = {137, 'P', 'N', 'G', 13, 10, 26, 10};
   uint8_t *palette_data = NULL;
@@ -2868,7 +2911,7 @@ static app_code png_read(const uint8_t *file_data, size_t file_size, flat_grid *
   uint8_t *raw_data = NULL;
   size_t pack_size = 0, pack_fill = 0, raw_size = 0, line_bytes = 0, walk;
   int wide_count = 0, high_count = 0, deep_count = 0, kind_mark = -1, weave_mark = 0;
-  int lane_count = 0, step_bytes, band_count, pass_index;
+  int lane_count = 0, step_bytes, band_count, pass_index, pass_count, turn_index;
   int high_index, wide_index, band_index;
   app_code code = APP_FAIL_FORMAT;
   float level_span;
@@ -2879,7 +2922,7 @@ static app_code png_read(const uint8_t *file_data, size_t file_size, flat_grid *
   /* Two passes: the first reads the header and measures the payload, the
    * second copies it.  A PNG may split its data over any number of chunks and
    * nothing announces the total, so one pass would mean growing a buffer. */
-  for (pass_index = 0; pass_index < 2; ++pass_index) {
+  for (turn_index = 0; turn_index < 2; ++turn_index) {
     walk = 8;
     pack_fill = 0;
     while (walk + 12 <= file_size) {
@@ -2894,13 +2937,13 @@ static app_code png_read(const uint8_t *file_data, size_t file_size, flat_grid *
         deep_count = body_data[8];
         kind_mark = body_data[9];
         weave_mark = body_data[12];
-      } else if (memcmp(name_text, "PLTE", 4) == 0 && pass_index == 1) {
+      } else if (memcmp(name_text, "PLTE", 4) == 0 && turn_index == 1) {
         mem_free(palette_data);
         palette_data = (uint8_t *)mem_clear(768);
         if (!palette_data) { code = APP_FAIL_MEMORY; goto png_done; }
         memcpy(palette_data, body_data, body_size < 768u ? (size_t)body_size : 768u);
       } else if (memcmp(name_text, "IDAT", 4) == 0) {
-        if (pass_index == 0) {
+        if (turn_index == 0) {
           pack_size += body_size;
         } else {
           if (pack_fill + body_size > pack_size) goto png_done;
@@ -2912,37 +2955,63 @@ static app_code png_read(const uint8_t *file_data, size_t file_size, flat_grid *
       }
       walk += 12 + (size_t)body_size;
     }
-    if (pass_index == 0) {
+    if (turn_index == 0) {
       if (wide_count < 1 || high_count < 1 || pack_size == 0) goto png_done;
       if (wide_count > MEDIA_SIDE_LIMIT || high_count > MEDIA_SIDE_LIMIT) {
         code = APP_FAIL_SUPPORT;
         goto png_done;
       }
-      if (weave_mark != 0 || (deep_count != 8 && deep_count != 16)) {
-        code = APP_FAIL_SUPPORT; /* interlaced, or a sub-byte depth */
-        goto png_done;
-      }
+      if (weave_mark != 0 && weave_mark != 1) { code = APP_FAIL_SUPPORT; goto png_done; }
+      /* Each colour kind allows its own set of depths and nothing else, so the
+       * two are checked together rather than one and then the other. */
       switch (kind_mark) {
-        case 0: lane_count = 1; break;
+        case 0: lane_count = 1; break; /* grey: 1, 2, 4, 8, 16 */
         case 2: lane_count = 3; break;
-        case 3: lane_count = 1; break;
+        case 3: lane_count = 1; break; /* palette: 1, 2, 4, 8 */
         case 4: lane_count = 2; break;
         case 6: lane_count = 4; break;
         default: code = APP_FAIL_SUPPORT; goto png_done;
       }
-      if (kind_mark == 3 && deep_count != 8) { code = APP_FAIL_SUPPORT; goto png_done; }
+      if (deep_count != 1 && deep_count != 2 && deep_count != 4 && deep_count != 8 &&
+          deep_count != 16) {
+        code = APP_FAIL_SUPPORT;
+        goto png_done;
+      }
+      if (kind_mark != 0 && kind_mark != 3 && deep_count < 8) {
+        code = APP_FAIL_SUPPORT;
+        goto png_done;
+      }
+      if (kind_mark == 3 && deep_count == 16) { code = APP_FAIL_SUPPORT; goto png_done; }
       pack_data = (uint8_t *)mem_clear(pack_size);
       if (!pack_data) { code = APP_FAIL_MEMORY; goto png_done; }
     }
   }
 
-  step_bytes = lane_count * (deep_count / 8);
-  line_bytes = (size_t)wide_count * (size_t)step_bytes;
-  raw_size = (line_bytes + 1) * (size_t)high_count;
+  /* A byte of filter carries the width of one pixel, or one byte where a pixel
+   * is narrower than that. */
+  step_bytes = lane_count * deep_count / 8;
+  if (step_bytes < 1) step_bytes = 1;
+
+  /* Seven lattices where the file is interlaced and one where it is not.  Each
+   * of them is a picture of its own in the stream: its own rows, its own filter
+   * byte a row, and its filters looking back only within the lattice. */
+  pass_count = weave_mark ? 7 : 1;
+  raw_size = 0;
+  for (pass_index = 0; pass_index < pass_count; ++pass_index) {
+    int from_x, from_y, step_x, step_y, pass_wide, pass_high;
+    png_pass_shape(weave_mark, pass_index, &from_x, &from_y, &step_x, &step_y);
+    pass_wide = png_pass_span(wide_count, from_x, step_x);
+    pass_high = png_pass_span(high_count, from_y, step_y);
+    /* A lattice that catches no pixel is not in the stream at all, and a
+     * lattice with rows but no columns catches none: a picture narrower than
+     * the lattice is the case that tells the two apart. */
+    if (pass_wide < 1 || pass_high < 1) continue;
+    raw_size += (size_t)pass_high * (png_pass_bytes(pass_wide, lane_count, deep_count) + 1u);
+  }
+  if (raw_size == 0) goto png_done;
   raw_data = (uint8_t *)mem_clear(raw_size);
   if (!raw_data) { code = APP_FAIL_MEMORY; goto png_done; }
   if (puff_run(pack_data, pack_fill, raw_data, raw_size) != (long)raw_size) goto png_done;
-  png_unfilter(raw_data, high_count, line_bytes, step_bytes);
 
   /* Alpha is dropped rather than composited: a tower is shown the colour the
    * file recorded, and inventing a background would be a preprocessing choice
@@ -2950,26 +3019,36 @@ static app_code png_read(const uint8_t *file_data, size_t file_size, flat_grid *
   band_count = (kind_mark == 2 || kind_mark == 6 || kind_mark == 3) ? 3 : 1;
   code = grid_open(grid_out, wide_count, high_count, band_count);
   if (code != APP_OKAY) goto png_done;
-  level_span = deep_count == 16 ? 65535.0f : 255.0f;
-  for (high_index = 0; high_index < high_count; ++high_index) {
-    const uint8_t *line_data = raw_data + (size_t)high_index * (line_bytes + 1) + 1;
-    for (wide_index = 0; wide_index < wide_count; ++wide_index) {
-      const uint8_t *cell_data = line_data + (size_t)wide_index * (size_t)step_bytes;
-      float *out_data = grid_at(grid_out, high_index, wide_index);
-      if (kind_mark == 3) {
-        int slot_index = cell_data[0];
-        for (band_index = 0; band_index < 3; ++band_index)
+  level_span = (float)((1 << deep_count) - 1);
+  if (deep_count == 16) level_span = 65535.0f;
+  walk = 0;
+  for (pass_index = 0; pass_index < pass_count; ++pass_index) {
+    int from_x, from_y, step_x, step_y, pass_wide, pass_high;
+    png_pass_shape(weave_mark, pass_index, &from_x, &from_y, &step_x, &step_y);
+    pass_wide = png_pass_span(wide_count, from_x, step_x);
+    pass_high = png_pass_span(high_count, from_y, step_y);
+    if (pass_wide < 1 || pass_high < 1) continue;
+    line_bytes = png_pass_bytes(pass_wide, lane_count, deep_count);
+    png_unfilter(raw_data + walk, pass_high, line_bytes, step_bytes);
+    for (high_index = 0; high_index < pass_high; ++high_index) {
+      const uint8_t *line_data = raw_data + walk + (size_t)high_index * (line_bytes + 1) + 1;
+      for (wide_index = 0; wide_index < pass_wide; ++wide_index) {
+        float *out_data =
+            grid_at(grid_out, from_y + high_index * step_y, from_x + wide_index * step_x);
+        if (kind_mark == 3) {
+          int slot_index = png_sample(line_data, wide_index, deep_count);
+          for (band_index = 0; band_index < 3; ++band_index)
+            out_data[band_index] =
+                palette_data ? (float)palette_data[slot_index * 3 + band_index] / 255.0f : 0.0f;
+          continue;
+        }
+        for (band_index = 0; band_index < band_count; ++band_index)
           out_data[band_index] =
-              palette_data ? (float)palette_data[slot_index * 3 + band_index] / 255.0f : 0.0f;
-        continue;
-      }
-      for (band_index = 0; band_index < band_count; ++band_index) {
-        const uint8_t *lane_data = cell_data + (size_t)band_index * (size_t)(deep_count / 8);
-        int level_value =
-            deep_count == 16 ? (((int)lane_data[0] << 8) | lane_data[1]) : lane_data[0];
-        out_data[band_index] = (float)level_value / level_span;
+              (float)png_sample(line_data, wide_index * lane_count + band_index, deep_count) /
+              level_span;
       }
     }
+    walk += (line_bytes + 1) * (size_t)pass_high;
   }
   code = APP_OKAY;
 

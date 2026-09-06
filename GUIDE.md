@@ -332,10 +332,15 @@ floats or a run of samples.
 - `puff_run` — an inflate reader: stored, fixed and dynamic Huffman blocks,
   with the zlib wrapper skipped when one is present. It is here because a PNG
   cannot be read without one and a third party decoder is not an option.
-- `png_read` — eight and sixteen bit grey, RGB, palette, and the two alpha
-  forms, non-interlaced. All five line filters are undone. Alpha is dropped
-  rather than composited: inventing a background is a preprocessing choice
-  this layer has no business making.
+- `png_read` — grey at one, two, four, eight and sixteen bits, palette at one
+  to eight, RGB and the two alpha forms at eight and sixteen, interlaced or
+  not. All five line filters are undone. An interlaced file is seven lattices,
+  each a picture of its own in the stream with its own rows and its own filter
+  byte a row, and one that catches no pixel is not in the stream at all; a file
+  that is not interlaced is the same walk with one lattice that catches
+  everything, which is why there is one path rather than two. Alpha is dropped
+  rather than composited: inventing a background is a preprocessing choice this
+  layer has no business making.
 - `jpeg_read` — baseline and extended sequential jpeg: the marker walk, a
   canonical Huffman decode per component, dequantization, an eight by eight
   inverse cosine transform, chroma upsampling at whatever the sampling factors
@@ -846,14 +851,22 @@ miniature checkpoint — config, tokenizer, and every tensor the loader binds,
 once dense and once with a mixture block — and asserts that a batched prefill
 reaches exactly the logits produced by feeding the same tokens one at a time.
 
-`test_puff`, `test_image`, `test_jpeg`, `test_scale`, `test_wave` and
-`test_mel` cover the media layer. The inflate reader is held against a stored block assembled in the
+`test_puff`, `test_image`, `test_png_wide`, `test_jpeg`, `test_scale`,
+`test_wave` and `test_mel` cover the media layer. The inflate reader is held against a stored block assembled in the
 test and against a dynamic Huffman block produced by an independent compressor
 over four hundred bytes the test can regenerate from a formula; a truncated
 stream and one that would overrun its room are both required to be refused. The
 png fixture is a twelve by eight picture written by an independent encoder with
 the five line filters used in turn, and the same picture is written again as a
 pnm and as a bottom-up bitmap, so the three readers are held to one answer.
+`test_png_wide` carries a writer of its own for the range the reader grew into:
+its own chunk framing and check values, its own line filters applied forward
+from the definitions, its own bit packing, and a deflate stream of stored blocks
+— which is a compressor the test does not need to have. Every depth of grey and
+of palette, interlaced and not, and the wider kinds interlaced, have to come
+back exactly; so do a picture smaller than the lattice and a picture of one
+pixel, which are the cases that tell a lattice with no columns apart from one
+that is simply absent.
 `test_jpeg` carries a baseline encoder of its own — its own forward transform
 in double precision, its own canonical code assignment, its own bit writer —
 and quantizes with tables of ones, so a round trip loses only what the two

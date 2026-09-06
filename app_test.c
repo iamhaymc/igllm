@@ -1277,6 +1277,348 @@ static void test_image(void) {
   test_true(image_read(path_text, &grid) != APP_OKAY, "a missing file is refused");
 }
 
+/* An independent png writer, so the reader's wider range is checked against the
+ * format rather than against files it was developed on.  It shares nothing with
+ * the reader: its own chunk framing and check values, its own line filters
+ * applied forward from the definitions, its own bit packing, and a deflate
+ * stream of stored blocks — which is a compressor the test does not need to
+ * have. */
+typedef struct test_png_room {
+  uint8_t *file_data;
+  size_t   file_fill;
+  size_t   file_room;
+  int      fault_flag;
+} test_png_room;
+
+static void test_png_byte(test_png_room *room, int byte_value) {
+  if (room->file_fill >= room->file_room) { room->fault_flag = 1; return; }
+  room->file_data[room->file_fill++] = (uint8_t)byte_value;
+}
+
+static void test_png_word(test_png_room *room, uint32_t word_value) {
+  test_png_byte(room, (int)((word_value >> 24) & 0xFF));
+  test_png_byte(room, (int)((word_value >> 16) & 0xFF));
+  test_png_byte(room, (int)((word_value >> 8) & 0xFF));
+  test_png_byte(room, (int)(word_value & 0xFF));
+}
+
+static uint32_t test_png_crc(const uint8_t *data, size_t byte_count) {
+  uint32_t value_now = 0xFFFFFFFFu;
+  size_t slot_index;
+  int bit_index;
+  for (slot_index = 0; slot_index < byte_count; ++slot_index) {
+    value_now ^= data[slot_index];
+    for (bit_index = 0; bit_index < 8; ++bit_index)
+      value_now = (value_now >> 1) ^ (0xEDB88320u & (uint32_t)(0u - (value_now & 1u)));
+  }
+  return value_now ^ 0xFFFFFFFFu;
+}
+
+static uint32_t test_png_adler(const uint8_t *data, size_t byte_count) {
+  uint32_t low_sum = 1, high_sum = 0;
+  size_t slot_index;
+  for (slot_index = 0; slot_index < byte_count; ++slot_index) {
+    low_sum = (low_sum + data[slot_index]) % 65521u;
+    high_sum = (high_sum + low_sum) % 65521u;
+  }
+  return (high_sum << 16) | low_sum;
+}
+
+static void test_png_chunk(test_png_room *room, const char *name_text, const uint8_t *body_data,
+                           size_t body_size) {
+  uint8_t *name_from;
+  size_t slot_index;
+  test_png_word(room, (uint32_t)body_size);
+  name_from = room->file_data + room->file_fill;
+  for (slot_index = 0; slot_index < 4; ++slot_index) test_png_byte(room, name_text[slot_index]);
+  for (slot_index = 0; slot_index < body_size; ++slot_index) test_png_byte(room, body_data[slot_index]);
+  if (room->fault_flag) return;
+  test_png_word(room, test_png_crc(name_from, body_size + 4u));
+}
+
+/* The sample a pixel carries, and the palette a slot names.  Both are formulas
+ * so the check can restate them without holding the picture. */
+static int test_png_level(int wide_index, int high_index, int band_index, int deep_count) {
+  int span_value = deep_count >= 16 ? 65535 : (1 << deep_count) - 1;
+  int seed_value = wide_index * 7 + high_index * 13 + band_index * 29;
+  return (seed_value * 2654435761u) % (unsigned)(span_value + 1);
+}
+
+static int test_png_shade(int slot_index, int band_index) {
+  return (slot_index * (11 + band_index * 9) + band_index * 37) & 0xFF;
+}
+
+static void test_png_pack(uint8_t *row_data, int slot_index, int deep_count, int value_now) {
+  if (deep_count == 16) {
+    row_data[(size_t)slot_index * 2] = (uint8_t)((value_now >> 8) & 0xFF);
+    row_data[(size_t)slot_index * 2 + 1] = (uint8_t)(value_now & 0xFF);
+    return;
+  }
+  if (deep_count == 8) {
+    row_data[slot_index] = (uint8_t)value_now;
+    return;
+  }
+  {
+    int per_byte = 8 / deep_count;
+    int shift_count = 8 - deep_count * (slot_index % per_byte + 1);
+    row_data[slot_index / per_byte] |= (uint8_t)((value_now & ((1 << deep_count) - 1)) << shift_count);
+  }
+}
+
+/* The forward filters, from the definitions rather than from the reader's
+ * inverse: each byte less a prediction from the byte to its left, the one above
+ * it, and the one above that one. */
+static int test_png_guess(int rule_mark, int left_value, int over_value, int corner_value) {
+  int near_value, gap_left, gap_over, gap_corner;
+  switch (rule_mark) {
+    case 1: return left_value;
+    case 2: return over_value;
+    case 3: return (left_value + over_value) / 2;
+    case 4:
+      near_value = left_value + over_value - corner_value;
+      gap_left = near_value > left_value ? near_value - left_value : left_value - near_value;
+      gap_over = near_value > over_value ? near_value - over_value : over_value - near_value;
+      gap_corner = near_value > corner_value ? near_value - corner_value : corner_value - near_value;
+      if (gap_left <= gap_over && gap_left <= gap_corner) return left_value;
+      return gap_over <= gap_corner ? over_value : corner_value;
+    default: return 0;
+  }
+}
+
+static int test_png_write(const char *leaf_text, int wide_count, int high_count, int deep_count,
+                          int kind_mark, int weave_mark) {
+  static const uint8_t mark_list[8] = {137, 'P', 'N', 'G', 13, 10, 26, 10};
+  static const uint8_t from_x_list[7] = {0, 4, 0, 2, 0, 1, 0};
+  static const uint8_t from_y_list[7] = {0, 0, 4, 0, 2, 0, 1};
+  static const uint8_t step_x_list[7] = {8, 8, 4, 4, 2, 2, 1};
+  static const uint8_t step_y_list[7] = {8, 8, 8, 4, 4, 2, 2};
+  test_png_room room;
+  uint8_t head_list[13], *raw_data, *plain_data, *last_data, *this_data;
+  size_t raw_room, raw_fill = 0, line_room, walk;
+  int lane_count = kind_mark == 2 ? 3 : (kind_mark == 6 ? 4 : (kind_mark == 4 ? 2 : 1));
+  int step_bytes = lane_count * deep_count / 8;
+  int pass_count = weave_mark ? 7 : 1, pass_index, okay_flag, slot_index;
+
+  if (step_bytes < 1) step_bytes = 1;
+  memset(&room, 0, sizeof(room));
+  room.file_room = 4096u + (size_t)wide_count * (size_t)high_count * (size_t)lane_count * 8u;
+  room.file_data = (uint8_t *)mem_clear(room.file_room);
+  line_room = ((size_t)wide_count * (size_t)lane_count * (size_t)deep_count + 7u) / 8u + 1u;
+  raw_room = (line_room + 1u) * (size_t)high_count + 64u;
+  raw_data = (uint8_t *)mem_clear(raw_room);
+  last_data = (uint8_t *)mem_clear(line_room);
+  this_data = (uint8_t *)mem_clear(line_room);
+  plain_data = (uint8_t *)mem_clear(line_room);
+  if (!room.file_data || !raw_data || !last_data || !this_data || !plain_data) {
+    mem_free(room.file_data);
+    mem_free(raw_data);
+    mem_free(last_data);
+    mem_free(this_data);
+    mem_free(plain_data);
+    return 0;
+  }
+
+  /* The raw stream: every lattice in turn, every row of it filtered against the
+   * row above it inside that lattice alone. */
+  for (pass_index = 0; pass_index < pass_count; ++pass_index) {
+    int from_x = weave_mark ? from_x_list[pass_index] : 0;
+    int from_y = weave_mark ? from_y_list[pass_index] : 0;
+    int step_x = weave_mark ? step_x_list[pass_index] : 1;
+    int step_y = weave_mark ? step_y_list[pass_index] : 1;
+    int pass_wide = (wide_count - from_x + step_x - 1) / step_x;
+    int pass_high = (high_count - from_y + step_y - 1) / step_y;
+    size_t pass_bytes = ((size_t)pass_wide * (size_t)lane_count * (size_t)deep_count + 7u) / 8u;
+    int high_index, wide_index, band_index;
+    if (pass_wide < 1 || pass_high < 1) continue;
+    memset(last_data, 0, line_room);
+    for (high_index = 0; high_index < pass_high; ++high_index) {
+      int rule_mark = (high_index + pass_index) % 5;
+      memset(plain_data, 0, line_room);
+      for (wide_index = 0; wide_index < pass_wide; ++wide_index)
+        for (band_index = 0; band_index < lane_count; ++band_index) {
+          int level_value =
+              kind_mark == 3
+                  ? test_png_level(from_x + wide_index * step_x, from_y + high_index * step_y, 0,
+                                   deep_count)
+                  : test_png_level(from_x + wide_index * step_x, from_y + high_index * step_y,
+                                   band_index, deep_count);
+          test_png_pack(plain_data, wide_index * lane_count + band_index, deep_count, level_value);
+        }
+      for (slot_index = 0; slot_index < (int)pass_bytes; ++slot_index) {
+        int left_value = slot_index >= step_bytes ? plain_data[slot_index - step_bytes] : 0;
+        int corner_value = slot_index >= step_bytes ? last_data[slot_index - step_bytes] : 0;
+        this_data[slot_index] =
+            (uint8_t)((plain_data[slot_index] -
+                       test_png_guess(rule_mark, left_value, last_data[slot_index], corner_value)) &
+                      0xFF);
+      }
+      raw_data[raw_fill++] = (uint8_t)rule_mark;
+      memcpy(raw_data + raw_fill, this_data, pass_bytes);
+      raw_fill += pass_bytes;
+      memcpy(last_data, plain_data, pass_bytes);
+    }
+  }
+
+  for (slot_index = 0; slot_index < 8; ++slot_index) test_png_byte(&room, mark_list[slot_index]);
+  head_list[0] = (uint8_t)((wide_count >> 24) & 0xFF);
+  head_list[1] = (uint8_t)((wide_count >> 16) & 0xFF);
+  head_list[2] = (uint8_t)((wide_count >> 8) & 0xFF);
+  head_list[3] = (uint8_t)(wide_count & 0xFF);
+  head_list[4] = (uint8_t)((high_count >> 24) & 0xFF);
+  head_list[5] = (uint8_t)((high_count >> 16) & 0xFF);
+  head_list[6] = (uint8_t)((high_count >> 8) & 0xFF);
+  head_list[7] = (uint8_t)(high_count & 0xFF);
+  head_list[8] = (uint8_t)deep_count;
+  head_list[9] = (uint8_t)kind_mark;
+  head_list[10] = 0;
+  head_list[11] = 0;
+  head_list[12] = (uint8_t)weave_mark;
+  test_png_chunk(&room, "IHDR", head_list, sizeof(head_list));
+  if (kind_mark == 3) {
+    uint8_t shade_list[768];
+    int slot_count = 1 << deep_count;
+    for (slot_index = 0; slot_index < slot_count; ++slot_index) {
+      shade_list[slot_index * 3] = (uint8_t)test_png_shade(slot_index, 0);
+      shade_list[slot_index * 3 + 1] = (uint8_t)test_png_shade(slot_index, 1);
+      shade_list[slot_index * 3 + 2] = (uint8_t)test_png_shade(slot_index, 2);
+    }
+    test_png_chunk(&room, "PLTE", shade_list, (size_t)slot_count * 3u);
+  }
+  {
+    /* A zlib stream of stored blocks: the two header bytes, then the raw
+     * stream in runs of at most a block, then the adler sum. */
+    uint8_t *pack_data = (uint8_t *)mem_clear(raw_fill + raw_fill / 65535u * 5u + 64u);
+    size_t pack_fill = 0;
+    if (!pack_data) {
+      mem_free(room.file_data);
+      mem_free(raw_data);
+      mem_free(last_data);
+      mem_free(this_data);
+      mem_free(plain_data);
+      return 0;
+    }
+    pack_data[pack_fill++] = 0x78;
+    pack_data[pack_fill++] = 0x01;
+    walk = 0;
+    do {
+      size_t span = raw_fill - walk > 65535u ? 65535u : raw_fill - walk;
+      pack_data[pack_fill++] = (uint8_t)(walk + span >= raw_fill ? 1 : 0);
+      pack_data[pack_fill++] = (uint8_t)(span & 0xFF);
+      pack_data[pack_fill++] = (uint8_t)((span >> 8) & 0xFF);
+      pack_data[pack_fill++] = (uint8_t)(~span & 0xFF);
+      pack_data[pack_fill++] = (uint8_t)((~span >> 8) & 0xFF);
+      memcpy(pack_data + pack_fill, raw_data + walk, span);
+      pack_fill += span;
+      walk += span;
+    } while (walk < raw_fill);
+    {
+      uint32_t sum_value = test_png_adler(raw_data, raw_fill);
+      pack_data[pack_fill++] = (uint8_t)((sum_value >> 24) & 0xFF);
+      pack_data[pack_fill++] = (uint8_t)((sum_value >> 16) & 0xFF);
+      pack_data[pack_fill++] = (uint8_t)((sum_value >> 8) & 0xFF);
+      pack_data[pack_fill++] = (uint8_t)(sum_value & 0xFF);
+    }
+    test_png_chunk(&room, "IDAT", pack_data, pack_fill);
+    mem_free(pack_data);
+  }
+  test_png_chunk(&room, "IEND", NULL, 0);
+
+  okay_flag = !room.fault_flag && test_file_write(leaf_text, room.file_data, room.file_fill);
+  mem_free(room.file_data);
+  mem_free(raw_data);
+  mem_free(last_data);
+  mem_free(this_data);
+  mem_free(plain_data);
+  return okay_flag;
+}
+
+static void test_png_check(const char *leaf_text, const char *claim_text, int wide_count,
+                           int high_count, int deep_count, int kind_mark) {
+  char path_text[1024];
+  flat_grid grid;
+  int band_want = (kind_mark == 2 || kind_mark == 6 || kind_mark == 3) ? 3 : 1;
+  int high_index, wide_index, band_index, okay_flag = 1;
+  float level_span = deep_count >= 16 ? 65535.0f : (float)((1 << deep_count) - 1);
+  path_join(path_text, sizeof(path_text), test_yard_path, leaf_text);
+  if (image_read(path_text, &grid) != APP_OKAY) {
+    test_true(0, claim_text);
+    return;
+  }
+  if (grid.wide_count != wide_count || grid.high_count != high_count ||
+      grid.band_count != band_want)
+    okay_flag = 0;
+  for (high_index = 0; okay_flag && high_index < high_count; ++high_index)
+    for (wide_index = 0; wide_index < wide_count; ++wide_index) {
+      const float *cell_data = grid_at(&grid, high_index, wide_index);
+      for (band_index = 0; band_index < band_want; ++band_index) {
+        float want_value;
+        if (kind_mark == 3)
+          want_value =
+              (float)test_png_shade(test_png_level(wide_index, high_index, 0, deep_count),
+                                    band_index) /
+              255.0f;
+        else
+          want_value =
+              (float)test_png_level(wide_index, high_index, band_index, deep_count) / level_span;
+        if (cell_data[band_index] - want_value > 1e-6f ||
+            want_value - cell_data[band_index] > 1e-6f)
+          okay_flag = 0;
+      }
+    }
+  test_true(okay_flag, claim_text);
+  grid_free(&grid);
+}
+
+/* The depths and the two lattices, over sizes chosen so that a lattice's last
+ * row is a partial byte and the smaller passes are empty. */
+static void test_png_wide(void) {
+  static const int deep_list[5] = {1, 2, 4, 8, 16};
+  char leaf_text[64], claim_text[128];
+  int deep_index, weave_mark;
+  test_open("png");
+
+  for (deep_index = 0; deep_index < 5; ++deep_index)
+    for (weave_mark = 0; weave_mark < 2; ++weave_mark) {
+      int deep_count = deep_list[deep_index];
+      snprintf(leaf_text, sizeof(leaf_text), "grey%d_%d.png", deep_count, weave_mark);
+      snprintf(claim_text, sizeof(claim_text), "%d bit grey%s decodes to its samples", deep_count,
+               weave_mark ? ", interlaced" : "");
+      if (!test_png_write(leaf_text, 13, 11, deep_count, 0, weave_mark)) {
+        test_true(0, claim_text);
+        continue;
+      }
+      test_png_check(leaf_text, claim_text, 13, 11, deep_count, 0);
+    }
+
+  for (deep_index = 0; deep_index < 4; ++deep_index)
+    for (weave_mark = 0; weave_mark < 2; ++weave_mark) {
+      int deep_count = deep_list[deep_index];
+      snprintf(leaf_text, sizeof(leaf_text), "slot%d_%d.png", deep_count, weave_mark);
+      snprintf(claim_text, sizeof(claim_text), "%d bit palette%s decodes through its table",
+               deep_count, weave_mark ? ", interlaced" : "");
+      if (!test_png_write(leaf_text, 13, 11, deep_count, 3, weave_mark)) {
+        test_true(0, claim_text);
+        continue;
+      }
+      test_png_check(leaf_text, claim_text, 13, 11, deep_count, 3);
+    }
+
+  /* The wider kinds interlaced, and a size where four of the seven lattices
+   * carry nothing at all. */
+  test_true(test_png_write("rgb8i.png", 13, 11, 8, 2, 1), "an interlaced rgb fixture is written");
+  test_png_check("rgb8i.png", "an interlaced rgb file decodes to its pixels", 13, 11, 8, 2);
+  test_true(test_png_write("rgba16i.png", 13, 11, 16, 6, 1),
+            "an interlaced sixteen bit rgba fixture is written");
+  test_png_check("rgba16i.png", "an interlaced sixteen bit rgba file drops its alpha", 13, 11, 16,
+                 6);
+  test_true(test_png_write("tiny.png", 3, 2, 4, 3, 1), "a fixture smaller than the lattice is written");
+  test_png_check("tiny.png", "a picture smaller than the lattice decodes from the passes that "
+                             "carry anything",
+                 3, 2, 4, 3);
+  test_true(test_png_write("one.png", 1, 1, 1, 0, 1), "a one pixel interlaced fixture is written");
+  test_png_check("one.png", "a one pixel interlaced file is one pass of one sample", 1, 1, 1, 0);
+}
+
 /* An independent baseline jpeg encoder, written here so that the reader is
  * checked against the format rather than against a recorded file.  It shares
  * nothing with the reader: its own forward transform in double precision, its
@@ -3539,6 +3881,7 @@ int main(void) {
   test_token();
   test_puff();
   test_image();
+  test_png_wide();
   test_jpeg();
   test_scale();
   test_cache();

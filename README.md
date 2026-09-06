@@ -20,7 +20,8 @@ party library, and no build system beyond a C compiler.
 - **vision and audio** — a bidirectional patch encoder at variable resolution
   with two dimensional rotary positions, and a conformer audio encoder with
   chunked local attention, each projecting into the text embedding space
-- **its own decoders** — png, baseline jpeg, pnm, bmp and riff wave readers, a bicubic
+- **its own decoders** — png at every depth and interlace, baseline jpeg, pnm,
+  bmp and riff wave readers, a bicubic
   resize, and a mel filterbank, none of them borrowed
 
 ## Quickstart

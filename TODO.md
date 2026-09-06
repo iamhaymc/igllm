@@ -86,16 +86,6 @@ third behind on one of them.
   twelve bits, which the extended sequential frame header allows, needs the
   tables and the level shift widened.
 
-- Read a wider range of png. The reader refuses interlaced files and bit depths
-  under eight.
-
-  How `app_diff.py` should treat a picture the two sides decode differently was
-  an open question beside the jpeg item and is closed rather than carried:
-  `diff_tower` feeds the reference the patches the engine says it read, out of
-  the activation dump, and the seam's graph half is fed the same, so the only
-  thing either half reads from the picture file is its width and height. The
-  decoder is not in the comparison, and a jpeg case is held to the same floor as
-  a png one.
 - Support more than one concurrent session per model in the CLI, and add a
   multi-turn chat loop rather than a single turn.
 - Persist and restore a session cache, so a long prompt need not be primed
@@ -116,3 +106,15 @@ third behind on one of them.
 - Build under MSVC. The suite builds clean and passes on a Windows host with
   MinGW gcc, on the scalar, SSE2 and AVX2 backends; `cl` and its `/arch:AVX2`
   path have still only been read.
+
+Three items are closed rather than carried. Baseline jpeg and the wider range of
+png both arrive in 0.8.5: png now reads grey at one, two and four bits, palette
+at one to eight, and interlaced files of every kind, so there is no legal pairing
+of depth and colour kind left that the reader refuses.  What jpeg still refuses
+is a decoder of its own and is carried above. And how `app_diff.py` should treat a picture the two
+sides decode differently — the question the jpeg item raised — turns out to be
+answered already: `diff_tower` feeds the reference the patches the engine says
+it read, out of the activation dump, and the seam's graph half is fed the same,
+so the only thing either half reads from the picture file is its width and
+height. The decoder is not in the comparison, and a jpeg case is held to the
+same floor as a png one.
