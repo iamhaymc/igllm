@@ -54,8 +54,14 @@ def engine_path():
     return os.path.join(WORK_PATH, leaf)
 
 
-def engine_build():
-    line = [sys.executable, os.path.join(ROOT_PATH, "run.py"), "build"]
+def engine_build(build_flags=()):
+    """Builds the engine, with whatever build flags the caller was given.
+
+    The flags matter here rather than being a convenience: this rebuild
+    overwrites whatever is in `build/`, so without them a `check --tuned` or a
+    `check --wide` compared a default build and said nothing about the one
+    asked for."""
+    line = [sys.executable, os.path.join(ROOT_PATH, "run.py"), "build"] + list(build_flags)
     return subprocess.call(line) == 0
 
 
@@ -252,6 +258,8 @@ def main():
                         help="checkpoint folder in huggingface layout")
     parser.add_argument("--prompts", nargs="*", default=PROMPT_LIST)
     parser.add_argument("--skip-speed", action="store_true")
+    parser.add_argument("--build", action="append", default=[],
+                        help="a flag to pass on to `run.py build`, repeatable")
     flag = parser.parse_args()
 
     # The model answers in whatever alphabet it likes, and a Windows console is
@@ -269,7 +277,7 @@ def main():
     except ImportError:
         print("skip: torch and transformers are not installed; run `python3 run.py install`")
         return 0
-    if not engine_build():
+    if not engine_build(flag.build):
         print("fail: the engine did not build")
         return 1
 

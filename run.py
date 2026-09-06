@@ -151,6 +151,11 @@ def work_check(flag):
     line = [sys.executable, os.path.join(ROOT_PATH, "app_test.py")]
     if flag.model:
         line += ["--model", flag.model]
+    # The comparison rebuilds the engine for itself, so the build flags have to
+    # reach it or it measures a different binary than the one asked for.
+    for name in ("debug", "tuned", "wide"):
+        if getattr(flag, name, False):
+            line += ["--build", "--" + name]
     step_show("check", line)
     return subprocess.call(line)
 
