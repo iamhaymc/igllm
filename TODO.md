@@ -26,7 +26,11 @@ nothing; 0.8.15 measured this one because no entry above had.
 
 0.8.13 to 0.8.16 took the step floor on that host from 43.44 ms to **34.95** and
 decode from 23.02 tokens a second to **28.61**, with `logits` and a greedy
-`chat` byte for byte unchanged. Where those went, largest first: the output head
+`chat` byte for byte unchanged. 0.9.0 then built the half of speculative
+decoding that can be measured without a proposer and found that **the most that
+idea can be worth here is 2.2x**, held down by the same output head — so the
+sweep ceiling is not the only ceiling, and the entries below are ordered by
+which of them unlocks the others. Where those went, largest first: the output head
 11.87 ms to 5.99, the four bit planes ten to eighteen percent on the unpack, and
 every plane a little on the fork and the join. `CHANGES.md` has each of them.
 
@@ -107,6 +111,284 @@ the forks.
 
 ## Speed
 
+The order below is the order to take them in, and it is a dependency order
+rather than a ranking. 0.9.0 measured what speculative decoding is worth in this
+engine and found the ceiling held down by the output head, so the head entries
+now come before the speculative one rather than beside it. Where an entry is
+only a size, its size is given against a 34.95 ms step floor on the third host.
+
+- **The feed-forward planes, which are half of every token and have never been
+  looked at.** 19.2 ms of a 34.95 ms step — **55%** — reading 475.3 MiB at 22.5
+  GiB/s where a bare four thread sweep of this host reaches 49.80. Two point one
+  times its own memory floor, which is the same ratio every other integer plane
+  sits at and is therefore not obviously a bug.
+
+  It is first on this list for one reason: **it is the largest thing here and
+  nothing has ever been written about it.** Every entry below has a history of
+  attempts; this one has none. 0.8.14's affine take moved it 10% by accident,
+  as a side effect of a change written for the four bit planes generally, and
+  nobody has asked what else is in it.
+
+  0.8.16 is the argument for looking. The output head sat at six times its
+  memory floor for four versions while three entries reasoned about why, and the
+  answer turned out to be two independent things stacked in a plane everyone had
+  assumed was fine — the wrong kernel, and then a dependency chain four times
+  deeper than the ports. Both were invisible from the outside and obvious from
+  inside. The mlp is on the well-optimized integer path with its row block
+  already in place, so it may well be near its limit; it may also not be, and
+  the cost of finding out is a profile.
+
+  Start where 0.8.16 started: **count the loop against the ports, and count the
+  chain against the loop.** `kern_row_code_level_rows` carries one accumulator a
+  row over four rows. A 1536 column row at four bits is twenty-four blocks, so
+  each chain is twenty-four dependent `vpdpbusd` — five cycles deep on this
+  class of host against two a cycle of throughput, and four chains to cover it.
+  That is the same arithmetic that was wrong for the head. Check it before
+  reaching for anything cleverer.
+
+  What is not worth retrying: the bit width (0.8.11), eight rows a block
+  (0.8.11, and again in 0.8.16 on the other path), software prefetch (0.8.11),
+  and the page walk (0.8.12).
+
+- **The output head, which runs the float kernel and not the integer one.**
+  96 MiB and 12.2% of everything a decode step reads, 12.36 ms of a 44.74 ms
+  step on the third host, and **33 G multiply-adds a second against the mlp's
+  52** — because it is not on the integer path at all.
+
+  0.8.14 settled what three versions of this entry could not. The entry used to
+  read that the head is bound by neither the memory nor the instruction count;
+  it removed an instruction from the head's supposed inner loop — a quarter of
+  it, on every other two and four bit plane in the step — and the head did not
+  move while the four bit planes moved by ten to eighteen percent. The loop
+  under test was not the loop being run.
+
+  `kern_level_ready` requires `sheet->enter_gain > 0`, the plane's
+  `input_activation_scale`, because the integer path rounds the activation onto
+  that step's grid and requires it to land exactly. **The export ships
+  `lm_head.input_activation_scale` as `0.0`** where every other projection has a
+  real one, so the head falls to `kern_row_code` and `kern_dot_code`'s float
+  spread on every token, by construction. `CHANGES.md` 0.8.14 has the
+  instrumentation and the confirmation — 4 × 262144 × 1536 column-products a
+  step, all of them on the float path.
+
+  So the old entry's puzzle is not a puzzle. The 22.7 GiB/s microbenchmark ran
+  the integer kernel; the engine runs the float one. The GiB/s gap is
+  `kern_dot_code` against `vpdpbusd`, not two bit against four. 0.8.11's
+  epilogue and 0.8.12's fold are both in the integer path and neither could ever
+  have moved this plane.
+
+  **Three routes are open, in this order.**
+
+  *The float loop the head actually runs, which 0.8.15 and 0.8.16 took most of.*
+  0.8.15 made the mask and the widening one `vpermps` against a repeating table,
+  four instructions a vector rather than five, and got 8.3%. 0.8.16 found the
+  factor that was left, and it was not the instruction count: the row carried
+  **two** accumulators over ninety-six vectors, so each was a chain of
+  forty-eight dependent multiply-adds at four cycles deep against two a cycle of
+  throughput, and the row was bound by its own chain at about four times what
+  its ports allow. Four rows at a time, each keeping its own pair and its own
+  order, is eight chains covering each other and the same sum to the last bit:
+  the head **11.20 ms to 5.99**, the step floor 15.0%, decode 17.6%. Eight rows
+  was built and is worse on this plane, as it was on the other path.
+
+  What is left is the broadcast. Three of the loop's sixteen instructions per
+  sixty-four codes are broadcasts that one `vbroadcasti32x4` could replace,
+  because sixteen bytes are sixty-four codes and four shifts of them reach
+  every one. Thirteen per sixty-four rather than sixteen. It costs a staging
+  pass — the four quarters come out in the unpack's order rather than the
+  column's, so the activations have to be laid down in that order, exactly as
+  `kern_level_stage` already does for the integer path. Take it only knowing
+  that the loop is no longer latency-bound, which is what makes counting its
+  instructions worth anything for the first time.
+
+  The head is now 5.99 ms of a 34.95 ms step, 17.1% against 27.3%, at 67 G
+  multiply-adds a second against 33. A bare four thread sweep of its 97 MiB on
+  this host is 1.9 ms, so there is about three times left in it and the two
+  routes below are where the rest of it is.
+
+  **And the batched head got neither of those two versions, which is now a
+  speculative decoding problem as well as a prefill one.** 0.8.15's `vpermps`
+  lookup and 0.8.16's row block were both written into `kern_dot_code` and
+  `kern_row_code`, which are the one lane path. The many lane path —
+  `kern_row_code_many` over `kern_code_spread` and `kern_dot_real_many` — still
+  spreads the codes to floats through scratch and reads them a lane at a time.
+  It shares the head's 96 MiB across the lanes correctly, so the sweep is not
+  the problem; what it does not have is the cheaper unpack or the deeper set of
+  accumulators.
+
+  That is the first thing to take here, because it is bit-identical, it is two
+  changes that already exist in another function, and 0.9.0 measured what it is
+  worth: **six of the thirteen milliseconds an extra speculative lane costs are
+  this plane.** Prefill reaches it too.
+
+  *Give the head a grid, and take the integer path.* This is the large one — the
+  four bit planes run at 52 G multiply-adds a second against the head's 33, and
+  the head is two bit, so the ceiling is higher than that ratio suggests. It is
+  not exact: the export declined to calibrate this activation, so the engine
+  would be choosing a step, and that is a decision about output quality rather
+  than a kernel change. Measure it as one — a step chosen per token from the
+  activation's own range, against the float path's logits, over the whole
+  vocabulary and not just the argmax, before any timing is quoted. If the top
+  token moves on ordinary prompts the answer is no.
+
+  *Do not score 262144 rows at all.* The entry below, unchanged by any of this
+  except that the plane it prunes is five times more expensive per byte than
+  that entry assumed, which makes it worth more than it looked.
+
+  What is ruled out, and should not be tried again: the row epilogue (0.8.11,
+  and it is in the wrong path anyway); eight rows a block instead of four
+  (0.8.11, a wash); software prefetch of the code stream (0.8.11, 12 to 20%
+  *worse* on every code plane — read the numbers before having the idea);
+  sixteen rows closed together (0.8.12, wrong path); the page walk (0.8.12 — the
+  same 96 MiB costs the same with a gigabyte swept in between); and the affine
+  take (0.8.14, wrong path). Do not reopen any of it on a GiB/s comparison
+  across bit widths, which is not a comparison at all.
+
+- **Stop scoring 262144 rows to pick one.** The output head is untied on this
+  export and 2-bit: 262144 by 1536 is **96.0 MiB, 12.2% of everything a decode
+  step reads**, spent to find the largest of 262144 numbers and then throw the
+  rest away.
+
+  `RESEARCH.md` idea 10: cluster the head's rows once at load, bound each
+  cluster cheaply, evaluate the promising ones, and discard a cluster only when
+  its bound cannot beat the best candidate so far. Exact for greedy decoding,
+  and exact for top-k where every excluded row is provably under the retained
+  threshold. Arbitrary top-p cannot ignore the discarded tail and would fall
+  back to the full head.
+
+  *Not in mainline llama.cpp* — it always computes the full head. Two reasons
+  it may be worth more here than there: this head is untied, so it is a real
+  96 MiB rather than a table the embedding lookup already touched, and 2-bit
+  codes make the per-row bound cheap to precompute.
+
+  Removing the head entirely would only move the 41 tokens-a-second ceiling to
+  about 47, so this is a multiplier and not a strategy. Measure **bytes actually
+  not read**, not clusters skipped, and stop if the bound needs most of a row to
+  be useful.
+
+  0.8.14 changed what this is worth without changing the entry. The head runs
+  the float kernel rather than the integer one, so the bytes this would stop
+  reading are five times more expensive per byte than the entry assumed when it
+  wrote them off as "the best rate in the step". A bound that skips half the
+  head is worth half of 5.99 ms here after 0.8.16, not half of 6.65.
+
+  **And 0.9.0 gave it a second customer, which is a better fit than the first.**
+  Speculative decoding verifies a position by asking what the model would have
+  produced there, and for greedy verification that is not the distribution — it
+  is one question, *is the proposed id the argmax*. Confirming it needs exactly
+  the bound this entry is about: score the proposed row, then discard every
+  cluster whose bound cannot beat it. Rejecting is cheaper still, because any
+  single row that beats the proposal ends the question.
+
+  So this entry is the enabler for the speculative one below rather than a
+  parallel idea, and it is worth more there than in a plain decode step: a plain
+  step pays the head once, a block of eight pays it eight times. Six of the
+  thirteen milliseconds an extra speculative lane costs are this plane, and the
+  entry's own arithmetic — that removing the head entirely moves the sweep
+  ceiling from 41 tokens a second to about 47 — badly understates it for that
+  reason. Build the bound for verification first, where it is exact, cheap to
+  state and easy to measure; the sampling case can follow.
+
+  This entry used to be scoped together with the logit cap, on the argument that
+  a bound which never materializes most of the head makes capping most of the
+  head moot. 0.8.11 closed the cap on its own — 4.45 ms a step to 0.28 — so the
+  two are no longer one piece of work, and what is left to win here is the head
+  itself: 6.65 ms of a 34.79 ms step, with the cap and the sampler that used to
+  ride with it now 0.28 and 0.78.
+
+- **Produce more than one token per sweep of the weights.** The only idea here
+  that can pass the sweep ceiling at all, because it is the only one that
+  changes the ratio of tokens to sweeps rather than the cost of a sweep.
+  `RESEARCH.md` idea 1 in full; the short form is a cheap proposer guessing a
+  short block and the real model checking the whole block in one batched pass,
+  keeping the guesses it agrees with.
+
+  *llama.cpp has this three ways over* — a draft model
+  (`common/speculative.cpp`), lookahead decoding (`examples/lookahead`), and
+  n-gram/prompt lookup with no second model at all (`common/ngram-cache`,
+  `ngram-map`, `ngram-mod`). So the idea is not in doubt and neither is the
+  payoff there; what was unknown was this engine's verification cost, and 0.9.0
+  measured it.
+
+  **Is it still worth doing? Yes, but only after the two entries above, and the
+  measurement says why.** `igllm guess` runs a greedy continuation three ways —
+  plain, with a proposer that is always right, and with one that is always
+  wrong — and holds all three to the same token stream. On the shipped export at
+  four threads:
+
+  | block | proposer | vs plain |
+  | --- | --- | --- |
+  | 4 | oracle | 1.51x |
+  | 8 | oracle | **2.15x** |
+  | 16 | oracle | 2.21x |
+  | 8 | null | 0.30x |
+
+  **The ceiling is 2.2x** — that is a proposer that is *never wrong* — and
+  **break-even needs about 40% of guesses accepted**, because a round of eight
+  costs 142 ms against a plain step's 38 and so has to commit 3.7 tokens to pay.
+
+  The reason the ceiling is 2.2 and not 6 is the reason this entry is now third.
+  A block shares the weight *sweep* across its lanes and cannot share the
+  *arithmetic*, and this engine is arithmetic-bound: an extra lane costs about
+  **13 ms** against a plain step's 38. **Six of those 13 are the output head**,
+  because verifying a position means asking what the model would have produced
+  there, and that is the full 262144 rows for every lane. The two entries above
+  are therefore not merely nice to have first — they set this entry's ceiling.
+  Halve the marginal lane and the ceiling goes to about 4x and break-even to
+  about 25%, which is the difference between a feature worth shipping and a coin
+  flip.
+
+  **The order to finish it in.**
+
+  1. **Done, 0.9.0: the verify side.** All-position logits out of `session_pass`
+     (`PASS_LOGIT_ALL`), a cache that can be put back (`session_guess`,
+     `session_guess_keep`, `session_guess_limit`), and the bracket above. The
+     undo is held byte for byte by `test_guess` on the synthetic checkpoint,
+     whose four row window makes every block lap the ring; the bug the old entry
+     warned about — trusting `fill_count` — was written deliberately and the
+     test fails on it. **Nothing below should start before the two entries above
+     are done**, because until then any proposer is being measured against a
+     ceiling of 2.2.
+
+  2. **Make the batched head cheap, which is the entry above and this one at
+     once.** Two routes and they compose. `kern_row_code_many` shares the head's
+     96 MiB across the lanes correctly but got neither 0.8.15's `vpermps` lookup
+     nor 0.8.16's row block, both of which were written for the one lane path —
+     that is a bit-identical win sitting in plain sight. And verification does
+     not need the whole distribution: for greedy it needs only to know whether
+     the proposed id is the argmax, which is exactly the bound the entry below
+     is about. **Measure the marginal lane again before writing a proposer.**
+
+  3. **Then the n-gram proposer**, which needs no second model and no training.
+     Hold it to **committed tokens per millisecond** against `igllm guess`'s
+     oracle and null rows, not to acceptance rate, and measure it on the
+     workloads that differ: free generation, where it will be weakest, and
+     summarising or editing where the output quotes the input and prompt lookup
+     is at its best. If it does not clear the break-even line on free
+     generation, ship it behind a flag rather than on by default, and say so.
+
+  4. **Then sampling.** Everything above is greedy: `session_guess`'s
+     verification is an argmax comparison. Speculative decoding under a
+     temperature needs the modified rejection rule — accept a guess with
+     probability `min(1, p/q)` and resample from the difference — and an n-gram
+     proposer has no `q` to divide by. So either the feature is greedy-only and
+     says so, or it needs a proposer that carries a distribution. Decide which
+     before plumbing it into `chat`.
+
+  5. **Then the plumbing**: a `--guess <k>` flag, the block path inside
+     `main_serve`, and the tally counting committed tokens against rounds so a
+     user can see what it bought.
+
+  **One thing to watch that 0.9.0 found and did not settle.** A batched pass
+  answers every lane the same way — one lane off the calibrated grid puts the
+  whole batch on the float path — while a lane stepped alone is judged alone. So
+  a block and a sequence of steps can take different kernels and sum in a
+  different order, and an accepted token is the token the model would have
+  produced rather than the same arithmetic that would have produced it. Over 32
+  tokens on two prompts the streams matched exactly; that is evidence and not a
+  proof, and a long horizon is where it would first show. If `igllm guess` ever
+  prints `DIVERGES`, this is what it means and it is not necessarily a bug.
+
 - **What is left of `ple feed`, which is probably not the kernel.** 0.8.11
   counted the step in multiply-adds instead of bytes and the ranking changed
   completely. Four planes run at 50 to 61 G multiply-adds a second and two do
@@ -166,111 +448,6 @@ the forks.
   Together the two are 2.6 ms of a 34.8 ms step, so the ceiling on this entry
   was about 5% of a token and 0.8.12 took 2.4% of it.
 
-- **The output head, which runs the float kernel and not the integer one.**
-  96 MiB and 12.2% of everything a decode step reads, 12.36 ms of a 44.74 ms
-  step on the third host, and **33 G multiply-adds a second against the mlp's
-  52** — because it is not on the integer path at all.
-
-  0.8.14 settled what three versions of this entry could not. The entry used to
-  read that the head is bound by neither the memory nor the instruction count;
-  it removed an instruction from the head's supposed inner loop — a quarter of
-  it, on every other two and four bit plane in the step — and the head did not
-  move while the four bit planes moved by ten to eighteen percent. The loop
-  under test was not the loop being run.
-
-  `kern_level_ready` requires `sheet->enter_gain > 0`, the plane's
-  `input_activation_scale`, because the integer path rounds the activation onto
-  that step's grid and requires it to land exactly. **The export ships
-  `lm_head.input_activation_scale` as `0.0`** where every other projection has a
-  real one, so the head falls to `kern_row_code` and `kern_dot_code`'s float
-  spread on every token, by construction. `CHANGES.md` 0.8.14 has the
-  instrumentation and the confirmation — 4 × 262144 × 1536 column-products a
-  step, all of them on the float path.
-
-  So the old entry's puzzle is not a puzzle. The 22.7 GiB/s microbenchmark ran
-  the integer kernel; the engine runs the float one. The GiB/s gap is
-  `kern_dot_code` against `vpdpbusd`, not two bit against four. 0.8.11's
-  epilogue and 0.8.12's fold are both in the integer path and neither could ever
-  have moved this plane.
-
-  **Three routes are open, in this order.**
-
-  *The float loop the head actually runs, which 0.8.15 and 0.8.16 took most of.*
-  0.8.15 made the mask and the widening one `vpermps` against a repeating table,
-  four instructions a vector rather than five, and got 8.3%. 0.8.16 found the
-  factor that was left, and it was not the instruction count: the row carried
-  **two** accumulators over ninety-six vectors, so each was a chain of
-  forty-eight dependent multiply-adds at four cycles deep against two a cycle of
-  throughput, and the row was bound by its own chain at about four times what
-  its ports allow. Four rows at a time, each keeping its own pair and its own
-  order, is eight chains covering each other and the same sum to the last bit:
-  the head **11.20 ms to 5.99**, the step floor 15.0%, decode 17.6%. Eight rows
-  was built and is worse on this plane, as it was on the other path.
-
-  What is left is the broadcast. Three of the loop's sixteen instructions per
-  sixty-four codes are broadcasts that one `vbroadcasti32x4` could replace,
-  because sixteen bytes are sixty-four codes and four shifts of them reach
-  every one. Thirteen per sixty-four rather than sixteen. It costs a staging
-  pass — the four quarters come out in the unpack's order rather than the
-  column's, so the activations have to be laid down in that order, exactly as
-  `kern_level_stage` already does for the integer path. Take it only knowing
-  that the loop is no longer latency-bound, which is what makes counting its
-  instructions worth anything for the first time.
-
-  The head is now 5.99 ms of a 34.95 ms step, 17.1% against 27.3%, at 67 G
-  multiply-adds a second against 33. A bare four thread sweep of its 97 MiB on
-  this host is 1.9 ms, so there is about three times left in it and the two
-  routes below are where the rest of it is.
-
-  *Give the head a grid, and take the integer path.* This is the large one — the
-  four bit planes run at 52 G multiply-adds a second against the head's 33, and
-  the head is two bit, so the ceiling is higher than that ratio suggests. It is
-  not exact: the export declined to calibrate this activation, so the engine
-  would be choosing a step, and that is a decision about output quality rather
-  than a kernel change. Measure it as one — a step chosen per token from the
-  activation's own range, against the float path's logits, over the whole
-  vocabulary and not just the argmax, before any timing is quoted. If the top
-  token moves on ordinary prompts the answer is no.
-
-  *Do not score 262144 rows at all.* The entry below, unchanged by any of this
-  except that the plane it prunes is five times more expensive per byte than
-  that entry assumed, which makes it worth more than it looked.
-
-  What is ruled out, and should not be tried again: the row epilogue (0.8.11,
-  and it is in the wrong path anyway); eight rows a block instead of four
-  (0.8.11, a wash); software prefetch of the code stream (0.8.11, 12 to 20%
-  *worse* on every code plane — read the numbers before having the idea);
-  sixteen rows closed together (0.8.12, wrong path); the page walk (0.8.12 — the
-  same 96 MiB costs the same with a gigabyte swept in between); and the affine
-  take (0.8.14, wrong path). Do not reopen any of it on a GiB/s comparison
-  across bit widths, which is not a comparison at all.
-
-- **Produce more than one token per sweep of the weights.** The only idea on
-  this list that can pass 41 tokens a second, because it is the only one that
-  changes the ratio of tokens to sweeps rather than the cost of a sweep.
-  `RESEARCH.md` idea 1 in full; the short form is a cheap proposer guessing a
-  short block and the real model checking the whole block in one batched pass,
-  keeping the guesses it agrees with.
-
-  *llama.cpp has this three ways over* — a draft model
-  (`common/speculative.cpp`), lookahead decoding (`examples/lookahead`), and
-  n-gram/prompt lookup with no second model at all (`common/ngram-cache`,
-  `ngram-map`, `ngram-mod`). So the idea is not in doubt and neither is the
-  payoff; what is unknown is this engine's verification cost and this model's
-  acceptance rate.
-
-  Start with the n-gram proposer, which needs no second model and no training,
-  and measure **committed tokens per millisecond** rather than acceptance rate.
-  The engine already batches prefill, so the verify side is the batched path it
-  has; what it does not have is all-position logits out of `session_pass`, and a
-  way to undo a rejected block.
-
-  The correctness trap is that undo, and it is worse here than in a plain
-  transformer: sliding-window layers own rings that a rejected block has already
-  overwritten, and layers that share another layer's cache have to be unwound
-  with it. Restoring `fill_count` is not enough. Scope the transactional cache
-  before the proposer, not after.
-
 - **The tower's own attention, tiled, with the normalizer carried.** A picture
   is now mostly this. On the reference host at one thread, the same 768 by 768
   picture at the full patch budget costs 48.3 s where it cost 105.0 before
@@ -293,41 +470,6 @@ the forks.
   Retake 0.8.8's profile first — projections, scoring, blend, softmax, one
   thread — because 0.8.9 changed the shares it recorded and the schedule should
   be written against the new ones.
-
-- **Stop scoring 262144 rows to pick one.** The output head is untied on this
-  export and 2-bit: 262144 by 1536 is **96.0 MiB, 12.2% of everything a decode
-  step reads**, spent to find the largest of 262144 numbers and then throw the
-  rest away.
-
-  `RESEARCH.md` idea 10: cluster the head's rows once at load, bound each
-  cluster cheaply, evaluate the promising ones, and discard a cluster only when
-  its bound cannot beat the best candidate so far. Exact for greedy decoding,
-  and exact for top-k where every excluded row is provably under the retained
-  threshold. Arbitrary top-p cannot ignore the discarded tail and would fall
-  back to the full head.
-
-  *Not in mainline llama.cpp* — it always computes the full head. Two reasons
-  it may be worth more here than there: this head is untied, so it is a real
-  96 MiB rather than a table the embedding lookup already touched, and 2-bit
-  codes make the per-row bound cheap to precompute.
-
-  Removing the head entirely would only move the 41 tokens-a-second ceiling to
-  about 47, so this is a multiplier and not a strategy. Measure **bytes actually
-  not read**, not clusters skipped, and stop if the bound needs most of a row to
-  be useful.
-
-  0.8.14 changed what this is worth without changing the entry. The head runs
-  the float kernel rather than the integer one, so the bytes this would stop
-  reading are five times more expensive per byte than the entry assumed when it
-  wrote them off as "the best rate in the step". A bound that skips half the
-  head is worth half of 12.36 ms here, not half of 6.65.
-
-  This entry used to be scoped together with the logit cap, on the argument that
-  a bound which never materializes most of the head makes capping most of the
-  head moot. 0.8.11 closed the cap on its own — 4.45 ms a step to 0.28 — so the
-  two are no longer one piece of work, and what is left to win here is the head
-  itself: 6.65 ms of a 34.79 ms step, with the cap and the sampler that used to
-  ride with it now 0.28 and 0.78.
 
 - **Fewer patches, before the pooling — and a budget the caller can ask for.**
   The largest vision win available, and the one that costs behaviour.
@@ -469,3 +611,6 @@ the forks.
 | The two bit float loop's mask and widening as one `vpermps` against a repeating table, in the loop the output head actually runs | 0.8.15 |
 | Why the output head was slower than its own port count (answered: two accumulators over ninety-six vectors — the row waited on its own chain) and the four row block that fixed it | 0.8.16 |
 | Eight rows a block in the float path (refused: worse on the one plane it is for, as it was on the integer path) | 0.8.16 |
+| All-position logits out of `session_pass`, as one batched head rather than a loop of single ones | 0.9.0 |
+| A cache a rejected block can be taken out of — the bound that makes it a fixed scratch, and the byte-for-byte test that holds it | 0.9.0 |
+| What speculative decoding is worth in this engine, bracketed by a proposer that is always right and one that is always wrong (answered: 2.2x at best, break-even near 40% acceptance, and the output head is half the marginal lane) | 0.9.0 |
