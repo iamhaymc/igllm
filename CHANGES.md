@@ -4165,3 +4165,191 @@ had none since 0.8.9 declared them finished.
 `logit cap` at 7.0% and `sampler` at 1.5% are the other two, and both are the
 output head's 262144 rows being touched twice more after being read. They belong
 with the vocabulary bound rather than beside it.
+
+---
+
+## 0.8.11 — the epilogue, and two calls into libm that a step made 477184 times
+
+### Scope
+
+The first two speed entries on `TODO.md`. The first asked *why is a kernel
+slower on the short rows a decode step actually reads than on the widest row a
+bench can build*; the second asked for the logit cap without 262144 calls to
+`tanhf`. Both are answered, though the first is answered differently from the
+way it was asked — and looking for it turned up two more things of the same
+shape that the list did not have on it at all.
+
+On the reference host at four threads, wide build, on a 374 id prompt: prefill
+**59.3 tokens a second to 82.1**, decode **21.8 to 27.1**. On a 7 id prompt
+decode **23.1 to 29.3**, and the step floor 43.97 ms to 34.79.
+
+Every number below is the minimum a phase reached over fourteen runs a side,
+the two builds alternating. This host's whole-step figure swings by a fifth
+between one run and the next, which is enough to invent a result and enough to
+hide one; a minimum over interleaved runs survives that, because a shared host's
+noise only ever adds time.
+
+### The answer to the first entry was not arithmetic
+
+`TODO.md` guessed the row epilogue, and named the right suspect for the wrong
+reason. It supposed the cost was *the work in* the epilogue — a horizontal
+reduction, a scale and a store, paid once per 384 bytes on the output head
+instead of once per 3072 on a wide row — and proposed blocking the output rows
+so those reductions interleave.
+
+Read out of the generated code, the epilogue was not doing that work at all. It
+was making calls. Per row: one to `kern_dot_level_rest`, which handles the
+columns past the last whole block and had nothing to do because every span here
+is a whole number of blocks; and one to `real_read`, the switch over every
+storage type, to fetch a single `F32` gain. Around them, a `vzeroupper` and the
+whole caller-saved vector state, spilled and restored in the middle of the row
+loop. On a 384 byte row that is paid once per 384 bytes.
+
+So three changes, of which the blocking is the smallest:
+
+**A block of four output rows.** `KERN_LEVEL_ROWS_LOOP` and
+`kern_row_code_level_rows`: four independent accumulators, one load of the
+staged levels shared between them. The integer sum is the one row path's, bit
+for bit — an integer dot does not care in what order it is taken — and the test
+says so by comparing floats rather than asking for nearness.
+
+**The remainder call guarded.** `if (slot < span_count)` before it. Where the
+span is a whole number of blocks there is now no call, rather than a call that
+returns zero.
+
+**The gain read without the switch.** `plane_gain_line` picks the direct load
+once per product where the scales are `F32`, which in this export they always
+are, and the loop then carries a pointer rather than a branch on a type.
+
+### And two more of the same shape
+
+**The logit cap.** `tanh(x/c)*c` over 262144 logits, 4.45 ms of a step, on the
+one thread that reaches it. 0.8.10 tried to fork it and refused with numbers.
+The way through was the one that entry named and did not take: `tanh y` is
+`1 - 2/(e^{2y}+1)`, and the exponential is the series `kern_exp_wide` has
+carried for the softmax since 0.8.6. **4.45 ms to 0.28**, eight lanes at a time,
+still on the calling thread.
+
+It is not `tanhf` to the last bit and does not claim to be. Swept over 65536
+arguments from -200 to 200 the largest gap from the call is two and a half parts
+in ten million of the cap — 7.6e-6 at this export's cap of 30 — the result is
+still monotone, so no sampler's choice can change except between two logits
+already that close, and the ends are exact rather than near.
+
+**The gelu.** The same call, in the other elementwise map: 6144 values a layer,
+215040 a step, 2.40 ms across the whole pool while reading not one byte of
+weight. Written as
+
+```
+0.5 x (1 + tanh y)  =  x t / (t + 1),      t = e^{2y}
+```
+
+it is the same exponential again, and better conditioned than the form it
+replaces, because `t/(t+1)` has nothing to cancel where `1 + tanh y` loses the
+low bits of a small result. Measured against the closed form in double over
+200001 arguments, the series is off by at most **3.64e-7 where `tanhf` is off by
+4.31e-7**: it is the more accurate of the two as well as the quicker.
+**2.40 ms to 0.29.**
+
+Under the clamp the gate is stated to be zero rather than left to the clamped
+exponent. The cube overflows on the way in, so a saturated `tanh` — exactly
+minus one — makes the gate exactly zero, where `x e^{-30}` at a gate of 1e30 is
+9.4e16. Two instructions, and there is no argument the kernel answers absurdly.
+
+**The bf16 dot product.** Not on the list at all, and the largest single rate
+change here. `kern_dot_real` had a vector path for `F32` and a scalar loop for
+`BF16` — and this export keeps `per_layer_model_projection` in bf16, 8960 rows
+of 1536, **26.25 MiB that every decode step reads in full**. A bf16 is a
+sixteen bit shift into the top of a word, so a block of them is one widening and
+one shift; `kern_bf16_wide` is that, and nothing is rounded that was not rounded
+before. **9.63 GiB/s to 23.30.**
+
+### The step, before and after
+
+| part | before | after | | |
+| --- | --- | --- | --- | --- |
+| | ms | GiB/s | ms | GiB/s |
+| mlp | 17.918 | 25.90 | 16.787 | 27.65 |
+| final norm, head | 6.534 | 14.50 | 6.649 | 14.25 |
+| logit cap | 4.447 | — | 0.276 | — |
+| q k v | 2.874 | 23.82 | 2.900 | 23.61 |
+| ple lift | 2.664 | 9.63 | 1.100 | 23.30 |
+| attn out | 2.400 | 25.72 | 2.299 | 26.84 |
+| mlp gate | 2.399 | — | 0.286 | — |
+| ple feed | 1.720 | 15.04 | 1.532 | 16.89 |
+| score, softmax, blend | 1.423 | 7.60 | 1.434 | 7.54 |
+| sampler | 0.828 | — | 0.784 | — |
+| norms, residuals | 0.457 | 2.19 | 0.445 | 2.25 |
+| rope, cache write | 0.293 | 0.20 | 0.290 | 0.20 |
+
+### What the row block did not do, and the reframing that came out of it
+
+`TODO.md` named the output head as the extreme case and the plane to write the
+block against: 262144 rows of 384 bytes, and the slowest plane in the step by
+rate. The block does not move it. **14.50 GiB/s to 14.25** — inside the noise,
+which is to say unchanged — while the wide-row planes it was not written for
+took most of the gain.
+
+That is worth more than the change would have been, because chasing it turns up
+the reason, and the reason is that the entry was comparing the wrong quantity.
+`vpdpbusd` consumes sixty-four codes whatever their width. So a two bit plane
+spends the same instruction on 16 bytes of weight that a four bit plane spends
+on 32 and an eight bit plane on 64, and GiB/s is not comparable across widths at
+all. Counting the multiply-adds instead, on the phase minima above:
+
+| part | multiply-adds a step | G mac/s |
+| --- | --- | --- |
+| final norm, head | 402.7 M | **60.6** |
+| mlp | 990.9 M | 59.0 |
+| attn out | 132.5 M | 57.7 |
+| q k v | 147.0 M | 50.7 |
+| ple feed | 27.5 M | 18.0 |
+| ple lift | 13.8 M | 12.5 |
+
+**The output head is the fastest plane in the step, not the slowest.** It looks
+slow in GiB/s because a two bit weight is half the bytes of a four bit one, and
+for the same reason it is the cheapest 400 million multiply-adds the engine
+performs. The two planes that are actually behind are `ple feed`, whose
+`per_layer_projection` is 1536 rows of **256 columns** — four blocks and then an
+epilogue, which is the short-row question in its real form — and `ple lift`,
+which is a float path and always was.
+
+### Two things measured and refused
+
+**Eight rows a block instead of four.** Built and run: mlp 27.47 GiB/s to 27.49,
+the head 14.06 to 14.08, the step floor 37.36 ms to 37.07. A wash, for eight
+live accumulators and twice the code, on the same reasoning 0.8.8 refused the
+eight lane block with.
+
+**Software prefetch of the code stream.** The hardware prefetcher does not cross
+a page and the head crosses one every ten rows, so one touch a block of rows,
+four blocks ahead, looked free. It is not: mlp **12.7% worse**, q k v 19.5%,
+ple feed 17.9%, attn out 14.0%, and nothing better anywhere. Reverted.
+
+### What says it is still the same engine
+
+`app_test.py` against the transformers reference passes every check on all four
+prompts, on the wide build and on the plain one: rank one matches, and every
+logit gap is inside the bar the reference sets against itself. On the wide build
+the gaps are 1.4239, 1.3379, 0.8981 and 1.8306, which are 0.8.10's figures to
+the last digit printed. Nothing here was supposed to move them and nothing did:
+four decimal places do not resolve a cap that has shifted by 7.6e-6.
+
+A note on how not to read that comparison, because this version nearly recorded
+the mistake. The **plain** build reports smaller gaps than the wide one — 1.18,
+1.15, 0.83, 1.20 — and set beside the wide build's older run that looks exactly
+like an accuracy gain from the two series. It is not one. A plain build has no
+integer dot product, so every code plane takes the float path instead, and it is
+the path that moves those numbers rather than the version. Compare a build
+against itself, or the comparison will tell you whatever you brought to it.
+
+709 unit tests pass on the plain, SSE2, AVX2 and AVX-512 builds. Eight of them
+are new: that a block of rows is the one row path bit for bit, that the cap is
+within its stated bound of `tanhf` and never swaps two logits, that the cap and
+the gate are exact at both ends, and that the gate is the closed form over a
+whole row.
+
+The NEON paths for the cap and the gate are guarded on `__aarch64__`, because
+the lane divide they use is AArch64's; a 32-bit ARM host takes the scalar loop,
+which is the same series. Like the MSVC paths, they have been read and not run —
+there is no ARM host here.

@@ -1098,12 +1098,24 @@ failure a report like this invites.
 
 Two parts read no weights and are split out of the kernels they sit inside for
 that reason: `mlp gate`, the gelu between the feed-forward's halves, and
-`logit cap`, the `tanhf` over every one of 262144 logits. Folded in, they made
+`logit cap`, the soft cap over every one of 262144 logits. Folded in, they made
 the feed-forward read 16.82 GiB/s instead of 20.14 and the head 8.63 instead of
 12.67 — a phase that mixes a code plane with a transcendental over every
-element quotes a rate belonging to neither. The gelu goes to the pool
-(`back_gelu_gate`, above `GELU_BAND_COUNT`); the cap was tried there and left
-on the calling thread, and the measurement that decided it is in the comment.
+element quotes a rate belonging to neither. Splitting them out is also what
+made them findable: both were calling `tanhf` once per element, and 0.8.11
+replaced the call in each with the exponential series `kern_exp_wide` already
+carried for the softmax, which took the cap from 4.45 ms a step to 0.28 and the
+gelu from 2.40 to 0.29. The gelu goes to the pool (`back_gelu_gate`, above
+`GELU_BAND_COUNT`); the cap was tried there and left on the calling thread, and
+the measurement that decided it is in the comment.
+
+A rate is also not comparable between parts of different bit widths, and the
+report does not pretend otherwise. `vpdpbusd` consumes sixty-four codes
+whatever their width, so a two bit plane spends the same instruction on 16
+bytes of weight that a four bit plane spends on 32; the output head reads half
+the GiB/s of the feed-forward while doing slightly *more* multiply-adds a
+second. Use the share to decide which part to look at and the rate to compare a
+part against itself, before and after.
 
 The largest magnitude a session has put in each cache is tracked either way,
 in `key_peak` and `value_peak`. What the calibrated range has to cover is a
