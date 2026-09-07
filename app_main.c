@@ -433,19 +433,17 @@ typedef struct main_bet {
  * draws rarely and the flag costs a few percent, while on text that quotes its
  * prompt it is worth more than half again. */
 static void main_answer_guess(app_model *model, const main_flag *flag, app_session *session,
-                              const main_reel *reel, int quiet_flag, main_bet *bet) {
+                              app_scout *scout, const main_reel *reel, int quiet_flag,
+                              main_bet *bet) {
   int32_t block_list[16];
   int32_t id_value = reel->id_list[reel->id_count - 1];
-  app_scout *scout = NULL;
   int block_want = flag->guess_span;
   int shut_flag = 0;
   if (block_want > session_guess_limit(session)) block_want = session_guess_limit(session);
   if (block_want < 1) block_want = 1;
-  if (scout_open(&scout) != APP_OKAY) return;
-  if (scout_note(scout, reel->id_list, reel->id_count) != APP_OKAY) {
-    scout_close(scout);
-    return;
-  }
+  /* This turn's ids, which in a conversation are the new turn's alone: the
+   * scout is the caller's and already holds every turn before it. */
+  if (!scout || scout_note(scout, reel->id_list, reel->id_count) != APP_OKAY) return;
   while (bet->token_count < flag->serve_limit && !shut_flag) {
     const float *rows;
     int span_count, slot, take_count = 0;
@@ -499,7 +497,6 @@ static void main_answer_guess(app_model *model, const main_flag *flag, app_sessi
     }
     if (session_guess_keep(session, take_count + 1) != APP_OKAY) break;
   }
-  scout_close(scout);
 }
 
 static void main_answer(app_model *model, const main_flag *flag, app_session *session,
@@ -609,6 +606,7 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
   app_session *session = NULL;
   main_reel reel;
   main_bet bet;
+  app_scout *scout = NULL;
   int last_index;
   int guess_flag;
   int32_t id_value;
@@ -650,8 +648,9 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
                    : NULL;
   /* A block cannot carry an embedding row a tower filled, so a prompt whose
    * last id is a soft token takes the plain loop whatever the flag says. */
-  if (guess_flag && !state_data) {
-    main_answer_guess(model, flag, session, &reel, quiet_flag, &bet);
+  if (guess_flag && !state_data && scout_open(&scout) == APP_OKAY) {
+    main_answer_guess(model, flag, session, scout, &reel, quiet_flag, &bet);
+    scout_close(scout);
   } else {
     main_answer(model, flag, session, id_value, state_data, quiet_flag);
     guess_flag = 0;
@@ -714,6 +713,12 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
 
 typedef struct main_talk {
   app_session *session;
+  /* The conversation's own proposer, opened the first time `--guess` needs it.
+   * It belongs to the conversation rather than to the turn, and that is the
+   * whole reason it is here: a follow-up question about the same document
+   * quotes both the document and the answer before it, which is where prompt
+   * lookup is at its best and what a per-turn scout would throw away. */
+  app_scout   *scout;
   int          turn_count;
   int          open_flag;  /* whether the model has already answered in it */
   /* What `/image` and `/audio` have put in front of the next turn, and the room
@@ -790,7 +795,19 @@ static void main_talk_turn(app_model *model, const main_flag *flag, main_talk *t
   state_data = reel.state_flag[reel.id_count - 1]
                    ? reel.state_list + (size_t)(reel.id_count - 1) * (size_t)reel.state_size
                    : NULL;
-  main_answer(model, flag, talk->session, reel.id_list[reel.id_count - 1], state_data, 0);
+  if (flag->guess_span > 1 && !state_data &&
+      (talk->scout || scout_open(&talk->scout) == APP_OKAY)) {
+    main_bet bet;
+    memset(&bet, 0, sizeof(bet));
+    main_answer_guess(model, flag, talk->session, talk->scout, &reel, 0, &bet);
+    if (flag->verbose_level && bet.round_count > 0)
+      fprintf(stderr, "\nguess   %.2f tokens a round over %ld rounds, %.0f%% of %ld kept\n",
+              (double)bet.token_count / (double)bet.round_count, bet.round_count,
+              bet.draw_count > 0 ? 100.0 * (double)bet.take_count / (double)bet.draw_count : 0.0,
+              bet.draw_count);
+  } else {
+    main_answer(model, flag, talk->session, reel.id_list[reel.id_count - 1], state_data, 0);
+  }
   printf("\n");
   fflush(stdout);
   main_reel_free(&reel);
@@ -804,6 +821,13 @@ static int main_loop(app_model *model, const main_flag *flag) {
   char line_text[MAIN_LINE_LIMIT];
   int talk_slot = 0, talk_index;
 
+  /* The same refusal the single turn path makes, and for the same reason:
+   * verification is an argmax comparison and there is no rejection rule here
+   * for a temperature to be sampled under. */
+  if (flag->guess_span > 1 && flag->taste.heat_value > 0.0f) {
+    fprintf(stderr, "--guess is greedy only; use --heat 0\n");
+    return 1;
+  }
   memset(talk_list, 0, sizeof(talk_list));
   if (session_open(model, &talk_list[0].session) != APP_OKAY) {
     fprintf(stderr, "session: %s\n", app_code_text(APP_FAIL_MEMORY));
@@ -876,6 +900,7 @@ static int main_loop(app_model *model, const main_flag *flag) {
       if (strcmp(line_text, "/drop") == 0) {
         int next_slot = -1;
         session_close(talk_list[talk_slot].session);
+        scout_close(talk_list[talk_slot].scout);
         memset(&talk_list[talk_slot], 0, sizeof(talk_list[talk_slot]));
         for (talk_index = 0; talk_index < MAIN_TALK_LIMIT; ++talk_index)
           if (talk_list[talk_index].session) { next_slot = talk_index; break; }
@@ -925,6 +950,13 @@ static int main_loop(app_model *model, const main_flag *flag) {
         talk->turn_count = (int)held_stamp;
         talk->open_flag = talk->turn_count > 0;
         talk->show_count = 0;
+        /* The scout's stream is the one this conversation was in, and the file
+         * has just replaced it.  It is forgotten rather than carried, because a
+         * proposer reading a conversation it is no longer in would be wrong
+         * without being caught — every guess is verified, so it would cost
+         * lanes rather than correctness, which is exactly the failure a test
+         * would not find. */
+        scout_clear(talk->scout);
         printf("conversation %d restored, %d turns, %d ids\n", talk_slot + 1, talk->turn_count,
                session_fill(talk->session));
         continue;
@@ -952,8 +984,10 @@ static int main_loop(app_model *model, const main_flag *flag) {
     main_talk_turn(model, flag, &talk_list[talk_slot], line_text);
   }
 
-  for (talk_index = 0; talk_index < MAIN_TALK_LIMIT; ++talk_index)
+  for (talk_index = 0; talk_index < MAIN_TALK_LIMIT; ++talk_index) {
     if (talk_list[talk_index].session) session_close(talk_list[talk_index].session);
+    scout_close(talk_list[talk_index].scout);
+  }
   return 0;
 }
 

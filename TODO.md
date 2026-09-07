@@ -431,12 +431,17 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      once a lane — so `decode tok/s` and `reads MiB a token` describe a guessed
      run rather than reading zero.
 
-     **What is left of it, and it is where prompt lookup would be at its best:**
-     `--guess` is on the single-turn path and not inside `chat --loop`. A scout
-     there would want to carry across turns, because a follow-up question about
-     the same document quotes both the document and the previous answer. A
-     prompt whose last id is a soft token from a tower also takes the plain loop
-     whatever the flag says, because a block cannot carry an embedding row.
+     **And 0.9.4 carried it into `chat --loop`,** which is where prompt lookup
+     belongs: the scout is the conversation's rather than the turn's, so a
+     follow-up question about the same document has both the document and the
+     answer before it. A passage planted in one turn and asked for back in the
+     next is **5.56 s to 4.33** end to end, and the second turn commits 3.08
+     tokens a round at 82% of guesses kept where a per-turn scout would have had
+     nothing at all.
+
+     What is left is small and named: a prompt whose last id is a soft token
+     from a tower takes the plain loop whatever the flag says, because a block
+     cannot carry an embedding row.
 
   **One thing to watch that 0.9.0 found and did not settle.** A batched pass
   answers every lane the same way — one lane off the calibrated grid puts the
@@ -676,6 +681,7 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | The batched output head's unpack and its chain depth — the two things 0.8.15 and 0.8.16 gave the one lane path and could not reach the many lane one | 0.9.1 |
 | The n-gram proposer, measured against the bracket rather than by acceptance rate, on the two workloads that differ | 0.9.3 |
 | The `--guess` flag, the block path inside `main_serve`, and a block counted into the decode tally | 0.9.3 |
+| A scout that belongs to the conversation rather than to the turn, so `chat --loop` has prompt lookup across turns | 0.9.4 |
 | Whether a proposer should match on a single id (answered: no — better on both workloads at once without it) | 0.9.3 |
 | The mlp's accumulator chain, which the entry named as the first thing to check (refused: a wash on the one lane block, 15% worse on the batched one, and the plane is at 78% of this host's bare sweep) | 0.9.2 |
 | What a bare sweep of the reference host actually is, against the third host's number the mlp entry had been reasoning from | 0.9.2 |

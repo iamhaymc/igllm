@@ -5531,3 +5531,56 @@ because a follow-up question about the same document quotes both the document
 and the previous answer. And a prompt whose last id is a soft token from a
 tower takes the plain loop whatever the flag says, because a block cannot carry
 an embedding row.
+
+---
+
+## 0.9.4 — the proposer carried across turns, which is where prompt lookup belongs
+
+### Scope
+
+0.9.3 shipped `--guess` on the single turn tasks and said what was left: the
+scout was per-run, so `chat --loop` could not have it. That is the case prompt
+lookup is *best* at and the one it was missing — a follow-up question about the
+same document quotes both the document and the answer before it.
+
+`app_scout` now belongs to the conversation rather than to the turn. `main_talk`
+carries one, opened the first time `--guess` needs it, told each turn's ids as
+they arrive and every committed token after that.
+
+### What it is worth
+
+Two turns: one that plants a passage, then one that asks for it back. `--serve
+48`, greedy, `--guess 4`, best of three alternating runs, whole process wall
+clock including the load and both prefills:
+
+| | plain | `--guess 4` | |
+| --- | --- | --- | --- |
+| a passage planted, then quoted back | 5.56 s | **4.33 s** | **1.28x** |
+
+The tally says where it came from. The first turn is mostly the model's own
+words with the passage quoted inside them, and the scout is already useful
+there — 2.09 tokens a round at 83% of guesses kept. The second turn is almost
+entirely quotation, and it reaches 3.08 tokens a round at 82%. A scout that
+started fresh at each turn would have had nothing for the second one, which is
+the turn that matters.
+
+The emitted text is byte for byte the plain text, checked over the whole two
+turn session.
+
+### The three places a conversation's scout has to be tidied
+
+- **`/drop`** closes it with the session.
+- **the loop's exit** closes every one, not only the current conversation's.
+- **`/open`** clears it. The file has just replaced the conversation the scout's
+  stream was in, and a proposer reading a conversation it is no longer in would
+  be wrong without being caught: every guess is verified, so it would cost lanes
+  rather than correctness — which is exactly the failure a test would not find.
+
+`/new` needs nothing, because a new conversation is a zeroed slot and its scout
+is opened on demand.
+
+### Still not here
+
+Sampling, which is step 4 of `TODO.md`'s entry and needs the modified rejection
+rule and a proposer that carries a distribution. `--guess` refuses a temperature
+in the loop exactly as it does in the single turn tasks.

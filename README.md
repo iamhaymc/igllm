@@ -74,7 +74,9 @@ That makes it worth a great deal on an answer that quotes its prompt —
 summarising, editing, answering about a document, repairing code that is in the
 prompt — and worth nothing on free generation, where it has only what it has
 written itself. It draws nothing rather than guessing badly in that case, so the
-cost of asking is a twentieth:
+cost of asking is a twentieth. In `chat --loop` the proposer belongs to the
+conversation rather than to the turn, so a follow-up question about the same
+document has both the document and the answer before it:
 
 ```
 igllm chat --model model --heat 0 --guess 4 --prompt "..."
