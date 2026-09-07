@@ -117,38 +117,52 @@ engine and found the ceiling held down by the output head, so the head entries
 now come before the speculative one rather than beside it. Where an entry is
 only a size, its size is given against a 34.95 ms step floor on the third host.
 
-- **The feed-forward planes, which are half of every token and have never been
-  looked at.** 19.2 ms of a 34.95 ms step — **55%** — reading 475.3 MiB at 22.5
-  GiB/s where a bare four thread sweep of this host reaches 49.80. Two point one
-  times its own memory floor, which is the same ratio every other integer plane
-  sits at and is therefore not obviously a bug.
+- **The feed-forward planes, which are half of every token and are closer to
+  the memory than this entry used to say.** 18.96 ms of a 36.9 ms step —
+  **52%** — reading 475.3 MiB at 24.44 GiB/s.
 
-  It is first on this list for one reason: **it is the largest thing here and
-  nothing has ever been written about it.** Every entry below has a history of
-  attempts; this one has none. 0.8.14's affine take moved it 10% by accident,
-  as a side effect of a change written for the four bit planes generally, and
-  nobody has asked what else is in it.
+  **0.9.2 corrected the ratio this entry was written on, and it halves the
+  prize.** The entry read "two point one times its own memory floor", and that
+  is the third host's number: a bare four thread sweep there reaches 49.80
+  GiB/s. On the reference host a bare sweep is **31.29 GiB/s** — measured again
+  in 0.9.2, and 0.8.9's 32.18 on the same machine — so the plane's floor is
+  14.83 ms against the 18.96 it takes, which is **1.28 times its floor and 78%
+  of a bare sweep**. A plane with no arithmetic in it at all would save 4.1 ms
+  of the step here, 11%, and 0.8.9 measured the four bit code path itself at
+  29.47 GiB/s in isolation, so the honest ceiling is nearer 17% of the plane.
+  Quote a host's own sweep beside this ratio or it means nothing.
 
-  0.8.16 is the argument for looking. The output head sat at six times its
-  memory floor for four versions while three entries reasoned about why, and the
-  answer turned out to be two independent things stacked in a plane everyone had
-  assumed was fine — the wrong kernel, and then a dependency chain four times
-  deeper than the ports. Both were invisible from the outside and obvious from
-  inside. The mlp is on the well-optimized integer path with its row block
-  already in place, so it may well be near its limit; it may also not be, and
-  the cost of finding out is a profile.
+  **The chain was the named hypothesis and it is refused, at both widths.**
+  0.9.2 built two accumulators a row into `KERN_LEVEL_ROWS_LOOP` — eight chains
+  where there were four, bit-identical because integer addition is associative,
+  and `logits` byte for byte unchanged to prove the build did it. The mlp phase
+  moved from 18.989 ms to 18.959 over three alternating runs, which is nothing.
+  A loop within a fifth of what its memory will hand over cannot be
+  latency-bound however its chains count.
 
-  Start where 0.8.16 started: **count the loop against the ports, and count the
-  chain against the loop.** `kern_row_code_level_rows` carries one accumulator a
-  row over four rows. A 1536 column row at four bits is twenty-four blocks, so
-  each chain is twenty-four dependent `vpdpbusd` — five cycles deep on this
-  class of host against two a cycle of throughput, and four chains to cover it.
-  That is the same arithmetic that was wrong for the head. Check it before
-  reaching for anything cleverer.
+  **And the same pairing in `KERN_LEVEL_MANY_LOOP` is 15% worse**, which is the
+  more interesting half. A batch reads the plane once and multiplies it by every
+  lane, so memory stops binding after a lane or two and that loop really should
+  be latency-bound — but eight accumulators, two decoded code vectors, four lane
+  pointers and the plan's three constants do not fit, and prefill fell from
+  78.28 tokens a second to 66.22. **The batched integer path is at its register
+  limit, not its latency limit.** Anything written into it has to spend
+  registers it does not have.
+
+  What is left, then, is a plane at 78% of this host's memory with its two
+  obvious kernel routes closed, and the next thing to try is probably not a
+  kernel at all. This export is dense — `num_experts` is null in its
+  `config.json`, so there is no routing to exploit — and 35 layers of
+  1536 by 6144 gate, up and down is simply the tensor. Either fewer bytes are
+  read for a token, which is a sparsity or a residency question and not a loop
+  one, or this plane is done. Take a host with more bandwidth than this one
+  before reopening it as a kernel: the third host sweeps at 49.80 GiB/s, where
+  the same plane sits at 45% of a sweep rather than 78%, and whatever is left in
+  the loop would show there and cannot show here.
 
   What is not worth retrying: the bit width (0.8.11), eight rows a block
   (0.8.11, and again in 0.8.16 on the other path), software prefetch (0.8.11),
-  and the page walk (0.8.12).
+  the page walk (0.8.12), and the accumulator chain at either width (0.9.2).
 
 - **The output head, which runs the float kernel and not the integer one.**
   96 MiB and 12.2% of everything a decode step reads, 12.36 ms of a 44.74 ms
@@ -206,20 +220,24 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   this host is 1.9 ms, so there is about three times left in it and the two
   routes below are where the rest of it is.
 
-  **And the batched head got neither of those two versions, which is now a
-  speculative decoding problem as well as a prefill one.** 0.8.15's `vpermps`
-  lookup and 0.8.16's row block were both written into `kern_dot_code` and
-  `kern_row_code`, which are the one lane path. The many lane path —
-  `kern_row_code_many` over `kern_code_spread` and `kern_dot_real_many` — still
-  spreads the codes to floats through scratch and reads them a lane at a time.
-  It shares the head's 96 MiB across the lanes correctly, so the sweep is not
-  the problem; what it does not have is the cheaper unpack or the deeper set of
-  accumulators.
+  **The batched head has both of those now, 0.9.1, and what it cost is worth
+  reading before the next route is scoped.** 0.8.15's `vpermps` lookup and
+  0.8.16's row block were written into `kern_dot_code` and `kern_row_code`,
+  which are the one lane path; the many lane path spread the codes out to floats
+  through scratch and read them back a block of lanes at a time.
+  `kern_dot_code_many` now decodes in the vector and multiplies straight into
+  four lanes' pairs of accumulators, which is both of those changes at once and
+  takes the scratch out of both sides of it.
 
-  That is the first thing to take here, because it is bit-identical, it is two
-  changes that already exist in another function, and 0.9.0 measured what it is
-  worth: **six of the thirteen milliseconds an extra speculative lane costs are
-  this plane.** Prefill reaches it too.
+  A speculative round is 8 to 13% cheaper for it and the marginal lane at a
+  block of eight is **12.44 ms to 10.56**. Two things it did not do, and they
+  bound what to expect from the routes below. **Prefill does not move**, because
+  a prefill pays the head once for its whole chunk — the batched head was never
+  a prefill problem, whatever the old entry said. And it is **not
+  bit-identical**: a 512 bit accumulator adds a lane's slots in a different order
+  than a 256 bit one, so the batch agrees with a lane at a time to a float's
+  tolerance, as a batch here always has. What is held exactly is `igllm guess`'s
+  `matches plain`, which is the block path's token stream against the plain one.
 
   *Give the head a grid, and take the integer path.* This is the large one — the
   four bit planes run at 52 G multiply-adds a second against the head's 33, and
@@ -280,6 +298,22 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   cluster whose bound cannot beat it. Rejecting is cheaper still, because any
   single row that beats the proposal ends the question.
 
+  **One thing to check before building any of it, because it decides the whole
+  idea and costs an afternoon rather than a week.** A bound is only worth
+  anything if it is tight enough to prune. Cauchy-Schwarz on a row gives
+  `|<w,a>| <= ||w|| ||a||`, and over 1536 dimensions a typical alignment makes
+  that about `sqrt(1536)` — thirty-nine times — looser than the value it bounds,
+  so a plain per-row norm prunes nothing at all. Clustering replaces it with
+  `<centroid, a> + radius * ||a||`, which is tight only where the cluster radius
+  is small against the row norms. **Measure that ratio on this export's head
+  before writing a k-means**: take a few thousand rows, cluster them any way at
+  all, and compare the radius with the norm. If the radius is most of the norm
+  the bound cannot beat a top logit and the entry is closed; the entry's own
+  rule — stop if the bound needs most of a row to be useful — is the same test
+  said less precisely. The clustering itself is also a load-time cost on an
+  engine whose startup is two JSON files, which is a second reason to know the
+  answer before paying it.
+
   So this entry is the enabler for the speculative one below rather than a
   parallel idea, and it is worth more there than in a plain decode step: a plain
   step pays the head once, a block of eight pays it eight times. Six of the
@@ -310,33 +344,36 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   payoff there; what was unknown was this engine's verification cost, and 0.9.0
   measured it.
 
-  **Is it still worth doing? Yes, but only after the two entries above, and the
-  measurement says why.** `igllm guess` runs a greedy continuation three ways —
-  plain, with a proposer that is always right, and with one that is always
-  wrong — and holds all three to the same token stream. On the shipped export at
-  four threads:
+  **It is built and it ships — 0.9.3 — and what is left of the entry is the
+  ceiling rather than the feature.** `igllm guess` runs a greedy continuation
+  with three proposers, one always right, the n-gram scout that ships, and one
+  always wrong, and holds all three to the plain run's token stream. On the
+  shipped export at four threads, on an answer that quotes its prompt:
 
-  | block | proposer | vs plain |
-  | --- | --- | --- |
-  | 4 | oracle | 1.51x |
-  | 8 | oracle | **2.15x** |
-  | 16 | oracle | 2.21x |
-  | 8 | null | 0.30x |
+  | block | proposer | committed a round | vs plain |
+  | --- | --- | --- | --- |
+  | 4 | oracle | 4.00 | 2.02x |
+  | 4 | n-gram | 2.67 | 1.69x |
+  | 8 | oracle | 8.00 | 2.11x |
+  | 8 | n-gram | 3.69 | **1.80x** |
+  | 8 | null | 1.00 | 0.30x |
 
-  **The ceiling is 2.2x** — that is a proposer that is *never wrong* — and
-  **break-even needs about 40% of guesses accepted**, because a round of eight
-  costs 142 ms against a plain step's 38 and so has to commit 3.7 tokens to pay.
+  **The ceiling is still about 2.2x** — that is a proposer that is never wrong —
+  and the scout reaches **85% of it** where prompt lookup applies. On free
+  generation it draws nothing and costs 0.92 to 0.95, which is why `--guess` is
+  a flag.
 
-  The reason the ceiling is 2.2 and not 6 is the reason this entry is now third.
-  A block shares the weight *sweep* across its lanes and cannot share the
-  *arithmetic*, and this engine is arithmetic-bound: an extra lane costs about
-  **13 ms** against a plain step's 38. **Six of those 13 are the output head**,
-  because verifying a position means asking what the model would have produced
-  there, and that is the full 262144 rows for every lane. The two entries above
-  are therefore not merely nice to have first — they set this entry's ceiling.
-  Halve the marginal lane and the ceiling goes to about 4x and break-even to
-  about 25%, which is the difference between a feature worth shipping and a coin
-  flip.
+  The reason the ceiling is 2.2 and not 6 is what is left of this entry. A block
+  shares the weight *sweep* across its lanes and cannot share the *arithmetic*,
+  and this engine is arithmetic-bound: an extra lane cost about **13 ms** against
+  a plain step's 38 when 0.9.0 measured it, and 0.9.1 took it to **10.6** by
+  giving the batched head the one lane head's unpack and chain depth. **The head
+  was six of the original thirteen and is now about three.** Halve what is left
+  of the marginal lane and the ceiling goes toward 4x — which would take the
+  scout's 1.80x with it, and would move free generation from a cost to a wash.
+  The head entry above is therefore still this entry's ceiling, and its second
+  route — not scoring 262144 rows to answer one question about one row — is the
+  one that has not been tried.
 
   **The order to finish it in.**
 
@@ -346,26 +383,38 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      undo is held byte for byte by `test_guess` on the synthetic checkpoint,
      whose four row window makes every block lap the ring; the bug the old entry
      warned about — trusting `fill_count` — was written deliberately and the
-     test fails on it. **Nothing below should start before the two entries above
-     are done**, because until then any proposer is being measured against a
-     ceiling of 2.2.
+     test fails on it.
 
   2. **Make the batched head cheap, which is the entry above and this one at
-     once.** Two routes and they compose. `kern_row_code_many` shares the head's
-     96 MiB across the lanes correctly but got neither 0.8.15's `vpermps` lookup
-     nor 0.8.16's row block, both of which were written for the one lane path —
-     that is a bit-identical win sitting in plain sight. And verification does
-     not need the whole distribution: for greedy it needs only to know whether
-     the proposed id is the argmax, which is exactly the bound the entry below
-     is about. **Measure the marginal lane again before writing a proposer.**
+     once.** Two routes and they compose. The first is **done, 0.9.1**:
+     `kern_dot_code_many` gives the many lane path 0.8.15's `vpermps` lookup and
+     0.8.16's chain depth at once, and the marginal lane at a block of eight is
+     12.44 ms to 10.56 — a round 8 to 13% cheaper. The second is still open and
+     is the larger of the two: verification does not need the whole
+     distribution, because for greedy it needs only to know whether the proposed
+     id is the argmax, which is exactly the bound the entry above is about.
+     **Measure the marginal lane again before writing a proposer**, which is
+     what 0.9.1 did and what the next change here should do.
 
-  3. **Then the n-gram proposer**, which needs no second model and no training.
-     Hold it to **committed tokens per millisecond** against `igllm guess`'s
-     oracle and null rows, not to acceptance rate, and measure it on the
-     workloads that differ: free generation, where it will be weakest, and
-     summarising or editing where the output quotes the input and prompt lookup
-     is at its best. If it does not clear the break-even line on free
-     generation, ship it behind a flag rather than on by default, and say so.
+  3. **Done, 0.9.3: the n-gram proposer.** `app_scout` asks what followed the
+     last time this stream said what it has just said — a growing array of ids
+     and a backward scan, no second model and no training. It runs as a third
+     row of `igllm guess` beside the oracle and the null, so it is held to
+     committed tokens per millisecond against the bracket rather than to an
+     acceptance rate. On an answer that quotes its prompt it reaches **1.80x at
+     a block of eight against a ceiling of 2.11x** — 85% of everything a
+     proposer that is never wrong could give, at 95% of guesses accepted. On
+     free generation it draws nothing at all and costs 0.92 to 0.95 of the plain
+     rate, so **it ships behind a flag**, which is what this step said to do if
+     it did not clear break-even there.
+
+     Two things settled in passing and worth not re-deriving. The shortest reach
+     it will match on is **two, not one**: a single id matches somewhere in
+     almost any stream, so a reach of one draws nearly every round and is right
+     almost never — and dropping it is better on the quoting workload *and* on
+     free generation at once. And where the scout proposes nothing the round is
+     an ordinary `session_step` rather than a block of one lane, which is the
+     other half of why the flag is nearly free when it does not help.
 
   4. **Then sampling.** Everything above is greedy: `session_guess`'s
      verification is an argmax comparison. Speculative decoding under a
@@ -375,9 +424,24 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      says so, or it needs a proposer that carries a distribution. Decide which
      before plumbing it into `chat`.
 
-  5. **Then the plumbing**: a `--guess <k>` flag, the block path inside
-     `main_serve`, and the tally counting committed tokens against rounds so a
-     user can see what it bought.
+  5. **Done, 0.9.3: the plumbing.** `--guess <lanes>` on `chat` and `complete`,
+     the block path inside `main_serve`, and a tally line counting committed
+     tokens against rounds and accepted guesses against drawn. `session_guess`
+     now counts into the decode tally as well — the weights once and the cache
+     once a lane — so `decode tok/s` and `reads MiB a token` describe a guessed
+     run rather than reading zero.
+
+     **And 0.9.4 carried it into `chat --loop`,** which is where prompt lookup
+     belongs: the scout is the conversation's rather than the turn's, so a
+     follow-up question about the same document has both the document and the
+     answer before it. A passage planted in one turn and asked for back in the
+     next is **5.56 s to 4.33** end to end, and the second turn commits 3.08
+     tokens a round at 82% of guesses kept where a per-turn scout would have had
+     nothing at all.
+
+     What is left is small and named: a prompt whose last id is a soft token
+     from a tower takes the plain loop whatever the flag says, because a block
+     cannot carry an embedding row.
 
   **One thing to watch that 0.9.0 found and did not settle.** A batched pass
   answers every lane the same way — one lane off the calibrated grid puts the
@@ -614,3 +678,10 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | All-position logits out of `session_pass`, as one batched head rather than a loop of single ones | 0.9.0 |
 | A cache a rejected block can be taken out of — the bound that makes it a fixed scratch, and the byte-for-byte test that holds it | 0.9.0 |
 | What speculative decoding is worth in this engine, bracketed by a proposer that is always right and one that is always wrong (answered: 2.2x at best, break-even near 40% acceptance, and the output head is half the marginal lane) | 0.9.0 |
+| The batched output head's unpack and its chain depth — the two things 0.8.15 and 0.8.16 gave the one lane path and could not reach the many lane one | 0.9.1 |
+| The n-gram proposer, measured against the bracket rather than by acceptance rate, on the two workloads that differ | 0.9.3 |
+| The `--guess` flag, the block path inside `main_serve`, and a block counted into the decode tally | 0.9.3 |
+| A scout that belongs to the conversation rather than to the turn, so `chat --loop` has prompt lookup across turns | 0.9.4 |
+| Whether a proposer should match on a single id (answered: no — better on both workloads at once without it) | 0.9.3 |
+| The mlp's accumulator chain, which the entry named as the first thing to check (refused: a wash on the one lane block, 15% worse on the batched one, and the plane is at 78% of this host's bare sweep) | 0.9.2 |
+| What a bare sweep of the reference host actually is, against the third host's number the mlp entry had been reasoning from | 0.9.2 |

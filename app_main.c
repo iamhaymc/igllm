@@ -39,6 +39,10 @@ typedef struct main_flag {
   int         cache_bits;   /* 0 keeps the key and value cache in float, 8 quantizes it */
   int         raw_flag;
   int         loop_flag;
+  /* Lanes a speculative round may carry, zero for none.  One is the same as
+   * none: a block of one lane is an ordinary step with the block path's
+   * bookkeeping around it. */
+  int         guess_span;
   const char *keep_path;
   app_taste   taste;
 } main_flag;
@@ -99,7 +103,7 @@ static void main_usage(void) {
   printf("  logits     print the next token distribution as json\n");
   printf("  probe      print the resolved model shape\n");
   printf("  cache      print the calibrated cache ranges against a prompt\n");
-  printf("  guess      what a block of guesses would be worth, bracketed\n\n");
+  printf("  guess      what a block of guesses is worth, against a proposer's ceiling\n\n");
   printf("options:\n");
   printf("  --model <folder>    checkpoint folder in huggingface layout\n");
   printf("  --prompt <text>     prompt text, defaults to a short greeting\n");
@@ -115,6 +119,7 @@ static void main_usage(void) {
   printf("  --top-p <value>     top-p cutoff\n");
   printf("  --echo-penalty <v>  repetition penalty\n");
   printf("  --seed <value>      sampler seed\n");
+  printf("  --guess <lanes>     speculative block, greedy only, 0 or 1 for none\n");
   printf("  --loop              keep the chat task open for more turns\n");
   printf("  --keep <path>       hold the prompt's cache here, and reuse it next time\n");
   printf("  --raw               skip the chat frame in the chat task\n");
@@ -152,6 +157,7 @@ static int main_flags(int argc, char **argv, main_flag *flag_out) {
       flag_out->show_list[flag_out->show_count++].path_text = argv[++argument_index];
     }
     else if (strcmp(name_text, "--serve") == 0 && value_text) flag_out->serve_limit = atoi(argv[++argument_index]);
+    else if (strcmp(name_text, "--guess") == 0 && value_text) flag_out->guess_span = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--threads") == 0 && value_text) flag_out->thread_count = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--window") == 0 && value_text) flag_out->window_limit = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--cache") == 0 && value_text) flag_out->cache_bits = atoi(argv[++argument_index]);
@@ -386,6 +392,113 @@ static app_code main_keep_prime(const main_flag *flag, app_session *session,
  * printing each piece as it lands.  The state row belongs to the prompt's last
  * id and only that id can have one, because only a prompt's ids come from a
  * tower. */
+/* The largest of a row of logits, which is what a greedy step picks and what
+ * a greedy verification compares against. */
+static int32_t main_guess_top(const float *logit_list, int vocab_count) {
+  int32_t best_id = 0;
+  int slot;
+  for (slot = 1; slot < vocab_count; ++slot)
+    if (logit_list[slot] > logit_list[best_id]) best_id = (int32_t)slot;
+  return best_id;
+}
+
+/* What a run of speculative rounds bought, for the line printed after it. */
+typedef struct main_bet {
+  long round_count;   /* blocks run */
+  long draw_count;    /* guesses proposed */
+  long take_count;    /* guesses the model agreed with */
+  long token_count;   /* tokens the answer produced */
+} main_bet;
+
+/* One answer, a block of guesses at a time.
+ *
+ * The scout proposes what the stream did the last time it said this, the block
+ * verifies every position in one pass, and the leading guesses the model agrees
+ * with are kept.  The token after the last accepted guess is the model's own
+ * and is true whatever was guessed, so a round always commits at least one:
+ * this cannot loop without progress and cannot produce a token a plain decode
+ * would not have.
+ *
+ * **Greedy only, and the caller has already checked it.** Verification here is
+ * an argmax comparison, which is the right rule at a temperature of zero and
+ * the wrong one above it — speculative decoding under a temperature needs the
+ * modified rejection rule, accept with probability `min(1, p/q)` and resample
+ * from the difference, and an n-gram proposer has no `q` to divide by.  Rather
+ * than sample from a distribution the block would have skewed, `--guess` is
+ * refused where the taste is not greedy.
+ *
+ * Where the scout has nothing to propose the round is a block of one lane.
+ * That is a little more than a plain step rather than a little less, and it is
+ * why `--guess` is a flag and not the default: on free generation the scout
+ * draws rarely and the flag costs a few percent, while on text that quotes its
+ * prompt it is worth more than half again. */
+static void main_answer_guess(app_model *model, const main_flag *flag, app_session *session,
+                              app_scout *scout, const main_reel *reel, int quiet_flag,
+                              main_bet *bet) {
+  int32_t block_list[16];
+  int32_t id_value = reel->id_list[reel->id_count - 1];
+  int block_want = flag->guess_span;
+  int shut_flag = 0;
+  if (block_want > session_guess_limit(session)) block_want = session_guess_limit(session);
+  if (block_want < 1) block_want = 1;
+  /* This turn's ids, which in a conversation are the new turn's alone: the
+   * scout is the caller's and already holds every turn before it. */
+  if (!scout || scout_note(scout, reel->id_list, reel->id_count) != APP_OKAY) return;
+  while (bet->token_count < flag->serve_limit && !shut_flag) {
+    const float *rows;
+    int span_count, slot, take_count = 0;
+    int want_count = block_want - 1;
+    if (want_count > flag->serve_limit - (int)bet->token_count - 1)
+      want_count = flag->serve_limit - (int)bet->token_count - 1;
+    if (want_count < 0) want_count = 0;
+    block_list[0] = id_value;
+    span_count = 1 + scout_draw(scout, block_list + 1, want_count);
+    if (span_count == 1) {
+      /* Nothing proposed, so nothing to verify: an ordinary step, which is
+       * cheaper than a block of one lane and is the whole of what `--guess`
+       * costs on a stream the scout cannot help with. */
+      const float *logit_list = session_step(session, id_value);
+      int32_t made_id;
+      if (!logit_list) break;
+      bet->round_count += 1;
+      made_id = main_guess_top(logit_list, model_vocab_count(model));
+      if (token_is_close(model, made_id)) break;
+      id_value = made_id;
+      if (!quiet_flag) main_emit(model, made_id);
+      bet->token_count += 1;
+      if (scout_note(scout, &made_id, 1) != APP_OKAY) break;
+      continue;
+    }
+    rows = session_guess(session, block_list, span_count);
+    if (!rows) break;
+    bet->round_count += 1;
+    bet->draw_count += span_count - 1;
+    while (take_count + 1 < span_count &&
+           main_guess_top(rows + (size_t)take_count * (size_t)model_vocab_count(model),
+                          model_vocab_count(model)) == block_list[take_count + 1])
+      take_count += 1;
+    bet->take_count += take_count;
+    for (slot = 0; slot <= take_count && bet->token_count < flag->serve_limit; ++slot) {
+      int32_t made_id =
+          slot < take_count ? block_list[slot + 1]
+                            : main_guess_top(rows + (size_t)slot * (size_t)model_vocab_count(model),
+                                             model_vocab_count(model));
+      if (token_is_close(model, made_id)) {
+        shut_flag = 1;
+        /* The block is kept up to the token before the close, so the cache
+         * carries exactly what was emitted. */
+        take_count = slot;
+        break;
+      }
+      id_value = made_id;
+      if (!quiet_flag) main_emit(model, made_id);
+      bet->token_count += 1;
+      if (scout_note(scout, &made_id, 1) != APP_OKAY) { shut_flag = 1; break; }
+    }
+    if (session_guess_keep(session, take_count + 1) != APP_OKAY) break;
+  }
+}
+
 static void main_answer(app_model *model, const main_flag *flag, app_session *session,
                         int32_t id_value, const float *state_data, int quiet_flag) {
   int serve_index;
@@ -492,10 +605,23 @@ static void main_phases(const app_session *session) {
 static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
   app_session *session = NULL;
   main_reel reel;
+  main_bet bet;
+  app_scout *scout = NULL;
   int last_index;
+  int guess_flag;
   int32_t id_value;
   const float *state_data;
   app_code code;
+
+  memset(&bet, 0, sizeof(bet));
+  guess_flag = flag->guess_span > 1;
+  /* Greedy only, and said out loud rather than quietly ignored: verification
+   * is an argmax comparison and there is no rejection rule here for a
+   * temperature to be sampled under. */
+  if (guess_flag && flag->taste.heat_value > 0.0f) {
+    fprintf(stderr, "--guess is greedy only; use --heat 0\n");
+    return 1;
+  }
 
   code = session_open(model, &session);
   if (code != APP_OKAY) {
@@ -520,7 +646,15 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
   state_data = reel.state_flag[last_index]
                    ? reel.state_list + (size_t)last_index * (size_t)reel.state_size
                    : NULL;
-  main_answer(model, flag, session, id_value, state_data, quiet_flag);
+  /* A block cannot carry an embedding row a tower filled, so a prompt whose
+   * last id is a soft token takes the plain loop whatever the flag says. */
+  if (guess_flag && !state_data && scout_open(&scout) == APP_OKAY) {
+    main_answer_guess(model, flag, session, scout, &reel, quiet_flag, &bet);
+    scout_close(scout);
+  } else {
+    main_answer(model, flag, session, id_value, state_data, quiet_flag);
+    guess_flag = 0;
+  }
   if (!quiet_flag) printf("\n");
 
   {
@@ -545,6 +679,15 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
             (double)model_memory_bytes(model) / (1024.0 * 1024.0));
     fprintf(stderr, "memory  %.1f MiB allocated\n",
             (double)tally.memory_bytes / (1024.0 * 1024.0));
+    /* What the block path actually bought, in the two numbers that decide it:
+     * how many tokens a round carried, and how often the scout was right.  A
+     * round always commits at least one, so a figure at 1.00 means the guessing
+     * never paid and the flag cost whatever the extra lanes cost. */
+    if (guess_flag && bet.round_count > 0)
+      fprintf(stderr, "guess   %.2f tokens a round over %ld rounds, %.0f%% of %ld guesses kept\n",
+              (double)bet.token_count / (double)bet.round_count, bet.round_count,
+              bet.draw_count > 0 ? 100.0 * (double)bet.take_count / (double)bet.draw_count : 0.0,
+              bet.draw_count);
   }
   if (flag->verbose_level) main_phases(session);
   main_reel_free(&reel);
@@ -570,6 +713,12 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
 
 typedef struct main_talk {
   app_session *session;
+  /* The conversation's own proposer, opened the first time `--guess` needs it.
+   * It belongs to the conversation rather than to the turn, and that is the
+   * whole reason it is here: a follow-up question about the same document
+   * quotes both the document and the answer before it, which is where prompt
+   * lookup is at its best and what a per-turn scout would throw away. */
+  app_scout   *scout;
   int          turn_count;
   int          open_flag;  /* whether the model has already answered in it */
   /* What `/image` and `/audio` have put in front of the next turn, and the room
@@ -646,7 +795,19 @@ static void main_talk_turn(app_model *model, const main_flag *flag, main_talk *t
   state_data = reel.state_flag[reel.id_count - 1]
                    ? reel.state_list + (size_t)(reel.id_count - 1) * (size_t)reel.state_size
                    : NULL;
-  main_answer(model, flag, talk->session, reel.id_list[reel.id_count - 1], state_data, 0);
+  if (flag->guess_span > 1 && !state_data &&
+      (talk->scout || scout_open(&talk->scout) == APP_OKAY)) {
+    main_bet bet;
+    memset(&bet, 0, sizeof(bet));
+    main_answer_guess(model, flag, talk->session, talk->scout, &reel, 0, &bet);
+    if (flag->verbose_level && bet.round_count > 0)
+      fprintf(stderr, "\nguess   %.2f tokens a round over %ld rounds, %.0f%% of %ld kept\n",
+              (double)bet.token_count / (double)bet.round_count, bet.round_count,
+              bet.draw_count > 0 ? 100.0 * (double)bet.take_count / (double)bet.draw_count : 0.0,
+              bet.draw_count);
+  } else {
+    main_answer(model, flag, talk->session, reel.id_list[reel.id_count - 1], state_data, 0);
+  }
   printf("\n");
   fflush(stdout);
   main_reel_free(&reel);
@@ -660,6 +821,13 @@ static int main_loop(app_model *model, const main_flag *flag) {
   char line_text[MAIN_LINE_LIMIT];
   int talk_slot = 0, talk_index;
 
+  /* The same refusal the single turn path makes, and for the same reason:
+   * verification is an argmax comparison and there is no rejection rule here
+   * for a temperature to be sampled under. */
+  if (flag->guess_span > 1 && flag->taste.heat_value > 0.0f) {
+    fprintf(stderr, "--guess is greedy only; use --heat 0\n");
+    return 1;
+  }
   memset(talk_list, 0, sizeof(talk_list));
   if (session_open(model, &talk_list[0].session) != APP_OKAY) {
     fprintf(stderr, "session: %s\n", app_code_text(APP_FAIL_MEMORY));
@@ -732,6 +900,7 @@ static int main_loop(app_model *model, const main_flag *flag) {
       if (strcmp(line_text, "/drop") == 0) {
         int next_slot = -1;
         session_close(talk_list[talk_slot].session);
+        scout_close(talk_list[talk_slot].scout);
         memset(&talk_list[talk_slot], 0, sizeof(talk_list[talk_slot]));
         for (talk_index = 0; talk_index < MAIN_TALK_LIMIT; ++talk_index)
           if (talk_list[talk_index].session) { next_slot = talk_index; break; }
@@ -781,6 +950,13 @@ static int main_loop(app_model *model, const main_flag *flag) {
         talk->turn_count = (int)held_stamp;
         talk->open_flag = talk->turn_count > 0;
         talk->show_count = 0;
+        /* The scout's stream is the one this conversation was in, and the file
+         * has just replaced it.  It is forgotten rather than carried, because a
+         * proposer reading a conversation it is no longer in would be wrong
+         * without being caught — every guess is verified, so it would cost
+         * lanes rather than correctness, which is exactly the failure a test
+         * would not find. */
+        scout_clear(talk->scout);
         printf("conversation %d restored, %d turns, %d ids\n", talk_slot + 1, talk->turn_count,
                session_fill(talk->session));
         continue;
@@ -808,8 +984,10 @@ static int main_loop(app_model *model, const main_flag *flag) {
     main_talk_turn(model, flag, &talk_list[talk_slot], line_text);
   }
 
-  for (talk_index = 0; talk_index < MAIN_TALK_LIMIT; ++talk_index)
+  for (talk_index = 0; talk_index < MAIN_TALK_LIMIT; ++talk_index) {
     if (talk_list[talk_index].session) session_close(talk_list[talk_index].session);
+    scout_close(talk_list[talk_index].scout);
+  }
   return 0;
 }
 
@@ -929,30 +1107,60 @@ static int main_tokens(app_model *model, const main_flag *flag) {
  * wrongly, or an undo that left a guess behind in the cache, shows up as a
  * stream that does not match. */
 
-static int32_t main_guess_top(const float *logit_list, int vocab_count) {
-  int32_t best_id = 0;
-  int slot;
-  for (slot = 1; slot < vocab_count; ++slot)
-    if (logit_list[slot] > logit_list[best_id]) best_id = (int32_t)slot;
-  return best_id;
+/* Guesses the model agreed with, as a share of guesses drawn.  A proposer that
+ * drew none — which is the null row's opposite and the scout's early rounds —
+ * has no share to report rather than a share of zero. */
+static const char *main_guess_share(long take_count, long draw_count) {
+  static char text_room[16];
+  if (draw_count < 1) return "-";
+  snprintf(text_room, sizeof(text_room), "%.0f%%",
+           100.0 * (double)take_count / (double)draw_count);
+  return text_room;
 }
 
-/* One speculative run.  `oracle_flag` picks the cheat: the true continuation,
- * or an id that is deliberately not it. */
+/* Which proposer a run is measured with.  The first two are cheats and could
+ * never be written for real work; the third is the one that ships. */
+#define MAIN_GUESS_NULL   0
+#define MAIN_GUESS_ORACLE 1
+#define MAIN_GUESS_SCOUT  2
+
+static const char *main_guess_name(int mode_value) {
+  if (mode_value == MAIN_GUESS_ORACLE) return "oracle";
+  if (mode_value == MAIN_GUESS_SCOUT) return "n-gram";
+  return "null";
+}
+
+/* One speculative run.  `mode_value` picks the proposer: the true continuation,
+ * an id that is deliberately not it, or the n-gram scout, which is the only one
+ * of the three a caller could actually have.
+ *
+ * The scout is told the prompt before the clock starts and every committed
+ * token after that, and it is never told a guess — so what it proposes is only
+ * ever built out of what the model has agreed to.  Where it has nothing to say
+ * the round is a block of one lane, which is what a caller without a proposal
+ * pays and is a little more than a plain step. */
 static double main_guess_run(app_session *session, main_reel *reel, int block_span,
-                             const int32_t *true_list, int serve_count, int oracle_flag,
+                             const int32_t *true_list, int serve_count, int mode_value,
                              int32_t *made_list, int vocab_count, long *round_out,
-                             long *commit_out) {
+                             long *commit_out, long *draw_out) {
   int32_t block_list[16];
   int32_t last_id = reel->id_list[reel->id_count - 1];
   int made_count = 0;
-  long round_count = 0, commit_count = 0;
+  long round_count = 0, commit_count = 0, draw_count = 0;
+  app_scout *scout = NULL;
   double from_time;
 
   session_reset(session);
   if (session_prime_media(session, reel->id_list, reel->id_count, reel->state_list,
                           reel->state_flag) != APP_OKAY)
     return -1.0;
+  if (mode_value == MAIN_GUESS_SCOUT) {
+    if (scout_open(&scout) != APP_OKAY) return -1.0;
+    if (scout_note(scout, reel->id_list, reel->id_count) != APP_OKAY) {
+      scout_close(scout);
+      return -1.0;
+    }
+  }
   from_time = time_now();
   while (made_count < serve_count) {
     const float *rows;
@@ -961,15 +1169,36 @@ static double main_guess_run(app_session *session, main_reel *reel, int block_sp
     if (span_count > serve_count - made_count + 1) span_count = serve_count - made_count + 1;
     if (span_count < 1) span_count = 1;
     block_list[0] = last_id;
-    for (slot = 1; slot < span_count; ++slot) {
-      /* The oracle proposes what the plain run produced; the other proposes
-       * something that is not it, so the first guess of every block fails and
-       * the block commits exactly the one token it was always going to. */
-      int32_t want_id = made_count + slot - 1 < serve_count ? true_list[made_count + slot - 1] : 0;
-      block_list[slot] = oracle_flag ? want_id : (int32_t)((want_id + 1) % vocab_count);
+    if (mode_value == MAIN_GUESS_SCOUT) {
+      span_count = 1 + scout_draw(scout, block_list + 1, span_count - 1);
+    } else {
+      for (slot = 1; slot < span_count; ++slot) {
+        /* The oracle proposes what the plain run produced; the other proposes
+         * something that is not it, so the first guess of every block fails and
+         * the block commits exactly the one token it was always going to. */
+        int32_t want_id =
+            made_count + slot - 1 < serve_count ? true_list[made_count + slot - 1] : 0;
+        block_list[slot] =
+            mode_value == MAIN_GUESS_ORACLE ? want_id : (int32_t)((want_id + 1) % vocab_count);
+      }
+    }
+    draw_count += span_count - 1;
+    if (span_count == 1 && mode_value == MAIN_GUESS_SCOUT) {
+      /* What the shipped path does with nothing to verify: an ordinary step,
+       * which is cheaper than a block of one lane.  The oracle and the null
+       * always draw, so only this row is affected and only where the scout has
+       * nothing — which is what a caller would actually pay. */
+      const float *logit_list = session_step(session, last_id);
+      if (!logit_list) { scout_close(scout); return -1.0; }
+      round_count += 1;
+      last_id = main_guess_top(logit_list, vocab_count);
+      made_list[made_count++] = last_id;
+      commit_count += 1;
+      if (scout_note(scout, &last_id, 1) != APP_OKAY) { scout_close(scout); return -1.0; }
+      continue;
     }
     rows = session_guess(session, block_list, span_count);
-    if (!rows) return -1.0;
+    if (!rows) { scout_close(scout); return -1.0; }
     round_count += 1;
     /* The leading guesses the model agrees with, and then the token after the
      * last of those, which is true whatever the guesses were. */
@@ -984,11 +1213,17 @@ static double main_guess_run(app_session *session, main_reel *reel, int block_sp
       made_list[made_count++] = made_id;
       last_id = made_id;
       commit_count += 1;
+      if (scout && scout_note(scout, &made_id, 1) != APP_OKAY) { scout_close(scout); return -1.0; }
     }
-    if (session_guess_keep(session, take_count + 1) != APP_OKAY) return -1.0;
+    if (session_guess_keep(session, take_count + 1) != APP_OKAY) {
+      scout_close(scout);
+      return -1.0;
+    }
   }
   *round_out = round_count;
   *commit_out = commit_count;
+  *draw_out = draw_count;
+  scout_close(scout);
   return time_now() - from_time;
 }
 
@@ -1038,33 +1273,40 @@ static int main_guess(app_model *model, const main_flag *flag) {
   printf("plain   %.2f tok/s, %.2f ms a token\n", (double)serve_count / plain_seconds,
          plain_seconds / (double)serve_count * 1000.0);
   printf("block   at most %d lanes\n\n", session_guess_limit(session));
-  printf("%-6s %-8s %8s %11s %10s %9s  %s\n", "block", "proposer", "tok/s", "ms a round",
-         "committed", "vs plain", "stream");
+  printf("%-6s %-8s %8s %11s %10s %8s %9s  %s\n", "block", "proposer", "tok/s", "ms a round",
+         "committed", "of drawn", "vs plain", "stream");
   for (span_slot = 0; span_slot < 4; ++span_slot) {
     int block_span = span_list[span_slot];
-    int oracle_flag;
+    int mode_slot;
+    /* The ceiling, then the one that ships, then the floor: a reader compares
+     * the middle row with the two it sits between. */
+    static const int mode_list[3] = {MAIN_GUESS_ORACLE, MAIN_GUESS_SCOUT, MAIN_GUESS_NULL};
     if (block_span > session_guess_limit(session)) continue;
-    for (oracle_flag = 1; oracle_flag >= 0; --oracle_flag) {
-      long round_count = 0, commit_count = 0;
-      double seconds = main_guess_run(session, &reel, block_span, true_list, serve_count,
-                                      oracle_flag, made_list, vocab_count, &round_count,
-                                      &commit_count);
+    for (mode_slot = 0; mode_slot < 3; ++mode_slot) {
+      int mode_value = mode_list[mode_slot];
+      long round_count = 0, commit_count = 0, draw_count = 0;
+      double seconds;
       int same_flag = 1;
+      seconds = main_guess_run(session, &reel, block_span, true_list, serve_count, mode_value,
+                               made_list, vocab_count, &round_count, &commit_count, &draw_count);
       if (seconds < 0.0 || round_count < 1) {
-        printf("%-6d %-8s   run failed\n", block_span, oracle_flag ? "oracle" : "null");
+        printf("%-6d %-8s   run failed\n", block_span, main_guess_name(mode_value));
         continue;
       }
       for (slot = 0; slot < serve_count; ++slot)
         if (made_list[slot] != true_list[slot]) { same_flag = 0; break; }
-      printf("%-6d %-8s %8.2f %11.2f %10.2f %8.2fx  %s\n", block_span,
-             oracle_flag ? "oracle" : "null", (double)serve_count / seconds,
+      printf("%-6d %-8s %8.2f %11.2f %10.2f %8s %8.2fx  %s\n", block_span,
+             main_guess_name(mode_value), (double)serve_count / seconds,
              seconds / (double)round_count * 1000.0,
-             (double)commit_count / (double)round_count, plain_seconds / seconds,
+             (double)commit_count / (double)round_count,
+             main_guess_share(commit_count - round_count, draw_count), plain_seconds / seconds,
              same_flag ? "matches plain" : "DIVERGES");
     }
   }
-  printf("\noracle is the ceiling of any proposer, null is its floor.  A real proposer\n");
-  printf("pays where its accepted guesses a round carry the round's cost past a plain step.\n");
+  printf("\noracle is the ceiling of any proposer and null is its floor; n-gram is the one\n");
+  printf("that ships, reads only the stream it has already seen, and takes a plain step\n");
+  printf("where it has nothing to propose, exactly as --guess does.  A proposer pays where\n");
+  printf("its accepted guesses a round carry the round's cost past a plain step.\n");
   session_close(session);
   free(true_list);
   free(made_list);

@@ -1168,6 +1168,36 @@ question only a real prompt answers, and `session_cache_peak` beside
 temperature, top-k, top-p, then a draw from an xorshift stream. A
 temperature of zero short-circuits to the maximum.
 
+**The block path.** `session_guess` runs several ids as one batch and hands back
+one row of the vocabulary a lane, so a caller can ask what the model would have
+produced at every position of a proposed continuation. Nothing else may touch
+the session until `session_guess_keep` says how many lanes to keep; zero puts it
+back exactly where it was.
+
+Undoing is the hard half and it is not a counter. Twenty-eight of thirty-five
+layers hold a ring of `slide_span` rows, so a block that writes past the ring's
+length has overwritten rows an earlier position still needs. What makes it
+tractable is that a block is at most `KERN_LANE_LIMIT` rows and a ring is at
+least `slide_span`, so a block never laps itself: the rows it will overwrite are
+known before it runs, saving them is a fixed scratch, and undoing is the same
+copy back. `session_guess_limit` reports the bound and a longer block is
+refused.
+
+`app_scout` is the other half: an n-gram proposer over the ids it has been told
+about, which are the prompt and then only the tokens the model has agreed to.
+`scout_draw` finds the most recent earlier place the stream's last few ids
+appeared and proposes what followed them there, longest reach first and latest
+match within a reach. It is a growing array and a backward scan — no model, no
+training, no index — and it refuses to match on a single id, which is measured
+at the constant rather than assumed.
+
+A block belongs in the decode tally rather than the prime one, and it counts the
+weights **once** and the cache **once a lane**, because a batched product reads
+each row for every lane while each lane attends over its own prefix. That
+asymmetry is the whole of why a block can pay. The phase division stays off for
+a block, as it does for a prime pass: those buckets are armed for a decode step
+and a block runs the same graph several lanes wide.
+
 ## 4. Data flow
 
 ```

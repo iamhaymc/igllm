@@ -5174,3 +5174,413 @@ Whether any real proposer reaches 40% on this model. That needs the proposer,
 and `TODO.md` now says which one to write and what to hold it to. What is
 settled is that the verify side works, that it costs 13 ms a lane, and that the
 best it can ever be worth in this engine's present shape is 2.2x.
+
+---
+
+## 0.9.1 — the batched output head, which had neither of the two things the one lane head grew
+
+### Scope
+
+`TODO.md`'s speculative decoding entry names this as the first thing to take
+after 0.9.0, and says why: **six of the thirteen milliseconds an extra
+speculative lane costs are the output head**, because verifying a position means
+asking what the model would have produced there, and that is the full 262144
+rows for every lane. 0.8.15 and 0.8.16 made the one lane head three times
+cheaper and neither of them reached the batched one.
+
+Nothing else is changed. Decode is one lane and is untouched; `logits` on the
+shipped export is byte for byte what it was, and a greedy `chat` and `complete`
+produce the same text.
+
+### What the batched head was doing
+
+The many lane float path is `kern_row_code_many` over two functions:
+`kern_code_spread`, which writes a group of a row out into a scratch buffer as
+floats, and `kern_dot_real_many`, which reads that scratch back four lanes at a
+time. Neither could ever have had what the one lane path was given.
+
+0.8.15 replaced the two bit mask and widening with one `vpermps` against a
+repeating table — the cheapest unpack in this file, and it exists only inside
+`kern_dot_code`'s loop. 0.8.16 found that a float row of the head is bound by
+the depth of its own accumulator chain rather than by its ports, and covered it
+by taking four rows at once so eight chains cover each other; that is inside
+`kern_row_code_rows`. A spread's scratch has no unpack to make cheaper — it has
+already been paid, at the width the spread was written for — and it turns every
+multiply-add on the other side into a load, because the codes have to be read
+back.
+
+Counted against the ports, on 32 columns and 4 lanes — 128 multiply-adds:
+
+| | loads | arithmetic |
+| --- | --- | --- |
+| spread, then `kern_dot_real_many` at 256 bits | 4 of the row, 16 of the lanes | 16 multiply-adds, plus the spread's own unpack and its stores |
+| `kern_dot_code_many` at 512 bits | 2 dwords, 8 of the lanes | 2 broadcasts, 2 shifts, 2 lookups, 8 multiply-adds |
+
+### What it does now
+
+`kern_dot_code_many` is the batch's answer to what `kern_row_code_rows` is for
+one lane. The group is decoded where the one lane path decodes it — a broadcast,
+a variable shift and the `vpermps` lookup, three instructions for sixteen codes
+— and multiplied straight into each lane's pair of accumulators, four lanes at a
+time. Eight chains, which is the count 0.8.16 found sufficient; the decode is
+spent once for the four lanes rather than once for each; and the scratch is gone
+from both sides of it.
+
+Two bits and AVX-512 only, guarded by `kern_code_rows_ready`, which is the
+predicate the one lane block already uses and is the same question. That is the
+width and the host the one plane on this path has. Lanes past the last block of
+four go through `kern_dot_code` itself, which is the one lane path's own loop.
+Every other width and every other backend takes the spread exactly as before.
+
+### The sum, and what holds it
+
+This agrees with `kern_row_code` to a float's tolerance and not to its last bit,
+because a 512 bit accumulator adds a lane's slots in a different order than a
+256 bit one. That is what a batch has always done here — `back_mat_mat matches a
+lane at a time` is the test that says so, at a tolerance rather than an equality,
+and the batched path has never been bit-identical to a sequence of single steps
+for the reason 0.9.0 wrote down. What is held exactly is the thing a caller
+sees: `igllm guess` prints `matches plain` on every block and every proposer,
+which is the block path's token stream against the plain one, end to end.
+
+### What it is worth
+
+Six runs alternating between the two builds, `igllm guess --serve 16` on the
+shipped export at four threads, the minimum of each. The host is a four core
+Xeon at 2.8 GHz with AVX-512 and VNNI, and it is not a quiet one: `plain` itself
+ranged 34.8 to 42.1 ms a token across the twelve runs, so the rows below are the
+minima and the spread is quoted rather than hidden.
+
+| block | proposer | rounds | before | after | |
+| --- | --- | --- | --- | --- | --- |
+| 2 | null | 16 | 64.86 | 57.90 | −10.7% |
+| 4 | null | 16 | 75.79 | 66.55 | −12.2% |
+| 8 | null | 16 | 124.36 | 108.69 | −12.6% |
+| 16 | null | 16 | 178.87 | 164.48 | −8.0% |
+| 4 | oracle | 4 | 82.15 | 72.32 | −12.0% |
+| 8 | oracle | 2 | 142.59 | 131.74 | −7.6% |
+
+The null rows are the ones to read. A null proposer commits one token a round,
+so `--serve 16` is sixteen rounds of it and the figure is a mean over them; an
+oracle at a block of sixteen is **one** round and is a single sample with a page
+fault in it, which is why that row is not quoted at all and why its numbers
+swung by a third between runs of the same binary.
+
+At a block of eight the round is **124.36 ms to 108.69**, and against a plain
+step of 37.26 that is a marginal lane of 12.44 ms falling to 10.56 — most of the
+way through the head's half of it, which is what the entry predicted.
+
+Prefill does not move, and that is expected rather than disappointing: a prefill
+pays the head once for its whole chunk. Eight alternating runs on a 228 id
+prompt, best of each: 78.23 tokens a second before and 80.76 after, which is
+noise in both directions.
+
+### What is left in it
+
+The batched head is now on the same unpack and the same chain depth as the one
+lane head, so the two routes still open in `TODO.md` are the two that were
+already there: the broadcast the loop still spends three of sixteen instructions
+on, and not scoring 262144 rows at all. The second of those is the larger, and
+0.9.0 gave it a second customer — greedy verification asks whether the proposed
+id is the argmax, which is a bound and not a distribution.
+
+---
+
+## 0.9.2 — the mlp's chain, counted and refused, and the sweep that says why
+
+### Scope
+
+No code changes. `TODO.md`'s first entry — the feed-forward planes, half of
+every token, with no history of attempts on it — names one thing to check before
+anything cleverer, and this is that check, on the reference host, with the
+numbers written down so it is not checked a third time.
+
+> Start where 0.8.16 started: **count the loop against the ports, and count the
+> chain against the loop.** `kern_row_code_level_rows` carries one accumulator a
+> row over four rows. A 1536 column row at four bits is twenty-four blocks, so
+> each chain is twenty-four dependent `vpdpbusd` — five cycles deep on this
+> class of host against two a cycle of throughput, and four chains to cover it.
+
+The arithmetic is right and the conclusion does not follow. Two accumulators a
+row were built, on both integer loops, and both are refused.
+
+### The one lane row block: a wash
+
+`KERN_LEVEL_ROWS_LOOP` was given a paired loop — two blocks an iteration, two
+accumulators a row, eight chains where there were four, the level vector still
+loaded once for the four rows, and the second accumulator folded into the first
+inside the macro so no caller could tell. It is bit-identical by construction:
+a `vpdpbusd` accumulator is an `int32` sum of products, integer addition is
+associative, and `logits` on the shipped export came back byte for byte
+unchanged, which is the check that says the build did what it says.
+
+Three runs each, alternating builds, `bench --serve 96 --verbose`, the minimum
+of the `mlp` phase:
+
+| | mlp, ms a step |
+| --- | --- |
+| four chains | 18.989, 19.745, 21.480 |
+| eight chains | 18.959, 20.648, 21.105 |
+
+18.989 against 18.959. There is nothing there, in either direction.
+
+### Why not, and the number the entry was missing
+
+The entry's ratio — "two point one times its own memory floor" — is the third
+host's, where a bare four thread sweep reaches 49.80 GiB/s. **It is not this
+host's.** A bare read-only sweep of a 2.4 GiB buffer here, best of four:
+
+| threads | 1 | 2 | 4 |
+| --- | --- | --- | --- |
+| sequential read | 10.06 GiB/s | 17.09 | **31.29** |
+
+which is the 32.18 of 0.8.9's table on the same machine, a year of neighbours
+later. The mlp reads **475.3 MiB at 24.44 GiB/s**, so on this host it is at
+**78% of a bare sweep**, and its memory floor is 14.83 ms against the 18.96 it
+takes: **1.28 times its floor, not 2.1.** Even a plane with no arithmetic at all
+in it would save 4.1 ms of a 36.9 ms step here — 11% — and 0.8.9 measured the
+four bit code path itself at 29.47 GiB/s in isolation, so the honest ceiling on
+this entry is nearer 17% of the plane than to anything larger.
+
+A loop that is within a fifth of what its memory will hand over cannot be
+latency-bound, whatever counting its chains says. The chains are real; there is
+simply no port pressure behind them to relieve. On the third host, which sweeps
+at 49.80 GiB/s and where the same plane sits at 45% of a sweep rather than 78%,
+the answer could well be different — and that is where this should be retried,
+not here.
+
+### The batched loop: 15% worse, and a better hypothesis than the first
+
+`KERN_LEVEL_MANY_LOOP` looked like the case the argument actually fits. A batch
+reads the plane once and multiplies it by every lane, so the arithmetic a byte
+carries is the lane count and memory stops binding after the first lane or two —
+which is exactly where a latency-bound loop shows, and it is the loop a
+speculative block spends its marginal lane in. The same pairing was built there:
+two accumulators a lane, two blocks an iteration, both blocks still decoded once
+for the four lanes.
+
+Three runs each on a 228 id prompt, best of each: **prefill 78.28 tokens a
+second against 66.22** — the deeper loop is 15% *worse*. Eight accumulators, two
+decoded code vectors, four lane pointers and the plan's three constants do not
+fit, and what the chains gain the spills lose several times over.
+
+So the batched integer path is at its register limit and not at its latency
+limit, and that is worth knowing before anything else is written into it.
+
+### What this leaves
+
+The mlp entry stays open and its hypothesis does not. What is ruled out on it is
+now: the bit width (0.8.11), eight rows a block (0.8.11, 0.8.16), software
+prefetch (0.8.11), the page walk (0.8.12), and the accumulator chain at both
+widths (here). What is left is a plane at 78% of the host's memory, which is a
+smaller prize than the entry was written for, and the entry now says so.
+
+---
+
+## 0.9.3 — a proposer, and the flag that puts a block behind an ordinary turn
+
+### Scope
+
+Steps 3 and 5 of `TODO.md`'s speculative decoding entry. 0.9.0 built the verify
+side and measured what a block is worth; 0.9.1 halved the head's share of a
+lane. What was missing was something to propose the block and a way for a caller
+to ask for one.
+
+- **`app_scout`**, an n-gram proposer with no second model in it.
+- **an `n-gram` row in `igllm guess`**, beside the oracle and the null, so the
+  thing that ships is measured against the bracket rather than against itself.
+- **`--guess <lanes>`** on `chat` and `complete`, greedy only, with a line
+  after the run saying what it bought.
+
+Step 4 — sampling — is deliberately not here, and the flag says so rather than
+sampling from a distribution the block would have skewed.
+
+### The proposer
+
+`scout_draw` asks one question: **what did this token stream do the last time it
+was here?** Take the last few ids, find the most recent earlier place the same
+ids appeared, and propose what followed them there. The longest reach that
+matches anywhere wins, and among the places a reach matches, the latest wins.
+
+There is no model, no training and no second set of weights — the whole of it is
+a growing array of ids and a backward scan. A scan of the longest window this
+export has is a few hundred thousand `int32_t` comparisons, under a fifth of a
+millisecond against a round of a hundred, so the obvious loop is the right loop
+and an index would be complexity for nothing.
+
+A scout is told the prompt and then **only the tokens the model has agreed to**.
+One told about its own guesses would learn from them.
+
+### The shortest reach is two, and that is the whole of why the flag is cheap
+
+The obvious floor is one — match on a single id — and it is wrong on both
+workloads at once. A single id matches somewhere in almost any stream, so a
+reach of one is not a memory of anything: it draws nearly every round and is
+right almost never. At `--guess 4` on the shipped export, a prompt whose answer
+quotes it against free generation:
+
+| shortest reach | quoting | free |
+| --- | --- | --- |
+| 1 | 46.18 tok/s, 90% of 30 kept | 20.37 tok/s, 0% of 53 kept |
+| **2** | **47.28**, 100% of 27 | **24.80**, and it draws nothing at all |
+| 3 | 43.98, 96% of 27 | 25.33, and it draws nothing at all |
+
+Two is better than one on the workload the scout is for *and* on the one it is
+not, which is the rare shape of an argument that needs no trade-off: dropping
+the reach of one throws away guesses that were wrong anyway. Three costs the
+quoting case a fifteenth for very little on the other side.
+
+The second half of the same saving is in the caller. Where the scout proposes
+nothing the round is an ordinary `session_step` rather than a block of one lane,
+which is cheaper by the block path's bookkeeping. Together these two are what
+takes free generation from 0.74 of the plain rate to 0.95.
+
+### What it is worth
+
+`chat --heat 0 --serve 64` on the shipped export at four threads, best of three
+alternating runs each, and the emitted text is byte for byte the plain text in
+every case:
+
+| prompt | plain | `--guess 4` | |
+| --- | --- | --- | --- |
+| an answer that quotes the prompt | 26.02 tok/s | **47.73** | **1.83x** |
+| free generation | 27.63 tok/s | 26.32 | 0.95x |
+
+The tally line says why, and it is the two numbers that decide any proposer:
+
+```
+guess   3.08 tokens a round over 12 rounds, 100% of 27 guesses kept
+guess   1.00 tokens a round over 64 rounds, 0% of 0 guesses kept
+```
+
+### Against the bracket
+
+`TODO.md` asked for the scout to be held to **committed tokens per millisecond**
+against `igllm guess`'s oracle and null rows rather than to an acceptance rate,
+and on the two workloads that differ. It now runs as a third row of that table,
+with the same plain-step fallback the flag has, so what is measured is what
+ships. On the shipped export at four threads:
+
+Free generation, `guess --serve 32` on a three id prompt:
+
+```
+block  proposer    tok/s  ms a round  committed of drawn  vs plain  stream
+4      oracle      49.68       80.52       4.00     100%     1.93x  matches plain
+4      n-gram      24.41       40.97       1.00       0%     0.95x  matches plain
+4      null        13.08       76.47       1.00       0%     0.51x  matches plain
+8      oracle      59.40      134.69       8.00     100%     2.31x  matches plain
+8      n-gram      23.55       42.45       1.00       0%     0.92x  matches plain
+8      null         7.98      125.39       1.00       0%     0.31x  matches plain
+```
+
+An answer that quotes its prompt, `guess --serve 48`:
+
+```
+block  proposer    tok/s  ms a round  committed of drawn  vs plain  stream
+4      oracle      49.73       80.44       4.00     100%     2.02x  matches plain
+4      n-gram      41.78       63.83       2.67      94%     1.69x  matches plain
+4      null        12.74       78.52       1.00       0%     0.52x  matches plain
+8      oracle      52.08      153.61       8.00     100%     2.11x  matches plain
+8      n-gram      44.27       83.41       3.69      95%     1.80x  matches plain
+8      null         7.37      135.66       1.00       0%     0.30x  matches plain
+```
+
+**On the workload it is for, the scout reaches 1.80x against a ceiling of
+2.11x** — 85% of everything a proposer that is never wrong could give — at 95%
+of guesses accepted and 3.69 tokens a round. On the workload it is not for it
+draws nothing at all and costs the block path's accounting. Every row matches
+the plain stream, which is the check that the block path verified correctly and
+the undo left nothing behind.
+
+**So this is a flag and not a default, and `TODO.md` said to decide that on this
+measurement.** On text that quotes its input — summarising, editing, answering
+about a document, repairing code that is in the prompt — the continuation of a
+phrase is usually in the prompt already and the scout is right nearly every
+time. On free generation it has only what it has written itself, draws nothing,
+and costs a twentieth for the block path's accounting.
+
+### What the decode rate now counts
+
+A block was invisible to the tally: `session_step` counted tokens, seconds and
+bytes, and `session_guess` counted none of them, so a run under `--guess`
+reported `decode 0.00 tok/s`. It now counts into the same three, and the way it
+counts is the point of the whole feature: the **weights once**, because every
+lane of a batched product reads the same row, and the **cache once a lane**,
+because each lane attends over its own prefix. `session_guess_keep` adds the
+tokens actually committed. On the quoting run that is `reads 227.0 MiB a token`
+against a plain step's 766.3 — the same tokens, a third of the memory.
+
+The phase division stays off for a block, for the reason a prime pass is kept
+out of it: it is armed for a decode step, and a block runs the same graph
+several lanes wide.
+
+### Greedy only, said out loud
+
+`--guess` with a temperature is refused rather than silently ignored.
+Verification here is an argmax comparison, which is the right rule at zero and
+the wrong one above it — speculative decoding under a temperature needs the
+modified rejection rule, accept with probability `min(1, p/q)` and resample from
+the difference, and an n-gram proposer has no `q` to divide by. That is step 4
+of the entry and it needs a proposer that carries a distribution, or a decision
+that the feature is greedy-only forever.
+
+Two other honest limits. `--guess` is on the single-turn path — `chat`,
+`complete` — and not yet inside `chat --loop`, where a scout would want to
+carry across turns; that is where prompt lookup would be at its very best,
+because a follow-up question about the same document quotes both the document
+and the previous answer. And a prompt whose last id is a soft token from a
+tower takes the plain loop whatever the flag says, because a block cannot carry
+an embedding row.
+
+---
+
+## 0.9.4 — the proposer carried across turns, which is where prompt lookup belongs
+
+### Scope
+
+0.9.3 shipped `--guess` on the single turn tasks and said what was left: the
+scout was per-run, so `chat --loop` could not have it. That is the case prompt
+lookup is *best* at and the one it was missing — a follow-up question about the
+same document quotes both the document and the answer before it.
+
+`app_scout` now belongs to the conversation rather than to the turn. `main_talk`
+carries one, opened the first time `--guess` needs it, told each turn's ids as
+they arrive and every committed token after that.
+
+### What it is worth
+
+Two turns: one that plants a passage, then one that asks for it back. `--serve
+48`, greedy, `--guess 4`, best of three alternating runs, whole process wall
+clock including the load and both prefills:
+
+| | plain | `--guess 4` | |
+| --- | --- | --- | --- |
+| a passage planted, then quoted back | 5.56 s | **4.33 s** | **1.28x** |
+
+The tally says where it came from. The first turn is mostly the model's own
+words with the passage quoted inside them, and the scout is already useful
+there — 2.09 tokens a round at 83% of guesses kept. The second turn is almost
+entirely quotation, and it reaches 3.08 tokens a round at 82%. A scout that
+started fresh at each turn would have had nothing for the second one, which is
+the turn that matters.
+
+The emitted text is byte for byte the plain text, checked over the whole two
+turn session.
+
+### The three places a conversation's scout has to be tidied
+
+- **`/drop`** closes it with the session.
+- **the loop's exit** closes every one, not only the current conversation's.
+- **`/open`** clears it. The file has just replaced the conversation the scout's
+  stream was in, and a proposer reading a conversation it is no longer in would
+  be wrong without being caught: every guess is verified, so it would cost lanes
+  rather than correctness — which is exactly the failure a test would not find.
+
+`/new` needs nothing, because a new conversation is a zeroed slot and its scout
+is opened on demand.
+
+### Still not here
+
+Sampling, which is step 4 of `TODO.md`'s entry and needs the modified rejection
+rule and a proposer that carries a distribution. `--guess` refuses a temperature
+in the loop exactly as it does in the single turn tasks.

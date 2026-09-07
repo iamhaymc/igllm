@@ -15,6 +15,8 @@ party library, and no build system beyond a C compiler.
   function pointers
 - **batched prefill** — prompt tokens run in lanes, so a projection is a
   matrix product rather than a matrix-vector product per token
+- **speculative decoding** — `--guess` proposes a block out of the stream's own
+  history and verifies it in one pass, for the same text in fewer sweeps
 - **mixture-of-experts** — routed blocks run beside the shared expert, with
   the stacked expert weights sliced as views
 - **vision and audio** — a bidirectional patch encoder at variable resolution
@@ -53,25 +55,50 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 | `logits`   | print the next token distribution as json     |
 | `probe`    | print the resolved model shape                |
 | `cache`    | print the export's calibrated cache ranges    |
-| `guess`    | what a block of guesses would be worth, bracketed |
+| `guess`    | what a block of guesses is worth, against a proposer's ceiling |
 
 Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
 `--threads`, `--window`, `--cache`, `--heat`, `--top-k`, `--top-p`,
-`--echo-penalty`, `--seed`, `--loop`, `--keep`, `--raw`, `--verbose`. Run
-`igllm --help` for the full list.
+`--echo-penalty`, `--seed`, `--guess`, `--loop`, `--keep`, `--raw`,
+`--verbose`. Run `igllm --help` for the full list.
 
-`guess` answers a question the engine could not answer before: what speculative
-decoding would be worth here. It runs the same greedy continuation three ways —
-plain, with a proposer that always guesses right, and with one that always
-guesses wrong — and holds all three to the same token stream, so it checks the
-block path as much as it measures it. The first is the ceiling of any proposer
-and the second is its floor. On the shipped export the ceiling is 2.2x at a
-block of eight, and `CHANGES.md` 0.9.0 says why it is not higher.
+`--guess <lanes>` is speculative decoding, and it is greedy only. A proposer
+guesses the next few tokens out of the stream's own history, the model checks
+the whole block in one pass, and the guesses it agrees with are kept — so the
+text is byte for byte the text a plain greedy run produces, and the only thing
+that changes is how many sweeps of the weights it took. The proposer carries no
+second model and no training: it asks what followed the last time this stream
+said what it has just said.
+
+That makes it worth a great deal on an answer that quotes its prompt —
+summarising, editing, answering about a document, repairing code that is in the
+prompt — and worth nothing on free generation, where it has only what it has
+written itself. It draws nothing rather than guessing badly in that case, so the
+cost of asking is a twentieth. In `chat --loop` the proposer belongs to the
+conversation rather than to the turn, so a follow-up question about the same
+document has both the document and the answer before it:
 
 ```
-block  proposer    tok/s  ms a round  committed  vs plain  stream
-8      oracle      56.41      141.82       8.00     2.18x  matches plain
-8      null         7.69      129.97       1.00     0.30x  matches plain
+igllm chat --model model --heat 0 --guess 4 --prompt "..."
+
+an answer that quotes the prompt   26.02 tok/s plain, 47.73 with --guess 4
+free generation                    27.63 tok/s plain, 26.32 with --guess 4
+guess   3.08 tokens a round over 12 rounds, 100% of 27 guesses kept
+```
+
+`guess` is where that is measured rather than asserted. It runs the same greedy
+continuation with three proposers — one that is always right, the n-gram
+proposer that ships, and one that is always wrong — and holds all three to the
+plain run's token stream, so it checks the block path as much as it measures it.
+The first is the ceiling of any proposer and the last is its floor. On the
+shipped export the ceiling is about 2.2x at a block of eight, `CHANGES.md` 0.9.0
+says why it is not higher, and the proposer reaches 85% of it where it applies.
+
+```
+block  proposer    tok/s  ms a round  committed of drawn  vs plain  stream
+8      oracle      52.08      153.61       8.00     100%     2.11x  matches plain
+8      n-gram      44.27       83.41       3.69      95%     1.80x  matches plain
+8      null         7.37      135.66       1.00       0%     0.30x  matches plain
 ```
 
 `bench --verbose` prints where a decode step goes, largest part first, with the
