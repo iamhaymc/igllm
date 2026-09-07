@@ -38,6 +38,18 @@ that had never been vectorized. Decode at four threads is **27.1 tokens a
 second** of the 41 on a 374 id prompt and 29.3 on a short one; prefill is
 **82.1**. `CHANGES.md` 0.8.11 has every number and the two refusals.
 
+**And the correction has itself been corrected.** 0.8.11's table put the output
+head at 60.6 G multiply-adds a second, the best rate in the step, and every
+version since has reasoned from that. 0.8.14 found that the head does not run
+the integer kernel at all — the export's `lm_head.input_activation_scale` is
+`0.0`, so the plane can never be on the calibrated grid and falls to the float
+spread every token. On the third host it gives **33 G multiply-adds a second
+against the mlp's 52**, which is the worst rate in the step and not the best.
+Whether 0.8.11's 60.6 was the float path on a faster host or an arithmetic slip
+is not settled and does not need to be: the head's rate is a property of a
+kernel nothing else in the step uses, and it is not comparable to the rest of
+the table for that reason rather than for the bit width one.
+
 **What is actually behind is the two smallest planes, and one of them for a
 reason the first entry described exactly.** `ple feed` runs at 18.0 G
 multiply-adds a second and `ple lift` at 12.5, against 50 to 61 everywhere
@@ -140,60 +152,69 @@ the forks.
   Together the two are 2.6 ms of a 34.8 ms step, so the ceiling on this entry
   was about 5% of a token and 0.8.12 took 2.4% of it.
 
-- **The output head, if there is anything left in it at all.** 96 MiB and 12.2%
-  of everything a decode step reads, at 60.6 G multiply-adds a second, which is
-  the best rate in the step. Two measurements say there may still be something,
-  and neither is conclusive.
+- **The output head, which runs the float kernel and not the integer one.**
+  96 MiB and 12.2% of everything a decode step reads, 12.36 ms of a 44.74 ms
+  step on the third host, and **33 G multiply-adds a second against the mlp's
+  52** — because it is not on the integer path at all.
 
-  The same kernel on the same shape, run over the same memory-mapped file
-  outside the engine with the real epilogue attached, gives **22.7 GiB/s at
-  four threads** where the engine's head phase gives 14.25. A bare sweep on
-  this host gives 38.3 at four threads and 9.37 at one. So the loop can go
-  faster on this shape than the engine gets out of it, and whatever the
-  difference is, it is not in the loop — the generated code for the row block
-  has no calls in it and no spills.
+  0.8.14 settled what three versions of this entry could not. The entry used to
+  read that the head is bound by neither the memory nor the instruction count;
+  it removed an instruction from the head's supposed inner loop — a quarter of
+  it, on every other two and four bit plane in the step — and the head did not
+  move while the four bit planes moved by ten to eighteen percent. The loop
+  under test was not the loop being run.
 
-  What has been ruled out: the row epilogue (0.8.11 removed the calls and the
-  head did not move, 14.50 to 14.25); eight rows a block instead of four (a
-  wash everywhere); software prefetch of the code stream ahead of the row loop
-  (12 to 20% *worse* on every code plane — the numbers are in `CHANGES.md`
-  0.8.11, and the next person to have the idea should read them before having
-  it); and closing sixteen rows together rather than four, which is 0.8.12 and
-  which the head is the one plane it does not move.
+  `kern_level_ready` requires `sheet->enter_gain > 0`, the plane's
+  `input_activation_scale`, because the integer path rounds the activation onto
+  that step's grid and requires it to land exactly. **The export ships
+  `lm_head.input_activation_scale` as `0.0`** where every other projection has a
+  real one, so the head falls to `kern_row_code` and `kern_dot_code`'s float
+  spread on every token, by construction. `CHANGES.md` 0.8.14 has the
+  instrumentation and the confirmation — 4 × 262144 × 1536 column-products a
+  step, all of them on the float path.
 
-  And the page walk, which this entry used to name as the obvious remaining
-  difference — in the microbenchmark the same 96 MiB is swept three times in a
-  row so its page table entries stay hot, and in the engine it is swept once
-  with thirty-five layers of other memory in between. 0.8.12 tested that
-  directly, on the second host: the same 96 MiB of the mapped checkpoint at four
-  threads gives **32.4 GiB/s swept back to back and 43.4 with a gigabyte of the
-  rest of the file swept in between**, which is no penalty at all, and anonymous
-  memory of the same size gives 39.4 and 39.8, so four kilobyte file-backed
-  pages are not costing anything either. The hypothesis is gone; the puzzle is
-  not, and it reproduces on that host unchanged — the head phase reads 12.6
-  GiB/s where a bare sweep of the same bytes reads 32 to 43.
+  So the old entry's puzzle is not a puzzle. The 22.7 GiB/s microbenchmark ran
+  the integer kernel; the engine runs the float one. The GiB/s gap is
+  `kern_dot_code` against `vpdpbusd`, not two bit against four. 0.8.11's
+  epilogue and 0.8.12's fold are both in the integer path and neither could ever
+  have moved this plane.
 
-  What that leaves is a plane that is bound by neither of the two things it
-  could be bound by, which is worth stating plainly because it is the shape of
-  the remaining question. At two bits the row loop issues about seventeen
-  instructions per sixty-four bytes of weight — four broadcasts, four shifts,
-  four masks, four dot products and a shared load of the levels — against about
-  thirteen per two hundred and fifty-six bytes at eight bits, so four times the
-  instructions a byte. That is real, and it is still not enough: on the second
-  host the head reads 12.6 GiB/s where a bare sweep of the same bytes reads 32
-  to 43, and seventeen instructions per sixty-four bytes over four threads is a
-  budget several times larger than the phase actually takes.
+  **Three routes are open, in this order.**
 
-  So neither the memory nor the instruction count explains it on the arithmetic
-  available here, and the next step is to *count* rather than to estimate:
-  retired instructions and cache and TLB misses for the head phase alone,
-  against the same for the microbenchmark. Do not reopen this with another
-  timing comparison — three of those have now been run and each one moved the
-  question rather than answering it.
+  *The float loop the head actually runs, which has never been written for.*
+  `kern_dot_code`'s two bit path spends five instructions per sixteen codes — a
+  broadcast of a dword, a variable shift, a mask, a convert and an fma — where
+  the integer path spends four per sixty-four. One `vbroadcasti32x4` of sixteen
+  bytes serving four shifts takes it to seventeen per sixty-four rather than
+  twenty, about fifteen percent of the loop. It costs a staging pass: the four
+  quarters come out in the unpack's order rather than the column's, so the
+  activations have to be laid down in that order, exactly as `kern_level_stage`
+  already does for the integer path. Keep the two accumulators and their slot
+  assignment and the sum is bit-identical. This is the smallest of the three and
+  the only one that costs nothing but work.
 
-  Do not reopen this on a GiB/s comparison. The head is two bit and everything
-  it is compared against is four or eight, and that alone accounts for the gap
-  the first version of this entry was written about.
+  *Give the head a grid, and take the integer path.* This is the large one — the
+  four bit planes run at 52 G multiply-adds a second against the head's 33, and
+  the head is two bit, so the ceiling is higher than that ratio suggests. It is
+  not exact: the export declined to calibrate this activation, so the engine
+  would be choosing a step, and that is a decision about output quality rather
+  than a kernel change. Measure it as one — a step chosen per token from the
+  activation's own range, against the float path's logits, over the whole
+  vocabulary and not just the argmax, before any timing is quoted. If the top
+  token moves on ordinary prompts the answer is no.
+
+  *Do not score 262144 rows at all.* The entry below, unchanged by any of this
+  except that the plane it prunes is five times more expensive per byte than
+  that entry assumed, which makes it worth more than it looked.
+
+  What is ruled out, and should not be tried again: the row epilogue (0.8.11,
+  and it is in the wrong path anyway); eight rows a block instead of four
+  (0.8.11, a wash); software prefetch of the code stream (0.8.11, 12 to 20%
+  *worse* on every code plane — read the numbers before having the idea);
+  sixteen rows closed together (0.8.12, wrong path); the page walk (0.8.12 — the
+  same 96 MiB costs the same with a gigabyte swept in between); and the affine
+  take (0.8.14, wrong path). Do not reopen any of it on a GiB/s comparison
+  across bit widths, which is not a comparison at all.
 
 - **Produce more than one token per sweep of the weights.** The only idea on
   this list that can pass 41 tokens a second, because it is the only one that
@@ -265,6 +286,12 @@ the forks.
   about 47, so this is a multiplier and not a strategy. Measure **bytes actually
   not read**, not clusters skipped, and stop if the bound needs most of a row to
   be useful.
+
+  0.8.14 changed what this is worth without changing the entry. The head runs
+  the float kernel rather than the integer one, so the bytes this would stop
+  reading are five times more expensive per byte than the entry assumed when it
+  wrote them off as "the best rate in the step". A bound that skips half the
+  head is worth half of 12.36 ms here, not half of 6.65.
 
   This entry used to be scoped together with the logit cap, on the argument that
   a bound which never materializes most of the head makes capping most of the
@@ -407,3 +434,6 @@ the forks.
 | Whether widening a block of rows can help on its own (answered: no, at any width — the ratio of close to work is fixed by the columns) | 0.8.12 |
 | The fork and the join off the mutex — a spinning worker publishes and collects on atomics, and the lock is only what a sleeper is woken through | 0.8.13 |
 | A stress test that grinds the pool on both paths and on the handoff between them, with both wakes checked by removing them | 0.8.13 |
+| The packed field taken with one bit matrix multiply rather than a variable shift and a mask, at two bits and at four | 0.8.14 |
+| Why the output head is slower than anything else per byte (answered: it runs the float kernel — the export's `lm_head.input_activation_scale` is `0.0`, so it can never be on the grid) | 0.8.14 |
+| Whether the four bit planes are memory-bound or issue-bound (answered: issue-bound — a quarter off the inner loop is ten to eighteen percent off the phase) | 0.8.14 |

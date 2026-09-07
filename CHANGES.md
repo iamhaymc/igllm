@@ -4704,3 +4704,160 @@ atomics are recent and gated, and the engine builds under `cl`; five operations
 behind `_Interlocked*` on that compiler and `__atomic_*` on the others is
 smaller than the configuration test the header would need.
 
+---
+
+## 0.8.14 — one bit matrix where the shift and the mask were two, and what the output head has actually been doing
+
+### Scope
+
+Two things, and the second is worth more than the first even though it is not a
+change to the engine at all.
+
+The first is a kernel: the packed field a code plane's inner loop takes out of
+a byte is a per-byte linear map over GF(2), so `vgf2p8affineqb` does it in one
+instruction where a variable shift and a mask did it in two.
+
+The second is a diagnosis. Making that change and watching which planes moved
+answered `TODO.md`'s second speed entry — the output head reading a third of a
+bare sweep with neither the memory nor the instruction count able to explain
+it — and the answer is that **the head has never been running the integer
+kernel.**
+
+### The host
+
+The third machine again — four cores of a Xeon at 2.1 GHz, virtualized, step
+floor 43.44 ms before this version. Eight alternating runs a side, minimum per
+phase, checkpoint warm. Output is bit-identical either way: `logits` and a
+48 token greedy `chat` compare byte for byte.
+
+### The affine take
+
+`KERN_LEVEL_TAKE_2` broadcast sixteen packed bytes, shifted each quarter of the
+broadcast down by its own bit position and masked two bits out of every byte.
+The shift is by 0, 2, 4 or 6 places and the mask keeps the low two bits, so
+although `_mm512_srlv_epi32` shifts a whole dword, **the low two bits of output
+byte `b` come from bits `[s, s+2)` of input byte `b` and from nowhere else.**
+Every field is taken from within its own byte, which is precisely the shape
+`vgf2p8affineqb` is for: it gives each byte of the result as an eight by eight
+bit matrix multiplied by that byte of the source, with the matrix a per-qword
+operand so the four quarters can each have their own.
+
+Output bit `k` is the parity of `matrix.byte[7 - k]` against the source byte, so
+taking source bit `s + k` into result bit `k` is the matrix whose byte `7 - k`
+is `1 << (s + k)` and whose other bytes are zero. Bits above the field's width
+have no row and come out zero, which is the mask, for free. `kern_level_matrix`
+writes that; `KERN_LEVEL_PLAN` lays four of them out to match the quarters the
+old `step_wide` addressed, and the same construction serves four bits with two
+rows apiece.
+
+The two bit inner loop is now `vbroadcasti32x4`, `vgf2p8affineqb`, `vpdpbusd` —
+three instructions per sixty-four codes against four. Eight bit codes need no
+unpack and are untouched.
+
+`gfni` is asked of the host the way `vnni` already was, because it does not
+travel with it: Cascade Lake has `vnni` and no `gfni`, Ice Lake has both. Where
+the compiler says `-march=native` would not define `__GFNI__`, the shift and the
+mask are still there.
+
+### What moved, and what did not
+
+| part | before | after | |
+| --- | --- | --- | --- |
+| mlp (4 bit) | 21.137 | **19.021** | **-10.0%** |
+| q k v (4 bit) | 3.695 | **3.015** | **-18.4%** |
+| attn out (4 bit) | 2.875 | **2.526** | **-12.1%** |
+| ple feed (8 bit) | 1.339 | 1.302 | -2.8% |
+| **final norm, head (2 bit)** | 12.073 | 12.356 | **+2.3%** |
+| step floor | 47.550 | **44.740** | **-5.9%** |
+| decode | 21.03 tok/s | **22.35** | **+6.3%** |
+| prefill | 84.00 tok/s | 86.12 | +2.5% |
+
+On a 3 id prompt the same eight runs give the step floor 43.110 to 41.340 and
+decode 23.20 to 24.19.
+
+Two of those rows are the result and the third is the finding. The four bit
+planes are a quarter of their inner loop lighter and move by ten to eighteen
+percent, which settles that they were issue-bound rather than memory-bound —
+they read 475 MiB a step at 22 GiB/s where a bare four thread sweep on this host
+reaches 32 to 43, and now they read the same bytes faster without reading fewer
+of them. `ple feed` is eight bit, has no unpack, and correctly does not move.
+
+**And the head, which is two bit and has the unpack, does not move either.**
+
+### The output head, answered
+
+`TODO.md`'s second speed entry has been open across three versions. 0.8.11
+removed the row epilogue's calls and the head did not move. 0.8.12 folded
+sixteen rows into one close and the head was the one plane it did not move.
+0.8.12 also killed the page walk hypothesis outright. The entry's own summary
+was that the head is bound by neither of the two things it could be bound by,
+and that the next step was to count retired instructions rather than estimate
+them.
+
+This version removed an instruction from the head's supposed inner loop — a
+quarter of it — and the head did not move. That is the counting experiment in
+the only form this host allows, and it says the loop under test is not the loop
+being run.
+
+It is not. Instrumenting `kern_mat_vec_band` by plane shows the 262144 row
+plane taking the **float fallback**, `kern_row_code`, on every decode step —
+1610612736 column-products over four steps, which is 4 × 262144 × 1536 exactly.
+The integer path never sees it.
+
+The reason is one number in the export. `kern_level_ready` requires
+`sheet->enter_gain > 0`, the plane's `input_activation_scale`, because the
+integer path works by rounding the activation onto that step's grid and
+requiring it to land exactly. Every other projection has one — `q_proj` 0.0728,
+the audio tower's first 0.1591, and so on. **`lm_head.input_activation_scale` is
+0.0.** The export ships the head with no calibrated input step, so the head's
+input is not quantized, so the plane can never be on a grid, so it takes the
+float path, every token, by construction.
+
+Everything the entry could not explain follows from that:
+
+- **The GiB/s gap.** The head reads 97 MiB at 7.8 GiB/s where the four bit
+  planes read at 20 to 22. That is not two bit against four bit; it is
+  `kern_dot_code`'s float spread against `vpdpbusd`. In multiply-adds the head
+  gives 33 G a second against the mlp's 52 on this host.
+- **The microbenchmark that ran faster than the engine.** The entry's 22.7
+  GiB/s was "the same kernel on the same shape" — but it was the integer
+  kernel, and the engine runs the float one. The two were never the same
+  measurement.
+- **Every fix that did not move it.** 0.8.11's epilogue, 0.8.12's fold and this
+  version's affine take are all in the integer path. The head is not in the
+  integer path.
+
+The entry is closed as a question. What is left is a different and much better
+posed one, which `TODO.md` now carries: the head runs `kern_dot_code`'s two bit
+loop at five instructions per sixteen codes — a broadcast, a variable shift, a
+mask, a convert and an fma — where the integer path spends four per sixty-four,
+and that loop has never had a version written for it.
+
+### Why the head was not fixed here as well
+
+Three routes were considered and none of them belongs in this version.
+
+**Quantizing the head's input to a step the engine picks.** That is what would
+put it on the integer path, and it is not exact: the export declined to
+calibrate this activation, and choosing a step here would change the logits for
+a speed win, which is a decision about output quality rather than a kernel
+change. It wants its own version and its own measurement of what it costs.
+
+**A cheaper float loop.** Real and available — a broadcast amortized over
+sixty-four codes rather than sixteen takes the loop from twenty instructions to
+seventeen — but it needs the activations staged in the unpack's order, the way
+`kern_level_stage` already stages levels for the integer path, and that is a
+new staging pass and a new correctness surface. Also its own version.
+
+**Not scoring 262144 rows at all.** `TODO.md`'s fourth speed entry, unchanged by
+any of this except that the plane it would prune is now known to be five times
+more expensive per byte than the entry assumed.
+
+### A note for whoever reads the old entry
+
+Do not re-derive the head's cost from GiB/s, and do not re-derive it from the
+integer path's instruction count either. Both were done, both were careful, and
+both were measuring a kernel the head does not run. The first question to ask of
+any plane that looks anomalous is which of the two paths it is on, and
+`kern_mat_vec_band` is four lines of instrumentation away from saying so.
+

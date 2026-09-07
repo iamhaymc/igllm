@@ -351,7 +351,15 @@ app_setup   app_setup_plain(void);
  * four may not have: it arrived two generations after them.  It buys one
  * instruction — a dot product of four byte pairs into a thirty-two bit lane —
  * and that instruction is what the integer path beside `kern_dot_code` is
- * written around, so it names itself rather than riding on the tier. */
+ * written around, so it names itself rather than riding on the tier.
+ *
+ * `gfni` is asked for on the same terms and for the same kind of reason, and a
+ * host with `vnni` may or may not have it — Cascade Lake has the one and not
+ * the other, Ice Lake has both.  It buys `vgf2p8affineqb`, a bit matrix
+ * multiply applied to every byte of a vector independently, which is exactly
+ * what taking a two or four bit field out of a packed byte is: one instruction
+ * where the shift and the mask were two.  It is a strict extra, so where it is
+ * missing the shift and the mask are still there. */
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && \
     defined(__AVX512VL__)
 #  include <immintrin.h>
@@ -359,6 +367,9 @@ app_setup   app_setup_plain(void);
 #  define APP_SIMD_AVX512 1
 #  if defined(__AVX512VNNI__)
 #    define APP_SIMD_AVX512VNNI 1
+#    if defined(__GFNI__)
+#      define APP_SIMD_AVX512GFNI 1
+#    endif
 #  endif
 #elif defined(__AVX2__)
 #  include <immintrin.h>
@@ -2779,18 +2790,49 @@ static int kern_level_stage(const plane *sheet, const float *act_data, int8_t *l
  * written out per width: `slot / part_count` with the count a literal is a
  * shift, and with it a variable it is a sixty-four bit division inside the
  * loop, which at eight bits cost more than the whole float path it replaces. */
-#  define KERN_LEVEL_TAKE_2(head)                                                                \
-    _mm512_and_si512(                                                                            \
-        _mm512_srlv_epi32(                                                                       \
-            _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(const void *)(head))),       \
-            step_wide),                                                                          \
-        code_mask)
-#  define KERN_LEVEL_TAKE_4(head)                                                                \
-    _mm512_and_si512(                                                                            \
-        _mm512_srlv_epi32(                                                                       \
-            _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *)(const void *)(head))),    \
-            step_wide),                                                                          \
-        code_mask)
+#  if defined(APP_SIMD_AVX512GFNI)
+/* The shift and the mask, as one bit matrix a byte.
+ *
+ * `vgf2p8affineqb` gives every byte of the result as a matrix product over
+ * GF(2) of an eight by eight matrix with that byte of the source: output bit
+ * `k` is the parity of `matrix.byte[7 - k]` against the source byte.  Taking
+ * bit `shift + k` of the source into bit `k` of the result is therefore the
+ * matrix whose byte `7 - k` is `1 << (shift + k)`, and every other byte zero —
+ * bits above the field's width have no row and come out zero, which is the
+ * mask.
+ *
+ * The matrix is a per-qword operand, so the four shifts a two bit block needs
+ * are four matrices in one vector, laid out to match `step_wide`: quarters of
+ * the broadcast, two qwords each. */
+static uint64_t kern_level_matrix(int shift, int width) {
+  uint64_t rows = 0;
+  int bit_index;
+  for (bit_index = 0; bit_index < width; ++bit_index)
+    rows |= (uint64_t)(1u << (shift + bit_index)) << (8 * (7 - bit_index));
+  return rows;
+}
+#    define KERN_LEVEL_TAKE_2(head)                                                              \
+      _mm512_gf2p8affine_epi64_epi8(                                                             \
+          _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(const void *)(head))),         \
+          code_take, 0)
+#    define KERN_LEVEL_TAKE_4(head)                                                              \
+      _mm512_gf2p8affine_epi64_epi8(                                                             \
+          _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *)(const void *)(head))),      \
+          code_take, 0)
+#  else
+#    define KERN_LEVEL_TAKE_2(head)                                                              \
+      _mm512_and_si512(                                                                          \
+          _mm512_srlv_epi32(                                                                     \
+              _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(const void *)(head))),     \
+              step_wide),                                                                        \
+          code_mask)
+#    define KERN_LEVEL_TAKE_4(head)                                                              \
+      _mm512_and_si512(                                                                          \
+          _mm512_srlv_epi32(                                                                     \
+              _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *)(const void *)(head))),  \
+              step_wide),                                                                        \
+          code_mask)
+#  endif
 #  define KERN_LEVEL_TAKE_8(head) _mm512_xor_si512(_mm512_loadu_si512((const void *)(head)), flip_wide)
 
 /* The one lane loop: two accumulators, for the same reason the float paths
@@ -2865,13 +2907,36 @@ static int kern_level_stage(const plane *sheet, const float *act_data, int8_t *l
 /* The constants every width's block is taken with.  Two bits shifts each
  * quarter of the broadcast down by its own bit position, four bits each half;
  * eight has nothing to shift and takes the flip instead. */
-#  define KERN_LEVEL_PLAN(bit_count)                                                             \
-    const __m512i step_wide =                                                                    \
-        (bit_count) == 2                                                                         \
-            ? _mm512_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2, 4, 4, 4, 4, 6, 6, 6, 6)                  \
-            : _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4);                 \
-    const __m512i code_mask = _mm512_set1_epi8((char)(uint8_t)((1u << (bit_count)) - 1u));       \
-    const __m512i flip_wide = _mm512_set1_epi8((char)(uint8_t)code_flip)
+#  if defined(APP_SIMD_AVX512GFNI)
+#    define KERN_LEVEL_PLAN(bit_count)                                                           \
+      const __m512i code_take =                                                                  \
+          (bit_count) == 2                                                                       \
+              ? _mm512_set_epi64((long long)kern_level_matrix(6, 2),                             \
+                                 (long long)kern_level_matrix(6, 2),                             \
+                                 (long long)kern_level_matrix(4, 2),                             \
+                                 (long long)kern_level_matrix(4, 2),                             \
+                                 (long long)kern_level_matrix(2, 2),                             \
+                                 (long long)kern_level_matrix(2, 2),                             \
+                                 (long long)kern_level_matrix(0, 2),                             \
+                                 (long long)kern_level_matrix(0, 2))                             \
+              : _mm512_set_epi64((long long)kern_level_matrix(4, 4),                             \
+                                 (long long)kern_level_matrix(4, 4),                             \
+                                 (long long)kern_level_matrix(4, 4),                             \
+                                 (long long)kern_level_matrix(4, 4),                             \
+                                 (long long)kern_level_matrix(0, 4),                             \
+                                 (long long)kern_level_matrix(0, 4),                             \
+                                 (long long)kern_level_matrix(0, 4),                             \
+                                 (long long)kern_level_matrix(0, 4));                            \
+      const __m512i flip_wide = _mm512_set1_epi8((char)(uint8_t)code_flip)
+#  else
+#    define KERN_LEVEL_PLAN(bit_count)                                                           \
+      const __m512i step_wide =                                                                  \
+          (bit_count) == 2                                                                       \
+              ? _mm512_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2, 4, 4, 4, 4, 6, 6, 6, 6)                \
+              : _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4);               \
+      const __m512i code_mask = _mm512_set1_epi8((char)(uint8_t)((1u << (bit_count)) - 1u));     \
+      const __m512i flip_wide = _mm512_set1_epi8((char)(uint8_t)code_flip)
+#  endif
 #endif
 
 /* The blocks a vector path did not take, from `slot` on, which on a host

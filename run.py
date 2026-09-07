@@ -69,32 +69,47 @@ def tool_pick():
 WIDE_FLAGS = ["-mavx512f", "-mavx512bw", "-mavx512dq", "-mavx512vl",
               "-mprefer-vector-width=256"]
 
-# The one subset that is asked of the host rather than of the tier.  `vnni` came
-# two generations after the four above, so a machine with all of them may still
-# not have it, and a build that assumed it would stop with an illegal
-# instruction rather than fall back.  The compiler is the one that knows: it is
-# asked what `-march=native` would define here, and the flag is added only where
-# the answer says the flag is safe.  Where it is not, the integer kernels
-# compile away and the float ones are the whole of the engine, as before.
+# The two subsets that are asked of the host rather than of the tier.  `vnni`
+# came two generations after the four above, so a machine with all of them may
+# still not have it, and a build that assumed it would stop with an illegal
+# instruction rather than fall back.  `gfni` is the same kind of extra and does
+# not travel with `vnni` either — Cascade Lake has `vnni` and not `gfni`, Ice
+# Lake has both.  The compiler is the one that knows: it is asked what
+# `-march=native` would define here, and each flag is added only where the
+# answer says that flag is safe.  Without `vnni` the integer kernels compile
+# away and the float ones are the whole of the engine, as before; without
+# `gfni` the integer kernels take a packed field with a shift and a mask rather
+# than with one bit matrix multiply.
 VNNI_FLAG = "-mavx512vnni"
-_vnni_answer = None
+GFNI_FLAG = "-mgfni"
+_native_macros = None
+
+
+def tool_native_macros(kind, program):
+    """The macros `-march=native` would define here, as one blob of bytes."""
+    global _native_macros
+    if _native_macros is not None:
+        return _native_macros
+    _native_macros = b""
+    if kind != "unix" or platform.machine().lower() not in ("x86_64", "amd64"):
+        return _native_macros
+    try:
+        report = subprocess.run([program, "-march=native", "-dM", "-E", "-x", "c", os.devnull],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        _native_macros = report.stdout
+    except OSError:
+        _native_macros = b""
+    return _native_macros
 
 
 def tool_has_vnni(kind, program):
     """Whether the build host advertises AVX-512 VNNI to this compiler."""
-    global _vnni_answer
-    if _vnni_answer is not None:
-        return _vnni_answer
-    _vnni_answer = False
-    if kind != "unix" or platform.machine().lower() not in ("x86_64", "amd64"):
-        return _vnni_answer
-    try:
-        report = subprocess.run([program, "-march=native", "-dM", "-E", "-x", "c", os.devnull],
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        _vnni_answer = b"__AVX512VNNI__" in report.stdout
-    except OSError:
-        _vnni_answer = False
-    return _vnni_answer
+    return b"__AVX512VNNI__" in tool_native_macros(kind, program)
+
+
+def tool_has_gfni(kind, program):
+    """Whether the build host advertises GFNI to this compiler."""
+    return b"__GFNI__" in tool_native_macros(kind, program)
 
 
 def tool_line(kind, program, source, target, tuned, debug, trace=False, wide=False):
@@ -123,6 +138,8 @@ def tool_line(kind, program, source, target, tuned, debug, trace=False, wide=Fal
             line += WIDE_FLAGS
             if tool_has_vnni(kind, program):
                 line += [VNNI_FLAG]
+                if tool_has_gfni(kind, program):
+                    line += [GFNI_FLAG]
     line += ["-lm"]
     if platform.system() != "Windows":
         line += ["-lpthread"]
