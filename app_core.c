@@ -9173,7 +9173,8 @@ struct app_session {
   float *value_room;
   float *blend_room;
   float *score_room;   /* one row of scores a head of the widest group */
-  float *cache_room;   /* one block of cached rows, decoded */
+  float *cache_room;   /* a block of cached rows, decoded — one a slice of the pool */
+  int    block_room;   /* floats one slice's block occupies, the stride above */
   float *gate_room;
   float *rise_room;
   float *cos_room;
@@ -9564,57 +9565,199 @@ static int session_attend_wide(const layer_wing *wing) { return wing->group_shar
  * costs is a score row per head of the group rather than one, which is what
  * `score_stride` sizes.  A layer whose share is one has nothing to divide and
  * does not come here. */
+typedef struct attend_job {
+  app_session *session;
+  const void  *key_store;
+  const void  *value_store;
+  const float *key_grid;
+  const float *value_grid;
+  const float *query_lane;
+  float       *blend_lane;
+  int cache_span;
+  int place_start;
+  int span_count;
+  int block_rows;
+  int block_room;   /* floats of decode scratch a slice owns */
+  int kv_index;
+  int head_first;
+  int group_share;
+  int head_size;
+  int kv_width;
+} attend_job;
+
+/* Which blocks of the span a slice takes.  Whole blocks, so the decode a slice
+ * does is the decode the serial loop did and no row is decoded twice. */
+static void attend_span_share(const attend_job *job, int slice_index, int slice_count,
+                              int *from_out, int *upto_out) {
+  int block_total = (job->span_count + job->block_rows - 1) / job->block_rows;
+  int from_block = (int)((long long)block_total * slice_index / slice_count);
+  int upto_block = (int)((long long)block_total * (slice_index + 1) / slice_count);
+  *from_out = from_block * job->block_rows;
+  *upto_out = upto_block * job->block_rows;
+  if (*upto_out > job->span_count) *upto_out = job->span_count;
+}
+
+/* The scores, divided by position.
+ *
+ * A score is one dot product against one cached row, so a slice writes only the
+ * scores of the positions it took and reads only the rows behind them.  Nothing
+ * is summed across slices and no score is computed twice, so this is the same
+ * number in the same place however many slices there are. */
+static void attend_score_band(void *state, int slice_index, int slice_count) {
+  attend_job *job = (attend_job *)state;
+  app_session *session = job->session;
+  float *block_room = session->cache_room + (size_t)slice_index * (size_t)job->block_room;
+  int span_from, span_upto, head_local, row_index;
+
+  attend_span_share(job, slice_index, slice_count, &span_from, &span_upto);
+  for (; span_from < span_upto; span_from += job->block_rows) {
+    int block_count = span_upto - span_from < job->block_rows ? span_upto - span_from
+                                                              : job->block_rows;
+    cache_block(job->key_store, job->key_grid, job->cache_span, job->place_start + span_from,
+                block_count, job->kv_index, job->head_size, job->kv_width, block_room);
+    for (head_local = 0; head_local < job->group_share; ++head_local) {
+      const float *query_head =
+          job->query_lane + (size_t)(job->head_first + head_local) * job->head_size;
+      float *score_head = session->score_room + (size_t)head_local * session->score_stride;
+      for (row_index = 0; row_index < block_count; ++row_index)
+        score_head[span_from + row_index] =
+            kern_dot_real(block_room + (size_t)row_index * job->head_size, STORE_F32, query_head,
+                          job->head_size);
+    }
+  }
+}
+
+/* The softmax and the blend, divided by head.
+ *
+ * Divided by head and not by position, which is the whole reason this is two
+ * jobs rather than one.  A blend is a running sum down the span, and splitting
+ * a running sum across slices would regroup its additions: the same arithmetic,
+ * a different rounding, and an engine whose answer depended on how many cores
+ * the host has.  Split by head instead, each slice carries its own heads the
+ * whole way down the span and the sum is added in the order it always was, so a
+ * blend is bit for bit what the serial loop produced at any thread count.
+ *
+ * What it costs is that every slice decodes the value block for itself where
+ * one slice decoded it for all the heads.  The block is eight kilobytes and is
+ * read straight back, so what is repeated is the decode and not the fetch. */
+static void attend_blend_band(void *state, int slice_index, int slice_count) {
+  attend_job *job = (attend_job *)state;
+  app_session *session = job->session;
+  app_model *model = session->model;
+  float *block_room = session->cache_room + (size_t)slice_index * (size_t)job->block_room;
+  int head_from = (int)((long long)job->group_share * slice_index / slice_count);
+  int head_upto = (int)((long long)job->group_share * (slice_index + 1) / slice_count);
+  int head_local, span_from, row_index, value_index;
+
+  for (head_local = head_from; head_local < head_upto; ++head_local) {
+    float *blend_head = job->blend_lane + (size_t)(job->head_first + head_local) * job->head_size;
+    model->desk.soft_max(&model->desk,
+                         session->score_room + (size_t)head_local * session->score_stride,
+                         job->span_count);
+    for (value_index = 0; value_index < job->head_size; ++value_index)
+      blend_head[value_index] = 0.0f;
+  }
+  if (head_from >= head_upto) return;
+  for (span_from = 0; span_from < job->span_count; span_from += job->block_rows) {
+    int block_count = job->span_count - span_from < job->block_rows ? job->span_count - span_from
+                                                                   : job->block_rows;
+    cache_block(job->value_store, job->value_grid, job->cache_span, job->place_start + span_from,
+                block_count, job->kv_index, job->head_size, job->kv_width, block_room);
+    for (head_local = head_from; head_local < head_upto; ++head_local) {
+      float *blend_head = job->blend_lane + (size_t)(job->head_first + head_local) * job->head_size;
+      const float *score_head =
+          session->score_room + (size_t)head_local * session->score_stride;
+      for (row_index = 0; row_index < block_count; ++row_index) {
+        const float *value_row = block_room + (size_t)row_index * job->head_size;
+        float weight_value = score_head[span_from + row_index];
+        for (value_index = 0; value_index < job->head_size; ++value_index)
+          blend_head[value_index] += weight_value * value_row[value_index];
+      }
+    }
+  }
+}
+
+/* Below this many cached positions the span is carried on the calling thread.
+ *
+ * A fork and a join cost the same whatever they are handed, and 0.8.8 measured
+ * a third of a token in the 277 of them a step already has; two more a layer
+ * pay for themselves only where there is a span worth dividing.  Measured on
+ * the reference host at four threads, the two jobs add about 0.6 ms to a step
+ * — seventy forks at nine microseconds — and the phase they divide runs 0.70
+ * ms at a span of 45 and 6.02 ms at 288, so the crossing is somewhere between
+ * those two and nearer the first.  It was not pinned closer than that, so the
+ * figure is the safe side of the bracket rather than its middle: at 288 this
+ * threshold and no threshold at all measure the same, and at 45 the serial
+ * path keeps the step it would otherwise lose.
+ *
+ * The suite lowers it, because a fixture whose whole window is 64 positions
+ * would otherwise never take the divided path at all and the property the
+ * two jobs were written for would go unchecked. */
+#ifndef ATTEND_BAND_SPAN
+#define ATTEND_BAND_SPAN 128
+#endif
+
+/* One lane's heads, blocked by cached row rather than by head.
+ *
+ * This export ships one key-value head against eight attention heads, so
+ * `group_share` is eight: all eight score against the same cached key row and
+ * blend the same cached value row.  Taken head by head, as the loop below this
+ * one takes them, a byte cache decodes every one of those bytes eight times —
+ * eight table reads where one would do.  Taken this way round a run of rows is
+ * decoded once into a block that stays in the first level cache and every head
+ * of the group reads it there, which divides the decode work by the share
+ * without giving back any of the storage the byte cache collects, and which
+ * serves every backend rather than only the one whose table read is a gather.
+ *
+ * The block hands each head exactly the floats it would have looked up for
+ * itself, and the dot and the blend here are the kernels the float cache always
+ * used, so a score and a blend come out bit for bit what they were.  What it
+ * costs is a score row per head of the group rather than one, which is what
+ * `score_stride` sizes.  A layer whose share is one has nothing to divide and
+ * does not come here.
+ *
+ * The two halves go to the pool separately because they divide along different
+ * axes; `attend_score_band` and `attend_blend_band` say why, and both were
+ * written so that neither can move a number.  With one key-value head against
+ * eight attention heads this was the last part of a decode step running on one
+ * core: at a four thousand id prompt it was two fifths of the step and it did
+ * not shorten when threads were added to it. */
 static void session_attend_group(app_session *session, int layer_index, const float *query_lane,
                                  float *blend_lane, int place_start, int span_count) {
   app_model *model = session->model;
   layer_wing *wing = &model->wing_list[layer_index];
   int owner_slot = wing->share_flag ? wing->source_slot : layer_index;
   layer_wing *owner = &model->wing_list[owner_slot];
-  const float *key_grid = session->key_grid[owner_slot];
-  const float *value_grid = session->value_grid[owner_slot];
   int head_size = wing->head_size;
-  int kv_width = wing->kv_count * head_size;
-  int block_rows = cache_block_rows(head_size);
-  int kv_index, head_local, row_index, span_from, value_index;
+  int band_flag = model->pool.worker_count > 0 && span_count >= ATTEND_BAND_SPAN;
+  attend_job job;
+  int kv_index;
+
+  job.session = session;
+  job.key_store = session->key_store[owner_slot];
+  job.value_store = session->value_store[owner_slot];
+  job.key_grid = session->key_grid[owner_slot];
+  job.value_grid = session->value_grid[owner_slot];
+  job.query_lane = query_lane;
+  job.blend_lane = blend_lane;
+  job.cache_span = owner->cache_span;
+  job.place_start = place_start;
+  job.span_count = span_count;
+  job.block_rows = cache_block_rows(head_size);
+  job.block_room = session->block_room;
+  job.group_share = wing->group_share;
+  job.head_size = head_size;
+  job.kv_width = wing->kv_count * head_size;
 
   for (kv_index = 0; kv_index < wing->kv_count; ++kv_index) {
-    int head_first = kv_index * wing->group_share;
-    for (span_from = 0; span_from < span_count; span_from += block_rows) {
-      int block_count = span_count - span_from < block_rows ? span_count - span_from : block_rows;
-      cache_block(session->key_store[owner_slot], key_grid, owner->cache_span,
-                  place_start + span_from, block_count, kv_index, head_size, kv_width,
-                  session->cache_room);
-      for (head_local = 0; head_local < wing->group_share; ++head_local) {
-        const float *query_head = query_lane + (size_t)(head_first + head_local) * head_size;
-        float *score_head = session->score_room + (size_t)head_local * session->score_stride;
-        for (row_index = 0; row_index < block_count; ++row_index)
-          score_head[span_from + row_index] =
-              kern_dot_real(session->cache_room + (size_t)row_index * head_size, STORE_F32,
-                            query_head, head_size);
-      }
-    }
-    for (head_local = 0; head_local < wing->group_share; ++head_local) {
-      float *blend_head = blend_lane + (size_t)(head_first + head_local) * head_size;
-      model->desk.soft_max(&model->desk,
-                           session->score_room + (size_t)head_local * session->score_stride,
-                           span_count);
-      for (value_index = 0; value_index < head_size; ++value_index) blend_head[value_index] = 0.0f;
-    }
-    for (span_from = 0; span_from < span_count; span_from += block_rows) {
-      int block_count = span_count - span_from < block_rows ? span_count - span_from : block_rows;
-      cache_block(session->value_store[owner_slot], value_grid, owner->cache_span,
-                  place_start + span_from, block_count, kv_index, head_size, kv_width,
-                  session->cache_room);
-      for (head_local = 0; head_local < wing->group_share; ++head_local) {
-        float *blend_head = blend_lane + (size_t)(head_first + head_local) * head_size;
-        const float *score_head = session->score_room + (size_t)head_local * session->score_stride;
-        for (row_index = 0; row_index < block_count; ++row_index) {
-          const float *value_row = session->cache_room + (size_t)row_index * head_size;
-          float weight_value = score_head[span_from + row_index];
-          for (value_index = 0; value_index < head_size; ++value_index)
-            blend_head[value_index] += weight_value * value_row[value_index];
-        }
-      }
+    job.kv_index = kv_index;
+    job.head_first = kv_index * wing->group_share;
+    if (band_flag) {
+      pool_run(&model->pool, attend_score_band, &job);
+      pool_run(&model->pool, attend_blend_band, &job);
+    } else {
+      attend_score_band(&job, 0, 1);
+      attend_blend_band(&job, 0, 1);
     }
   }
 }
@@ -11007,8 +11150,13 @@ app_code session_open(app_model *model, app_session **session_out) {
   session->blend_room = LANE_ROOM(session->head_stride);
   session->score_room =
       (float *)mem_clear(sizeof(float) * (size_t)session->score_stride * (size_t)group_peak);
+  /* One decode block a slice: the two attention jobs hand each slice its own,
+   * because two slices decoding into one block would be two slices writing the
+   * same floats. */
   block_peak = cache_block_rows(head_peak) * head_peak;
-  session->cache_room = (float *)mem_clear(sizeof(float) * (size_t)block_peak);
+  session->block_room = block_peak;
+  session->cache_room =
+      (float *)mem_clear(sizeof(float) * (size_t)block_peak * (size_t)pool_bands(&model->pool));
   session->gate_room = LANE_ROOM(session->gate_stride);
   session->rise_room = LANE_ROOM(session->rise_stride);
   session->cos_room = (float *)mem_clear(sizeof(float) * (size_t)half_peak);

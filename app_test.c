@@ -11,6 +11,14 @@
  * numbers recorded from the build the reference comparison judged, which takes
  * about twenty seconds; without a checkpoint it says so and passes over. */
 
+/* The attention divides its span across the pool only where the span is long
+ * enough to pay for the fork, and the synthetic checkpoint's whole window is
+ * sixty-four positions.  Left at the shipped figure the divided path would
+ * never run here, so the suite would be checking the serial one twice and
+ * calling it agreement.  Lowered, `test_wing` runs one session on each path
+ * and holds them to the same bits. */
+#define ATTEND_BAND_SPAN 8
+
 #include "app_core.c"
 
 #if defined(_WIN32)
@@ -3818,6 +3826,35 @@ static void test_wing(void) {
     test_true(okay_flag, "a batched prefill matches one token at a time");
     test_true(session_fill(wide_session) == session_fill(thin_session),
               "both routes land on the same position");
+
+    /* The attention's two jobs divide along axes chosen so that neither can
+     * move a number: the scores by position, which are independent, and the
+     * blends by head, so a running sum is never regrouped.  The claim is that
+     * a logit row is bit for bit the same however many threads carried it, and
+     * bits are what this compares — not a tolerance, which would pass on a
+     * regrouped sum too. */
+    {
+      app_setup lone_setup = setup;
+      app_model *lone_model = NULL;
+      lone_setup.thread_count = 1;
+      if (model_load(test_yard_path, &lone_setup, &lone_model) == APP_OKAY && lone_model) {
+        app_session *lone_session = NULL;
+        if (session_open(lone_model, &lone_session) == APP_OKAY && lone_session) {
+          const float *lone_list;
+          int same_flag = 1;
+          test_true(session_prime(lone_session, id_list, 21) == APP_OKAY,
+                    "a one thread prefill runs");
+          lone_list = session_step(lone_session, id_list[20]);
+          if (!lone_list) same_flag = 0;
+          else
+            for (slot = 0; slot < 27; ++slot)
+              if (memcmp(&lone_list[slot], &have_list[slot], sizeof(float)) != 0) same_flag = 0;
+          test_true(same_flag, "one thread and two agree to the bit");
+          session_close(lone_session);
+        }
+        model_free(lone_model);
+      }
+    }
 
     /* The timer is a partition, and the property that makes it worth reading is
      * that the parts sum to the step rather than sample it.  A session that did
