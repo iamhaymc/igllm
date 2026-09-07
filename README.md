@@ -463,10 +463,12 @@ the step floor 2.4%, prefill went **87.2 tokens a second to 93.8** and decode
 the last digit printed.
 
 It is not the entry closed. `ple feed` is 17.5 G multiply-adds a second to 19.4
-against the 50 to 61 the other four planes reach, and what is left of it is
-probably not the kernel at all: two planes of 384 KiB a layer, each its own fork
-and join, is seventy of them a step for under a millisecond and a half of work.
-`TODO.md` says so and says how to measure it.
+against the 50 to 61 the other four planes reach, and what is left of it is not
+the kernel at all. Two planes of 384 KiB a layer, each its own fork and join, is
+seventy of them a step, and an empty fork and join of the engine's own pool
+measures **2.95 us** — so 0.21 ms of the phase's 1.42, and 0.82 ms of the whole
+step's 277 forks. `TODO.md` carries the measurement and what the fix would have
+to be.
 
 0.8.12 also took the one hypothesis `TODO.md` had left for the output head — that
 the microbenchmark's 96 MiB stays swept because its page table entries stay hot,

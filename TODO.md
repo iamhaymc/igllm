@@ -109,16 +109,35 @@ the forks.
   against thirty-two dot products just as four rows is four against sixteen. The
   ratio only moves if the rows close together, and that is what 0.8.12 did.
 
-  **The next suspect is the dispatch, not the loop.** `ple feed` is
-  `per_layer_input_gate` and `per_layer_projection`, two planes of 384 KiB a
-  layer, and each is its own `pool_run` — **seventy forks and joins a step** for
-  1.42 ms of work. At the fork cost 0.8.8 measured that is on the order of a
-  seventh of the phase and it is paid whatever the rows do. The two cannot
-  simply be merged, because the gelu and the per-layer embedding sit between
-  them, but the gelu is 256 values a lane and could be inside the same fork.
-  Measure the fork cost on this shape first — a plane of 384 KiB against the
-  `row_count >= 64` gate that decides whether it forks at all — because if it is
-  not a seventh then this entry is about the loop after all.
+  **The next suspect is the dispatch, not the loop, and it is measured.**
+  `ple feed` is `per_layer_input_gate` and `per_layer_projection`, two planes of
+  384 KiB a layer, and each is its own `pool_run` — **seventy forks and joins a
+  step** for 1.42 ms of work. Timed against the engine's own pool on the second
+  host, 20000 rounds at four threads, an empty fork and join is **2.95 us**, so
+  those seventy are **0.21 ms**: a seventh of the phase, paid whatever the rows
+  do. The same measurement puts a 384 KiB read at 21.9 us across the pool
+  against 18.6 us of work, which is the same seventh from the other side.
+
+  The whole step forks 277 times, so this is **0.82 ms of a 39.5 ms step** and
+  not only `ple feed`'s problem — but `ple feed` is where it is the largest
+  share, because its jobs are the smallest.
+
+  Two routes, and the second is the one worth having. Fusing the gate, the gelu
+  and the lift into one fork saves 35 of the 70, but they are sequential — the
+  lift needs the whole gate — so it needs a barrier inside a job, which
+  `pool_group` does not have and which is a real change to it.
+
+  The other is to make the fork itself cheap. On the spinning path, which is the
+  one a decode token is always on, a fork and join still takes about eight mutex
+  acquisitions and four condition broadcasts: the caller takes the lock to
+  publish, each worker takes it again to read what was published, each takes it
+  a third time to count itself done and broadcast, and the caller takes it once
+  more to confirm. A spinning worker needs none of that — publish the task with
+  a release store on `task_serial`, count completions with an atomic increment,
+  and touch the lock only when a waiter has actually gone to sleep, which a
+  guarded sleeper count can say. That is a rewrite of the engine's most
+  safety-critical primitive and should be landed with a stress test that runs it
+  hard against the sleeping path too, not measured once and shipped.
 
   `ple lift` is a different thing and is not touched: `per_layer_model_projection`
   is bf16, so it is a float multiply-add path — eight lanes an instruction

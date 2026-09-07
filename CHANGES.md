@@ -4471,10 +4471,21 @@ it is not the entry closed: the plane is still a third of the rate of the four
 that are not behind, and the entry's own estimate of the ceiling — about 5% of a
 token for the two planes together — is larger than the 2.4% taken here.
 
-What the next attempt should look at is not the kernel. `ple feed` is two pool
-forks a layer, seventy a step, for two planes of 384 KiB each; at the fork cost
-0.8.8 measured that is on the order of a seventh of the phase, and it is paid
-whatever the rows cost. The entry stays open with that named.
+What the next attempt should look at is not the kernel, and it was measured
+rather than guessed at. `ple feed` is two pool forks a layer, seventy a step,
+for two planes of 384 KiB each. Timed against the engine's own `pool_group` on
+this host, 20000 rounds at four threads, **an empty fork and join is 2.95 us**,
+so those seventy are **0.21 ms of the phase's 1.42** — a seventh, paid whatever
+the rows cost. The same run puts a 384 KiB read at 21.9 us across the pool
+against 18.6 us of work, which is the same seventh seen from the other side, and
+the step's 277 forks at 0.82 ms of 39.5.
+
+The entry stays open with that named, and `TODO.md` says what the fix would have
+to be: on the spinning path a fork and join still takes about eight mutex
+acquisitions and four condition broadcasts, none of which a spinning worker
+needs. That is a rewrite of the pool rather than of a kernel, and it wants a
+stress test against the sleeping path before it ships — which is why it is not
+in this version.
 
 ### Two folds measured against each other
 
