@@ -66,11 +66,11 @@ the step rather than a sample of it — the timer closes one as it opens the nex
 what the timing itself cost.
 
 ```
-phases  32 decode steps, 54.35 ms a step, 785.7 MiB swept
+phases  128 decode steps, 33.97 ms a step, 770.5 MiB swept
 part                      ms a step   share MiB a step    GiB/s  a step
-mlp                          23.051   41.8%      475.3    20.14    70.0
-final norm, head              7.475   13.6%       97.0    12.67     1.0
-score, softmax, blend         4.117    7.5%       26.2     6.23    35.0
+mlp                          16.715   48.0%      475.3    27.77    70.0
+final norm, head              6.512   18.7%       97.0    14.55     1.0
+q k v                         2.925    8.4%       70.1    23.41    35.0
 ...
 unnamed 0.000 ms a step: the step's own clock, less the pass's parts
 timer   0.011 ms a step of the above, 428 reads at 26 ns
@@ -392,10 +392,37 @@ second to 18.4 and prefill 43.1 to 54.8; on a 2004 id prompt decode 13.4 to
 15.5, and on a 4334 id one 10.1 to 13.0 with prefill 25.0 to 33.2. Not a bit of
 any logit moves.
 
-The last thing the table says is that 0.8.9's claim to have finished the
-kernels was measured on a bench of this export's *widest* row. On the rows a
-decode step actually reads — 1536 wide, most of the time — the same kernels
-give 12.67 to 20.14 GiB/s against the 25.90 to 31.04 the bench gives and the
-32.18 a bare sweep gives. That is the first entry on `TODO.md` now, and it is a
-kernel item on a list that had had none since 0.8.9 declared there were none
-left.
+## Where a token goes now, and what the division was hiding
+
+0.8.11 acted on that table, and the largest thing in it turned out not to be a
+kernel at all. A row of a code plane ends in one gain, and fetching it was a
+call into the switch over every storage type, beside a second call to a
+remainder handler that had nothing to handle — with a `vzeroupper` and the
+whole caller-saved vector state spilled through the middle of the row loop for
+the two of them. A block of four output rows, the remainder call guarded, and
+the gain read directly where the scales are `F32`: mlp 25.90 GiB/s to 27.65,
+`attn out` 25.72 to 26.84, `ple feed` 15.04 to 16.89.
+
+Looking for it turned up three more of the same shape, none of them on the
+list. The logit cap and the gelu were both calling `tanhf` — 477184 calls a
+step between them — where `tanh y` is `1 - 2/(e^{2y}+1)` and the exponential is
+the series the softmax has carried since 0.8.6: **4.45 ms a step to 0.28 and
+2.40 to 0.29**, and both are *closer* to the closed form than the calls they
+replace, because the form without the subtraction has nothing to cancel. And
+`kern_dot_real` had a vector path for `F32` and a scalar loop for `BF16`, while
+this export keeps 26.25 MiB of bf16 that every step reads in full: `ple lift`
+9.63 GiB/s to 23.30.
+
+Decode 21.8 tokens a second to **27.1** on a 374 id prompt and 23.1 to **29.3**
+on a short one, prefill 59.3 to **82.1**, the step 43.97 ms to 34.79.
+
+The last thing the table says is what it does *not* say. 0.8.9's kernel claim
+was reopened on the grounds that the output head reads 12.67 GiB/s where the
+mlp reads 20.14, so the kernels must be slower on short rows. They are not:
+`vpdpbusd` consumes sixty-four codes whatever their width, so a two bit plane
+spends the same instruction on 16 bytes that a four bit plane spends on 32, and
+**GiB/s cannot be compared across bit widths.** Counted in multiply-adds the
+output head is the *fastest* plane in the step — 60.6 G a second against the
+mlp's 59.0 — and the two that are really behind are the two smallest,
+`ple feed` at 18.0 and `ple lift` at 12.5. That is the first entry on `TODO.md`
+now.

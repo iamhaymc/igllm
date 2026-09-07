@@ -16,33 +16,33 @@ VNNI, the wide build — a bare sweep gives **32.18 GiB/s** at four threads and 
 decode step reads **784.4 MiB**, so a token that spent nothing at all outside
 the memory would take 24 ms: **41 tokens a second, and no more.**
 
-0.8.10 divided the step and the division is in `CHANGES.md`. Two things it
-settles, both of which move this list.
+0.8.10 divided the step. 0.8.11 acted on the division, and the two things it
+settles both move this list.
 
-**The step was never mostly outside the kernels.** This section used to ask
-where 56 ms of an 80 ms token went and answer, in advance, "the attention, the
-norms, the sampler, the forks and joins, the per-layer embedding lookup, the
-residual adds." Measured, the norms and the residual adds are **0.9%** of a
-step, the rotary turn and the cache write **0.6%**, the embedding lookup a
-tenth of a millisecond. All of it together, less the attention, is under 2%.
-The question is closed and the guess was wrong.
+**The first entry's premise was wrong, and the entry is closed by the
+correction rather than by the work it asked for.** It read a table of GiB/s,
+saw the output head at 12.67 against the mlp's 20.14, and concluded that the
+kernels were slower on the short rows a step actually reads. But `vpdpbusd`
+consumes sixty-four codes whatever their width, so a two bit plane spends the
+same instruction on 16 bytes of weight that a four bit plane spends on 32 —
+**GiB/s is not comparable across bit widths at all.** Counted in multiply-adds,
+the output head is the *fastest* plane in the step: 60.6 G a second against the
+mlp's 59.0, `attn out` 57.7, `q k v` 50.7. It looks slow in bytes for the same
+reason it is cheap in work.
 
-**0.8.9 did not finish the kernels.** It measured them on a row of 12288, which
-is this export's widest. A decode step reads 1536-wide rows most of the time,
-and on those the same kernels give 12.67 to 20.14 GiB/s where the bench gives
-25.90 to 31.04. That is the first entry below, and it is a kernel item on a
-list that has had none since 0.8.9 said there were none left.
+What was really costing was in the entry's other half, and was not arithmetic:
+a row's epilogue was making two out-of-line calls and dragging a `vzeroupper`
+and the whole caller-saved vector state through the row loop. That is fixed,
+along with two `tanhf` loops the list did not have on it and a bf16 dot product
+that had never been vectorized. Decode at four threads is **27.1 tokens a
+second** of the 41 on a 374 id prompt and 29.3 on a short one; prefill is
+**82.1**. `CHANGES.md` 0.8.11 has every number and the two refusals.
 
-What 0.8.10 took: the attention across the pool, which was the last part of a
-step on one core, and the gelu, which is an eighth of a step and reads no
-weight so no byte count had ever shown it. Decode at four threads is **18.4
-tokens a second** of the 41 on a 288 id prompt and 15.5 on a 2004 id one;
-prefill is **54.8**.
-
-So the two questions this section carries are now: **why is a kernel slower on
-a short row than on a long one, and by enough to be half the step?** — the
-first entry. And **how does anything get past 41?** — still only by producing
-more than one token per sweep, which is the second.
+**What is actually behind is the two smallest planes, and one of them for a
+reason the first entry described exactly.** `ple feed` runs at 18.0 G
+multiply-adds a second and `ple lift` at 12.5, against 50 to 61 everywhere
+else. That is the first entry below. And **how does anything get past 41?** —
+still only by producing more than one token per sweep, which is the second.
 
 ## Against llama.cpp
 
@@ -61,50 +61,71 @@ the forks.
 
 ## Speed
 
-- **The kernels on the rows this export actually has, not on its widest one.**
-  0.8.9 closed the kernel question on a bench of a 12288 wide row and the phase
-  timer reopens it, because a decode step does not read many rows that shape.
+- **The two planes that are actually behind, and the short row in its real
+  form.** 0.8.11 counted the step in multiply-adds instead of bytes and the
+  ranking changed completely. Four planes run at 50 to 61 G multiply-adds a
+  second and two do not:
 
-  At four threads, with the elementwise work counted apart from the planes it
-  sits between: `attn out` **19.42 GiB/s**, `mlp` **20.14**, `q k v` **17.04**,
-  the output head **12.67**, `ple lift` **9.42** — against the 25.90, 29.47 and
-  31.04 the same kernels give on a 12288 row at two, four and eight bits, and
-  the 32.18 a bare sweep gives. At one thread the same five are 6.76, 6.27,
-  6.57, 3.34 and 2.61 against 9.62.
+  | part | ms a step | multiply-adds | G mac/s |
+  | --- | --- | --- | --- |
+  | final norm, head | 6.649 | 402.7 M | 60.6 |
+  | mlp | 16.787 | 990.9 M | 59.0 |
+  | attn out | 2.299 | 132.5 M | 57.7 |
+  | q k v | 2.900 | 147.0 M | 50.7 |
+  | **ple feed** | 1.532 | 27.5 M | **18.0** |
+  | **ple lift** | 1.100 | 13.8 M | **12.5** |
 
-  The obvious suspect is the row epilogue. A 1536 wide row at two bits is 384
-  bytes — eight loads — and then a horizontal reduction of the accumulator, a
-  scale, and a store; on a 12288 row that epilogue is paid once per 3072 bytes
-  instead. If that is it, the fix is a block of output rows carried in
-  independent accumulators so their epilogues interleave, which is the same
-  trick 0.8.8 played on the batch's loads and is a kernel change rather than a
-  schedule one. The head is the extreme case and the one to write it against:
-  262144 rows of 384 bytes, and the slowest plane in the step by rate.
+  `ple feed` is the short row question in the form the head was wrongly thought
+  to have it: `per_layer_projection` is 1536 rows of **256 columns**, which is
+  four blocks of the unpack and then an epilogue — the ratio of epilogue to
+  work that the head, at twenty-four blocks a row, never had. The row block
+  0.8.11 added helps it least where it would help most, because four rows of
+  256 columns is still four epilogues per sixteen blocks. What it wants is
+  either more rows a block on narrow planes specifically, or the group loop
+  lifted out so a whole plane's epilogues are one pass.
 
-  Measure it the way the timer already reports it — GiB/s a phase on the shipped
-  export — and not on a synthetic row, because a synthetic row is what got this
-  wrong the first time.
+  `ple lift` is a different thing: `per_layer_model_projection` is bf16, so it
+  is a float multiply-add path — eight lanes an instruction against the integer
+  path's sixty-four — and 12.5 G a second is roughly what that path should give.
+  It cannot join the integer path without a calibrated step it does not have.
+  The question worth asking of it is whether the export's other bf16 could be
+  quantized at load, which is a footprint change as much as a speed one, and
+  which belongs with the residency item under *Not speed*.
 
-  *llama.cpp blocks its output rows this way* throughout `ggml-cpu`, so the
-  shape is known to be worth having; what is unknown here is how much of the
-  gap it accounts for.
+  Together they are 2.6 ms of a 34.8 ms step, so the ceiling on this entry is
+  about 5% of a token. Measure it the way 0.8.11 did — the minimum a phase
+  reaches over runs alternating between the two builds — because this host's
+  whole-step figure swings by a fifth and that is enough to invent a result.
 
-- **Stop calling `tanhf` 262144 times to cap the logits.** The output head's
-  own row count, touched twice more after it is read: the cap at **7.0%** of a
-  decode step and the sampler at **1.5%**, both on the calling thread.
+- **The output head, if there is anything left in it at all.** 96 MiB and 12.2%
+  of everything a decode step reads, at 60.6 G multiply-adds a second, which is
+  the best rate in the step. Two measurements say there may still be something,
+  and neither is conclusive.
 
-  Forking the cap was tried in 0.8.10 and refused with the numbers — serial
-  3.94, 3.82, 3.87 ms against 5.20, 1.33, 5.21 forked, one fork whose workers
-  had just been joined on the head and had not settled. So the way through is
-  not the pool. It is either the series `RESEARCH.md` gives and 0.8.6 already
-  put in the picture's softmax, which would move numbers and needs the
-  reference comparison run against it, or capping only the rows the sampler is
-  going to look at, which is exact for greedy and top-k and wrong for anything
-  that reads the tail.
+  The same kernel on the same shape, run over the same memory-mapped file
+  outside the engine with the real epilogue attached, gives **22.7 GiB/s at
+  four threads** where the engine's head phase gives 14.25. A bare sweep on
+  this host gives 38.3 at four threads and 9.37 at one. So the loop can go
+  faster on this shape than the engine gets out of it, and whatever the
+  difference is, it is not in the loop — the generated code for the row block
+  has no calls in it and no spills.
 
-  This is the same 262144 rows the vocabulary bound below is about, and the two
-  should be scoped together: a bound that never materializes most of the head
-  makes the cap over most of the head moot.
+  What has been ruled out: the row epilogue (0.8.11 removed the calls and the
+  head did not move, 14.50 to 14.25); eight rows a block instead of four (a
+  wash everywhere); and software prefetch of the code stream ahead of the row
+  loop (12 to 20% *worse* on every code plane — the numbers are in `CHANGES.md`
+  0.8.11, and the next person to have the idea should read them before having
+  it). What has not been tried is the obvious remaining difference between the
+  two settings: in the microbenchmark the same 96 MiB is swept three times in a
+  row, so its page table entries stay hot, and in the engine the head is swept
+  once with thirty-five layers of other memory in between. That points at the
+  page walk rather than the data, and a file-backed mapping cannot be given
+  huge pages, so if that is the answer the answer is that there is nothing to
+  do here and this entry closes.
+
+  Do not reopen this on a GiB/s comparison. The head is two bit and everything
+  it is compared against is four or eight, and that alone accounts for the gap
+  the first version of this entry was written about.
 
 - **Produce more than one token per sweep of the weights.** The only idea on
   this list that can pass 41 tokens a second, because it is the only one that
@@ -176,6 +197,13 @@ the forks.
   about 47, so this is a multiplier and not a strategy. Measure **bytes actually
   not read**, not clusters skipped, and stop if the bound needs most of a row to
   be useful.
+
+  This entry used to be scoped together with the logit cap, on the argument that
+  a bound which never materializes most of the head makes capping most of the
+  head moot. 0.8.11 closed the cap on its own — 4.45 ms a step to 0.28 — so the
+  two are no longer one piece of work, and what is left to win here is the head
+  itself: 6.65 ms of a 34.79 ms step, with the cap and the sampler that used to
+  ride with it now 0.28 and 0.78.
 
 - **Fewer patches, before the pooling — and a budget the caller can ask for.**
   The largest vision win available, and the one that costs behaviour.
@@ -298,3 +326,10 @@ the forks.
 | What a token spends outside the kernels, a part at a time — and the answer that most of it never was outside them | 0.8.10 |
 | The attention scoring and blend across the pool, and the gelu with them | 0.8.10 |
 | The logit cap across the pool (refused: measured, and a single fork after the head does not settle) | 0.8.10 |
+| The logit cap itself — the series rather than 262144 calls to `tanhf`, on the calling thread still | 0.8.11 |
+| The row epilogue's two out-of-line calls, and the `vzeroupper` they dragged through the row loop | 0.8.11 |
+| The gelu's own `tanhf`, 215040 calls a step (and the series is the more accurate of the two) | 0.8.11 |
+| The bf16 dot product, which had never had a vector path and carries 26.25 MiB of every step | 0.8.11 |
+| Why a kernel looks slower on a short row (answered: it does not — `GiB/s` is not comparable across bit widths) | 0.8.11 |
+| Eight rows a block instead of four (refused: a wash on every plane, for eight live accumulators) | 0.8.11 |
+| Software prefetch ahead of the row loop (refused: 12 to 20% worse on every code plane) | 0.8.11 |
