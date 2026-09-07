@@ -3916,6 +3916,23 @@ is exact in one half and rounded in the other is not half way between them; it
 is a third thing, and it drifts further than either. That is why the batch path
 is in this change rather than a later one.
 
+### The eight lane block, settled
+
+0.8.8 measured an eight lane batch and refused it: eight lanes are quicker only
+with a single accumulator each, which reassociates the sum, and 16% of one loop
+was not judged worth moving the engine's last bit. `TODO.md` carried that as an
+open question rather than a closed one, because it named two larger claimants
+for the same spending — the tower's attention, and an integer accumulator that
+changes the arithmetic anyway — and said the bit should be moved once, for
+whichever of them measured out.
+
+This is that spending. The integer accumulator is in, it moved every code
+plane's last bit, and the towers came out closer to the reference for it. The
+eight lane block does not get a second hearing: the reassociation it wanted is
+now spent, and what it was worth — 16% of a loop that is no longer the loop —
+was never on the same scale. The tower's attention is the other claimant and is
+still open.
+
 ### What was not taken
 
 `RESEARCH.md`'s idea 3, the lookup table execution, is not here. It was the
@@ -3937,3 +3954,28 @@ a multiply and a compare per column, run once per product per lane — one pass
 over 1536 activations against the output head's 262144 rows of them, so it is
 the row count smaller than what it saves. It would be a vector loop in a day and
 would not be measurable.
+
+### The lists, rewritten around it
+
+`TODO.md` had grown a tail of closed items and the reasoning behind them, all of
+which is in this file under the version that closed it — the gain mirror and the
+conformer's score loop in 0.8.4, the shared cache row in 0.8.5, the softmax
+series in 0.8.6, the odd widths and the wide tier in 0.8.7, the fork and join
+and the eight lane block in 0.8.8. It was duplication rather than a record, so
+it is gone, and what is left in its place is a table naming the version to read.
+
+The list it leaves is ordered by what moves a token, and it now says for each
+entry whether mainline llama.cpp has the same thing — checked by reading
+`ggml-org/llama.cpp` at `465e49b`. That is a prior rather than a scoreboard:
+where llama.cpp has an idea the payoff is known and the work is porting, and
+where it does not, either the idea is worse than it looks or this checkpoint
+makes it worth more than it would be there.
+
+`RESEARCH.md` lost its idea 2, which is this change, and lost the six ideas that
+are now ordinary engineering rather than research — speculative verification,
+the image budget, early token merging, the head's vocabulary bound, tiled tower
+attention, and the visual feature cache — all of which moved to `TODO.md` with
+what is known about them from that reading. What stays there is what still needs
+a trained artifact or an untested hypothesis: the distilled encoder, the
+per-layer-conditioned drafter, QAT-cell certification, structured sparsity, and
+the lookup-table kernel for hosts with no integer dot product.

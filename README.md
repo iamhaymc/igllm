@@ -247,10 +247,11 @@ sequential read, so the tuned build uses 42% of the memory and the default build
 30%. The scaling says it independently: from one thread to four the memory gives
 1.5 times as much and decode produces 3.2 times as many tokens.
 
-So what is left on both builds is in spending fewer instructions as much as in
-reading fewer bytes, and `TODO.md` says what the candidates are. `CHANGES.md`
-0.8.1 sets out how the earlier reading of this — that decode was at the wall —
-came of dividing by the key and value cache instead of the weights.
+So what was left on both builds, at that point, was in spending fewer
+instructions as much as in reading fewer bytes. Six passes later the first half
+of that is finished — see 0.8.9 below — and `TODO.md` is about the second.
+`CHANGES.md` 0.8.1 sets out how the earlier reading of this — that decode was at
+the wall — came of dividing by the key and value cache instead of the weights.
 
 The third pass is 0.8.4's, and it is measured on a different machine, so it is
 not folded into the desktop's table above. The two bit decode — 366 MiB of the
