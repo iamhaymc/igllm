@@ -398,6 +398,96 @@ static void main_answer(app_model *model, const main_flag *flag, app_session *se
   }
 }
 
+/* What one clock read costs on this host, so the timer can be held to account
+ * in the units it reports in rather than assumed to be free.
+ *
+ * The loop is written so the compiler cannot hoist the call: each read is
+ * consumed.  A hundred thousand of them is a few milliseconds and is paid once,
+ * after the run it describes, so it is not in the numbers it qualifies. */
+static double main_clock_cost(void) {
+  double from_time, keep_value = 0.0;
+  int read_index;
+  const int read_limit = 100000;
+  from_time = time_now();
+  for (read_index = 0; read_index < read_limit; ++read_index) keep_value += time_now();
+  if (keep_value == 0.0) return 0.0; /* never, and the compiler cannot know it */
+  return (time_now() - from_time) / (double)read_limit;
+}
+
+/* Where a decode step goes, a part at a time.
+ *
+ * The parts are a partition of the step and not a sample of it, so they sum to
+ * the step by construction; what the last two lines report is the two ways that
+ * claim could still be wrong.  `unnamed` is the step's wall clock less the sum,
+ * which is the accounting either side of the pass and should be microseconds.
+ * `timer` is the clock reads the division itself spent, priced at what a read
+ * measured just now — the part of every number above that is the measuring. */
+static void main_phases(const app_session *session) {
+  app_phase_book book = session_phases(session);
+  size_t byte_list[APP_PHASE_COUNT];
+  double total_seconds = 0.0, pass_seconds, step_each, read_cost;
+  size_t total_bytes = 0;
+  int phase_slot, order_list[APP_PHASE_COUNT], order_index, order_scan;
+
+  if (!book.step_count) return;
+  session_phase_bytes(session, byte_list);
+  for (phase_slot = 0; phase_slot < APP_PHASE_COUNT; ++phase_slot) {
+    total_seconds += book.seconds[phase_slot];
+    total_bytes += byte_list[phase_slot];
+  }
+  if (total_seconds <= 0.0) return;
+  /* The sampler runs after `session_step` returns, so it is in the token but
+   * not in the step the step's clock timed.  Everything else is the pass. */
+  pass_seconds = total_seconds - book.seconds[APP_PHASE_PICK];
+  step_each = book.step_seconds / (double)book.step_count;
+
+  /* Largest first: the point of the report is which part to look at next, and
+   * a list in graph order buries it. */
+  for (phase_slot = 0; phase_slot < APP_PHASE_COUNT; ++phase_slot)
+    order_list[phase_slot] = phase_slot;
+  for (order_index = 1; order_index < APP_PHASE_COUNT; ++order_index) {
+    int keep_slot = order_list[order_index];
+    for (order_scan = order_index;
+         order_scan > 0 && book.seconds[order_list[order_scan - 1]] < book.seconds[keep_slot];
+         --order_scan)
+      order_list[order_scan] = order_list[order_scan - 1];
+    order_list[order_scan] = keep_slot;
+  }
+
+  fprintf(stderr, "\nphases  %zu decode steps, %.2f ms a step, %.1f MiB swept\n", book.step_count,
+          step_each * 1000.0, (double)total_bytes / (1024.0 * 1024.0));
+  fprintf(stderr, "%-24s %10s %7s %10s %8s %7s\n", "part", "ms a step", "share", "MiB a step",
+          "GiB/s", "a step");
+  for (order_index = 0; order_index < APP_PHASE_COUNT; ++order_index) {
+    double phase_seconds, phase_mib;
+    phase_slot = order_list[order_index];
+    if (book.counts[phase_slot] == 0) continue;
+    phase_seconds = book.seconds[phase_slot] / (double)book.step_count;
+    phase_mib = (double)byte_list[phase_slot] / (1024.0 * 1024.0);
+    fprintf(stderr, "%-24s %10.3f %6.1f%% %10.1f ", app_phase_text(phase_slot),
+            phase_seconds * 1000.0, 100.0 * book.seconds[phase_slot] / total_seconds, phase_mib);
+    /* A part that reads no weights has no rate to quote, and quoting one would
+     * invite the reader to compare it with the memory's. */
+    if (byte_list[phase_slot] > 0 && phase_seconds > 0.0)
+      fprintf(stderr, "%8.2f", phase_mib / 1024.0 / phase_seconds);
+    else
+      fprintf(stderr, "%8s", "-");
+    fprintf(stderr, " %7.1f\n", (double)book.counts[phase_slot] / (double)book.step_count);
+  }
+  fprintf(stderr, "%-24s %10.3f %6.1f%% %10.1f %8.2f\n", "named, in all",
+          total_seconds / (double)book.step_count * 1000.0, 100.0,
+          (double)total_bytes / (1024.0 * 1024.0),
+          (double)total_bytes / (1024.0 * 1024.0 * 1024.0) /
+              (total_seconds / (double)book.step_count));
+
+  read_cost = main_clock_cost();
+  fprintf(stderr, "unnamed %.3f ms a step: the step's own clock, less the pass's parts\n",
+          (book.step_seconds - pass_seconds) / (double)book.step_count * 1000.0);
+  fprintf(stderr, "timer   %.3f ms a step of the above, %.0f reads at %.0f ns\n",
+          read_cost * (double)book.read_count / (double)book.step_count * 1000.0,
+          (double)book.read_count / (double)book.step_count, read_cost * 1e9);
+}
+
 static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
   app_session *session = NULL;
   main_reel reel;
@@ -455,6 +545,7 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
     fprintf(stderr, "memory  %.1f MiB allocated\n",
             (double)tally.memory_bytes / (1024.0 * 1024.0));
   }
+  if (flag->verbose_level) main_phases(session);
   main_reel_free(&reel);
   session_close(session);
   return 0;
