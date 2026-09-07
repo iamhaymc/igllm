@@ -117,38 +117,52 @@ engine and found the ceiling held down by the output head, so the head entries
 now come before the speculative one rather than beside it. Where an entry is
 only a size, its size is given against a 34.95 ms step floor on the third host.
 
-- **The feed-forward planes, which are half of every token and have never been
-  looked at.** 19.2 ms of a 34.95 ms step — **55%** — reading 475.3 MiB at 22.5
-  GiB/s where a bare four thread sweep of this host reaches 49.80. Two point one
-  times its own memory floor, which is the same ratio every other integer plane
-  sits at and is therefore not obviously a bug.
+- **The feed-forward planes, which are half of every token and are closer to
+  the memory than this entry used to say.** 18.96 ms of a 36.9 ms step —
+  **52%** — reading 475.3 MiB at 24.44 GiB/s.
 
-  It is first on this list for one reason: **it is the largest thing here and
-  nothing has ever been written about it.** Every entry below has a history of
-  attempts; this one has none. 0.8.14's affine take moved it 10% by accident,
-  as a side effect of a change written for the four bit planes generally, and
-  nobody has asked what else is in it.
+  **0.9.2 corrected the ratio this entry was written on, and it halves the
+  prize.** The entry read "two point one times its own memory floor", and that
+  is the third host's number: a bare four thread sweep there reaches 49.80
+  GiB/s. On the reference host a bare sweep is **31.29 GiB/s** — measured again
+  in 0.9.2, and 0.8.9's 32.18 on the same machine — so the plane's floor is
+  14.83 ms against the 18.96 it takes, which is **1.28 times its floor and 78%
+  of a bare sweep**. A plane with no arithmetic in it at all would save 4.1 ms
+  of the step here, 11%, and 0.8.9 measured the four bit code path itself at
+  29.47 GiB/s in isolation, so the honest ceiling is nearer 17% of the plane.
+  Quote a host's own sweep beside this ratio or it means nothing.
 
-  0.8.16 is the argument for looking. The output head sat at six times its
-  memory floor for four versions while three entries reasoned about why, and the
-  answer turned out to be two independent things stacked in a plane everyone had
-  assumed was fine — the wrong kernel, and then a dependency chain four times
-  deeper than the ports. Both were invisible from the outside and obvious from
-  inside. The mlp is on the well-optimized integer path with its row block
-  already in place, so it may well be near its limit; it may also not be, and
-  the cost of finding out is a profile.
+  **The chain was the named hypothesis and it is refused, at both widths.**
+  0.9.2 built two accumulators a row into `KERN_LEVEL_ROWS_LOOP` — eight chains
+  where there were four, bit-identical because integer addition is associative,
+  and `logits` byte for byte unchanged to prove the build did it. The mlp phase
+  moved from 18.989 ms to 18.959 over three alternating runs, which is nothing.
+  A loop within a fifth of what its memory will hand over cannot be
+  latency-bound however its chains count.
 
-  Start where 0.8.16 started: **count the loop against the ports, and count the
-  chain against the loop.** `kern_row_code_level_rows` carries one accumulator a
-  row over four rows. A 1536 column row at four bits is twenty-four blocks, so
-  each chain is twenty-four dependent `vpdpbusd` — five cycles deep on this
-  class of host against two a cycle of throughput, and four chains to cover it.
-  That is the same arithmetic that was wrong for the head. Check it before
-  reaching for anything cleverer.
+  **And the same pairing in `KERN_LEVEL_MANY_LOOP` is 15% worse**, which is the
+  more interesting half. A batch reads the plane once and multiplies it by every
+  lane, so memory stops binding after a lane or two and that loop really should
+  be latency-bound — but eight accumulators, two decoded code vectors, four lane
+  pointers and the plan's three constants do not fit, and prefill fell from
+  78.28 tokens a second to 66.22. **The batched integer path is at its register
+  limit, not its latency limit.** Anything written into it has to spend
+  registers it does not have.
+
+  What is left, then, is a plane at 78% of this host's memory with its two
+  obvious kernel routes closed, and the next thing to try is probably not a
+  kernel at all. This export is dense — `num_experts` is null in its
+  `config.json`, so there is no routing to exploit — and 35 layers of
+  1536 by 6144 gate, up and down is simply the tensor. Either fewer bytes are
+  read for a token, which is a sparsity or a residency question and not a loop
+  one, or this plane is done. Take a host with more bandwidth than this one
+  before reopening it as a kernel: the third host sweeps at 49.80 GiB/s, where
+  the same plane sits at 45% of a sweep rather than 78%, and whatever is left in
+  the loop would show there and cannot show here.
 
   What is not worth retrying: the bit width (0.8.11), eight rows a block
   (0.8.11, and again in 0.8.16 on the other path), software prefetch (0.8.11),
-  and the page walk (0.8.12).
+  the page walk (0.8.12), and the accumulator chain at either width (0.9.2).
 
 - **The output head, which runs the float kernel and not the integer one.**
   96 MiB and 12.2% of everything a decode step reads, 12.36 ms of a 44.74 ms
@@ -621,3 +635,5 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | A cache a rejected block can be taken out of — the bound that makes it a fixed scratch, and the byte-for-byte test that holds it | 0.9.0 |
 | What speculative decoding is worth in this engine, bracketed by a proposer that is always right and one that is always wrong (answered: 2.2x at best, break-even near 40% acceptance, and the output head is half the marginal lane) | 0.9.0 |
 | The batched output head's unpack and its chain depth — the two things 0.8.15 and 0.8.16 gave the one lane path and could not reach the many lane one | 0.9.1 |
+| The mlp's accumulator chain, which the entry named as the first thing to check (refused: a wash on the one lane block, 15% worse on the batched one, and the plane is at 78% of this host's bare sweep) | 0.9.2 |
+| What a bare sweep of the reference host actually is, against the third host's number the mlp entry had been reasoning from | 0.9.2 |

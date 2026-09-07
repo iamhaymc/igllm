@@ -5283,3 +5283,94 @@ already there: the broadcast the loop still spends three of sixteen instructions
 on, and not scoring 262144 rows at all. The second of those is the larger, and
 0.9.0 gave it a second customer — greedy verification asks whether the proposed
 id is the argmax, which is a bound and not a distribution.
+
+---
+
+## 0.9.2 — the mlp's chain, counted and refused, and the sweep that says why
+
+### Scope
+
+No code changes. `TODO.md`'s first entry — the feed-forward planes, half of
+every token, with no history of attempts on it — names one thing to check before
+anything cleverer, and this is that check, on the reference host, with the
+numbers written down so it is not checked a third time.
+
+> Start where 0.8.16 started: **count the loop against the ports, and count the
+> chain against the loop.** `kern_row_code_level_rows` carries one accumulator a
+> row over four rows. A 1536 column row at four bits is twenty-four blocks, so
+> each chain is twenty-four dependent `vpdpbusd` — five cycles deep on this
+> class of host against two a cycle of throughput, and four chains to cover it.
+
+The arithmetic is right and the conclusion does not follow. Two accumulators a
+row were built, on both integer loops, and both are refused.
+
+### The one lane row block: a wash
+
+`KERN_LEVEL_ROWS_LOOP` was given a paired loop — two blocks an iteration, two
+accumulators a row, eight chains where there were four, the level vector still
+loaded once for the four rows, and the second accumulator folded into the first
+inside the macro so no caller could tell. It is bit-identical by construction:
+a `vpdpbusd` accumulator is an `int32` sum of products, integer addition is
+associative, and `logits` on the shipped export came back byte for byte
+unchanged, which is the check that says the build did what it says.
+
+Three runs each, alternating builds, `bench --serve 96 --verbose`, the minimum
+of the `mlp` phase:
+
+| | mlp, ms a step |
+| --- | --- |
+| four chains | 18.989, 19.745, 21.480 |
+| eight chains | 18.959, 20.648, 21.105 |
+
+18.989 against 18.959. There is nothing there, in either direction.
+
+### Why not, and the number the entry was missing
+
+The entry's ratio — "two point one times its own memory floor" — is the third
+host's, where a bare four thread sweep reaches 49.80 GiB/s. **It is not this
+host's.** A bare read-only sweep of a 2.4 GiB buffer here, best of four:
+
+| threads | 1 | 2 | 4 |
+| --- | --- | --- | --- |
+| sequential read | 10.06 GiB/s | 17.09 | **31.29** |
+
+which is the 32.18 of 0.8.9's table on the same machine, a year of neighbours
+later. The mlp reads **475.3 MiB at 24.44 GiB/s**, so on this host it is at
+**78% of a bare sweep**, and its memory floor is 14.83 ms against the 18.96 it
+takes: **1.28 times its floor, not 2.1.** Even a plane with no arithmetic at all
+in it would save 4.1 ms of a 36.9 ms step here — 11% — and 0.8.9 measured the
+four bit code path itself at 29.47 GiB/s in isolation, so the honest ceiling on
+this entry is nearer 17% of the plane than to anything larger.
+
+A loop that is within a fifth of what its memory will hand over cannot be
+latency-bound, whatever counting its chains says. The chains are real; there is
+simply no port pressure behind them to relieve. On the third host, which sweeps
+at 49.80 GiB/s and where the same plane sits at 45% of a sweep rather than 78%,
+the answer could well be different — and that is where this should be retried,
+not here.
+
+### The batched loop: 15% worse, and a better hypothesis than the first
+
+`KERN_LEVEL_MANY_LOOP` looked like the case the argument actually fits. A batch
+reads the plane once and multiplies it by every lane, so the arithmetic a byte
+carries is the lane count and memory stops binding after the first lane or two —
+which is exactly where a latency-bound loop shows, and it is the loop a
+speculative block spends its marginal lane in. The same pairing was built there:
+two accumulators a lane, two blocks an iteration, both blocks still decoded once
+for the four lanes.
+
+Three runs each on a 228 id prompt, best of each: **prefill 78.28 tokens a
+second against 66.22** — the deeper loop is 15% *worse*. Eight accumulators, two
+decoded code vectors, four lane pointers and the plan's three constants do not
+fit, and what the chains gain the spills lose several times over.
+
+So the batched integer path is at its register limit and not at its latency
+limit, and that is worth knowing before anything else is written into it.
+
+### What this leaves
+
+The mlp entry stays open and its hypothesis does not. What is ruled out on it is
+now: the bit width (0.8.11), eight rows a block (0.8.11, 0.8.16), software
+prefetch (0.8.11), the page walk (0.8.12), and the accumulator chain at both
+widths (here). What is left is a plane at 78% of the host's memory, which is a
+smaller prize than the entry was written for, and the entry now says so.
