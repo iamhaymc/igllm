@@ -78,12 +78,16 @@ typedef struct app_tally {
 
 /* The named parts of one decode step, for the phase timer.
  *
- * 0.8.9 closed the kernels: every code plane now streams at the memory's own
- * rate, and yet a step takes three times what its bytes cost.  The question
- * that leaves is where the rest of the step is, and it cannot be answered by
- * reasoning about the graph — 0.8.8 found a third of a token in the fork and
- * join, which nobody had thought to look at.  So the step is divided here,
- * once and for all, into parts that name themselves.
+ * 0.8.9 read the kernels as closed — every code plane streaming at the
+ * memory's own rate on a bench of a 12288 wide row — and yet a step took three
+ * times what its bytes cost.  The question that leaves is where the rest of
+ * the step is, and it cannot be answered by reasoning about the graph: 0.8.8
+ * found a third of a token in the fork and join, which nobody had thought to
+ * look at, and the guess this timer was written to test turned out to be wrong
+ * in the other direction — most of the step was never outside the kernels at
+ * all, and the kernels were not at the memory on the rows a step actually
+ * reads.  So the step is divided here, once and for all, into parts that name
+ * themselves.
  *
  * The division is a partition and not a sample: the timer closes one part as
  * it opens the next, so the parts sum to the step exactly and nothing can hide

@@ -265,8 +265,9 @@ sequential read, so the tuned build uses 42% of the memory and the default build
 1.5 times as much and decode produces 3.2 times as many tokens.
 
 So what was left on both builds, at that point, was in spending fewer
-instructions as much as in reading fewer bytes. Six passes later the first half
-of that is finished — see 0.8.9 below — and `TODO.md` is about the second.
+instructions as much as in reading fewer bytes. Six passes later 0.8.9 read the
+first half as finished; 0.8.10 measured a step part by part and found that it
+is not, on the rows this export actually has. `TODO.md` carries both halves.
 `CHANGES.md` 0.8.1 sets out how the earlier reading of this — that decode was at
 the wall — came of dividing by the key and value cache instead of the weights.
 
