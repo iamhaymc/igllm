@@ -69,6 +69,33 @@ def tool_pick():
 WIDE_FLAGS = ["-mavx512f", "-mavx512bw", "-mavx512dq", "-mavx512vl",
               "-mprefer-vector-width=256"]
 
+# The one subset that is asked of the host rather than of the tier.  `vnni` came
+# two generations after the four above, so a machine with all of them may still
+# not have it, and a build that assumed it would stop with an illegal
+# instruction rather than fall back.  The compiler is the one that knows: it is
+# asked what `-march=native` would define here, and the flag is added only where
+# the answer says the flag is safe.  Where it is not, the integer kernels
+# compile away and the float ones are the whole of the engine, as before.
+VNNI_FLAG = "-mavx512vnni"
+_vnni_answer = None
+
+
+def tool_has_vnni(kind, program):
+    """Whether the build host advertises AVX-512 VNNI to this compiler."""
+    global _vnni_answer
+    if _vnni_answer is not None:
+        return _vnni_answer
+    _vnni_answer = False
+    if kind != "unix" or platform.machine().lower() not in ("x86_64", "amd64"):
+        return _vnni_answer
+    try:
+        report = subprocess.run([program, "-march=native", "-dM", "-E", "-x", "c", os.devnull],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        _vnni_answer = b"__AVX512VNNI__" in report.stdout
+    except OSError:
+        _vnni_answer = False
+    return _vnni_answer
+
 
 def tool_line(kind, program, source, target, tuned, debug, trace=False, wide=False):
     """Builds the full command line for one translation unit."""
@@ -94,6 +121,8 @@ def tool_line(kind, program, source, target, tuned, debug, trace=False, wide=Fal
         line += ["-mavx2", "-mfma"]
         if wide:
             line += WIDE_FLAGS
+            if tool_has_vnni(kind, program):
+                line += [VNNI_FLAG]
     line += ["-lm"]
     if platform.system() != "Windows":
         line += ["-lpthread"]
