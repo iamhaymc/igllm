@@ -10189,18 +10189,27 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
   TRACE_LANE("final", -1, place_from + lane_count - 1, session->scrap_room, form->state_size);
   session_lift(session, &model->head_sheet, session->scrap_room, session->logit_room);
   if (form->logit_cap > 0.0f) {
-    /* A `tanhf` for each of 262144 logits, which the timer put at a sixteenth
-     * of a decode step spent on the one thread that got here.  Elementwise, so
-     * the pool changes nothing but who runs it. */
+    /* A `tanhf` for each of 262144 logits, and the timer puts it at a
+     * fourteenth of a decode step on the one thread that gets here.  It is an
+     * elementwise map like the gelu above, so the pool would be free of any
+     * question about what it does to the numbers — and it was tried, and it is
+     * not taken, because on the reference host it does not pay.  Three runs
+     * each at four threads: serial 3.94, 3.82, 3.87 ms, against 5.20, 1.33,
+     * 5.21 forked.  It reaches the four threads' figure once in three and is
+     * worse than serial the other two, which is the shape of a single fork
+     * whose workers have just been joined on the output head and have not
+     * settled.  A steady 3.87 beats a mean of 3.9 that swings by four
+     * milliseconds, and the swing is what a caller feels.
+     *
+     * What would make it pay is not a better fork.  It is not calling `tanhf`
+     * 262144 times: `RESEARCH.md`'s series, which 0.8.6 already put in the
+     * picture's softmax, or capping only the rows the sampler will look at. */
     cap_job job;
     phase_turn(session, APP_PHASE_CAP);
     job.logit_list = session->logit_room;
     job.value_count = model->head_sheet.row_count;
     job.cap_value = form->logit_cap;
-    if (model->pool.worker_count > 0 && job.value_count >= GELU_BAND_COUNT)
-      pool_run(&model->pool, session_cap_band, &job);
-    else
-      session_cap_band(&job, 0, 1);
+    session_cap_band(&job, 0, 1);
   }
   TRACE_LANE("logits", -1, place_from + lane_count - 1, session->logit_room,
              model->head_sheet.row_count);
