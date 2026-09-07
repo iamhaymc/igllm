@@ -48,7 +48,7 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 | ---------- | --------------------------------------------- |
 | `chat`     | an instruction-tuned turn, chat framed; `--loop` for more |
 | `complete` | raw continuation of the prompt text           |
-| `bench`    | timed prefill and decode report               |
+| `bench`    | timed prefill and decode report; `--verbose` divides a decode step into named parts |
 | `tokens`   | print the token ids of the prompt             |
 | `logits`   | print the next token distribution as json     |
 | `probe`    | print the resolved model shape                |
@@ -58,6 +58,23 @@ Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
 `--threads`, `--window`, `--cache`, `--heat`, `--top-k`, `--top-p`,
 `--echo-penalty`, `--seed`, `--loop`, `--keep`, `--raw`, `--verbose`. Run
 `igllm --help` for the full list.
+
+`bench --verbose` prints where a decode step goes, largest part first, with the
+bytes each part sweeps and the rate that comes to. The parts are a partition of
+the step rather than a sample of it — the timer closes one as it opens the next
+— so they sum to the step, and the last two lines say what the sum misses and
+what the timing itself cost.
+
+```
+phases  32 decode steps, 54.35 ms a step, 785.7 MiB swept
+part                      ms a step   share MiB a step    GiB/s  a step
+mlp                          23.051   41.8%      475.3    20.14    70.0
+final norm, head              7.475   13.6%       97.0    12.67     1.0
+score, softmax, blend         4.117    7.5%       26.2     6.23    35.0
+...
+unnamed 0.000 ms a step: the step's own clock, less the pass's parts
+timer   0.011 ms a step of the above, 428 reads at 26 ns
+```
 
 `chat --loop` keeps the turn open and reads more from standard input, so a
 conversation carries: what the model answered stays in the session's cache and
@@ -311,8 +328,9 @@ host with AVX-512 VNNI one instruction takes sixty-four of those products where
 the float loop unpacked, converted and multiplied sixteen. Against a bare sweep
 of 32.18 GiB/s at four threads, the two bit path goes from 12.26 GiB/s of codes
 to 25.90, the four bit from 17.37 to 29.47 and the eight bit from 23.17 to
-31.04: all three are now at the memory, which is the question the kernels can
-answer closed. On the shipped export at four threads, decode goes from 8.92
+31.04: all three are now at the memory, which 0.8.9 read as the question the
+kernels can answer closed — and 0.8.10 reopened, because that bench is a row of
+12288 and a decode step mostly reads rows of 1536. On the shipped export at four threads, decode goes from 8.92
 tokens a second to 12.57 and prefill from 15.19 to 33.96; at one thread prefill
 is 5.21 to 16.86. A picture — the tower and the 256 soft tokens it lays down,
 prefilled — goes from 36.3 seconds to 20.7 at four threads and 105.0 to 48.3 at
@@ -330,3 +348,53 @@ with gaps a little wider than before and inside the same bar. `CHANGES.md` 0.8.9
 gives both tables. Builds without the instruction — every `--tuned` build, and a
 `--wide` build on a host that lacks VNNI — produce the export's logits byte for
 byte as they did before.
+
+The seventh pass is 0.8.10's, on the same machine as the fifth and sixth, and
+it is the one that measures before it changes anything. Six passes had been
+argued from byte counts, and a byte count cannot see a part of a step that
+reads no bytes. `session_step` now closes one named part as it opens the next —
+one clock read a boundary, so the parts join edge to edge and sum to the step
+rather than sampling it — and `bench --verbose` prints them beside the bytes
+each sweeps.
+
+The first thing that fell out is that `TODO.md`'s standing question was
+mis-posed. It asked where 56 ms of an 80 ms token went and guessed: the norms,
+the residual adds, the rotary turn, the per-layer embedding lookup, the forks
+and joins. Measured, all of that together is under 2% of a step — the norms and
+the residual adds are 0.9%, the rotary turn and the cache write 0.6%. The step
+was never mostly outside the kernels.
+
+What was outside them was smaller and more specific, and three of the four
+things the table pointed at were taken. The attention's scoring and blend had
+never reached the pool at all: at a 4334 id prompt they were two fifths of the
+step, 38.4 ms at four threads against 39.7 at one. They are two jobs now, and
+the two divide along different axes deliberately — the scores by position,
+which are independent, and the blend by head, because a blend is a running sum
+down the span and dividing that by position would regroup its additions and
+make the engine's answer depend on the host's core count. So the export's
+logits are byte for byte what they were, at one, two and four threads, and the
+suite pins it with a bit comparison rather than a tolerance. The gelu between
+the feed-forward's halves was the other: an eighth of a decode step and a fifth
+of a prefill batch, on the calling thread, invisible to every profile before
+this one because it reads no weight.
+
+The fourth was the `tanhf` over all 262144 logits, and it was taken and put
+back. The same reasoning applied — an elementwise map, nothing to lose — and
+the measurement refused it: serial 3.94, 3.82, 3.87 ms against 5.20, 1.33, 5.21
+forked, one fork whose workers had just been joined on the output head and had
+not settled. A steady 3.87 beats a mean of 3.9 that swings by four
+milliseconds, and the numbers are kept in the comment where the next person to
+have the idea will find them.
+
+On the reference host at four threads, on a 288 id prompt: decode 15.5 tokens a
+second to 18.4 and prefill 43.1 to 54.8; on a 2004 id prompt decode 13.4 to
+15.5, and on a 4334 id one 10.1 to 13.0 with prefill 25.0 to 33.2. Not a bit of
+any logit moves.
+
+The last thing the table says is that 0.8.9's claim to have finished the
+kernels was measured on a bench of this export's *widest* row. On the rows a
+decode step actually reads — 1536 wide, most of the time — the same kernels
+give 12.67 to 20.14 GiB/s against the 25.90 to 31.04 the bench gives and the
+32.18 a bare sweep gives. That is the first entry on `TODO.md` now, and it is a
+kernel item on a list that had had none since 0.8.9 declared there were none
+left.

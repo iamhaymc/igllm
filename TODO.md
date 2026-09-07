@@ -16,16 +16,33 @@ VNNI, the wide build — a bare sweep gives **32.18 GiB/s** at four threads and 
 decode step reads **784.4 MiB**, so a token that spent nothing at all outside
 the memory would take 24 ms: **41 tokens a second, and no more.**
 
-0.8.9 finished the kernels. All three widths the export packs now stream at the
-memory's own rate — 25.90, 29.47 and 31.04 GiB/s of codes at four threads
-against that 32.18 — so no kernel that reads a code plane has anything left to
-give. Decode runs at 12.57 tokens a second of the 41, and prefill at 33.96 on a
-288 id prompt.
+0.8.10 divided the step and the division is in `CHANGES.md`. Two things it
+settles, both of which move this list.
 
-That leaves two questions, and they are the first two entries below. **Where do
-the other 56 ms of a token go?** — nobody has measured it, and it is now two
-thirds of the step. And **how does anything get past 41?** — only by producing
-more than one token per sweep, which is one idea and it is the second entry.
+**The step was never mostly outside the kernels.** This section used to ask
+where 56 ms of an 80 ms token went and answer, in advance, "the attention, the
+norms, the sampler, the forks and joins, the per-layer embedding lookup, the
+residual adds." Measured, the norms and the residual adds are **0.9%** of a
+step, the rotary turn and the cache write **0.6%**, the embedding lookup a
+tenth of a millisecond. All of it together, less the attention, is under 2%.
+The question is closed and the guess was wrong.
+
+**0.8.9 did not finish the kernels.** It measured them on a row of 12288, which
+is this export's widest. A decode step reads 1536-wide rows most of the time,
+and on those the same kernels give 12.67 to 20.14 GiB/s where the bench gives
+25.90 to 31.04. That is the first entry below, and it is a kernel item on a
+list that has had none since 0.8.9 said there were none left.
+
+What 0.8.10 took: the attention across the pool, which was the last part of a
+step on one core, and the gelu, which is an eighth of a step and reads no
+weight so no byte count had ever shown it. Decode at four threads is **18.4
+tokens a second** of the 41 on a 288 id prompt and 15.5 on a 2004 id one;
+prefill is **54.8**.
+
+So the two questions this section carries are now: **why is a kernel slower on
+a short row than on a long one, and by enough to be half the step?** — the
+first entry. And **how does anything get past 41?** — still only by producing
+more than one token per sweep, which is the second.
 
 ## Against llama.cpp
 
@@ -44,25 +61,50 @@ the forks.
 
 ## Speed
 
-- **Measure what a token spends outside the kernels, a part at a time.** This
-  gates everything else on this list and is the largest single unknown in the
-  engine.
+- **The kernels on the rows this export actually has, not on its widest one.**
+  0.8.9 closed the kernel question on a bench of a 12288 wide row and the phase
+  timer reopens it, because a decode step does not read many rows that shape.
 
-  Decode at four threads is 12.57 tokens a second, reading 9.63 GiB/s of the
-  784.4 MiB a step sweeps. The memory would hand those bytes over in 24 ms and
-  the step takes 80. So 56 ms a token — **two thirds of it** — is somewhere the
-  kernels are not: the attention, the norms, the sampler, the 277 forks and
-  joins, the bands that do not divide evenly, the per-layer embedding lookup,
-  the residual adds. 0.8.8 found a third of a token hiding in the fork and join
-  and nobody had thought to look; there is twice as much hiding now and the same
-  reasoning applies.
+  At four threads, with the elementwise work counted apart from the planes it
+  sits between: `attn out` **19.42 GiB/s**, `mlp` **20.14**, `q k v` **17.04**,
+  the output head **12.67**, `ple lift` **9.42** — against the 25.90, 29.47 and
+  31.04 the same kernels give on a 12288 row at two, four and eight bits, and
+  the 32.18 a bare sweep gives. At one thread the same five are 6.76, 6.27,
+  6.57, 3.34 and 2.61 against 9.62.
 
-  Until this exists, nothing below can be sized honestly, and no new kernel can
-  be justified — there may not be one worth writing.
+  The obvious suspect is the row epilogue. A 1536 wide row at two bits is 384
+  bytes — eight loads — and then a horizontal reduction of the accumulator, a
+  scale, and a store; on a 12288 row that epilogue is paid once per 3072 bytes
+  instead. If that is it, the fix is a block of output rows carried in
+  independent accumulators so their epilogues interleave, which is the same
+  trick 0.8.8 played on the batch's loads and is a kernel change rather than a
+  schedule one. The head is the extreme case and the one to write it against:
+  262144 rows of 384 bytes, and the slowest plane in the step by rate.
 
-  Cheapest useful form: a compiled-in phase timer around the named parts of
-  `session_step`, reported by `bench --verbose`, at one thread and at four. It
-  is not a profiler and does not need to be.
+  Measure it the way the timer already reports it — GiB/s a phase on the shipped
+  export — and not on a synthetic row, because a synthetic row is what got this
+  wrong the first time.
+
+  *llama.cpp blocks its output rows this way* throughout `ggml-cpu`, so the
+  shape is known to be worth having; what is unknown here is how much of the
+  gap it accounts for.
+
+- **Stop calling `tanhf` 262144 times to cap the logits.** The output head's
+  own row count, touched twice more after it is read: the cap at **7.0%** of a
+  decode step and the sampler at **1.5%**, both on the calling thread.
+
+  Forking the cap was tried in 0.8.10 and refused with the numbers — serial
+  3.94, 3.82, 3.87 ms against 5.20, 1.33, 5.21 forked, one fork whose workers
+  had just been joined on the head and had not settled. So the way through is
+  not the pool. It is either the series `RESEARCH.md` gives and 0.8.6 already
+  put in the picture's softmax, which would move numbers and needs the
+  reference comparison run against it, or capping only the rows the sampler is
+  going to look at, which is exact for greedy and top-k and wrong for anything
+  that reads the tail.
+
+  This is the same 262144 rows the vocabulary bound below is about, and the two
+  should be scoped together: a bound that never materializes most of the head
+  makes the cap over most of the head moot.
 
 - **Produce more than one token per sweep of the weights.** The only idea on
   this list that can pass 41 tokens a second, because it is the only one that
@@ -218,7 +260,9 @@ the forks.
 - **Run two conversations at once rather than one after the other.** The
   sessions are already independent; every kernel under them reaches the model's
   one `pool_group`, which is a fork and join with no queue and one caller's to
-  be inside at a time. It wants either a pool a session owns — a thread a
+  be inside at a time — and 0.8.10 added the attention's two jobs and the gelu's
+  to what reaches it, so there is more of the step behind that single gate than
+  when this was written. It wants either a pool a session owns — a thread a
   session, and the host's cores to whoever asks first — or a queue in front of
   the one pool, which is the shape a server wants anyway. Neither is worth
   guessing at without a caller that needs it.
@@ -251,3 +295,6 @@ the forks.
 | The eight lane block (refused: 16% of one loop was not worth the engine's last bit; 0.8.9 spent it on something larger) | 0.8.8, settled in 0.8.9 |
 | How `app_diff.py` should treat a picture the two sides decode differently (answered: the decoder is not in the comparison) | 0.8.5 |
 | Spending fewer instructions in the decode paths — all three widths, both halves of the engine | 0.8.9 |
+| What a token spends outside the kernels, a part at a time — and the answer that most of it never was outside them | 0.8.10 |
+| The attention scoring and blend across the pool, and the gelu with them | 0.8.10 |
+| The logit cap across the pool (refused: measured, and a single fork after the head does not settle) | 0.8.10 |

@@ -452,7 +452,11 @@ in isolation and slower in the engine, and taken out again — see
 - `kern_norm_rms` — `x * rsqrt(mean(x²) + eps) * weight`. Gemma 4 uses the
   weight directly, **not** `1 + weight`.
 - `kern_gelu_tanh`, `kern_gelu_gate` — the tanh approximation, and the gated
-  form the MLP wants.
+  form the MLP wants. `kern_gelu_band` divides it across the pool above
+  `GELU_BAND_COUNT`, which is where `back_gelu_gate` sends it. It reads no
+  weights, so no byte count ever showed it, and the phase timer put it at an
+  eighth of a decode step and a fifth of a prefill batch running on the calling
+  thread while the projections either side had the whole pool.
 - `kern_soft_max` — streaming maximum then streaming sum, so a long attention
   row never overflows, each of its three passes a vector lane at a time.
 - `kern_exp_near`, `kern_exp_wide` — the exponential the softmax needs, without
@@ -941,6 +945,10 @@ one code path rather than two.
 4. the final norm, the output head, and optional logit softcapping, for the
    last token of the batch only
 
+Each of those steps is a named part of the phase timer, which `session_step`
+runs when `verbose_level` asks for it. See `bench --verbose` under §3.12's tail
+and `app_phase_text` for the names.
+
 `session_attend` is the attention itself. Queries and keys are normalized
 with their own RMSNorm weights, rotated, and scored against the cache.
 Attention scaling is `1.0`, not `1/sqrt(d)`; the query and key norms absorb
@@ -959,6 +967,28 @@ level cache, and every head of the group reads it there. It costs a row of
 scores per head of the group rather than one, which is what `score_stride`
 sizes, and it hands each head exactly the floats it would have looked up for
 itself, so the scores and the blends are unchanged to the bit.
+
+That read is divided across the pool, as two jobs rather than one, and the two
+divide along different axes on purpose. `attend_score_band` takes the span by
+position: a score is one dot product against one cached row, so a slice writes
+only the scores of the positions it took and no sum crosses a slice.
+`attend_blend_band` takes the heads instead, and this is the whole reason it is
+a second job — a blend is a running sum down the span, and dividing *that* by
+position would regroup its additions and leave the engine's answer depending on
+how many cores the host has. Divided by head, each slice carries its own heads
+the whole way down and adds in the order the serial loop added in, so a logit
+row is byte for byte the same at one thread and at four. What it costs is that
+every slice decodes the value block for itself where one slice decoded it for
+all eight heads; that block is eight kilobytes and is read straight back, so
+what is repeated is the decode and not the fetch. Each slice therefore needs
+its own `cache_room`, which is why that buffer is `pool_bands` blocks long and
+`block_room` is its stride.
+
+Below `ATTEND_BAND_SPAN` cached positions the span stays on the calling thread,
+because a fork and a join cost the same whatever they are handed. The figure is
+measured and is documented at the constant; it was first guessed at three times
+too high, which cost 2.9 ms a step at a 288 id prompt until the phase timer
+said so.
 
 When `enable_moe_block` is set, the dense MLP above is the shared expert and
 a routed branch runs beside it. `session_route` normalizes the pre-MLP
@@ -1039,6 +1069,41 @@ file and primes only the difference.
 `session_cache_room_at` says what the cache costs at either storage, and
 `session_cache_bytes` asks the layer rather than assuming a float, so what
 `bench` reports a token reads falls with the storage.
+
+The phase timer divides a decode step into the named parts of `app_phase_text`
+and `bench --verbose` prints them. It is a partition and not a sample:
+`phase_turn` closes the part that is open as it opens the next, at one clock
+read rather than two, so the parts join edge to edge and sum to the step by
+construction. The read that ends a part is charged to that part, which is the
+honest place for it — the sum is then the step, timer and all, and the report
+says what fraction of it the timer is. Anything not marked is charged to
+whatever was open, so the catch-all parts are named for what they catch
+(`norms, residuals` inside a layer, `pass bookkeeping` outside every layer)
+rather than left blank.
+
+It is armed only when `verbose_level` is set, so an ordinary run pays a load
+and a predicted branch a boundary, and armed only for the decode pass — a prime
+pass runs the same graph sixteen lanes wide and its parts would answer a
+different question in the same buckets. `session_pick` is charged separately,
+because the sampler runs after `session_step` returns and is in the token
+without being in the step.
+
+`model_phase_bytes` splits the same sweep `model_decode_bytes` counts into the
+same buckets, which is what gives a part a rate rather than only a share: the
+share says which part to look at, the rate says whether there is anything in it
+to find. The two totals have to agree to the byte and `test_wing` checks that
+they do — a sheet added to one and forgotten in the other does not fail
+anything on its own, it just makes a rate quietly wrong, which is exactly the
+failure a report like this invites.
+
+Two parts read no weights and are split out of the kernels they sit inside for
+that reason: `mlp gate`, the gelu between the feed-forward's halves, and
+`logit cap`, the `tanhf` over every one of 262144 logits. Folded in, they made
+the feed-forward read 16.82 GiB/s instead of 20.14 and the head 8.63 instead of
+12.67 — a phase that mixes a code plane with a transcendental over every
+element quotes a rate belonging to neither. The gelu goes to the pool
+(`back_gelu_gate`, above `GELU_BAND_COUNT`); the cap was tried there and left
+on the calling thread, and the measurement that decided it is in the comment.
 
 The largest magnitude a session has put in each cache is tracked either way,
 in `key_peak` and `value_peak`. What the calibrated range has to cover is a

@@ -3979,3 +3979,189 @@ what is known about them from that reading. What stays there is what still needs
 a trained artifact or an untested hypothesis: the distilled encoder, the
 per-layer-conditioned drafter, QAT-cell certification, structured sparsity, and
 the lookup-table kernel for hosts with no integer dot product.
+
+---
+
+## 0.8.10 — where the other two thirds of a token actually were
+
+### Scope
+
+The head item on `TODO.md`, which gated the rest of the list: measure what a
+token spends outside the kernels, a part at a time. It is measured now, and the
+answer is not the one the item was written around — most of it was never
+outside the kernels at all. Three of the four things the measurement then
+pointed at were taken; the fourth was taken and reverted, and the reverting is
+the interesting one.
+
+On the reference host at four threads, on a 288 id prompt: decode 15.5 tokens a
+second to 18.4, prefill 43.1 to 54.8. On a 2004 id prompt decode 13.4 to 15.5.
+Not one bit of any logit moves, at any thread count, and the suite now says so
+by comparing bits rather than a tolerance.
+
+### The premise the item was written on, and why it was wrong
+
+`TODO.md` reasoned this way. A decode step reads 784.4 MiB. The memory gives
+32.18 GiB/s at four threads, so the bytes cost 24 ms. The step took 80. The
+missing 56 ms had to be "somewhere the kernels are not: the attention, the
+norms, the sampler, the 277 forks and joins, the bands that do not divide
+evenly, the per-layer embedding lookup, the residual adds."
+
+That list is a hypothesis about a step nobody had divided, and it is mostly
+wrong. Divided, at four threads:
+
+| part | ms a step | share | MiB a step | GiB/s |
+| --- | --- | --- | --- | --- |
+| mlp | 23.05 | 41.8% | 475.3 | 20.14 |
+| final norm, head | 7.48 | 13.6% | 97.0 | 12.67 |
+| score, softmax, blend | 4.12 | 7.5% | 26.2 | 6.23 |
+| q k v | 4.02 | 7.3% | 70.1 | 17.04 |
+| logit cap | 3.86 | 7.0% | — | — |
+| attn out | 3.18 | 5.8% | 63.2 | 19.42 |
+| ple lift | 2.72 | 4.9% | 26.3 | 9.42 |
+| mlp gate | 2.57 | 4.7% | — | — |
+| ple feed | 2.54 | 4.6% | 26.5 | 10.19 |
+| sampler | 0.80 | 1.5% | — | — |
+| norms, residuals | 0.48 | 0.9% | 1.0 | 2.07 |
+| rope, cache write | 0.34 | 0.6% | 0.1 | 0.17 |
+| embed, bookkeeping | 0.01 | 0.0% | — | — |
+
+The norms and the residual adds are **0.9%**. The rotary turn and the cache
+write are **0.6%**. The per-layer embedding lookup is a tenth of a millisecond
+inside `ple lift`. The whole of what the item guessed at, less the attention,
+comes to under 2% of a step. What the missing 56 ms was, instead, was the
+kernels not going as fast in place as they go on a bench — and four specific
+things sitting between them that nobody had counted because none of them reads
+a weight.
+
+This is the argument for the timer rather than for any of the changes under it.
+0.8.8 found a third of a token in the fork and join by measuring; this found
+the same order of thing by measuring, and would not have found it by reasoning,
+because the reasoning had already been done and had produced a wrong list.
+
+### The timer
+
+`session_step` closes one named part as it opens the next. One clock read a
+boundary and not two: the read that ends a part begins the one after it, so the
+parts join edge to edge with no gap between them to lose time in, and they sum
+to the step by construction rather than by hope. `bench --verbose` prints them
+largest first.
+
+Anything not marked is charged to the part that was open, which is a quiet way
+to be wrong, so the parts that catch the unmarked code are named for what they
+catch — `norms, residuals` inside a layer, `pass bookkeeping` outside every
+layer — rather than left blank. The report closes with the two ways the claim
+could still fail: `unnamed`, the step's own clock less the parts of the pass,
+which measures 0.000 ms and is the accounting either side of the pass; and
+`timer`, the reads the division itself spent, priced at what a read measures on
+the host just after the run — 0.011 ms of a 54 ms step, 428 reads at 26 ns.
+
+The same sweep is split a second time, into bytes, by `model_phase_bytes`, so a
+part has a rate and not only a share. This is what makes the table say anything:
+a part's share of the clock says which part to look at, and its share of the
+bytes says whether there is anything in it to find. The suite holds the two
+totals to the byte, and caught a norm missing from the split while the split was
+being written — which is the whole reason the check exists, since a forgotten
+sheet does not fail anything, it just makes a rate quietly wrong.
+
+The timer is armed by `verbose_level`, so a run that did not ask for it pays a
+load and a predicted branch a boundary. With it on and off, decode measures the
+same within the run-to-run noise of this host.
+
+### The attention, which was the last part running on one core
+
+`session_attend_group` reached the pool nowhere. Every projection either side of
+it was banded across four threads and the scoring between them was not, which
+the table above makes obvious and which nothing before it would have. At a 4334
+id prompt it was two fifths of the whole step: 38.4 ms at four threads against
+39.7 at one.
+
+It is two jobs now rather than one, because the two halves have to divide along
+different axes and that is the whole design.
+
+**The scores divide by position.** A score is one dot product against one cached
+row, so a slice writes only the scores of the positions it took and reads only
+the rows behind them. Nothing is summed across a slice boundary.
+
+**The blend divides by head.** A blend is a running sum down the span, and
+dividing *that* by position would regroup its additions — the same arithmetic,
+a different rounding, and an engine whose answer depended on how many cores the
+host has. Divided by head, each slice carries its own heads the whole way down
+the span and adds in the order the serial loop added in. What it costs is that
+every slice decodes the value block for itself where one slice decoded it for
+all eight heads; the block is eight kilobytes and is read straight back, so what
+is repeated is the decode and not the fetch.
+
+So the export's logits are byte for byte what they were, at one, two and four
+threads. The suite pins it with a `memcmp` rather than a tolerance, because a
+tolerance is exactly what a regrouped sum would pass. The suite also lowers the
+fork threshold, because the synthetic fixture's whole window is sixty-four
+positions and at the shipped threshold the divided path would never run there —
+the check would have been comparing the serial path with itself and calling it
+agreement. Breaking the blend on purpose fails sixteen assertions across four
+sections, including the three recorded prompts on the shipped export.
+
+The threshold was guessed at 384 and the guess was wrong. Measured: the two jobs
+add about 0.6 ms to a step — seventy forks at nine microseconds — and the phase
+they divide runs 0.70 ms at a span of 45 and 6.02 ms at 288. At 288 the divided
+path wins by 2.9 ms, so 384 was leaving that on the floor. The crossing was not
+pinned closer than "between 45 and 288, nearer 45", so the figure is 128, the
+safe side of the bracket rather than its middle.
+
+| prompt, four threads | decode before | after | prefill before | after |
+| --- | --- | --- | --- | --- |
+| 288 ids | 17.8 | 19.6 | 44.5 | 46.0 |
+| 2004 ids | 13.2, 13.3, 13.8 | 16.1, 16.3, 14.2 | 32.4 | 36.6 |
+| 4334 ids | 10.1 | 13.0 | 25.0 | 33.2 |
+
+At one thread nothing forks and nothing should move, and nothing does beyond the
+noise — which on this host is wide enough to be worth saying: the same binary
+measured 6.51 and 7.63 tokens a second on the same prompt. The four thread rows
+move one way and grow with the context, which is the signal.
+
+### The two elementwise maps between the kernels
+
+Splitting the gelu out of the feed-forward and the logit cap out of the head
+puts them at 12.9% and 6.1% of a decode step between them, both on the calling
+thread with the whole pool idle. Neither had ever been looked at, and the reason
+is structural: neither reads a weight, so neither appeared in any byte count,
+and every profile before this one was a byte count.
+
+Keeping them separate also fixes what the kernels either side of them appeared
+to be doing. With the gelu folded in, the feed-forward reported 16.82 GiB/s;
+with it counted apart, 20.14. The head reported 8.63 and reports 12.67. A phase
+that mixes a code plane with a transcendental over every element quotes a rate
+that belongs to neither.
+
+**The gelu is forked and stays forked.** It is 35 jobs a step of 0.22 ms each,
+and a clean win in every round: decode 17.5, 19.2, 20.1 tokens a second against
+15.8, 16.3, 18.3, and prefill 51.5, 54.3, 55.9 against 42.6, 43.9, 44.5. Prefill
+gains twice what decode does, because a batch runs the same gate sixteen lanes
+wide and so had sixteen times as much of it to give.
+
+**The logit cap is forked, measured, and put back.** The same reasoning applies
+to it — an elementwise map, no summation order to lose — and the measurement
+refuses it. Three runs each at four threads: serial 3.94, 3.82, 3.87 ms against
+5.20, 1.33, 5.21 forked. It reaches the four threads' figure once in three and
+is worse than serial the other two. That is the shape of a single fork whose
+workers were joined on the output head a moment earlier and have not settled,
+and a steady 3.87 beats a mean of 3.9 that swings by four milliseconds, because
+the swing is what a caller feels and the mean is not.
+
+The measurement is kept in the comment where the next person to have the idea
+will read it, with what would actually make it pay: not a better fork, but not
+calling `tanhf` 262144 times.
+
+### What the table leaves for the next pass
+
+The kernels are not at the memory on this export's rows, and 0.8.9's claim that
+they were rests on a bench of the export's *widest* row. At four threads, with
+the elementwise work counted apart: `attn out` 19.42 GiB/s, `mlp` 20.14, `q k v`
+17.04, the head 12.67, `ple lift` 9.42 — against 25.90 to 31.04 on a row of
+12288. The rows a decode step actually reads are 1536 wide most of the time, and
+a row eight times shorter pays the per-row epilogue eight times as often. That
+is the first entry on `TODO.md` now, and it is a kernel item where the list has
+had none since 0.8.9 declared them finished.
+
+`logit cap` at 7.0% and `sampler` at 1.5% are the other two, and both are the
+output head's 262144 rows being touched twice more after being read. They belong
+with the vocabulary bound rather than beside it.
