@@ -4330,11 +4330,18 @@ ple feed 17.9%, attn out 14.0%, and nothing better anywhere. Reverted.
 
 `app_test.py` against the transformers reference passes every check on all four
 prompts, on the wide build and on the plain one: rank one matches, and every
-logit gap is inside the bar the reference sets against itself. The gaps are
-*smaller* than before this version — 1.18, 1.15, 0.83, 1.20 against 1.42, 1.34,
-0.90, 1.83 — and the top sixteen overlap is higher on three of the four prompts,
-which is the two series being closer to the closed form than the calls they
-replace.
+logit gap is inside the bar the reference sets against itself. On the wide build
+the gaps are 1.4239, 1.3379, 0.8981 and 1.8306, which are 0.8.10's figures to
+the last digit printed. Nothing here was supposed to move them and nothing did:
+four decimal places do not resolve a cap that has shifted by 7.6e-6.
+
+A note on how not to read that comparison, because this version nearly recorded
+the mistake. The **plain** build reports smaller gaps than the wide one — 1.18,
+1.15, 0.83, 1.20 — and set beside the wide build's older run that looks exactly
+like an accuracy gain from the two series. It is not one. A plain build has no
+integer dot product, so every code plane takes the float path instead, and it is
+the path that moves those numbers rather than the version. Compare a build
+against itself, or the comparison will tell you whatever you brought to it.
 
 709 unit tests pass on the plain, SSE2, AVX2 and AVX-512 builds. Eight of them
 are new: that a block of rows is the one row path bit for bit, that the cap is

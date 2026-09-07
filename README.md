@@ -407,8 +407,12 @@ Looking for it turned up three more of the same shape, none of them on the
 list. The logit cap and the gelu were both calling `tanhf` — 477184 calls a
 step between them — where `tanh y` is `1 - 2/(e^{2y}+1)` and the exponential is
 the series the softmax has carried since 0.8.6: **4.45 ms a step to 0.28 and
-2.40 to 0.29**, and both are *closer* to the closed form than the calls they
-replace, because the form without the subtraction has nothing to cancel. And
+2.40 to 0.29**. The gelu comes out *closer* to the closed form than the call it
+replaces — 3.64e-7 against 4.31e-7 over 200001 arguments — because writing it as
+`x t / (t + 1)` removes the subtraction that was losing the low bits; the cap
+keeps the subtraction and stays within two and a half parts in ten million of
+the cap, monotone, and exact at both ends. Neither moves the reference
+comparison: every logit gap it reports is what 0.8.10 recorded. And
 `kern_dot_real` had a vector path for `F32` and a scalar loop for `BF16`, while
 this export keeps 26.25 MiB of bf16 that every step reads in full: `ple lift`
 9.63 GiB/s to 23.30.

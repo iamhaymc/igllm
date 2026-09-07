@@ -2574,9 +2574,14 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
  * epilogue that closes it is not: a horizontal reduction, a gain, a widening
  * and a store, once per row whatever the row's length.  Four rows in flight put
  * four of those epilogues beside each other and share the staged levels between
- * them.  Four rather than eight because eight accumulators plus the block's own
- * constants is more than sixteen vector registers hold on the narrower tiers,
- * and because four already covers the dot product's latency. */
+ * them.
+ *
+ * Four rather than eight, and that is measured rather than reasoned.  Eight was
+ * built and run: mlp 27.47 GiB/s to 27.49, the output head 14.06 to 14.08, the
+ * step floor 37.36 ms to 37.07.  A wash, for eight live accumulators and twice
+ * the code — which is what 0.8.8 said of the eight lane block for the same
+ * reason.  Four already covers the dot product's latency, and the fifth
+ * accumulator would buy nothing to cover. */
 #define KERN_ROW_BLOCK 4
 
 /* The level a value sits on, or this when it sits between two of them. */
