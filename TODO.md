@@ -44,6 +44,26 @@ multiply-adds a second and `ple lift` at 12.5, against 50 to 61 everywhere
 else. That is the first entry below. And **how does anything get past 41?** —
 still only by producing more than one token per sweep, which is the second.
 
+0.8.12 took part of the first of those. A block of rows was closing each row on
+its own — a horizontal reduction into a general register, then scalar
+arithmetic to put it back into a float — and on a 256 column row that close
+costs more than the four dot products it closes. Sixteen rows now fold into one
+vector and close together. `ple feed` moved 17.5 G multiply-adds a second to
+19.4, the step floor 2.4%, and prefill 7.6% where the same fold reaches the
+batched path. It is not the entry closed; what is left of it is below.
+
+**A second host, and what it is good for.** 0.8.12's figures were taken on a
+different machine from the one this section's ceiling was measured on: four
+cores of a Xeon at 2.1 GHz rather than 2.8, same instruction set, where the step
+floor is 40.55 ms against 34.79 and a bare four-thread sweep reaches 40 to 49
+GiB/s against 32.18. Its ratios track the reference host's and its absolute
+numbers do not, so anything below quoting it says so. Whichever host a
+measurement is taken on, take it as the minimum a phase reaches over runs
+alternating between the two builds, on a quiet machine with the checkpoint in
+the page cache — 0.8.12 recorded two false results before doing that, one from a
+`pip install` running beside the bench and one from a page cache that had been
+evicted.
+
 ## Against llama.cpp
 
 Several entries below note whether mainline llama.cpp has the same thing. That
@@ -61,10 +81,10 @@ the forks.
 
 ## Speed
 
-- **The two planes that are actually behind, and the short row in its real
-  form.** 0.8.11 counted the step in multiply-adds instead of bytes and the
-  ranking changed completely. Four planes run at 50 to 61 G multiply-adds a
-  second and two do not:
+- **What is left of `ple feed`, which is probably not the kernel.** 0.8.11
+  counted the step in multiply-adds instead of bytes and the ranking changed
+  completely. Four planes run at 50 to 61 G multiply-adds a second and two do
+  not:
 
   | part | ms a step | multiply-adds | G mac/s |
   | --- | --- | --- | --- |
@@ -75,27 +95,41 @@ the forks.
   | **ple feed** | 1.532 | 27.5 M | **18.0** |
   | **ple lift** | 1.100 | 13.8 M | **12.5** |
 
-  `ple feed` is the short row question in the form the head was wrongly thought
-  to have it: `per_layer_projection` is 1536 rows of **256 columns**, which is
-  four blocks of the unpack and then an epilogue — the ratio of epilogue to
-  work that the head, at twenty-four blocks a row, never had. The row block
-  0.8.11 added helps it least where it would help most, because four rows of
-  256 columns is still four epilogues per sixteen blocks. What it wants is
-  either more rows a block on narrow planes specifically, or the group loop
-  lifted out so a whole plane's epilogues are one pass.
+  0.8.12 answered the *close*. `per_layer_projection` is 1536 rows of **256
+  columns** — four blocks of the unpack against one epilogue, where a 1536 wide
+  row has twenty-four — and a block of four rows was closing each of its rows on
+  its own. Sixteen rows now fold into one vector and close in a handful of
+  instructions. On the second host that is `ple feed` 17.5 G multiply-adds a
+  second to 19.4, and it does not close this entry: the plane is still a third
+  of the rate of the four that are not behind.
 
-  `ple lift` is a different thing: `per_layer_model_projection` is bf16, so it
-  is a float multiply-add path — eight lanes an instruction against the integer
-  path's sixty-four — and 12.5 G a second is roughly what that path should give.
-  It cannot join the integer path without a calibrated step it does not have.
-  The question worth asking of it is whether the export's other bf16 could be
-  quantized at load, which is a footprint change as much as a speed one, and
-  which belongs with the residency item under *Not speed*.
+  Note what 0.8.11's refusal of eight rows a block actually established, because
+  it is easy to take it the wrong way twice. Widening a block does not change
+  the ratio of close to work at all — eight rows of four blocks is eight closes
+  against thirty-two dot products just as four rows is four against sixteen. The
+  ratio only moves if the rows close together, and that is what 0.8.12 did.
 
-  Together they are 2.6 ms of a 34.8 ms step, so the ceiling on this entry is
-  about 5% of a token. Measure it the way 0.8.11 did — the minimum a phase
-  reaches over runs alternating between the two builds — because this host's
-  whole-step figure swings by a fifth and that is enough to invent a result.
+  **The next suspect is the dispatch, not the loop.** `ple feed` is
+  `per_layer_input_gate` and `per_layer_projection`, two planes of 384 KiB a
+  layer, and each is its own `pool_run` — **seventy forks and joins a step** for
+  1.42 ms of work. At the fork cost 0.8.8 measured that is on the order of a
+  seventh of the phase and it is paid whatever the rows do. The two cannot
+  simply be merged, because the gelu and the per-layer embedding sit between
+  them, but the gelu is 256 values a lane and could be inside the same fork.
+  Measure the fork cost on this shape first — a plane of 384 KiB against the
+  `row_count >= 64` gate that decides whether it forks at all — because if it is
+  not a seventh then this entry is about the loop after all.
+
+  `ple lift` is a different thing and is not touched: `per_layer_model_projection`
+  is bf16, so it is a float multiply-add path — eight lanes an instruction
+  against the integer path's sixty-four — and 12.5 G a second is roughly what
+  that path should give. It cannot join the integer path without a calibrated
+  step it does not have. The question worth asking of it is whether the export's
+  other bf16 could be quantized at load, which is a footprint change as much as
+  a speed one, and which belongs with the residency item under *Not speed*.
+
+  Together the two are 2.6 ms of a 34.8 ms step, so the ceiling on this entry
+  was about 5% of a token and 0.8.12 took 2.4% of it.
 
 - **The output head, if there is anything left in it at all.** 96 MiB and 12.2%
   of everything a decode step reads, at 60.6 G multiply-adds a second, which is
@@ -112,16 +146,41 @@ the forks.
 
   What has been ruled out: the row epilogue (0.8.11 removed the calls and the
   head did not move, 14.50 to 14.25); eight rows a block instead of four (a
-  wash everywhere); and software prefetch of the code stream ahead of the row
-  loop (12 to 20% *worse* on every code plane — the numbers are in `CHANGES.md`
+  wash everywhere); software prefetch of the code stream ahead of the row loop
+  (12 to 20% *worse* on every code plane — the numbers are in `CHANGES.md`
   0.8.11, and the next person to have the idea should read them before having
-  it). What has not been tried is the obvious remaining difference between the
-  two settings: in the microbenchmark the same 96 MiB is swept three times in a
-  row, so its page table entries stay hot, and in the engine the head is swept
-  once with thirty-five layers of other memory in between. That points at the
-  page walk rather than the data, and a file-backed mapping cannot be given
-  huge pages, so if that is the answer the answer is that there is nothing to
-  do here and this entry closes.
+  it); and closing sixteen rows together rather than four, which is 0.8.12 and
+  which the head is the one plane it does not move.
+
+  And the page walk, which this entry used to name as the obvious remaining
+  difference — in the microbenchmark the same 96 MiB is swept three times in a
+  row so its page table entries stay hot, and in the engine it is swept once
+  with thirty-five layers of other memory in between. 0.8.12 tested that
+  directly, on the second host: the same 96 MiB of the mapped checkpoint at four
+  threads gives **32.4 GiB/s swept back to back and 43.4 with a gigabyte of the
+  rest of the file swept in between**, which is no penalty at all, and anonymous
+  memory of the same size gives 39.4 and 39.8, so four kilobyte file-backed
+  pages are not costing anything either. The hypothesis is gone; the puzzle is
+  not, and it reproduces on that host unchanged — the head phase reads 12.6
+  GiB/s where a bare sweep of the same bytes reads 32 to 43.
+
+  What that leaves is a plane that is bound by neither of the two things it
+  could be bound by, which is worth stating plainly because it is the shape of
+  the remaining question. At two bits the row loop issues about seventeen
+  instructions per sixty-four bytes of weight — four broadcasts, four shifts,
+  four masks, four dot products and a shared load of the levels — against about
+  thirteen per two hundred and fifty-six bytes at eight bits, so four times the
+  instructions a byte. That is real, and it is still not enough: on the second
+  host the head reads 12.6 GiB/s where a bare sweep of the same bytes reads 32
+  to 43, and seventeen instructions per sixty-four bytes over four threads is a
+  budget several times larger than the phase actually takes.
+
+  So neither the memory nor the instruction count explains it on the arithmetic
+  available here, and the next step is to *count* rather than to estimate:
+  retired instructions and cache and TLB misses for the head phase alone,
+  against the same for the microbenchmark. Do not reopen this with another
+  timing comparison — three of those have now been run and each one moved the
+  question rather than answering it.
 
   Do not reopen this on a GiB/s comparison. The head is two bit and everything
   it is compared against is four or eight, and that alone accounts for the gap
@@ -333,3 +392,7 @@ the forks.
 | Why a kernel looks slower on a short row (answered: it does not — `GiB/s` is not comparable across bit widths) | 0.8.11 |
 | Eight rows a block instead of four (refused: a wash on every plane, for eight live accumulators) | 0.8.11 |
 | Software prefetch ahead of the row loop (refused: 12 to 20% worse on every code plane) | 0.8.11 |
+| How a block of rows closes — sixteen folded into one vector instead of four reductions and four rows of scalar | 0.8.12 |
+| The batched path's four lanes closed with the same fold, which is where prefill's share of it came from | 0.8.12 |
+| Whether the page walk explains the output head's microbenchmark gap (answered: no — the same bytes cost the same with a gigabyte swept in between) | 0.8.12 |
+| Whether widening a block of rows can help on its own (answered: no, at any width — the ratio of close to work is fixed by the columns) | 0.8.12 |

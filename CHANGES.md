@@ -4353,3 +4353,184 @@ The NEON paths for the cap and the gate are guarded on `__aarch64__`, because
 the lane divide they use is AArch64's; a 32-bit ARM host takes the scalar loop,
 which is the same series. Like the MSVC paths, they have been read and not run —
 there is no ARM host here.
+
+---
+
+## 0.8.12 — how a block of rows closes, and the plane that was paying for it
+
+### Scope
+
+The first speed entry on `TODO.md`: the two planes that 0.8.11's multiply-add
+count found were actually behind, `ple feed` at 18.0 G multiply-adds a second
+and `ple lift` at 12.5, against 50 to 61 everywhere else. The entry named two
+routes for the first of them — more rows a block on narrow planes, or the group
+loop lifted out so a whole plane's epilogues are one pass — and the answer is
+neither exactly. It is that the rows have to close *together*.
+
+`ple lift` is not touched. It is a bf16 float path and 12.5 G a second is what
+that path gives; the entry says so, and the only thing that would move it is
+quantizing the export's remaining bf16 at load, which is a footprint question
+and stays under *Not speed*.
+
+### A note on the host, because the numbers are not 0.8.11's
+
+Every figure here was taken on a different machine from the one 0.8.11's table
+came from: four cores of a Xeon at **2.1 GHz** rather than 2.8, same
+instruction set, AVX-512 and VNNI, wide build. The shipped export's step floor
+on it is 40.55 ms where the reference host's is 34.79, and a bare four-thread
+sweep reaches 40 to 49 GiB/s where the reference host reaches 32.18. So the
+absolute numbers below are **not comparable to 0.8.11's line for line** — only
+the ratios are, and every ratio is a minimum a phase reached over twelve runs a
+side with the two builds alternating, which is the discipline 0.8.11 set for the
+same reason: a single run of this host swings by more than the whole result.
+
+The first attempt at this change was measured against a host that had a
+`pip install` running on it and reported the wide-row planes 4 to 7% slower.
+They were not. It was also measured once against a page cache that no longer
+held the checkpoint, and reported the change losing to the baseline. Neither
+was true. Warm the cache and quiet the host, or this file records a fiction.
+
+### Where a row's close was going
+
+A row of the integer path ends in a horizontal sum of its accumulator, a zero
+point correction, two multiplies and a store. `kern_row_code_level_rows` did
+four rows at a time and closed each of them on its own: four
+`_mm512_reduce_add_epi32`, four sums arriving in general registers, and four
+rows of scalar arithmetic to put them back into floats.
+
+On a 1536 column row that is one close against twenty-four blocks of dot
+product and it disappears into them. On `per_layer_projection` — 1536 rows of
+**256 columns**, half of what `ple feed` reads — it is one close against *four*,
+and the close costs more than the dot products it closes.
+
+0.8.11 measured eight rows a block against four and found a wash, and this
+version agrees with that measurement and disagrees with what it was taken to
+mean. Widening the block changes nothing on its own: eight rows of four blocks
+is eight closes against thirty-two dot products exactly as four rows is four
+against sixteen. The ratio is fixed by the columns. What moves it is closing
+the rows *together*.
+
+### Three changes, and the third is the one that matters
+
+**`kern_level_fold`.** Four accumulators of sixteen lanes in, four sums side by
+side in one vector out. Three rounds of pick and add put each accumulator's
+four quarters into one quarter of a single register, two more sum each quarter
+within itself, and one gather takes the four down to the low four lanes.
+Fourteen instructions against four `_mm512_reduce_add_epi32`'s near forty — and
+the sums land in a vector, which is where the next change needs them.
+
+**`kern_row_code_level_wide`.** Four of those folds stacked into one vector of
+sixteen rows, closed at once: the zero point correction is one subtract of
+sixteen lanes, the sixteen gains are one load, the activation step is one
+broadcast, the sixteen results are one store. The dot products are still taken
+four rows at a time, four times, so no more than four accumulators are ever
+live — the width is a width of the *close*, not of the loop, which is why the
+register pressure that made eight rows a wash never arises.
+
+`kern_level_wide_ready` says which planes may take it: one group a row, `F32`
+gains, a whole number of blocks a row, and a span narrow enough that the
+correction is exact in thirty-two bits. Every code plane in this export
+qualifies. `kern_mat_vec_band` takes the wide block as far as it goes, then the
+block of four, then a row at a time — three forms of one arithmetic.
+
+**And the same fold in `kern_dot_level_many`,** which is the batched path and
+was closing its four lanes with four calls for the same reason. That one was
+not on the list at all and is where most of prefill's share comes from.
+
+### The step, before and after
+
+A 3 id prompt, four threads, wide build, the minimum each phase reached over
+twelve runs a side:
+
+| part | before | after | |
+| --- | --- | --- | --- |
+| mlp | 21.757 | 21.367 | -1.8% |
+| final norm, head | 7.867 | 7.851 | -0.2% |
+| q k v | 3.627 | 3.426 | -5.5% |
+| attn out | 2.828 | 2.789 | -1.4% |
+| **ple feed** | 1.577 | **1.422** | **-9.8%** |
+| ple lift | 1.270 | 1.279 | +0.7% |
+| step floor | 40.550 | 39.570 | -2.4% |
+
+And on a 301 id prompt, where the batched path is reached too:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| prefill | 87.17 tok/s | **93.80** | **+7.6%** |
+| decode | 23.42 tok/s | **24.01** | +2.5% |
+| ple feed | 1.601 ms | 1.441 | -10.0% |
+| q k v | 3.539 ms | 3.297 | -6.8% |
+| step floor | 42.700 ms | 41.650 | -2.5% |
+
+Decode on the short prompt is 24.66 tokens a second to **25.27**.
+
+### What the entry asked for, and what is left of it
+
+`ple feed` is 17.5 G multiply-adds a second to **19.4**. That is a real move and
+it is not the entry closed: the plane is still a third of the rate of the four
+that are not behind, and the entry's own estimate of the ceiling — about 5% of a
+token for the two planes together — is larger than the 2.4% taken here.
+
+What the next attempt should look at is not the kernel. `ple feed` is two pool
+forks a layer, seventy a step, for two planes of 384 KiB each; at the fork cost
+0.8.8 measured that is on the order of a seventh of the phase, and it is paid
+whatever the rows cost. The entry stays open with that named.
+
+### Two folds measured against each other
+
+The first form of `kern_level_fold` reduced each accumulator to four lanes with
+extracts and then combined the four with three `_mm_hadd_epi32`. The second is
+the one that shipped: `_mm512_shuffle_i32x4` three times over, then two in-lane
+swaps and a gather. Built and run against each other on the same twelve
+alternating rounds: `ple feed` 1.398 ms against 1.422, step floor 40.010 against
+39.570, decode 24.99 against 25.27. A wash on the plane it was written for, the
+shuffle form ahead on the step, and it is the shorter of the two — so it ships,
+and the numbers are here rather than a claim that it is faster.
+
+### The page walk, tested and not found
+
+`TODO.md`'s second speed entry names one untried explanation for the output
+head reading 22.7 GiB/s in a microbenchmark and 14.25 in the engine: the
+microbenchmark sweeps the same 96 MiB three times in a row so its page table
+entries stay hot, while the engine sweeps it once with thirty-five layers of
+other memory in between.
+
+That is testable, and on this host it is not what is happening. The same 96 MiB
+of the mapped checkpoint, four threads, best of four: **32.4 GiB/s swept back to
+back and 43.4 with a gigabyte of the rest of the file swept in between** — no
+penalty at all, and the difference is this host's own noise. Anonymous memory of
+the same size gives 39.4 and 39.8, so a file-backed mapping is not paying for
+its four kilobyte pages either.
+
+This does not close the entry, because the entry's own measurements were taken
+on the other host and this is not that host. What it does is remove the
+hypothesis the entry called "the obvious remaining difference", and the puzzle
+reproduces here unchanged — the head phase reads 12.6 GiB/s where a bare sweep
+of the same bytes reads 32 to 43 — with the page walk no longer available as the
+answer.
+
+### What says it is still the same engine
+
+`app_test.py` against the transformers reference passes every check on all four
+prompts. The largest logit gaps are **1.4239, 1.3379, 0.8981 and 1.8306**, which
+are 0.8.11's four figures to the last digit printed, and rank one matches on
+every prompt. Nothing here was supposed to move them: the integer sum is the
+same sum in a different order, which an integer does not care about, and the
+float close is the same two multiplies in the same order, sixteen lanes at a
+time instead of one row at a time. The correction moved from sixty-four bits to
+thirty-two, and `kern_level_wide_ready` is what says it cannot wrap there — a
+level is at most 128 in size and a code at most `2^bits - 1`, so the integer sum
+is under `128 (2^bits - 1) span`; a zero point is `2^(bits-1)` plus a signed
+byte and so at most 256, against a level sum under `128 span`. On the widest
+plane this export has, 3072 columns of eight bit codes, the sum of those bounds
+is a tenth of `INT32_MAX`.
+
+The unit tests pass on the scalar, SSE2, AVX2 and AVX-512 builds: 727 on the
+first three and **736** on the wide one, where nine more assertions run because
+the wide block exists there to be checked. The new ones say that it is the one
+row path bit for bit at every width and column count the suite carries — floats
+compared for equality, not for nearness — that `kern_level_wide_ready` offers it
+exactly where a row is a whole number of blocks, and that a host without the
+integer dot product is offered it nowhere. `row_count` in that test is seventy,
+which is four whole wide blocks and six rows past them, so the block of four
+and the single row each take a share of the tail behind it.
