@@ -53,11 +53,26 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 | `logits`   | print the next token distribution as json     |
 | `probe`    | print the resolved model shape                |
 | `cache`    | print the export's calibrated cache ranges    |
+| `guess`    | what a block of guesses would be worth, bracketed |
 
 Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
 `--threads`, `--window`, `--cache`, `--heat`, `--top-k`, `--top-p`,
 `--echo-penalty`, `--seed`, `--loop`, `--keep`, `--raw`, `--verbose`. Run
 `igllm --help` for the full list.
+
+`guess` answers a question the engine could not answer before: what speculative
+decoding would be worth here. It runs the same greedy continuation three ways —
+plain, with a proposer that always guesses right, and with one that always
+guesses wrong — and holds all three to the same token stream, so it checks the
+block path as much as it measures it. The first is the ceiling of any proposer
+and the second is its floor. On the shipped export the ceiling is 2.2x at a
+block of eight, and `CHANGES.md` 0.9.0 says why it is not higher.
+
+```
+block  proposer    tok/s  ms a round  committed  vs plain  stream
+8      oracle      56.41      141.82       8.00     2.18x  matches plain
+8      null         7.69      129.97       1.00     0.30x  matches plain
+```
 
 `bench --verbose` prints where a decode step goes, largest part first, with the
 bytes each part sweeps and the rate that comes to. The parts are a partition of
