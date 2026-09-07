@@ -715,6 +715,30 @@ static void test_level(void) {
         test_true(okay_flag, "kern_row_code_level matches the dense product");
       }
 
+      { /* And the block of rows is the one row path, bit for bit.
+         *
+         * The block shares one staged load between four rows and closes four
+         * epilogues beside each other, which is a schedule and not a different
+         * sum: an integer dot does not care in what order it is taken, and the
+         * two multiplies that put it back in the activation's units are the
+         * same two in the same order.  So the claim is equality of floats and
+         * not nearness of them.  `row_count` is seventy, which is seventeen
+         * whole blocks and two rows past them, so the tail is reached too. */
+        float *block_list = (float *)mem_clear(sizeof(float) * (size_t)row_count);
+        okay_flag = 1;
+        for (row_index = 0; row_index + KERN_ROW_BLOCK <= row_count;
+             row_index += KERN_ROW_BLOCK)
+          kern_row_code_level_rows(&kit.sheet, row_index, level_list, isum_list, block_list);
+        for (; row_index < row_count; ++row_index)
+          block_list[row_index] = kern_row_code_level(&kit.sheet, row_index, level_list, isum_list);
+        for (row_index = 0; row_index < row_count; ++row_index)
+          if (block_list[row_index] !=
+              kern_row_code_level(&kit.sheet, row_index, level_list, isum_list))
+            okay_flag = 0;
+        test_true(okay_flag, "a block of rows is the one row path bit for bit");
+        mem_free(block_list);
+      }
+
       { /* One activation off the grid puts the whole product back on floats. */
         act_list[col_count / 2] += 0.5f * step_value;
         test_true(!kern_level_stage(&kit.sheet, act_list, level_list, isum_list),
@@ -879,6 +903,51 @@ static void test_kernel(void) {
     mem_free(act_list);
     mem_free(row_list);
     mem_free(half_list);
+  }
+
+  { /* The soft cap against the call it replaces.
+     *
+     * `kern_logit_cap` is a series rather than `tanhf`, so what is claimed of
+     * it is a bound and not equality — and the bound is absolute, because the
+     * subtraction from one is where the low bits of a small result go.  Two and
+     * a half parts in ten million of the cap is what the sweep measures; the
+     * test asks for five, so a host whose series lands a bit differently is
+     * still inside it and a path that is actually wrong is not.
+     *
+     * The three claims after it are the ones a sampler rests on: the order of
+     * two logits is never swapped, the ends are exact rather than near, and an
+     * argument far past the cap comes back the cap rather than a nan. */
+    int value_count = 4001;
+    float cap_value = 30.0f;
+    float *have_list = (float *)mem_clear(sizeof(float) * (size_t)value_count);
+    float *want_list = (float *)mem_clear(sizeof(float) * (size_t)value_count);
+    float worst_gap = 0.0f;
+    int slot, order_flag = 1;
+    for (slot = 0; slot < value_count; ++slot) {
+      have_list[slot] = -200.0f + 400.0f * (float)slot / (float)(value_count - 1);
+      want_list[slot] = tanhf(have_list[slot] / cap_value) * cap_value;
+    }
+    kern_logit_cap(have_list, value_count, cap_value);
+    for (slot = 0; slot < value_count; ++slot) {
+      float gap = have_list[slot] - want_list[slot];
+      if (gap < 0.0f) gap = -gap;
+      if (gap > worst_gap) worst_gap = gap;
+      if (slot && have_list[slot] < have_list[slot - 1]) order_flag = 0;
+    }
+    test_true(worst_gap <= 5e-7f * cap_value,
+              "kern_logit_cap is within five parts in ten million of the cap of tanhf");
+    test_true(order_flag, "and never swaps the order of two logits");
+    {
+      float edge_list[5] = {0.0f, 300.0f, -300.0f, 1e30f, -1e30f};
+      kern_logit_cap(edge_list, 5, cap_value);
+      test_true(edge_list[0] == 0.0f, "zero caps to zero exactly");
+      test_true(edge_list[1] == cap_value && edge_list[2] == -cap_value,
+                "and an argument past the cap to the cap itself");
+      test_true(edge_list[3] == cap_value && edge_list[4] == -cap_value,
+                "however far past it the argument is");
+    }
+    mem_free(have_list);
+    mem_free(want_list);
   }
 
   { /* The batch's dot against the one it blocks.  Four lanes at a time share

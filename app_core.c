@@ -1575,6 +1575,28 @@ static float plane_gain(const plane *sheet, size_t slot) {
   return real_read(sheet->gain_data, sheet->gain_type, slot);
 }
 
+/* The same gain, without the type switch, for the kernels that read one per
+ * output row.
+ *
+ * `real_read` is a switch over every storage type the reader knows, and it is
+ * large enough that the compiler keeps it out of line.  A row of a code plane
+ * ends in one gain, so on the shapes a decode step actually has — a 1536 wide
+ * row of the output head is 384 bytes, and there are 262144 of them — that call
+ * is paid once per 384 bytes, and it drags a `vzeroupper` and the whole
+ * caller-saved vector state through the middle of the row loop with it.
+ *
+ * Every scale in this export is `F32`, which is the case worth a direct load;
+ * anything else falls back to the switch, once a row as before.  The choice is
+ * made once per product rather than once per row, so the loop carries a
+ * pointer and not a branch on a type. */
+static const float *plane_gain_line(const plane *sheet) {
+  return sheet->gain_type == STORE_F32 ? (const float *)sheet->gain_data : NULL;
+}
+
+static float plane_gain_of(const plane *sheet, const float *gain_line, size_t slot) {
+  return gain_line ? gain_line[slot] : plane_gain(sheet, slot);
+}
+
 /* Decodes a whole row of a plane into f32. */
 static void plane_row(const plane *sheet, int row_index, float *row_out) {
   int col_index;
@@ -1755,6 +1777,33 @@ static float kern_dot_total(__m128 wide_total) {
 #  endif
 #endif
 
+/* A block of bf16 weights as floats, in whatever width the host has.
+ *
+ * `real_from_bf16` is a sixteen bit shift into the top of a word and nothing
+ * else, so a block of them is one widening and one shift — the same two
+ * operations the scalar does, on eight or four values at a time rather than
+ * one.  Nothing is rounded here that was not rounded there.
+ *
+ * It is worth having because this export keeps one plane in bf16 and it is not
+ * a small one: `per_layer_model_projection` is 8960 rows of 1536, 26.25 MiB,
+ * and a decode step reads all of it. */
+#if defined(APP_SIMD_AVX2)
+static __m256 kern_bf16_wide(const uint16_t *raw_data) {
+  return _mm256_castsi256_ps(_mm256_slli_epi32(
+      _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(const void *)raw_data)), 16));
+}
+#elif defined(APP_SIMD_SSE2)
+static __m128 kern_bf16_wide(const uint16_t *raw_data) {
+  /* Interleaving zero below each half word puts it where the shift would. */
+  return _mm_castsi128_ps(_mm_unpacklo_epi16(
+      _mm_setzero_si128(), _mm_loadl_epi64((const __m128i *)(const void *)raw_data)));
+}
+#elif defined(APP_SIMD_NEON)
+static float32x4_t kern_bf16_wide(const uint16_t *raw_data) {
+  return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(raw_data), 16));
+}
+#endif
+
 static float kern_dot_real(const void *row_data, store_type row_type, const float *act_data,
                            int span_count) {
   int slot;
@@ -1811,13 +1860,54 @@ static float kern_dot_real(const void *row_data, store_type row_type, const floa
     return total;
   }
   if (row_type == STORE_BF16) {
+    /* The same two accumulators the float path carries, for the same reason. */
     const uint16_t *row_raw = (const uint16_t *)row_data;
-    float part_a = 0.0f, part_b = 0.0f;
-    for (slot = 0; slot + 2 <= span_count; slot += 2) {
-      part_a += real_from_bf16(row_raw[slot]) * act_data[slot];
-      part_b += real_from_bf16(row_raw[slot + 1]) * act_data[slot + 1];
+#if defined(APP_SIMD_AVX2)
+    __m256 part_a = _mm256_setzero_ps(), part_b = _mm256_setzero_ps();
+    for (slot = 0; slot + 16 <= span_count; slot += 16) {
+      part_a = _mm256_fmadd_ps(kern_bf16_wide(row_raw + slot),
+                               _mm256_loadu_ps(act_data + slot), part_a);
+      part_b = _mm256_fmadd_ps(kern_bf16_wide(row_raw + slot + 8),
+                               _mm256_loadu_ps(act_data + slot + 8), part_b);
     }
-    total = part_a + part_b;
+    for (; slot + 8 <= span_count; slot += 8)
+      part_a = _mm256_fmadd_ps(kern_bf16_wide(row_raw + slot),
+                               _mm256_loadu_ps(act_data + slot), part_a);
+    total = kern_dot_total(_mm256_add_ps(part_a, part_b));
+#elif defined(APP_SIMD_SSE2)
+    __m128 part_a = _mm_setzero_ps(), part_b = _mm_setzero_ps();
+    for (slot = 0; slot + 8 <= span_count; slot += 8) {
+      part_a = _mm_add_ps(part_a, _mm_mul_ps(kern_bf16_wide(row_raw + slot),
+                                             _mm_loadu_ps(act_data + slot)));
+      part_b = _mm_add_ps(part_b, _mm_mul_ps(kern_bf16_wide(row_raw + slot + 4),
+                                             _mm_loadu_ps(act_data + slot + 4)));
+    }
+    for (; slot + 4 <= span_count; slot += 4)
+      part_a = _mm_add_ps(part_a, _mm_mul_ps(kern_bf16_wide(row_raw + slot),
+                                             _mm_loadu_ps(act_data + slot)));
+    total = kern_dot_total(_mm_add_ps(part_a, part_b));
+#elif defined(APP_SIMD_NEON)
+    float32x4_t part_a = vdupq_n_f32(0.0f), part_b = vdupq_n_f32(0.0f);
+    float32x4_t wide_total;
+    for (slot = 0; slot + 8 <= span_count; slot += 8) {
+      part_a = vmlaq_f32(part_a, kern_bf16_wide(row_raw + slot), vld1q_f32(act_data + slot));
+      part_b = vmlaq_f32(part_b, kern_bf16_wide(row_raw + slot + 4), vld1q_f32(act_data + slot + 4));
+    }
+    for (; slot + 4 <= span_count; slot += 4)
+      part_a = vmlaq_f32(part_a, kern_bf16_wide(row_raw + slot), vld1q_f32(act_data + slot));
+    wide_total = vaddq_f32(part_a, part_b);
+    total = vgetq_lane_f32(wide_total, 0) + vgetq_lane_f32(wide_total, 1) +
+            vgetq_lane_f32(wide_total, 2) + vgetq_lane_f32(wide_total, 3);
+#else
+    {
+      float part_a = 0.0f, part_b = 0.0f;
+      for (slot = 0; slot + 2 <= span_count; slot += 2) {
+        part_a += real_from_bf16(row_raw[slot]) * act_data[slot];
+        part_b += real_from_bf16(row_raw[slot + 1]) * act_data[slot + 1];
+      }
+      total = part_a + part_b;
+    }
+#endif
     for (; slot < span_count; ++slot) total += real_from_bf16(row_raw[slot]) * act_data[slot];
     return total;
   }
@@ -2478,6 +2568,17 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
  * divides evenly. */
 #define KERN_LEVEL_BLOCK 64
 
+/* Output rows a decode step's matrix-vector takes together.
+ *
+ * A code row is small — 384 bytes at two bits and 1536 columns — and the
+ * epilogue that closes it is not: a horizontal reduction, a gain, a widening
+ * and a store, once per row whatever the row's length.  Four rows in flight put
+ * four of those epilogues beside each other and share the staged levels between
+ * them.  Four rather than eight because eight accumulators plus the block's own
+ * constants is more than sixteen vector registers hold on the narrower tiers,
+ * and because four already covers the dot product's latency. */
+#define KERN_ROW_BLOCK 4
+
 /* The level a value sits on, or this when it sits between two of them. */
 #define KERN_LEVEL_OFF 256
 
@@ -2626,6 +2727,38 @@ static int kern_level_stage(const plane *sheet, const float *act_data, int8_t *l
       }                                                                                          \
     } while (0)
 
+/* And the row block one: one staged block read by four rows of codes at once.
+ *
+ * The other two loops above hold one row against several lanes of activations.
+ * This one is the transpose of that and the shape a decode step actually has —
+ * one lane, and rows by the hundred thousand.  A row of this export is 1536
+ * columns, which is twenty-four blocks and then an epilogue: a horizontal
+ * reduction of the accumulator, a gain, and a store.  Taken a row at a time
+ * that epilogue sits at the end of the row's own dependency chain with nothing
+ * to overlap it; taken four rows at a time there are four chains and four
+ * epilogues, and each one covers the others.
+ *
+ * The staged block is loaded once and four rows read it, which is the same
+ * trade `KERN_LEVEL_MANY_LOOP` makes in the other direction.  It matters more
+ * here: a row's levels are four times its codes at two bits, so a lane at a
+ * time the first level cache carries four times the tensor's own traffic, and
+ * sharing the load across a block of rows is most of that back.
+ *
+ * One accumulator a row rather than the one row path's two.  Four chains
+ * already cover the dot product's latency, and the integer sum is the same
+ * whatever order it is taken in. */
+#  define KERN_LEVEL_ROWS_LOOP(TAKE, PART)                                                       \
+    do {                                                                                         \
+      for (; slot + KERN_LEVEL_BLOCK <= span_count; slot += KERN_LEVEL_BLOCK) {                  \
+        __m512i level_wide = _mm512_loadu_si512((const void *)(lane_head + slot));                \
+        size_t word_step = (size_t)slot / (PART);                                                \
+        part_a = _mm512_dpbusd_epi32(part_a, TAKE(head_a + word_step), level_wide);               \
+        part_b = _mm512_dpbusd_epi32(part_b, TAKE(head_b + word_step), level_wide);               \
+        part_c = _mm512_dpbusd_epi32(part_c, TAKE(head_c + word_step), level_wide);               \
+        part_d = _mm512_dpbusd_epi32(part_d, TAKE(head_d + word_step), level_wide);               \
+      }                                                                                          \
+    } while (0)
+
 /* The constants every width's block is taken with.  Two bits shifts each
  * quarter of the broadcast down by its own bit position, four bits each half;
  * eight has nothing to shift and takes the flip instead. */
@@ -2638,31 +2771,19 @@ static int kern_level_stage(const plane *sheet, const float *act_data, int8_t *l
     const __m512i flip_wide = _mm512_set1_epi8((char)(uint8_t)code_flip)
 #endif
 
-static int32_t kern_dot_level(const uint8_t *code_row, int from_index, int span_count,
-                              const int8_t *level_data, int bit_count, int code_flip) {
+/* The blocks a vector path did not take, from `slot` on, which on a host
+ * without the dot product is all of them.  It walks the staging the way the
+ * staging was written — level `run_wide * part + run` of a block belongs to
+ * column `part_count * run + part` of it — so the two paths read the same bytes
+ * in the same pairs, and this is what the unit tests hold the vector one
+ * against.
+ *
+ * One definition, read by the one row path and the row block one alike, so
+ * there is a single place the remainder's arithmetic lives. */
+static int32_t kern_dot_level_rest(const uint8_t *code_row, int from_index, int slot,
+                                   int span_count, const int8_t *level_data, int bit_count,
+                                   int code_flip) {
   int32_t total = 0;
-  int slot = 0;
-#if defined(APP_SIMD_AVX512VNNI)
-  {
-    const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
-    const int8_t *lane_head = level_data + from_index;
-    __m512i part_a = _mm512_setzero_si512(), part_b = _mm512_setzero_si512();
-    KERN_LEVEL_PLAN(bit_count);
-    if (bit_count == 2)
-      KERN_LEVEL_ONE_LOOP(KERN_LEVEL_TAKE_2, 4);
-    else if (bit_count == 4)
-      KERN_LEVEL_ONE_LOOP(KERN_LEVEL_TAKE_4, 2);
-    else
-      KERN_LEVEL_ONE_LOOP(KERN_LEVEL_TAKE_8, 1);
-    total = _mm512_reduce_add_epi32(_mm512_add_epi32(part_a, part_b));
-  }
-#endif
-  /* The blocks the vector path did not take, which on a host without the dot
-   * product is all of them.  It walks the staging the way the staging was
-   * written — level `run_wide * part + run` of a block belongs to column
-   * `part_count * run + part` of it — so the two paths read the same bytes in
-   * the same pairs, and this is what the unit tests hold the vector one
-   * against. */
   {
     int part_count = 8 / bit_count;
     int run_wide = KERN_LEVEL_BLOCK / part_count;
@@ -2685,6 +2806,78 @@ static int32_t kern_dot_level(const uint8_t *code_row, int from_index, int span_
   return total;
 }
 
+static int32_t kern_dot_level(const uint8_t *code_row, int from_index, int span_count,
+                              const int8_t *level_data, int bit_count, int code_flip) {
+  int32_t total = 0;
+  int slot = 0;
+#if defined(APP_SIMD_AVX512VNNI)
+  {
+    const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
+    const int8_t *lane_head = level_data + from_index;
+    __m512i part_a = _mm512_setzero_si512(), part_b = _mm512_setzero_si512();
+    KERN_LEVEL_PLAN(bit_count);
+    if (bit_count == 2)
+      KERN_LEVEL_ONE_LOOP(KERN_LEVEL_TAKE_2, 4);
+    else if (bit_count == 4)
+      KERN_LEVEL_ONE_LOOP(KERN_LEVEL_TAKE_4, 2);
+    else
+      KERN_LEVEL_ONE_LOOP(KERN_LEVEL_TAKE_8, 1);
+    total = _mm512_reduce_add_epi32(_mm512_add_epi32(part_a, part_b));
+  }
+#endif
+  if (slot >= span_count) return total;
+  return total + kern_dot_level_rest(code_row, from_index, slot, span_count, level_data, bit_count,
+                                     code_flip);
+}
+
+/* A block of consecutive rows against one staged level vector.
+ *
+ * `part_list` comes back with one sum a row, in row order.  The block is
+ * `KERN_ROW_BLOCK` rows and the caller has already checked there are that many
+ * left; a shorter tail goes through `kern_dot_level` a row at a time, which is
+ * the same arithmetic by construction because an integer sum does not care in
+ * what order it is taken. */
+static void kern_dot_level_rows(const uint8_t *code_head, size_t row_stride, int from_index,
+                                int span_count, const int8_t *level_data, int bit_count,
+                                int code_flip, int32_t *part_list) {
+  int slot = 0;
+  int row_index;
+#if defined(APP_SIMD_AVX512VNNI)
+  {
+    const uint8_t *head_a = code_head + (size_t)from_index * (size_t)bit_count / 8u;
+    const uint8_t *head_b = head_a + row_stride;
+    const uint8_t *head_c = head_b + row_stride;
+    const uint8_t *head_d = head_c + row_stride;
+    const int8_t *lane_head = level_data + from_index;
+    __m512i part_a = _mm512_setzero_si512(), part_b = _mm512_setzero_si512();
+    __m512i part_c = _mm512_setzero_si512(), part_d = _mm512_setzero_si512();
+    KERN_LEVEL_PLAN(bit_count);
+    if (bit_count == 2)
+      KERN_LEVEL_ROWS_LOOP(KERN_LEVEL_TAKE_2, 4);
+    else if (bit_count == 4)
+      KERN_LEVEL_ROWS_LOOP(KERN_LEVEL_TAKE_4, 2);
+    else
+      KERN_LEVEL_ROWS_LOOP(KERN_LEVEL_TAKE_8, 1);
+    part_list[0] = _mm512_reduce_add_epi32(part_a);
+    part_list[1] = _mm512_reduce_add_epi32(part_b);
+    part_list[2] = _mm512_reduce_add_epi32(part_c);
+    part_list[3] = _mm512_reduce_add_epi32(part_d);
+  }
+#else
+  for (row_index = 0; row_index < KERN_ROW_BLOCK; ++row_index) part_list[row_index] = 0;
+#endif
+  /* Where the span is a whole number of blocks the vector path has taken all of
+   * it, and there is nothing here to call.  The guard is what keeps the call
+   * out of the row loop rather than merely making it return zero: it is a call
+   * through the caller-saved vector state, four times a block of rows, on every
+   * shape this export has. */
+  if (slot < span_count)
+    for (row_index = 0; row_index < KERN_ROW_BLOCK; ++row_index)
+      part_list[row_index] += kern_dot_level_rest(code_head + (size_t)row_index * row_stride,
+                                                  from_index, slot, span_count, level_data,
+                                                  bit_count, code_flip);
+}
+
 /* One row against the staged levels.  The group's whole correction is taken in
  * integers — the zero point times the group's level sum is exact, and so is the
  * difference — so the only rounding left in a row is the two multiplies that
@@ -2692,13 +2885,14 @@ static int32_t kern_dot_level(const uint8_t *code_row, int from_index, int span_
 static float kern_row_code_level(const plane *sheet, int row_index, const int8_t *level_data,
                                  const int32_t *sum_data) {
   const uint8_t *code_row = sheet->code_data + (size_t)row_index * sheet->row_stride;
+  const float *gain_line = plane_gain_line(sheet);
   size_t gain_base = (size_t)row_index * (size_t)sheet->group_count;
   float total = 0.0f;
   int group_index;
   for (group_index = 0; group_index < sheet->group_count; ++group_index) {
     int from_index = group_index * sheet->group_size;
     int span_count = sheet->col_count - from_index;
-    float gain_value = plane_gain(sheet, gain_base + (size_t)group_index);
+    float gain_value = plane_gain_of(sheet, gain_line, gain_base + (size_t)group_index);
     int32_t bias_value = (int32_t)sheet->code_bias +
                          (sheet->bias_data ? (int32_t)sheet->bias_data[gain_base + (size_t)group_index] : 0);
     int64_t part_value;
@@ -2709,6 +2903,42 @@ static float kern_row_code_level(const plane *sheet, int row_index, const int8_t
     total += gain_value * sheet->enter_gain * (float)part_value;
   }
   return total;
+}
+
+/* A block of rows against the staged levels, each row closing on its own.
+ *
+ * The arithmetic is `kern_row_code_level`'s, row for row and term for term:
+ * the same integer sum, the same integer correction, and the same two
+ * multiplies in the same order.  What is different is that four rows are in
+ * flight, so the reduction that closes one overlaps the dot products of the
+ * next three instead of standing at the end of a chain on its own. */
+static void kern_row_code_level_rows(const plane *sheet, int row_index, const int8_t *level_data,
+                                     const int32_t *sum_data, float *out_data) {
+  const uint8_t *code_head = sheet->code_data + (size_t)row_index * sheet->row_stride;
+  const float *gain_line = plane_gain_line(sheet);
+  int32_t part_list[KERN_ROW_BLOCK];
+  float total_list[KERN_ROW_BLOCK];
+  int group_index, block_slot;
+  for (block_slot = 0; block_slot < KERN_ROW_BLOCK; ++block_slot) total_list[block_slot] = 0.0f;
+  for (group_index = 0; group_index < sheet->group_count; ++group_index) {
+    int from_index = group_index * sheet->group_size;
+    int span_count = sheet->col_count - from_index;
+    if (span_count > sheet->group_size) span_count = sheet->group_size;
+    kern_dot_level_rows(code_head, sheet->row_stride, from_index, span_count, level_data,
+                        sheet->bit_count, sheet->code_flip, part_list);
+    for (block_slot = 0; block_slot < KERN_ROW_BLOCK; ++block_slot) {
+      size_t gain_slot =
+          (size_t)(row_index + block_slot) * (size_t)sheet->group_count + (size_t)group_index;
+      float gain_value = plane_gain_of(sheet, gain_line, gain_slot);
+      int32_t bias_value =
+          (int32_t)sheet->code_bias + (sheet->bias_data ? (int32_t)sheet->bias_data[gain_slot] : 0);
+      int64_t part_value = (int64_t)part_list[block_slot];
+      part_value -= (int64_t)bias_value * (int64_t)sum_data[group_index];
+      total_list[block_slot] += gain_value * sheet->enter_gain * (float)part_value;
+    }
+  }
+  for (block_slot = 0; block_slot < KERN_ROW_BLOCK; ++block_slot)
+    out_data[row_index + block_slot] = total_list[block_slot];
 }
 
 /* The same decode `kern_dot_code` performs, written out into floats instead of
@@ -3249,7 +3479,9 @@ static void kern_mat_vec_band(void *state, int slice_index, int slice_count) {
     for (row_index = row_from; row_index < row_upto; ++row_index)
       kern_row_code_level_many(sheet, row_index, job);
   } else if (job->lane_count == 1 && job->level_data) {
-    for (row_index = row_from; row_index < row_upto; ++row_index)
+    for (row_index = row_from; row_index + KERN_ROW_BLOCK <= row_upto; row_index += KERN_ROW_BLOCK)
+      kern_row_code_level_rows(sheet, row_index, job->level_data, job->isum_data, job->out_data);
+    for (; row_index < row_upto; ++row_index)
       job->out_data[row_index] =
           kern_row_code_level(sheet, row_index, job->level_data, job->isum_data);
   } else if (job->lane_count == 1) {
@@ -3713,6 +3945,111 @@ static void kern_soft_max(float *value_list, int value_count) {
 #endif
     for (; value_index < value_count; ++value_index) value_list[value_index] *= shrink_value;
   }
+}
+
+/* The soft cap a logit passes through, over a whole row of them.
+ *
+ * `tanh(x / c) * c`, which the export asks for on all 262144 logits of a decode
+ * step and on every attention score of a layer that caps them.  Called once a
+ * value it is a fourteenth of a step on the one thread that reaches it — larger
+ * than the whole attention, larger than every norm and residual in the graph
+ * put together, and reading no weight at all, so no byte count ever showed it.
+ *
+ * The call is what costs, not the arithmetic.  `tanh` is one exponential:
+ *
+ *     tanh(y)  =  1 - 2 / (e^{2y} + 1)
+ *
+ * and the exponential is the series `kern_exp_wide` already carries for the
+ * softmax, eight lanes at a time.  The argument is clamped to ten first, which
+ * is where a float's `tanh` has already reached one to the last bit — `2 /
+ * (e^{20} + 1)` is four parts in a thousand million — and which keeps `2^k`
+ * inside the exponent field the series writes it into.
+ *
+ * What this is not is `tanhf` to the last bit.  The subtraction from one loses
+ * the low bits of a small result, so the error is absolute rather than
+ * relative: swept over sixty-five thousand arguments from -200 to 200, the
+ * largest gap from the call is **two and a half parts in ten million of the
+ * cap** — 7.6e-6 at this export's cap of 30, 1.5e-5 at the attention's 50 —
+ * which is two or three of the last bits of the cap itself, and below what a
+ * logit out of thirty-five layers of two-bit weights carries.  The same sweep
+ * says the result is still monotone, so what a greedy or a top-k sampler picks
+ * cannot change except between two logits already that close together, and the
+ * ends are exact: zero comes back zero and a large argument comes back the cap
+ * rather than something near it.
+ *
+ * The pool is not used, and that is 0.8.10's measurement rather than an
+ * oversight: a single fork here lands on workers just joined on the output head
+ * and swings by four milliseconds.  This makes the work small enough that the
+ * question does not arise. */
+#define KERN_CAP_REACH 10.0f /* where `tanh` is one to the last bit a float has */
+
+static float kern_logit_cap_one(float value_now, float cap_value, float back_cap) {
+  float turn_value = value_now * back_cap;
+  if (turn_value > KERN_CAP_REACH) turn_value = KERN_CAP_REACH;
+  if (turn_value < -KERN_CAP_REACH) turn_value = -KERN_CAP_REACH;
+  return cap_value * (1.0f - 2.0f / (kern_exp_near(turn_value + turn_value) + 1.0f));
+}
+
+static void kern_logit_cap(float *value_list, int value_count, float cap_value) {
+  float back_cap = 1.0f / cap_value;
+  int value_index = 0;
+#if defined(APP_SIMD_AVX2)
+  {
+    const __m256 wide_cap = _mm256_set1_ps(cap_value);
+    const __m256 wide_back = _mm256_set1_ps(back_cap);
+    const __m256 wide_reach = _mm256_set1_ps(KERN_CAP_REACH);
+    const __m256 wide_one = _mm256_set1_ps(1.0f);
+    const __m256 wide_two = _mm256_set1_ps(2.0f);
+    for (; value_index + 8 <= value_count; value_index += 8) {
+      __m256 turn_value = _mm256_mul_ps(_mm256_loadu_ps(value_list + value_index), wide_back);
+      __m256 rise_value;
+      turn_value = _mm256_min_ps(turn_value, wide_reach);
+      turn_value = _mm256_max_ps(turn_value, _mm256_sub_ps(_mm256_setzero_ps(), wide_reach));
+      rise_value = _mm256_add_ps(kern_exp_wide(_mm256_add_ps(turn_value, turn_value)), wide_one);
+      _mm256_storeu_ps(value_list + value_index,
+                       _mm256_mul_ps(wide_cap, _mm256_sub_ps(wide_one, _mm256_div_ps(wide_two,
+                                                                                     rise_value))));
+    }
+  }
+#elif defined(APP_SIMD_SSE2)
+  {
+    const __m128 wide_cap = _mm_set1_ps(cap_value);
+    const __m128 wide_back = _mm_set1_ps(back_cap);
+    const __m128 wide_reach = _mm_set1_ps(KERN_CAP_REACH);
+    const __m128 wide_one = _mm_set1_ps(1.0f);
+    const __m128 wide_two = _mm_set1_ps(2.0f);
+    for (; value_index + 4 <= value_count; value_index += 4) {
+      __m128 turn_value = _mm_mul_ps(_mm_loadu_ps(value_list + value_index), wide_back);
+      __m128 rise_value;
+      turn_value = _mm_min_ps(turn_value, wide_reach);
+      turn_value = _mm_max_ps(turn_value, _mm_sub_ps(_mm_setzero_ps(), wide_reach));
+      rise_value = _mm_add_ps(kern_exp_wide(_mm_add_ps(turn_value, turn_value)), wide_one);
+      _mm_storeu_ps(value_list + value_index,
+                    _mm_mul_ps(wide_cap, _mm_sub_ps(wide_one, _mm_div_ps(wide_two, rise_value))));
+    }
+  }
+#elif defined(APP_SIMD_NEON) && defined(__aarch64__)
+  /* The lane divide is AArch64's; a 32-bit ARM host takes the scalar loop
+   * below, which is the same series and still not a call into libm. */
+  {
+    const float32x4_t wide_cap = vdupq_n_f32(cap_value);
+    const float32x4_t wide_back = vdupq_n_f32(back_cap);
+    const float32x4_t wide_reach = vdupq_n_f32(KERN_CAP_REACH);
+    const float32x4_t wide_one = vdupq_n_f32(1.0f);
+    const float32x4_t wide_two = vdupq_n_f32(2.0f);
+    for (; value_index + 4 <= value_count; value_index += 4) {
+      float32x4_t turn_value = vmulq_f32(vld1q_f32(value_list + value_index), wide_back);
+      float32x4_t rise_value;
+      turn_value = vminq_f32(turn_value, wide_reach);
+      turn_value = vmaxq_f32(turn_value, vnegq_f32(wide_reach));
+      rise_value = vaddq_f32(kern_exp_wide(vaddq_f32(turn_value, turn_value)), wide_one);
+      vst1q_f32(value_list + value_index,
+                vmulq_f32(wide_cap, vsubq_f32(wide_one, vdivq_f32(wide_two, rise_value))));
+    }
+  }
+#endif
+  for (; value_index < value_count; ++value_index)
+    value_list[value_index] = kern_logit_cap_one(value_list[value_index], cap_value, back_cap);
 }
 
 /* Rotary turn using the reference rotate-half convention. */
@@ -10105,10 +10442,7 @@ static void session_cap_band(void *state, int slice_index, int slice_count) {
   cap_job *job = (cap_job *)state;
   int from_slot = (int)((long long)job->value_count * slice_index / slice_count);
   int upto_slot = (int)((long long)job->value_count * (slice_index + 1) / slice_count);
-  int value_index;
-  for (value_index = from_slot; value_index < upto_slot; ++value_index)
-    job->logit_list[value_index] =
-        tanhf(job->logit_list[value_index] / job->cap_value) * job->cap_value;
+  kern_logit_cap(job->logit_list + from_slot, upto_slot - from_slot, job->cap_value);
 }
 
 /* A batch of tokens through the whole graph.  Logits are produced for the last
