@@ -3541,6 +3541,127 @@ static float kern_row_code(const plane *sheet, int row_index, const float *act_d
   return total;
 }
 
+/* Output rows the float path takes together, and why it needs to take any.
+ *
+ * A row of the output head is 1536 columns, which is 96 vectors, and the loop
+ * above carries two accumulators.  Each of them is therefore a chain of 48
+ * dependent multiply-adds, and a multiply-add is four cycles deep against two a
+ * cycle of throughput: the row is bound by the depth of its own chain at about
+ * four times what the ports would allow.  More accumulators would fix it and
+ * would change which slots are added to which, and the sum would move.
+ *
+ * Four rows at a time fixes it without touching the sum.  Each row keeps its
+ * own two accumulators, its own slots and its own order — the arithmetic is
+ * `kern_row_code`'s term for term — and the eight chains cover each other.  The
+ * activation vector is loaded once for the four, which is the same trade the
+ * integer path's row block makes.
+ *
+ * Two bits only, and AVX-512 only.  That is the width and the host the one
+ * plane on this path has, and writing the other widths out would be four more
+ * loops for planes that take the integer path anyway. */
+#define KERN_CODE_BLOCK 4
+
+/* Whether a plane's rows can be taken four at a time here: the width the block
+ * is written for, no flip, and groups that begin on a byte. */
+static int kern_code_rows_ready(const plane *sheet) {
+#if defined(APP_SIMD_AVX512)
+  return sheet->form == PLANE_CODE && sheet->bit_count == 2 && sheet->code_flip == 0 &&
+         (sheet->group_size & 3) == 0;
+#else
+  (void)sheet;
+  return 0;
+#endif
+}
+
+#if defined(APP_SIMD_AVX512)
+/* Four rows of two bit codes against one span of activations.
+ *
+ * The body is `kern_dot_code`'s two bit loop with the row as the inner index,
+ * so the constants, the lanes, the lookup and each row's pair of accumulators
+ * are the ones that loop has.  The tail below is its tail, run once a row,
+ * added onto that row's vector total in the same order. */
+static void kern_dot_code_two_rows(const uint8_t *code_head, size_t row_stride, int from_index,
+                                   int span_count, const float *act_data, float *total_list) {
+  const __m512i step_wide =
+      _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+  const __m512 code_look = _mm512_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f, 0.0f,
+                                          1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f);
+  const uint8_t *head_list[KERN_CODE_BLOCK];
+  __m512 part_a[KERN_CODE_BLOCK], part_b[KERN_CODE_BLOCK];
+  int slot = 0, block_slot;
+  for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot) {
+    head_list[block_slot] =
+        code_head + (size_t)block_slot * row_stride + (size_t)from_index / 4u;
+    part_a[block_slot] = _mm512_setzero_ps();
+    part_b[block_slot] = _mm512_setzero_ps();
+  }
+  for (; slot + 32 <= span_count; slot += 32) {
+    __m512 act_a = _mm512_loadu_ps(act_data + slot);
+    __m512 act_b = _mm512_loadu_ps(act_data + slot + 16);
+    for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot) {
+      uint32_t word_a, word_b;
+      memcpy(&word_a, head_list[block_slot] + slot / 4, 4);
+      memcpy(&word_b, head_list[block_slot] + slot / 4 + 4, 4);
+      part_a[block_slot] = _mm512_fmadd_ps(
+          _mm512_permutexvar_ps(_mm512_srlv_epi32(_mm512_set1_epi32((int)word_a), step_wide),
+                                code_look),
+          act_a, part_a[block_slot]);
+      part_b[block_slot] = _mm512_fmadd_ps(
+          _mm512_permutexvar_ps(_mm512_srlv_epi32(_mm512_set1_epi32((int)word_b), step_wide),
+                                code_look),
+          act_b, part_b[block_slot]);
+    }
+  }
+  for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot) {
+    const uint8_t *byte_head = head_list[block_slot];
+    float total = kern_zmm_total(_mm512_add_ps(part_a[block_slot], part_b[block_slot]));
+    int rest = slot;
+    for (; rest + 4 <= span_count; rest += 4) {
+      uint8_t quad = byte_head[rest / 4];
+      total += (float)(quad & 3u) * act_data[rest];
+      total += (float)((quad >> 2) & 3u) * act_data[rest + 1];
+      total += (float)((quad >> 4) & 3u) * act_data[rest + 2];
+      total += (float)((quad >> 6) & 3u) * act_data[rest + 3];
+    }
+    for (; rest < span_count; ++rest)
+      total += (float)((byte_head[rest / 4] >> (2 * (rest & 3))) & 3u) * act_data[rest];
+    total_list[block_slot] = total;
+  }
+}
+
+/* A block of rows against the activations, each row closing as it always did.
+ *
+ * Term for term `kern_row_code`'s, four rows over: the same group order, the
+ * same gain, the same zero point correction and the same running total. */
+static void kern_row_code_rows(const plane *sheet, int row_index, const float *act_data,
+                               const float *sum_data, float *out_data) {
+  const uint8_t *code_head = sheet->code_data + (size_t)row_index * sheet->row_stride;
+  size_t gain_base = (size_t)row_index * (size_t)sheet->group_count;
+  float total_list[KERN_CODE_BLOCK];
+  int group_index, block_slot;
+  for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot) total_list[block_slot] = 0.0f;
+  for (group_index = 0; group_index < sheet->group_count; ++group_index) {
+    int from_index = group_index * sheet->group_size;
+    int span_count = sheet->col_count - from_index;
+    float part_list[KERN_CODE_BLOCK];
+    if (span_count > sheet->group_size) span_count = sheet->group_size;
+    kern_dot_code_two_rows(code_head, sheet->row_stride, from_index, span_count,
+                           act_data + from_index, part_list);
+    for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot) {
+      size_t gain_slot =
+          gain_base + (size_t)block_slot * (size_t)sheet->group_count + (size_t)group_index;
+      float gain_value = plane_gain(sheet, gain_slot);
+      float bias_value =
+          (float)(sheet->code_bias + (sheet->bias_data ? sheet->bias_data[gain_slot] : 0));
+      total_list[block_slot] +=
+          gain_value * (part_list[block_slot] - bias_value * sum_data[group_index]);
+    }
+  }
+  for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot)
+    out_data[row_index + block_slot] = total_list[block_slot];
+}
+#endif
+
 typedef struct kern_job {
   const plane *sheet;
   const float *act_data;  /* lane_count rows of col_count, act_stride apart */
@@ -3856,7 +3977,16 @@ static void kern_mat_vec_band(void *state, int slice_index, int slice_count) {
       job->out_data[row_index] =
           kern_row_code_level(sheet, row_index, job->level_data, job->isum_data);
   } else if (job->lane_count == 1) {
-    for (row_index = row_from; row_index < row_upto; ++row_index)
+    /* The block of four where the plane admits it, then a row at a time for
+     * what is left — the same arithmetic either way, and the block is the one
+     * the output head is on. */
+    row_index = row_from;
+#if defined(APP_SIMD_AVX512)
+    if (kern_code_rows_ready(sheet))
+      for (; row_index + KERN_CODE_BLOCK <= row_upto; row_index += KERN_CODE_BLOCK)
+        kern_row_code_rows(sheet, row_index, job->act_data, job->sum_data, job->out_data);
+#endif
+    for (; row_index < row_upto; ++row_index)
       job->out_data[row_index] = kern_row_code(sheet, row_index, job->act_data, job->sum_data);
   } else {
     for (row_index = row_from; row_index < row_upto; ++row_index)

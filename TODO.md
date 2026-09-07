@@ -181,27 +181,32 @@ the forks.
 
   **Three routes are open, in this order.**
 
-  *The float loop the head actually runs, which 0.8.15 started on.* The mask and
-  the widening are now one `vpermps` against a sixteen entry table — four
-  instructions a vector rather than five, the head 8.3% and the step floor 2.1%,
-  bit-identical. What is left is the broadcast: three of the loop's sixteen
-  instructions per sixty-four codes are broadcasts that could be one, because
-  `vbroadcasti32x4` takes sixteen bytes and four shifts of it reach every code in
-  them. Thirteen per sixty-four rather than sixteen. It costs a staging pass —
-  the four quarters come out in the unpack's order rather than the column's, so
-  the activations have to be laid down in that order, exactly as
-  `kern_level_stage` already does for the integer path — and that is a new
-  correctness surface rather than a four line change.
+  *The float loop the head actually runs, which 0.8.15 and 0.8.16 took most of.*
+  0.8.15 made the mask and the widening one `vpermps` against a repeating table,
+  four instructions a vector rather than five, and got 8.3%. 0.8.16 found the
+  factor that was left, and it was not the instruction count: the row carried
+  **two** accumulators over ninety-six vectors, so each was a chain of
+  forty-eight dependent multiply-adds at four cycles deep against two a cycle of
+  throughput, and the row was bound by its own chain at about four times what
+  its ports allow. Four rows at a time, each keeping its own pair and its own
+  order, is eight chains covering each other and the same sum to the last bit:
+  the head **11.20 ms to 5.99**, the step floor 15.0%, decode 17.6%. Eight rows
+  was built and is worse on this plane, as it was on the other path.
 
-  And the arithmetic does not close even then. On this host the loop at four
-  instructions a vector is worth about 4.5 ms by port count and the head is
-  11.17, while a bare four thread sweep of the same 97 MiB would be 1.9 ms at
-  the 49.80 GiB/s this host reaches. So the head is bound by neither the memory
-  nor this loop's issue rate, which is where the *old* entry came in — except
-  that now it is the right loop being counted. Whoever takes this next should
-  count the per-row epilogue and the row-at-a-time dispatch before shaving the
-  loop further: `kern_row_code` closes every row on its own with a
-  `_mm512_reduce_add_ps`, and the integer path stopped doing that in 0.8.12.
+  What is left is the broadcast. Three of the loop's sixteen instructions per
+  sixty-four codes are broadcasts that one `vbroadcasti32x4` could replace,
+  because sixteen bytes are sixty-four codes and four shifts of them reach
+  every one. Thirteen per sixty-four rather than sixteen. It costs a staging
+  pass — the four quarters come out in the unpack's order rather than the
+  column's, so the activations have to be laid down in that order, exactly as
+  `kern_level_stage` already does for the integer path. Take it only knowing
+  that the loop is no longer latency-bound, which is what makes counting its
+  instructions worth anything for the first time.
+
+  The head is now 5.99 ms of a 34.95 ms step, 17.1% against 27.3%, at 67 G
+  multiply-adds a second against 33. A bare four thread sweep of its 97 MiB on
+  this host is 1.9 ms, so there is about three times left in it and the two
+  routes below are where the rest of it is.
 
   *Give the head a grid, and take the integer path.* This is the large one — the
   four bit planes run at 52 G multiply-adds a second against the head's 33, and
@@ -448,3 +453,5 @@ the forks.
 | Why the output head is slower than anything else per byte (answered: it runs the float kernel — the export's `lm_head.input_activation_scale` is `0.0`, so it can never be on the grid) | 0.8.14 |
 | Whether the four bit planes are memory-bound or issue-bound (answered: issue-bound — a quarter off the inner loop is ten to eighteen percent off the phase) | 0.8.14 |
 | The two bit float loop's mask and widening as one `vpermps` against a repeating table, in the loop the output head actually runs | 0.8.15 |
+| Why the output head was slower than its own port count (answered: two accumulators over ninety-six vectors — the row waited on its own chain) and the four row block that fixed it | 0.8.16 |
+| Eight rows a block in the float path (refused: worse on the one plane it is for, as it was on the integer path) | 0.8.16 |

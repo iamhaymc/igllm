@@ -4939,3 +4939,91 @@ Against the ceiling: the head reads 97 MiB, which at this host's 49.80 GiB/s is
 machine has, is worth about 4.5 ms of that by arithmetic, and the gap between 4.5
 and 11.17 is not yet accounted for. `TODO.md` carries it with the other two
 routes.
+
+---
+
+## 0.8.16 — the output head was waiting on its own accumulator
+
+### Scope
+
+The rest of `TODO.md`'s head entry, and it was not the instruction count after
+all. 0.8.15 took the two bit float loop from five instructions a vector to four
+and got 8.3%; the arithmetic said the loop should then be worth about 4.5 ms and
+it was 11.17. This is the missing factor, and it is latency.
+
+### The chain
+
+A row of the output head is 1536 columns, which is 96 vectors, and
+`kern_dot_code` carries **two** accumulators. So each of them is a chain of
+forty-eight dependent `vfmadd132ps`, and a multiply-add is four cycles deep
+against two a cycle of throughput. The row's floor is the depth of its chain —
+about 192 cycles — where its ports would allow about 48. **Four times, and it is
+not the loop body at all.**
+
+More accumulators fix it and change which slot is added to which, so the sum
+moves. Four rows at a time fix it without touching the sum: each row keeps its
+own pair of accumulators, its own slots and its own order, and the eight chains
+cover each other. The activation vector is loaded once for the four, which is
+the same trade the integer path's row block already makes.
+
+This is exactly what 0.8.12 did to the integer path — and the head was the one
+plane 0.8.12 could not reach, because the head is not on that path. It took
+0.8.14 to find that out and 0.8.15 to make the float loop worth blocking.
+
+### The step
+
+Eight alternating runs a side on a 3 id prompt, six on a 449 id one, minimum per
+phase, checkpoint warm:
+
+| part | 3 id prompt | | 449 id prompt | |
+| --- | --- | --- | --- | --- |
+| **final norm, head** | 11.203 to **5.994** | **-46.5%** | 11.298 to **5.896** | **-47.8%** |
+| step floor | 41.100 to **34.950** | **-15.0%** | 43.880 to **38.310** | **-12.7%** |
+| decode | 24.33 to **28.61** tok/s | **+17.6%** | 22.79 to **26.10** | **+14.5%** |
+
+Nothing else moves outside the noise: the block is reached by one plane. The
+head is 97 MiB at **16.2 GiB/s** where it was 8.7, and 67 G multiply-adds a
+second where it was 33.
+
+`logits` and a 48 token greedy `chat` on the shipped export are byte for byte
+what the build at the start of this session produced, across all four of
+0.8.13 to 0.8.16.
+
+### Four rows, and eight measured against them
+
+Eight was built and run, and it is worse on the plane it is for: the head 5.989
+ms against 6.240, six alternating rounds a side, with the step floor inside the
+noise either way. Sixteen live accumulators plus the two activation vectors and
+the constants is most of the register file, and four chains a row already cover
+a four cycle multiply-add. That agrees with 0.8.8 and 0.8.11, which found the
+same wash at eight for the same reason on the other path.
+
+### Where the head stands now
+
+5.99 ms of a 34.95 ms step, 17.1% against 27.3% before this version. A bare four
+thread sweep of the same 97 MiB on this host is 1.9 ms, so the plane is now
+about three times its memory floor rather than six.
+
+What is left in it is the loop, and `TODO.md` carries it: three of the sixteen
+instructions per sixty-four codes are broadcasts that one `vbroadcasti32x4`
+could replace, at the price of staging the activations in the unpack's order.
+That is now a change to a loop that is no longer latency-bound, so for the first
+time the instruction count is the thing to count.
+
+### The four versions together
+
+From the build at the start of this session to this one, on a 3 id prompt, four
+threads, wide build:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| decode | 23.02 tok/s | **28.61** | **+24.3%** |
+| step floor | 43.440 ms | **34.950** | **-19.5%** |
+| final norm, head | 11.865 | **5.994** | -49.5% |
+| mlp | 20.564 | 19.312 | -6.1% |
+| q k v | 3.662 | 3.069 | -16.2% |
+| attn out | 2.835 | 2.524 | -11.0% |
+| ple feed | 1.533 | 1.281 | -16.4% |
+| mlp gate | 0.407 | 0.251 | -38.3% |
+
+Same weights, same answer to the byte.
