@@ -298,6 +298,22 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   cluster whose bound cannot beat it. Rejecting is cheaper still, because any
   single row that beats the proposal ends the question.
 
+  **One thing to check before building any of it, because it decides the whole
+  idea and costs an afternoon rather than a week.** A bound is only worth
+  anything if it is tight enough to prune. Cauchy-Schwarz on a row gives
+  `|<w,a>| <= ||w|| ||a||`, and over 1536 dimensions a typical alignment makes
+  that about `sqrt(1536)` — thirty-nine times — looser than the value it bounds,
+  so a plain per-row norm prunes nothing at all. Clustering replaces it with
+  `<centroid, a> + radius * ||a||`, which is tight only where the cluster radius
+  is small against the row norms. **Measure that ratio on this export's head
+  before writing a k-means**: take a few thousand rows, cluster them any way at
+  all, and compare the radius with the norm. If the radius is most of the norm
+  the bound cannot beat a top logit and the entry is closed; the entry's own
+  rule — stop if the bound needs most of a row to be useful — is the same test
+  said less precisely. The clustering itself is also a load-time cost on an
+  engine whose startup is two JSON files, which is a second reason to know the
+  answer before paying it.
+
   So this entry is the enabler for the speculative one below rather than a
   parallel idea, and it is worth more there than in a plain decode step: a plain
   step pays the head once, a block of eight pays it eight times. Six of the
@@ -328,33 +344,36 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   payoff there; what was unknown was this engine's verification cost, and 0.9.0
   measured it.
 
-  **Is it still worth doing? Yes, but only after the two entries above, and the
-  measurement says why.** `igllm guess` runs a greedy continuation three ways —
-  plain, with a proposer that is always right, and with one that is always
-  wrong — and holds all three to the same token stream. On the shipped export at
-  four threads:
+  **It is built and it ships — 0.9.3 — and what is left of the entry is the
+  ceiling rather than the feature.** `igllm guess` runs a greedy continuation
+  with three proposers, one always right, the n-gram scout that ships, and one
+  always wrong, and holds all three to the plain run's token stream. On the
+  shipped export at four threads, on an answer that quotes its prompt:
 
-  | block | proposer | vs plain |
-  | --- | --- | --- |
-  | 4 | oracle | 1.51x |
-  | 8 | oracle | **2.15x** |
-  | 16 | oracle | 2.21x |
-  | 8 | null | 0.30x |
+  | block | proposer | committed a round | vs plain |
+  | --- | --- | --- | --- |
+  | 4 | oracle | 4.00 | 2.02x |
+  | 4 | n-gram | 2.67 | 1.69x |
+  | 8 | oracle | 8.00 | 2.11x |
+  | 8 | n-gram | 3.69 | **1.80x** |
+  | 8 | null | 1.00 | 0.30x |
 
-  **The ceiling is 2.2x** — that is a proposer that is *never wrong* — and
-  **break-even needs about 40% of guesses accepted**, because a round of eight
-  costs 142 ms against a plain step's 38 and so has to commit 3.7 tokens to pay.
+  **The ceiling is still about 2.2x** — that is a proposer that is never wrong —
+  and the scout reaches **85% of it** where prompt lookup applies. On free
+  generation it draws nothing and costs 0.92 to 0.95, which is why `--guess` is
+  a flag.
 
-  The reason the ceiling is 2.2 and not 6 is the reason this entry is now third.
-  A block shares the weight *sweep* across its lanes and cannot share the
-  *arithmetic*, and this engine is arithmetic-bound: an extra lane costs about
-  **13 ms** against a plain step's 38. **Six of those 13 are the output head**,
-  because verifying a position means asking what the model would have produced
-  there, and that is the full 262144 rows for every lane. The two entries above
-  are therefore not merely nice to have first — they set this entry's ceiling.
-  Halve the marginal lane and the ceiling goes to about 4x and break-even to
-  about 25%, which is the difference between a feature worth shipping and a coin
-  flip.
+  The reason the ceiling is 2.2 and not 6 is what is left of this entry. A block
+  shares the weight *sweep* across its lanes and cannot share the *arithmetic*,
+  and this engine is arithmetic-bound: an extra lane cost about **13 ms** against
+  a plain step's 38 when 0.9.0 measured it, and 0.9.1 took it to **10.6** by
+  giving the batched head the one lane head's unpack and chain depth. **The head
+  was six of the original thirteen and is now about three.** Halve what is left
+  of the marginal lane and the ceiling goes toward 4x — which would take the
+  scout's 1.80x with it, and would move free generation from a cost to a wash.
+  The head entry above is therefore still this entry's ceiling, and its second
+  route — not scoring 262144 rows to answer one question about one row — is the
+  one that has not been tried.
 
   **The order to finish it in.**
 
@@ -364,9 +383,7 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      undo is held byte for byte by `test_guess` on the synthetic checkpoint,
      whose four row window makes every block lap the ring; the bug the old entry
      warned about — trusting `fill_count` — was written deliberately and the
-     test fails on it. **Nothing below should start before the two entries above
-     are done**, because until then any proposer is being measured against a
-     ceiling of 2.2.
+     test fails on it.
 
   2. **Make the batched head cheap, which is the entry above and this one at
      once.** Two routes and they compose. The first is **done, 0.9.1**:
@@ -379,13 +396,25 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      **Measure the marginal lane again before writing a proposer**, which is
      what 0.9.1 did and what the next change here should do.
 
-  3. **Then the n-gram proposer**, which needs no second model and no training.
-     Hold it to **committed tokens per millisecond** against `igllm guess`'s
-     oracle and null rows, not to acceptance rate, and measure it on the
-     workloads that differ: free generation, where it will be weakest, and
-     summarising or editing where the output quotes the input and prompt lookup
-     is at its best. If it does not clear the break-even line on free
-     generation, ship it behind a flag rather than on by default, and say so.
+  3. **Done, 0.9.3: the n-gram proposer.** `app_scout` asks what followed the
+     last time this stream said what it has just said — a growing array of ids
+     and a backward scan, no second model and no training. It runs as a third
+     row of `igllm guess` beside the oracle and the null, so it is held to
+     committed tokens per millisecond against the bracket rather than to an
+     acceptance rate. On an answer that quotes its prompt it reaches **1.80x at
+     a block of eight against a ceiling of 2.11x** — 85% of everything a
+     proposer that is never wrong could give, at 95% of guesses accepted. On
+     free generation it draws nothing at all and costs 0.92 to 0.95 of the plain
+     rate, so **it ships behind a flag**, which is what this step said to do if
+     it did not clear break-even there.
+
+     Two things settled in passing and worth not re-deriving. The shortest reach
+     it will match on is **two, not one**: a single id matches somewhere in
+     almost any stream, so a reach of one draws nearly every round and is right
+     almost never — and dropping it is better on the quoting workload *and* on
+     free generation at once. And where the scout proposes nothing the round is
+     an ordinary `session_step` rather than a block of one lane, which is the
+     other half of why the flag is nearly free when it does not help.
 
   4. **Then sampling.** Everything above is greedy: `session_guess`'s
      verification is an argmax comparison. Speculative decoding under a
@@ -395,9 +424,19 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      says so, or it needs a proposer that carries a distribution. Decide which
      before plumbing it into `chat`.
 
-  5. **Then the plumbing**: a `--guess <k>` flag, the block path inside
-     `main_serve`, and the tally counting committed tokens against rounds so a
-     user can see what it bought.
+  5. **Done, 0.9.3: the plumbing.** `--guess <lanes>` on `chat` and `complete`,
+     the block path inside `main_serve`, and a tally line counting committed
+     tokens against rounds and accepted guesses against drawn. `session_guess`
+     now counts into the decode tally as well — the weights once and the cache
+     once a lane — so `decode tok/s` and `reads MiB a token` describe a guessed
+     run rather than reading zero.
+
+     **What is left of it, and it is where prompt lookup would be at its best:**
+     `--guess` is on the single-turn path and not inside `chat --loop`. A scout
+     there would want to carry across turns, because a follow-up question about
+     the same document quotes both the document and the previous answer. A
+     prompt whose last id is a soft token from a tower also takes the plain loop
+     whatever the flag says, because a block cannot carry an embedding row.
 
   **One thing to watch that 0.9.0 found and did not settle.** A batched pass
   answers every lane the same way — one lane off the calibrated grid puts the
@@ -635,5 +674,8 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | A cache a rejected block can be taken out of — the bound that makes it a fixed scratch, and the byte-for-byte test that holds it | 0.9.0 |
 | What speculative decoding is worth in this engine, bracketed by a proposer that is always right and one that is always wrong (answered: 2.2x at best, break-even near 40% acceptance, and the output head is half the marginal lane) | 0.9.0 |
 | The batched output head's unpack and its chain depth — the two things 0.8.15 and 0.8.16 gave the one lane path and could not reach the many lane one | 0.9.1 |
+| The n-gram proposer, measured against the bracket rather than by acceptance rate, on the two workloads that differ | 0.9.3 |
+| The `--guess` flag, the block path inside `main_serve`, and a block counted into the decode tally | 0.9.3 |
+| Whether a proposer should match on a single id (answered: no — better on both workloads at once without it) | 0.9.3 |
 | The mlp's accumulator chain, which the entry named as the first thing to check (refused: a wash on the one lane block, 15% worse on the batched one, and the plane is at 78% of this host's bare sweep) | 0.9.2 |
 | What a bare sweep of the reference host actually is, against the third host's number the mlp entry had been reasoning from | 0.9.2 |

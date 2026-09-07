@@ -5374,3 +5374,160 @@ now: the bit width (0.8.11), eight rows a block (0.8.11, 0.8.16), software
 prefetch (0.8.11), the page walk (0.8.12), and the accumulator chain at both
 widths (here). What is left is a plane at 78% of the host's memory, which is a
 smaller prize than the entry was written for, and the entry now says so.
+
+---
+
+## 0.9.3 — a proposer, and the flag that puts a block behind an ordinary turn
+
+### Scope
+
+Steps 3 and 5 of `TODO.md`'s speculative decoding entry. 0.9.0 built the verify
+side and measured what a block is worth; 0.9.1 halved the head's share of a
+lane. What was missing was something to propose the block and a way for a caller
+to ask for one.
+
+- **`app_scout`**, an n-gram proposer with no second model in it.
+- **an `n-gram` row in `igllm guess`**, beside the oracle and the null, so the
+  thing that ships is measured against the bracket rather than against itself.
+- **`--guess <lanes>`** on `chat` and `complete`, greedy only, with a line
+  after the run saying what it bought.
+
+Step 4 — sampling — is deliberately not here, and the flag says so rather than
+sampling from a distribution the block would have skewed.
+
+### The proposer
+
+`scout_draw` asks one question: **what did this token stream do the last time it
+was here?** Take the last few ids, find the most recent earlier place the same
+ids appeared, and propose what followed them there. The longest reach that
+matches anywhere wins, and among the places a reach matches, the latest wins.
+
+There is no model, no training and no second set of weights — the whole of it is
+a growing array of ids and a backward scan. A scan of the longest window this
+export has is a few hundred thousand `int32_t` comparisons, under a fifth of a
+millisecond against a round of a hundred, so the obvious loop is the right loop
+and an index would be complexity for nothing.
+
+A scout is told the prompt and then **only the tokens the model has agreed to**.
+One told about its own guesses would learn from them.
+
+### The shortest reach is two, and that is the whole of why the flag is cheap
+
+The obvious floor is one — match on a single id — and it is wrong on both
+workloads at once. A single id matches somewhere in almost any stream, so a
+reach of one is not a memory of anything: it draws nearly every round and is
+right almost never. At `--guess 4` on the shipped export, a prompt whose answer
+quotes it against free generation:
+
+| shortest reach | quoting | free |
+| --- | --- | --- |
+| 1 | 46.18 tok/s, 90% of 30 kept | 20.37 tok/s, 0% of 53 kept |
+| **2** | **47.28**, 100% of 27 | **24.80**, and it draws nothing at all |
+| 3 | 43.98, 96% of 27 | 25.33, and it draws nothing at all |
+
+Two is better than one on the workload the scout is for *and* on the one it is
+not, which is the rare shape of an argument that needs no trade-off: dropping
+the reach of one throws away guesses that were wrong anyway. Three costs the
+quoting case a fifteenth for very little on the other side.
+
+The second half of the same saving is in the caller. Where the scout proposes
+nothing the round is an ordinary `session_step` rather than a block of one lane,
+which is cheaper by the block path's bookkeeping. Together these two are what
+takes free generation from 0.74 of the plain rate to 0.95.
+
+### What it is worth
+
+`chat --heat 0 --serve 64` on the shipped export at four threads, best of three
+alternating runs each, and the emitted text is byte for byte the plain text in
+every case:
+
+| prompt | plain | `--guess 4` | |
+| --- | --- | --- | --- |
+| an answer that quotes the prompt | 26.02 tok/s | **47.73** | **1.83x** |
+| free generation | 27.63 tok/s | 26.32 | 0.95x |
+
+The tally line says why, and it is the two numbers that decide any proposer:
+
+```
+guess   3.08 tokens a round over 12 rounds, 100% of 27 guesses kept
+guess   1.00 tokens a round over 64 rounds, 0% of 0 guesses kept
+```
+
+### Against the bracket
+
+`TODO.md` asked for the scout to be held to **committed tokens per millisecond**
+against `igllm guess`'s oracle and null rows rather than to an acceptance rate,
+and on the two workloads that differ. It now runs as a third row of that table,
+with the same plain-step fallback the flag has, so what is measured is what
+ships. On the shipped export at four threads:
+
+Free generation, `guess --serve 32` on a three id prompt:
+
+```
+block  proposer    tok/s  ms a round  committed of drawn  vs plain  stream
+4      oracle      49.68       80.52       4.00     100%     1.93x  matches plain
+4      n-gram      24.41       40.97       1.00       0%     0.95x  matches plain
+4      null        13.08       76.47       1.00       0%     0.51x  matches plain
+8      oracle      59.40      134.69       8.00     100%     2.31x  matches plain
+8      n-gram      23.55       42.45       1.00       0%     0.92x  matches plain
+8      null         7.98      125.39       1.00       0%     0.31x  matches plain
+```
+
+An answer that quotes its prompt, `guess --serve 48`:
+
+```
+block  proposer    tok/s  ms a round  committed of drawn  vs plain  stream
+4      oracle      49.73       80.44       4.00     100%     2.02x  matches plain
+4      n-gram      41.78       63.83       2.67      94%     1.69x  matches plain
+4      null        12.74       78.52       1.00       0%     0.52x  matches plain
+8      oracle      52.08      153.61       8.00     100%     2.11x  matches plain
+8      n-gram      44.27       83.41       3.69      95%     1.80x  matches plain
+8      null         7.37      135.66       1.00       0%     0.30x  matches plain
+```
+
+**On the workload it is for, the scout reaches 1.80x against a ceiling of
+2.11x** — 85% of everything a proposer that is never wrong could give — at 95%
+of guesses accepted and 3.69 tokens a round. On the workload it is not for it
+draws nothing at all and costs the block path's accounting. Every row matches
+the plain stream, which is the check that the block path verified correctly and
+the undo left nothing behind.
+
+**So this is a flag and not a default, and `TODO.md` said to decide that on this
+measurement.** On text that quotes its input — summarising, editing, answering
+about a document, repairing code that is in the prompt — the continuation of a
+phrase is usually in the prompt already and the scout is right nearly every
+time. On free generation it has only what it has written itself, draws nothing,
+and costs a twentieth for the block path's accounting.
+
+### What the decode rate now counts
+
+A block was invisible to the tally: `session_step` counted tokens, seconds and
+bytes, and `session_guess` counted none of them, so a run under `--guess`
+reported `decode 0.00 tok/s`. It now counts into the same three, and the way it
+counts is the point of the whole feature: the **weights once**, because every
+lane of a batched product reads the same row, and the **cache once a lane**,
+because each lane attends over its own prefix. `session_guess_keep` adds the
+tokens actually committed. On the quoting run that is `reads 227.0 MiB a token`
+against a plain step's 766.3 — the same tokens, a third of the memory.
+
+The phase division stays off for a block, for the reason a prime pass is kept
+out of it: it is armed for a decode step, and a block runs the same graph
+several lanes wide.
+
+### Greedy only, said out loud
+
+`--guess` with a temperature is refused rather than silently ignored.
+Verification here is an argmax comparison, which is the right rule at zero and
+the wrong one above it — speculative decoding under a temperature needs the
+modified rejection rule, accept with probability `min(1, p/q)` and resample from
+the difference, and an n-gram proposer has no `q` to divide by. That is step 4
+of the entry and it needs a proposer that carries a distribution, or a decision
+that the feature is greedy-only forever.
+
+Two other honest limits. `--guess` is on the single-turn path — `chat`,
+`complete` — and not yet inside `chat --loop`, where a scout would want to
+carry across turns; that is where prompt lookup would be at its very best,
+because a follow-up question about the same document quotes both the document
+and the previous answer. And a prompt whose last id is a soft token from a
+tower takes the plain loop whatever the flag says, because a block cannot carry
+an embedding row.

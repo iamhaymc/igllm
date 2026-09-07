@@ -4135,6 +4135,113 @@ static void test_guess(void) {
   model_free(model);
 }
 
+/* The proposer, which has to be right about what it has seen and honest about
+ * what it has not.
+ *
+ * Every case here is a property of the rule rather than of a model: the longest
+ * reach wins, the latest match of that reach wins, a pattern with nothing after
+ * it proposes nothing, and a stream that has never said this before proposes
+ * nothing at all.  A scout that guessed anyway would cost a lane a round for
+ * the life of the run and never be caught by a correctness test, because
+ * `session_guess` verifies every guess — which is exactly why the honesty has
+ * to be checked here. */
+static void test_scout(void) {
+  app_scout *scout = NULL;
+  int32_t draw_list[8];
+  test_open("scout");
+  test_true(scout_open(&scout) == APP_OKAY && scout, "a scout opens");
+  if (!scout) return;
+
+  test_true(scout_draw(scout, draw_list, 4) == 0, "an empty scout proposes nothing");
+
+  {
+    /* `4 5 6` will appear twice once the tail below is added, and what followed
+     * it the first time is `7 8 9`. */
+    static const int32_t seed_list[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    test_true(scout_note(scout, seed_list, 9) == APP_OKAY, "a scout takes a stream");
+    test_true(scout_span(scout) == 9, "and says how much of it it holds");
+    test_true(scout_draw(scout, draw_list, 4) == 0,
+              "a stream that has not repeated itself proposes nothing");
+  }
+  {
+    static const int32_t more_list[3] = {4, 5, 6};
+    int draw_count;
+    test_true(scout_note(scout, more_list, 3) == APP_OKAY, "a scout takes more");
+    draw_count = scout_draw(scout, draw_list, 4);
+    /* `4 5 6` matched at index three, and what follows it there is `7 8 9` and
+     * then the `4` of the stream's own tail — which is a real continuation of
+     * that pattern and is proposed like any other. */
+    test_true(draw_count == 4 && draw_list[0] == 7 && draw_list[1] == 8 && draw_list[2] == 9 &&
+                  draw_list[3] == 4,
+              "and proposes what followed the last time the stream said this");
+    test_true(scout_draw(scout, draw_list, 2) == 2,
+              "a caller asking for fewer gets fewer");
+  }
+  {
+    static const int32_t tail_list[4] = {7, 8, 9, 1};
+    scout_clear(scout);
+    test_true(scout_span(scout) == 0, "a cleared scout holds nothing");
+    test_true(scout_note(scout, tail_list, 4) == APP_OKAY, "a cleared scout takes a stream");
+    test_true(scout_draw(scout, draw_list, 3) == 0,
+              "a tail with nothing repeated proposes nothing");
+  }
+  {
+    /* `9` appears three times and is followed by something different each
+     * time, but a single id is not a memory of anything and the scout does not
+     * match on one.  This is the case `SCOUT_REACH_LEAST` exists for, and it
+     * is where the free generation cost of `--guess` was. */
+    static const int32_t twice_list[10] = {5, 9, 3, 3, 4, 9, 7, 7, 7, 9};
+    scout_clear(scout);
+    scout_note(scout, twice_list, 10);
+    test_true(scout_draw(scout, draw_list, 2) == 0, "a single id is not a pattern");
+  }
+  {
+    /* `8 9` appears twice: at index five followed by `7`, and at index one
+     * followed by `3`.  The latest is the one that counts. */
+    static const int32_t twice_list[11] = {5, 8, 9, 3, 4, 8, 9, 7, 1, 8, 9};
+    int draw_count;
+    scout_clear(scout);
+    scout_note(scout, twice_list, 11);
+    draw_count = scout_draw(scout, draw_list, 2);
+    test_true(draw_count == 2 && draw_list[0] == 7 && draw_list[1] == 1,
+              "the latest match of a reach beats an earlier one");
+  }
+  {
+    /* A longer reach that matches beats a shorter one that also matches, and
+     * the two disagree here on purpose: `1 2 3` was followed by `5`, while the
+     * later `2 3` was followed by `6`. */
+    static const int32_t deep_list[13] = {7, 1, 2, 3, 5, 9, 2, 3, 6, 4, 1, 2, 3};
+    int draw_count;
+    scout_clear(scout);
+    scout_note(scout, deep_list, 13);
+    draw_count = scout_draw(scout, draw_list, 1);
+    test_true(draw_count == 1 && draw_list[0] == 5, "a longer reach beats a shorter one");
+  }
+  {
+    /* Growth past the first block of room, so the doubling is exercised and
+     * what it copied is still readable. */
+    int32_t *long_list = (int32_t *)mem_clear(sizeof(int32_t) * 5000);
+    int slot, draw_count;
+    int okay_flag;
+    scout_clear(scout);
+    for (slot = 0; slot < 5000; ++slot) long_list[slot] = (int32_t)(slot % 977);
+    test_true(scout_note(scout, long_list, 5000) == APP_OKAY, "a scout grows past its first room");
+    test_true(scout_span(scout) == 5000, "and holds all of it");
+    draw_count = scout_draw(scout, draw_list, 4);
+    okay_flag = draw_count == 4;
+    for (slot = 0; slot < draw_count; ++slot)
+      if (draw_list[slot] != long_list[5000 - 977 + slot]) okay_flag = 0;
+    test_true(okay_flag, "and proposes the cycle it has been repeating");
+    mem_free(long_list);
+  }
+  {
+    test_true(scout_draw(scout, draw_list, 0) == 0, "a caller wanting nothing gets nothing");
+    test_true(scout_draw(NULL, draw_list, 4) == 0, "and no scout proposes nothing");
+  }
+  scout_close(scout);
+  scout_close(NULL);
+}
+
 static void test_wing(void) {
   static const int32_t id_list[21] = {1, 7, 8, 9, 10, 11, 12, 13, 7,  8, 9,
                                       10, 11, 12, 13, 7, 8, 9, 10, 11, 12};
@@ -5603,6 +5710,7 @@ int main(void) {
   test_mel();
   test_wing();
   test_guess();
+  test_scout();
   test_tower();
   test_turn();
   test_keep();

@@ -269,6 +269,24 @@ const float *session_guess(app_session *session, const int32_t *id_list, int id_
 app_code     session_guess_keep(app_session *session, int keep_count);
 int          session_guess_span(const app_session *session);
 int          session_guess_limit(const app_session *session);
+
+/* The other half of speculative decoding: something to propose the block.
+ *
+ * A scout is an n-gram proposer over the stream it has been told about — the
+ * prompt, and then every token committed — and it carries no model, no training
+ * and no weights.  `scout_draw` answers with what followed the last time this
+ * stream said what it has just said, and with nothing when it has not been here
+ * before, which a caller answers with an ordinary step.
+ *
+ * Tell it only what the model has agreed to.  A scout told about its own
+ * guesses would learn from them. */
+typedef struct app_scout app_scout;
+app_code scout_open(app_scout **scout_out);
+void     scout_close(app_scout *scout);
+void     scout_clear(app_scout *scout);
+app_code scout_note(app_scout *scout, const int32_t *id_list, int id_count);
+int      scout_span(const app_scout *scout);
+int      scout_draw(const app_scout *scout, int32_t *id_out, int want_count);
 int32_t      session_pick(app_session *session, const float *logit_list, const app_taste *taste);
 int          session_fill(const app_session *session); /* tokens held in cache */
 
@@ -11492,9 +11510,14 @@ static void guess_rows_move(app_session *session, int lane_from, int lane_upto, 
  *
  * Nothing is committed until `session_guess_keep`, and until then the session
  * refuses every other call that would move it. */
+/* Declared here because the block below wants it and it is defined with the
+ * step's own accounting, further down. */
+static size_t session_cache_bytes(const app_session *session);
+
 const float *session_guess(app_session *session, const int32_t *id_list, int id_count) {
   const float *logit_list;
   model_form *form;
+  double guess_from;
   int layer_index;
   if (!session || !id_list || session->guess_count > 0) return NULL;
   if (id_count < 1 || id_count > KERN_LANE_LIMIT) return NULL;
@@ -11512,7 +11535,24 @@ const float *session_guess(app_session *session, const int32_t *id_list, int id_
   }
   guess_rows_move(session, 0, id_count, 1);
 
+  /* A block belongs in the decode tally rather than the prime one — its tokens
+   * are tokens a caller asked for, one at a time, and the rate a caller reads
+   * off is the rate the block path gave them.  What it reads is the weights
+   * **once**, because every lane of a batched product reads the same row, and
+   * the cache once a lane, because each lane attends over its own prefix.  That
+   * asymmetry is the whole of why a block can pay, so it is counted rather than
+   * smoothed: `session_guess_keep` divides these bytes by the tokens actually
+   * committed, and a block that commits one carries the whole sweep against it.
+   *
+   * The phase division stays off.  It is armed for a decode step, and a block
+   * runs the same graph several lanes wide; letting a block into those buckets
+   * would make both unreadable, for the reason a prime pass is kept out. */
+  session->tally.serve_bytes +=
+      model_decode_bytes(session->model) + session_cache_bytes(session) * (size_t)id_count;
+  guess_from = time_now();
   logit_list = session_pass(session, id_list, NULL, NULL, id_count, PASS_LOGIT_ALL);
+  session->tally.serve_seconds += time_now() - guess_from;
+  session->tally.memory_bytes = app_total_bytes;
   if (!logit_list) {
     /* The pass refused before it wrote anything, so there is nothing to undo
      * beyond the block this call opened. */
@@ -11535,11 +11575,152 @@ app_code session_guess_keep(app_session *session, int keep_count) {
       session->key_peak[layer_index] = session->guess_key_peak[layer_index];
       session->value_peak[layer_index] = session->guess_value_peak[layer_index];
     }
+  /* The tokens the round actually produced, which is what the decode rate and
+   * the bytes a token are divided by. */
+  session->tally.serve_tokens += (size_t)keep_count;
   session->fill_count = session->guess_from + keep_count;
   session->echo_count = session->guess_echo + keep_count;
   if (session->echo_count > session->echo_limit) session->echo_count = session->echo_limit;
   session->guess_count = 0;
   return APP_OKAY;
+}
+
+
+/* -- a proposer with no second model in it -------------------------------- */
+
+/* `session_guess` is the half of speculative decoding that has to be exact.
+ * This is the half that only has to be right often enough, and it is the
+ * cheapest thing that can be: **what did this token stream do the last time it
+ * was here?**
+ *
+ * A scout keeps the ids it has been told about — the prompt and then every
+ * token committed — and answers one question.  Take the last `reach` ids, find
+ * the most recent earlier place the same `reach` ids appeared, and propose what
+ * followed them there.  The longest reach that matches anywhere wins, and among
+ * the places a reach matches the latest wins, because a stream's own recent
+ * habits beat its older ones.
+ *
+ * That is prompt lookup rather than drafting, and its shape decides where it is
+ * worth anything.  On text that quotes its input — summarising, editing,
+ * answering about a document, repairing code that is in the prompt — the
+ * continuation of a phrase is usually in the prompt already and the scout is
+ * right most of the time.  On free generation it has only what it has written
+ * itself, and it is right rarely.  `igllm guess` measures exactly this rather
+ * than asserting it, and prints the scout beside the oracle and the null so the
+ * two ends of the bracket are on the same page as the thing being judged.
+ *
+ * There is no model here, no training, and no second set of weights: the whole
+ * of it is a growing array of ids and a backward scan.  A scan of the longest
+ * window this export has is a few hundred thousand comparisons of a `int32_t`,
+ * which is under a fifth of a millisecond against a round of a hundred, so the
+ * obvious loop is the right loop and an index would be complexity for nothing.
+ *
+ * `SCOUT_REACH` is the longest pattern it will match on.  Three is what the
+ * literature and llama.cpp's `ngram-cache` both settle near; longer patterns
+ * match more rarely without being much more reliable when they do, and the cost
+ * of a wrong guess is one lane of a block rather than a token.
+ *
+ * `SCOUT_REACH_LEAST` is the shortest, and it is **two rather than one** for a
+ * reason worth writing down, because one is the obvious floor and it is wrong
+ * on both workloads at once.  A single id matches somewhere in almost any
+ * stream, so a reach of one is not a memory of anything — it draws a guess
+ * nearly every round and is right almost never.  Measured on the shipped
+ * export at `--guess 4`, a prompt the answer quotes against free generation:
+ *
+ * | shortest reach | quoting | free |
+ * | --- | --- | --- |
+ * | 1 | 46.18 tok/s, 90% of 30 kept | 20.37 tok/s, 0% of 53 kept |
+ * | **2** | **47.28**, 100% of 27 | **24.80**, and it draws nothing at all |
+ * | 3 | 43.98, 96% of 27 | 25.33, and it draws nothing at all |
+ *
+ * Two is better than one on the workload the scout is for *and* on the one it
+ * is not, which is the rare shape of an argument that needs no trade-off:
+ * dropping the reach of one throws away guesses that were wrong anyway.  Three
+ * costs the quoting case a fifteenth for nothing much on the other side. */
+#define SCOUT_REACH       3
+#define SCOUT_REACH_LEAST 2
+
+struct app_scout {
+  int32_t *id_data;
+  int      id_count;
+  int      id_room;
+};
+
+app_code scout_open(app_scout **scout_out) {
+  app_scout *scout;
+  if (!scout_out) return APP_FAIL_ARGUMENT;
+  *scout_out = NULL;
+  scout = (app_scout *)mem_clear(sizeof(app_scout));
+  if (!scout) return APP_FAIL_MEMORY;
+  *scout_out = scout;
+  return APP_OKAY;
+}
+
+void scout_close(app_scout *scout) {
+  if (!scout) return;
+  mem_free(scout->id_data);
+  mem_free(scout);
+}
+
+/* Forgets the stream without giving up the room, which is what a new
+ * conversation on the same scout wants. */
+void scout_clear(app_scout *scout) {
+  if (scout) scout->id_count = 0;
+}
+
+/* Ids the stream has actually committed to, in order.  A caller that told a
+ * scout about a guess before the model agreed with it would be teaching it its
+ * own mistakes, so nothing here is told anything until it is kept. */
+app_code scout_note(app_scout *scout, const int32_t *id_list, int id_count) {
+  if (!scout || (!id_list && id_count > 0) || id_count < 0) return APP_FAIL_ARGUMENT;
+  if (id_count == 0) return APP_OKAY;
+  if (scout->id_count + id_count > scout->id_room) {
+    int room_want = scout->id_room ? scout->id_room : 1024;
+    int32_t *room;
+    while (room_want < scout->id_count + id_count) room_want *= 2;
+    room = (int32_t *)mem_clear(sizeof(int32_t) * (size_t)room_want);
+    if (!room) return APP_FAIL_MEMORY;
+    if (scout->id_count)
+      memcpy(room, scout->id_data, sizeof(int32_t) * (size_t)scout->id_count);
+    mem_free(scout->id_data);
+    scout->id_data = room;
+    scout->id_room = room_want;
+  }
+  memcpy(scout->id_data + scout->id_count, id_list, sizeof(int32_t) * (size_t)id_count);
+  scout->id_count += id_count;
+  return APP_OKAY;
+}
+
+int scout_span(const app_scout *scout) { return scout ? scout->id_count : 0; }
+
+/* What the scout thinks comes next, at most `want_count` ids, and how many of
+ * them it found.  Zero is an honest answer and the common one early on: a
+ * caller with nothing proposed takes an ordinary step.
+ *
+ * The scan is backwards from the second most recent position, so the first
+ * match a reach finds is the latest one.  A match is refused where it has
+ * nothing after it, because a pattern that matched only at the very end of the
+ * stream is the pattern itself and proposes nothing. */
+int scout_draw(const app_scout *scout, int32_t *id_out, int want_count) {
+  int reach, place;
+  if (!scout || !id_out || want_count < 1) return 0;
+  for (reach = SCOUT_REACH; reach >= SCOUT_REACH_LEAST; --reach) {
+    const int32_t *tail;
+    if (scout->id_count < reach + 1) continue;
+    tail = scout->id_data + scout->id_count - reach;
+    for (place = scout->id_count - reach - 1; place >= 0; --place) {
+      int slot, take_count;
+      for (slot = 0; slot < reach; ++slot)
+        if (scout->id_data[place + slot] != tail[slot]) break;
+      if (slot < reach) continue;
+      take_count = scout->id_count - (place + reach);
+      if (take_count < 1) continue;
+      if (take_count > want_count) take_count = want_count;
+      memcpy(id_out, scout->id_data + place + reach, sizeof(int32_t) * (size_t)take_count);
+      return take_count;
+    }
+  }
+  return 0;
 }
 
 /* Lanes of a block in flight, zero where none is. */
