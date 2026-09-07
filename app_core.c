@@ -3822,6 +3822,101 @@ static void kern_dot_real_many(const float *row_data, const float *act_data, int
                                            span_count);
 }
 
+/* How many lanes of the batch the fused two bit loop below takes at once.  The
+ * float path's four, for the reason `kern_dot_level_many` has four: the codes
+ * are decoded once per group of lanes rather than once per lane, so a wider
+ * group would share the decode further and a narrower one would not cover the
+ * multiply-add's latency. */
+#define KERN_CODE_LANE 4
+
+#if defined(APP_SIMD_AVX512)
+/* Several lanes against one row of two bit codes, with the codes never leaving
+ * the vector.
+ *
+ * This is the batch's answer to what `kern_row_code_rows` is for one lane.  The
+ * pair below it — `kern_code_spread` writing a group out into scratch and
+ * `kern_dot_real_many` reading that scratch back a block of lanes at a time —
+ * has neither of the two things the one lane path grew: 0.8.15's `vpermps`
+ * lookup, which is the cheapest unpack this file has, and 0.8.16's finding that
+ * a float row is bound by the depth of its own accumulator chain rather than by
+ * its ports.  A spread's scratch cannot have either.  It is written for the
+ * widest vector and read back at half of it, and the read is a load for every
+ * multiply-add where the fused loop has none.
+ *
+ * So the group is decoded where the one lane path decodes it — a broadcast, a
+ * variable shift and the lookup, three instructions for sixteen codes — and
+ * multiplied straight into each lane's pair of accumulators.  Four lanes with
+ * two accumulators each is eight chains covering one another, which is the same
+ * count 0.8.16 found sufficient; the decode is spent once for the four rather
+ * than once for each, and the scratch is gone from both sides.
+ *
+ * The sum is the batch's own and not the one lane path's.  A wider accumulator
+ * adds a lane's slots in a different order than a narrower one, so this agrees
+ * with `kern_row_code` to a float's tolerance rather than to its last bit,
+ * which is what a batch has always done here — `back_mat_mat matches a lane at
+ * a time` is the test that says so, and the block path's stream is held to the
+ * plain one by `igllm guess` end to end.
+ *
+ * Lanes past the last block of four go through `kern_dot_code` itself, which is
+ * the one lane path's own loop over the same span. */
+static void kern_dot_code_many(const uint8_t *code_row, int from_index, int span_count,
+                               const float *act_data, int act_stride, int lane_count,
+                               float *part_list) {
+  const __m512i step_wide =
+      _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+  const __m512 code_look = _mm512_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f, 0.0f,
+                                          1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f);
+  const uint8_t *byte_head = code_row + (size_t)from_index / 4u;
+  int lane_index = 0;
+  for (; lane_index + KERN_CODE_LANE <= lane_count; lane_index += KERN_CODE_LANE) {
+    const float *lane_list[KERN_CODE_LANE];
+    __m512 part_a[KERN_CODE_LANE], part_b[KERN_CODE_LANE];
+    int slot = 0, lane_slot;
+    for (lane_slot = 0; lane_slot < KERN_CODE_LANE; ++lane_slot) {
+      lane_list[lane_slot] =
+          act_data + (size_t)(lane_index + lane_slot) * (size_t)act_stride;
+      part_a[lane_slot] = _mm512_setzero_ps();
+      part_b[lane_slot] = _mm512_setzero_ps();
+    }
+    for (; slot + 32 <= span_count; slot += 32) {
+      uint32_t word_a, word_b;
+      __m512 code_a, code_b;
+      memcpy(&word_a, byte_head + slot / 4, 4);
+      memcpy(&word_b, byte_head + slot / 4 + 4, 4);
+      code_a = _mm512_permutexvar_ps(
+          _mm512_srlv_epi32(_mm512_set1_epi32((int)word_a), step_wide), code_look);
+      code_b = _mm512_permutexvar_ps(
+          _mm512_srlv_epi32(_mm512_set1_epi32((int)word_b), step_wide), code_look);
+      for (lane_slot = 0; lane_slot < KERN_CODE_LANE; ++lane_slot) {
+        part_a[lane_slot] =
+            _mm512_fmadd_ps(code_a, _mm512_loadu_ps(lane_list[lane_slot] + slot), part_a[lane_slot]);
+        part_b[lane_slot] = _mm512_fmadd_ps(
+            code_b, _mm512_loadu_ps(lane_list[lane_slot] + slot + 16), part_b[lane_slot]);
+      }
+    }
+    for (lane_slot = 0; lane_slot < KERN_CODE_LANE; ++lane_slot) {
+      const float *lane_data = lane_list[lane_slot];
+      float total = kern_zmm_total(_mm512_add_ps(part_a[lane_slot], part_b[lane_slot]));
+      int rest = slot;
+      for (; rest + 4 <= span_count; rest += 4) {
+        uint8_t quad = byte_head[rest / 4];
+        total += (float)(quad & 3u) * lane_data[rest];
+        total += (float)((quad >> 2) & 3u) * lane_data[rest + 1];
+        total += (float)((quad >> 4) & 3u) * lane_data[rest + 2];
+        total += (float)((quad >> 6) & 3u) * lane_data[rest + 3];
+      }
+      for (; rest < span_count; ++rest)
+        total += (float)((byte_head[rest / 4] >> (2 * (rest & 3))) & 3u) * lane_data[rest];
+      part_list[lane_index + lane_slot] += total;
+    }
+  }
+  for (; lane_index < lane_count; ++lane_index)
+    part_list[lane_index] +=
+        kern_dot_code(code_row, from_index, span_count,
+                      act_data + (size_t)lane_index * (size_t)act_stride, 2, 0);
+}
+#endif
+
 /* Codes are unpacked once per group and reused by every lane, so a batch pays
  * the decode cost of a single vector and turns the projection into a product. */
 static void kern_row_code_many(const plane *sheet, int row_index, const kern_job *job) {
@@ -3830,6 +3925,11 @@ static void kern_row_code_many(const plane *sheet, int row_index, const kern_job
   float part_list[KERN_LANE_LIMIT];
   float code_room[KERN_SPREAD_LIMIT];
   int lane_index, group_index;
+#if defined(APP_SIMD_AVX512)
+  /* Whether this plane's codes can stay in the vector, asked once a row rather
+   * than once a group: it is a question about the plane. */
+  int fuse_flag = kern_code_rows_ready(sheet);
+#endif
   for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
     job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] = 0.0f;
   for (group_index = 0; group_index < sheet->group_count; ++group_index) {
@@ -3841,15 +3941,21 @@ static void kern_row_code_many(const plane *sheet, int row_index, const kern_job
     int done_count = 0;
     if (span_count > sheet->group_size) span_count = sheet->group_size;
     for (lane_index = 0; lane_index < job->lane_count; ++lane_index) part_list[lane_index] = 0.0f;
-    while (done_count < span_count) {
-      int chunk_count = span_count - done_count;
-      if (chunk_count > KERN_SPREAD_LIMIT) chunk_count = KERN_SPREAD_LIMIT;
-      kern_code_spread(code_row, from_index + done_count, chunk_count, sheet->bit_count,
-                       sheet->code_flip, code_room);
-      kern_dot_real_many(code_room, job->act_data + from_index + done_count, job->act_stride,
-                         job->lane_count, chunk_count, part_list);
-      done_count += chunk_count;
-    }
+#if defined(APP_SIMD_AVX512)
+    if (fuse_flag)
+      kern_dot_code_many(code_row, from_index, span_count, job->act_data + from_index,
+                         job->act_stride, job->lane_count, part_list);
+    else
+#endif
+      while (done_count < span_count) {
+        int chunk_count = span_count - done_count;
+        if (chunk_count > KERN_SPREAD_LIMIT) chunk_count = KERN_SPREAD_LIMIT;
+        kern_code_spread(code_row, from_index + done_count, chunk_count, sheet->bit_count,
+                         sheet->code_flip, code_room);
+        kern_dot_real_many(code_room, job->act_data + from_index + done_count, job->act_stride,
+                           job->lane_count, chunk_count, part_list);
+        done_count += chunk_count;
+      }
     for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
       job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] +=
           gain_value * (part_list[lane_index] -

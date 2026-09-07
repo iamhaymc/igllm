@@ -5174,3 +5174,112 @@ Whether any real proposer reaches 40% on this model. That needs the proposer,
 and `TODO.md` now says which one to write and what to hold it to. What is
 settled is that the verify side works, that it costs 13 ms a lane, and that the
 best it can ever be worth in this engine's present shape is 2.2x.
+
+---
+
+## 0.9.1 — the batched output head, which had neither of the two things the one lane head grew
+
+### Scope
+
+`TODO.md`'s speculative decoding entry names this as the first thing to take
+after 0.9.0, and says why: **six of the thirteen milliseconds an extra
+speculative lane costs are the output head**, because verifying a position means
+asking what the model would have produced there, and that is the full 262144
+rows for every lane. 0.8.15 and 0.8.16 made the one lane head three times
+cheaper and neither of them reached the batched one.
+
+Nothing else is changed. Decode is one lane and is untouched; `logits` on the
+shipped export is byte for byte what it was, and a greedy `chat` and `complete`
+produce the same text.
+
+### What the batched head was doing
+
+The many lane float path is `kern_row_code_many` over two functions:
+`kern_code_spread`, which writes a group of a row out into a scratch buffer as
+floats, and `kern_dot_real_many`, which reads that scratch back four lanes at a
+time. Neither could ever have had what the one lane path was given.
+
+0.8.15 replaced the two bit mask and widening with one `vpermps` against a
+repeating table — the cheapest unpack in this file, and it exists only inside
+`kern_dot_code`'s loop. 0.8.16 found that a float row of the head is bound by
+the depth of its own accumulator chain rather than by its ports, and covered it
+by taking four rows at once so eight chains cover each other; that is inside
+`kern_row_code_rows`. A spread's scratch has no unpack to make cheaper — it has
+already been paid, at the width the spread was written for — and it turns every
+multiply-add on the other side into a load, because the codes have to be read
+back.
+
+Counted against the ports, on 32 columns and 4 lanes — 128 multiply-adds:
+
+| | loads | arithmetic |
+| --- | --- | --- |
+| spread, then `kern_dot_real_many` at 256 bits | 4 of the row, 16 of the lanes | 16 multiply-adds, plus the spread's own unpack and its stores |
+| `kern_dot_code_many` at 512 bits | 2 dwords, 8 of the lanes | 2 broadcasts, 2 shifts, 2 lookups, 8 multiply-adds |
+
+### What it does now
+
+`kern_dot_code_many` is the batch's answer to what `kern_row_code_rows` is for
+one lane. The group is decoded where the one lane path decodes it — a broadcast,
+a variable shift and the `vpermps` lookup, three instructions for sixteen codes
+— and multiplied straight into each lane's pair of accumulators, four lanes at a
+time. Eight chains, which is the count 0.8.16 found sufficient; the decode is
+spent once for the four lanes rather than once for each; and the scratch is gone
+from both sides of it.
+
+Two bits and AVX-512 only, guarded by `kern_code_rows_ready`, which is the
+predicate the one lane block already uses and is the same question. That is the
+width and the host the one plane on this path has. Lanes past the last block of
+four go through `kern_dot_code` itself, which is the one lane path's own loop.
+Every other width and every other backend takes the spread exactly as before.
+
+### The sum, and what holds it
+
+This agrees with `kern_row_code` to a float's tolerance and not to its last bit,
+because a 512 bit accumulator adds a lane's slots in a different order than a
+256 bit one. That is what a batch has always done here — `back_mat_mat matches a
+lane at a time` is the test that says so, at a tolerance rather than an equality,
+and the batched path has never been bit-identical to a sequence of single steps
+for the reason 0.9.0 wrote down. What is held exactly is the thing a caller
+sees: `igllm guess` prints `matches plain` on every block and every proposer,
+which is the block path's token stream against the plain one, end to end.
+
+### What it is worth
+
+Six runs alternating between the two builds, `igllm guess --serve 16` on the
+shipped export at four threads, the minimum of each. The host is a four core
+Xeon at 2.8 GHz with AVX-512 and VNNI, and it is not a quiet one: `plain` itself
+ranged 34.8 to 42.1 ms a token across the twelve runs, so the rows below are the
+minima and the spread is quoted rather than hidden.
+
+| block | proposer | rounds | before | after | |
+| --- | --- | --- | --- | --- | --- |
+| 2 | null | 16 | 64.86 | 57.90 | −10.7% |
+| 4 | null | 16 | 75.79 | 66.55 | −12.2% |
+| 8 | null | 16 | 124.36 | 108.69 | −12.6% |
+| 16 | null | 16 | 178.87 | 164.48 | −8.0% |
+| 4 | oracle | 4 | 82.15 | 72.32 | −12.0% |
+| 8 | oracle | 2 | 142.59 | 131.74 | −7.6% |
+
+The null rows are the ones to read. A null proposer commits one token a round,
+so `--serve 16` is sixteen rounds of it and the figure is a mean over them; an
+oracle at a block of sixteen is **one** round and is a single sample with a page
+fault in it, which is why that row is not quoted at all and why its numbers
+swung by a third between runs of the same binary.
+
+At a block of eight the round is **124.36 ms to 108.69**, and against a plain
+step of 37.26 that is a marginal lane of 12.44 ms falling to 10.56 — most of the
+way through the head's half of it, which is what the entry predicted.
+
+Prefill does not move, and that is expected rather than disappointing: a prefill
+pays the head once for its whole chunk. Eight alternating runs on a 228 id
+prompt, best of each: 78.23 tokens a second before and 80.76 after, which is
+noise in both directions.
+
+### What is left in it
+
+The batched head is now on the same unpack and the same chain depth as the one
+lane head, so the two routes still open in `TODO.md` are the two that were
+already there: the broadcast the loop still spends three of sixteen instructions
+on, and not scoring 262144 rows at all. The second of those is the larger, and
+0.9.0 gave it a second customer — greedy verification asks whether the proposed
+id is the argmax, which is a bound and not a distribution.
