@@ -3987,6 +3987,154 @@ static int test_wing_write(int moe_flag) {
 }
 
 /* A batched prefill has to land on exactly the same state as a token at a time. */
+/* Every byte a session holds that a block could have moved, folded into one
+ * number: the cache stores of every layer that owns one, the peaks beside them,
+ * and the two counters.  A dropped block has to leave all of it exactly as it
+ * was, and "exactly" is the point — a tolerance here would pass a cache that
+ * still held a rejected guess. */
+static uint64_t test_guess_mark(const app_session *session) {
+  const model_form *form = &session->model->form;
+  uint64_t mark = 1469598103934665603ull;
+  int layer_index;
+  size_t byte_index;
+  const uint8_t *walk;
+#define TEST_GUESS_FOLD(base, bytes)                                                             \
+  do {                                                                                           \
+    walk = (const uint8_t *)(base);                                                              \
+    for (byte_index = 0; byte_index < (size_t)(bytes); ++byte_index)                             \
+      mark = (mark ^ walk[byte_index]) * 1099511628211ull;                                       \
+  } while (0)
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    const layer_wing *wing = &session->model->wing_list[layer_index];
+    size_t slot_count;
+    if (wing->share_flag) continue;
+    slot_count = (size_t)wing->cache_span * (size_t)wing->kv_count * (size_t)wing->head_size;
+    TEST_GUESS_FOLD(session->key_store[layer_index],
+                    slot_count * cache_slot_bytes(session->key_grid[layer_index]));
+    TEST_GUESS_FOLD(session->value_store[layer_index],
+                    slot_count * cache_slot_bytes(session->value_grid[layer_index]));
+  }
+  TEST_GUESS_FOLD(session->key_peak, sizeof(float) * (size_t)form->layer_count);
+  TEST_GUESS_FOLD(session->value_peak, sizeof(float) * (size_t)form->layer_count);
+  TEST_GUESS_FOLD(&session->fill_count, sizeof(session->fill_count));
+  TEST_GUESS_FOLD(&session->echo_count, sizeof(session->echo_count));
+  TEST_GUESS_FOLD(session->echo_room, sizeof(int32_t) * (size_t)session->echo_count);
+#undef TEST_GUESS_FOLD
+  return mark;
+}
+
+/* The block path: every position's logits out of one pass, and a cache that can
+ * be put back.
+ *
+ * The synthetic checkpoint is the right place for this and not the shipped one,
+ * because its sliding window is **four**.  A block of four starting anywhere
+ * past the fourth token therefore overwrites every row of the ring, which is
+ * the case the undo exists for and the case a 512 row ring would never reach in
+ * a test of a few dozen tokens. */
+static void test_guess(void) {
+  static const int32_t seed_list[13] = {1, 7, 8, 9, 10, 11, 12, 13, 7, 8, 9, 10, 11};
+  static const int32_t want_list[4] = {12, 13, 7, 8};
+  app_setup setup = app_setup_plain();
+  app_model *model = NULL;
+  app_session *session = NULL;
+  app_session *other = NULL;
+  test_open("guess");
+  if (!test_wing_write(0)) { test_true(0, "the synthetic checkpoint is written"); return; }
+  if (model_load(test_yard_path, &setup, &model) != APP_OKAY || !model) {
+    test_true(0, "a checkpoint loads for the block path");
+    return;
+  }
+  if (session_open(model, &session) != APP_OKAY || !session ||
+      session_open(model, &other) != APP_OKAY || !other) {
+    test_true(0, "two sessions open for the block path");
+    model_free(model);
+    return;
+  }
+
+  test_true(session_guess_limit(session) == 4,
+            "a four row ring caps a block at four, whatever the lane limit is");
+  test_true(session_guess(session, want_list, 5) == NULL, "a block longer than the ring is refused");
+  test_true(session_guess_span(session) == 0, "a refused block leaves nothing in flight");
+
+  test_true(session_prime(session, seed_list, 13) == APP_OKAY, "a prompt primes");
+  session_step(session, seed_list[12]);
+  test_true(session_fill(session) > 4, "the prompt has lapped the sliding ring");
+
+  {
+    /* A block run and dropped, against the mark taken before it. */
+    uint64_t before_mark = test_guess_mark(session);
+    const float *logit_list = session_guess(session, want_list, 4);
+    test_true(logit_list != NULL, "a block of four runs");
+    test_true(session_guess_span(session) == 4, "the block is in flight");
+    test_true(session_step(session, want_list[0]) == NULL, "a step is refused mid-block");
+    test_true(session_prime(session, want_list, 2) == APP_FAIL_STATE, "a prime is refused mid-block");
+    test_true(session_guess_keep(session, 0) == APP_OKAY, "the block is dropped");
+    test_true(session_guess_span(session) == 0, "nothing is left in flight");
+    test_true(test_guess_mark(session) == before_mark,
+              "a dropped block leaves the session byte for byte where it was");
+  }
+
+  {
+    /* And a block run twice over: dropping it must leave the second run able to
+     * reach the same logits as the first, which is what a proposer that guesses
+     * twice depends on. */
+    float first_row[27];
+    const float *logit_list = session_guess(session, want_list, 4);
+    int slot, same_flag = 1;
+    if (logit_list) memcpy(first_row, logit_list + 3 * 27, sizeof(first_row));
+    session_guess_keep(session, 0);
+    logit_list = session_guess(session, want_list, 4);
+    if (logit_list)
+      for (slot = 0; slot < 27; ++slot)
+        if (logit_list[3 * 27 + slot] != first_row[slot]) same_flag = 0;
+    test_true(same_flag, "the same block run after a drop gives the same logits to the bit");
+    session_guess_keep(session, 0);
+  }
+
+  {
+    /* A partial keep against the ordinary path: keeping two lanes of a block has
+     * to leave the session where feeding those two ids one at a time would.
+     *
+     * The cache rows are held to a tolerance rather than to the bit, and the
+     * reason is worth stating because it decides what speculative decoding can
+     * claim here.  A batched pass answers every lane the same way — one lane
+     * off the calibrated grid puts the whole batch on the float path — while a
+     * lane stepped alone is judged alone, so the two can take different kernels
+     * and sum in a different order.  The logits agree to a tolerance, not to
+     * the bit, and a proposer's accepted token is therefore the token the model
+     * would have produced rather than the same arithmetic that would have
+     * produced it. */
+    const float *block_row;
+    float step_row[27];
+    const float *step_list;
+    int slot, okay_flag = 1, keep_count = 2;
+    session_reset(other);
+    test_true(session_prime(other, seed_list, 13) == APP_OKAY, "the second session primes");
+    session_step(other, seed_list[12]);
+
+    block_row = session_guess(session, want_list, 4);
+    if (block_row) memcpy(step_row, block_row + (size_t)(keep_count - 1) * 27, sizeof(step_row));
+    test_true(session_guess_keep(session, keep_count) == APP_OKAY, "two lanes are kept");
+    test_true(session_fill(session) == session_fill(other) + keep_count,
+              "a kept block advances the fill by what it kept");
+
+    for (slot = 0; slot < keep_count; ++slot) step_list = session_step(other, want_list[slot]);
+    if (step_list)
+      for (slot = 0; slot < 27; ++slot) {
+        float gap = step_list[slot] - step_row[slot];
+        if (gap < 0.0f) gap = -gap;
+        if (gap > 1e-3f) okay_flag = 0;
+      }
+    test_true(okay_flag, "a block's row agrees with the same tokens stepped one at a time");
+    test_true(session_fill(session) == session_fill(other),
+              "and leaves the two sessions holding the same count");
+  }
+
+  session_close(other);
+  session_close(session);
+  model_free(model);
+}
+
 static void test_wing(void) {
   static const int32_t id_list[21] = {1, 7, 8, 9, 10, 11, 12, 13, 7,  8, 9,
                                       10, 11, 12, 13, 7, 8, 9, 10, 11, 12};
@@ -5454,6 +5602,7 @@ int main(void) {
   test_wave();
   test_mel();
   test_wing();
+  test_guess();
   test_tower();
   test_turn();
   test_keep();

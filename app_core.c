@@ -252,6 +252,23 @@ app_code     session_prime_media(app_session *session, const int32_t *id_list, i
                                  const float *state_list, const uint8_t *state_flag);
 const float *session_step(app_session *session, int32_t id_value);
 const float *session_step_state(app_session *session, int32_t id_value, const float *state_data);
+
+/* A block of ids run in one pass, with every position's logits, and undone
+ * where the caller does not want it.
+ *
+ * `session_guess` runs `id_count` ids — at most `KERN_LANE_LIMIT` — and hands
+ * back one row of the vocabulary a lane, row `i` being what the model puts
+ * after `id_list[i]`.  The cache carries the block, and no other call may touch
+ * the session, until `session_guess_keep` says how many of the lanes to keep:
+ * zero puts the session back exactly where it was, and anything less than the
+ * whole block undoes the rest of it.
+ *
+ * This is the verify side of speculative decoding, and it is useful on its own
+ * to anything that wants to score a branch and abandon it. */
+const float *session_guess(app_session *session, const int32_t *id_list, int id_count);
+app_code     session_guess_keep(app_session *session, int keep_count);
+int          session_guess_span(const app_session *session);
+int          session_guess_limit(const app_session *session);
 int32_t      session_pick(app_session *session, const float *logit_list, const app_taste *taste);
 int          session_fill(const app_session *session); /* tokens held in cache */
 
@@ -10165,6 +10182,28 @@ struct app_session {
   float *ple_seed;
   float *ple_room;
   float *logit_room;
+  /* Rows of the vocabulary `logit_room` can hold, and what a block of ids in
+   * flight is holding back.  Ordinary decode wants one row and gets one; the
+   * block path below wants one a lane and grows the room the first time it is
+   * asked, because a row of this vocabulary is a megabyte and a session that
+   * never guesses should not carry sixteen of them. */
+  int    logit_lane;
+  int    logit_span; /* rows the last pass actually wrote */
+
+  /* A block of ids run into the cache that the caller has not yet decided to
+   * keep.  `guess_room` holds the cached rows the block is about to overwrite,
+   * one run of `KERN_LANE_LIMIT` a side a layer, so undoing the block is a copy
+   * back rather than a replay.  `guess_count` above zero says a block is in
+   * flight and nothing else may touch the session until it is resolved. */
+  uint8_t *guess_room;
+  size_t  *guess_at;    /* byte offset into `guess_room`, key then value a layer */
+  size_t  *guess_step;  /* bytes one saved row occupies, key then value a layer */
+  float   *guess_key_peak;
+  float   *guess_value_peak;
+  int      guess_lane;  /* lanes `guess_room` was sized for, zero where unbuilt */
+  int      guess_count; /* lanes in flight, zero where none */
+  int      guess_from;  /* `fill_count` before the block */
+  int      guess_echo;  /* `echo_count` before the block */
   float *route_room;    /* router probabilities, one per expert */
   float *expert_room;   /* stacked gate and rise activations of one expert */
   float *expert_drop;   /* one expert's contribution, state width */
@@ -10255,6 +10294,11 @@ static void session_free_rooms(app_session *session) {
   mem_free(session->ple_seed);
   mem_free(session->ple_room);
   mem_free(session->logit_room);
+  mem_free(session->guess_room);
+  mem_free(session->guess_at);
+  mem_free(session->guess_step);
+  mem_free(session->guess_key_peak);
+  mem_free(session->guess_value_peak);
   mem_free(session->route_room);
   mem_free(session->expert_room);
   mem_free(session->expert_drop);
@@ -11050,6 +11094,11 @@ static void session_cap_band(void *state, int slice_index, int slice_count) {
 
 /* A batch of tokens through the whole graph.  Logits are produced for the last
  * token only, and skipped entirely when the caller is still filling the prompt. */
+/* What `session_pass` is asked to leave in `logit_room`. */
+#define PASS_LOGIT_NONE 0
+#define PASS_LOGIT_LAST 1 /* the last lane only, which is what a step wants */
+#define PASS_LOGIT_ALL  2 /* one row a lane, which is what verifying a block wants */
+
 static const float *session_pass(app_session *session, const int32_t *id_list,
                                  const float *state_list, const uint8_t *state_flag, int lane_count,
                                  int want_logits) {
@@ -11122,13 +11171,32 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
     if (session->echo_count < session->echo_limit)
       session->echo_room[session->echo_count++] = id_list[lane_index];
 
-  if (!want_logits) return NULL;
-  phase_turn(session, APP_PHASE_HEAD);
-  model->desk.norm_rms(&model->desk,
-                       session->state_room + (size_t)(lane_count - 1) * session->state_stride,
-                       model->final_norm, form->state_size, form->norm_eps, session->scrap_room);
-  TRACE_LANE("final", -1, place_from + lane_count - 1, session->scrap_room, form->state_size);
-  session_lift(session, &model->head_sheet, session->scrap_room, session->logit_room);
+  if (want_logits == PASS_LOGIT_NONE) return NULL;
+  /* One lane's logits or every lane's, and the head runs once either way: the
+   * batched path decodes a row of codes once and reads it with every lane, so
+   * verifying a block of sixteen costs the sweep once rather than sixteen
+   * times.  That sharing is the whole reason a block is cheaper than the
+   * tokens in it taken one at a time, and it is why this is a lane count
+   * handed to `session_lift_many` rather than a loop around `session_lift`. */
+  {
+    int logit_from = want_logits == PASS_LOGIT_ALL ? 0 : lane_count - 1;
+    int logit_span = lane_count - logit_from;
+    int logit_slot;
+    if (logit_span > session->logit_lane) return NULL;
+    phase_turn(session, APP_PHASE_HEAD);
+    for (logit_slot = 0; logit_slot < logit_span; ++logit_slot)
+      model->desk.norm_rms(
+          &model->desk,
+          session->state_room + (size_t)(logit_from + logit_slot) * session->state_stride,
+          model->final_norm, form->state_size, form->norm_eps,
+          session->scrap_room + (size_t)logit_slot * session->state_stride);
+    TRACE_LANE("final", -1, place_from + lane_count - 1,
+               session->scrap_room + (size_t)(logit_span - 1) * session->state_stride,
+               form->state_size);
+    session_lift_many(session, &model->head_sheet, session->scrap_room, session->state_stride,
+                      logit_span, session->logit_room, model->head_sheet.row_count);
+    session->logit_span = logit_span;
+  }
   if (form->logit_cap > 0.0f) {
     /* A `tanhf` for each of 262144 logits, and the timer puts it at a
      * fourteenth of a decode step on the one thread that gets here.  It is an
@@ -11146,15 +11214,238 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
      * 262144 times: `RESEARCH.md`'s series, which 0.8.6 already put in the
      * picture's softmax, or capping only the rows the sampler will look at. */
     cap_job job;
+    int cap_slot;
     phase_turn(session, APP_PHASE_CAP);
-    job.logit_list = session->logit_room;
-    job.value_count = model->head_sheet.row_count;
-    job.cap_value = form->logit_cap;
-    session_cap_band(&job, 0, 1);
+    for (cap_slot = 0; cap_slot < session->logit_span; ++cap_slot) {
+      job.logit_list =
+          session->logit_room + (size_t)cap_slot * (size_t)model->head_sheet.row_count;
+      job.value_count = model->head_sheet.row_count;
+      job.cap_value = form->logit_cap;
+      session_cap_band(&job, 0, 1);
+    }
   }
   TRACE_LANE("logits", -1, place_from + lane_count - 1, session->logit_room,
              model->head_sheet.row_count);
   return session->logit_room;
+}
+
+/* -- a block of ids the caller has not committed to ----------------------- */
+
+/* Speculative decoding needs two things this engine did not have: every
+ * position's logits out of one pass, which `PASS_LOGIT_ALL` above is, and a way
+ * to put the cache back where it was when the guesses turn out wrong.  This is
+ * the second, and it is the harder of the two here.
+ *
+ * A plain transformer appends its cache, so undoing a block is a counter.  This
+ * one does not.  Twenty-eight of the thirty-five layers of this export are
+ * sliding-window layers holding a ring of `slide_span` rows, and a block
+ * written past the ring's length has overwritten rows an earlier position still
+ * needs — so restoring `fill_count` would leave the ring holding the guesses
+ * and the model reading them.  Seven layers are full-attention and would be
+ * happy with the counter; some layers read another layer's cache and write
+ * none of their own, and unwinding those twice would corrupt the layer that
+ * owns the rows.
+ *
+ * What makes it tractable is that a block is at most `KERN_LANE_LIMIT` rows and
+ * a ring is at least `slide_span`, so a block never laps itself and the rows it
+ * will overwrite are known before it runs.  Saving them is a bounded copy —
+ * sixteen rows a side a layer — rather than a copy of the cache, and undoing is
+ * the same copy back.  `guess_step` is what one such row costs, which is a byte
+ * a value where the layer holds its cache quantized and a float where it does
+ * not.
+ *
+ * The peaks are a high-water mark rather than an input to any sum, so a partial
+ * keep leaves them alone: they may then carry a rejected lane's magnitude,
+ * which overstates what the cache was asked to hold, and overstating is the
+ * safe direction for a diagnostic about whether a calibrated range suffices.
+ * A full undo restores them, because a full undo has to leave nothing behind. */
+
+/* The largest block this session can undo: a block whose lanes all land on
+ * different slots of every ring.  A block as long as the shortest ring is the
+ * most that can be saved, because a longer one would lap the ring and the rows
+ * it overwrote first would already be its own.
+ *
+ * On this export the shortest ring is `slide_span`, 512, so the lane limit is
+ * what binds and this never refuses.  On a checkpoint with a window of four it
+ * is four, and refusing is the right answer rather than saving a ring twice. */
+static int guess_lane_room(const app_session *session) {
+  const model_form *form = &session->model->form;
+  int layer_index, span_least = KERN_LANE_LIMIT;
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    const layer_wing *wing = &session->model->wing_list[layer_index];
+    if (wing->share_flag) continue;
+    if (wing->cache_span < span_least) span_least = wing->cache_span;
+  }
+  return span_least;
+}
+
+/* Bytes one cached row of a layer's key or value side occupies. */
+static size_t guess_row_bytes(const app_session *session, int layer_index, int value_side) {
+  const layer_wing *wing = &session->model->wing_list[layer_index];
+  const float *grid =
+      (value_side ? session->value_grid : session->key_grid)[layer_index];
+  if (wing->share_flag) return 0;
+  return (size_t)wing->kv_count * (size_t)wing->head_size * cache_slot_bytes(grid);
+}
+
+/* The undo room and the logit rows, built the first time a caller guesses.
+ *
+ * Neither is small — sixteen rows of this vocabulary is sixteen megabytes — and
+ * a session that only ever steps needs neither, so they are not part of what
+ * `session_open` lays down. */
+static app_code session_guess_room(app_session *session, int lane_want) {
+  model_form *form = &session->model->form;
+  int vocab_count = session->model->head_sheet.row_count;
+  size_t total_bytes = 0;
+  int layer_index;
+  if (lane_want < 1 || lane_want > KERN_LANE_LIMIT) return APP_FAIL_ARGUMENT;
+
+  if (lane_want > session->logit_lane) {
+    float *room = (float *)mem_clear(sizeof(float) * (size_t)vocab_count * (size_t)lane_want);
+    if (!room) return APP_FAIL_MEMORY;
+    mem_free(session->logit_room);
+    session->logit_room = room;
+    session->logit_lane = lane_want;
+    session->logit_span = 0;
+  }
+  if (session->guess_lane >= lane_want) return APP_OKAY;
+
+  mem_free(session->guess_room);
+  mem_free(session->guess_at);
+  mem_free(session->guess_step);
+  mem_free(session->guess_key_peak);
+  mem_free(session->guess_value_peak);
+  session->guess_room = NULL;
+  session->guess_lane = 0;
+  session->guess_at = (size_t *)mem_clear(sizeof(size_t) * 2u * (size_t)form->layer_count);
+  session->guess_step = (size_t *)mem_clear(sizeof(size_t) * 2u * (size_t)form->layer_count);
+  session->guess_key_peak = (float *)mem_clear(sizeof(float) * (size_t)form->layer_count);
+  session->guess_value_peak = (float *)mem_clear(sizeof(float) * (size_t)form->layer_count);
+  if (!session->guess_at || !session->guess_step || !session->guess_key_peak ||
+      !session->guess_value_peak)
+    return APP_FAIL_MEMORY;
+
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    int side_index;
+    for (side_index = 0; side_index < 2; ++side_index) {
+      size_t row_bytes = guess_row_bytes(session, layer_index, side_index);
+      session->guess_step[2 * layer_index + side_index] = row_bytes;
+      session->guess_at[2 * layer_index + side_index] = total_bytes;
+      total_bytes += row_bytes * (size_t)lane_want;
+    }
+  }
+  if (total_bytes == 0) total_bytes = 1;
+  session->guess_room = (uint8_t *)mem_clear(total_bytes);
+  if (!session->guess_room) return APP_FAIL_MEMORY;
+  session->guess_lane = lane_want;
+  return APP_OKAY;
+}
+
+/* One side of one layer: where the block's row `lane_index` lives in the store,
+ * and where its copy lives in the undo room. */
+static void guess_row_pair(app_session *session, int layer_index, int side_index, int place_index,
+                           int lane_index, uint8_t **store_out, uint8_t **saved_out) {
+  const layer_wing *wing = &session->model->wing_list[layer_index];
+  size_t row_bytes = session->guess_step[2 * layer_index + side_index];
+  void *base_data =
+      (side_index ? session->value_store : session->key_store)[layer_index];
+  *store_out = (uint8_t *)base_data + (size_t)(place_index % wing->cache_span) * row_bytes;
+  *saved_out = session->guess_room + session->guess_at[2 * layer_index + side_index] +
+               (size_t)lane_index * row_bytes;
+}
+
+/* Copies the rows a block is about to overwrite out of the cache, or the other
+ * way round.  `lane_from` is the first lane to move, so undoing a block that
+ * kept its first two lanes moves lanes two upward and leaves the rest. */
+static void guess_rows_move(app_session *session, int lane_from, int lane_upto, int save_flag) {
+  model_form *form = &session->model->form;
+  int layer_index, lane_index, side_index;
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    if (session->model->wing_list[layer_index].share_flag) continue;
+    for (side_index = 0; side_index < 2; ++side_index) {
+      size_t row_bytes = session->guess_step[2 * layer_index + side_index];
+      if (row_bytes == 0) continue;
+      for (lane_index = lane_from; lane_index < lane_upto; ++lane_index) {
+        uint8_t *store_row;
+        uint8_t *saved_row;
+        guess_row_pair(session, layer_index, side_index, session->guess_from + lane_index,
+                       lane_index, &store_row, &saved_row);
+        if (save_flag)
+          memcpy(saved_row, store_row, row_bytes);
+        else
+          memcpy(store_row, saved_row, row_bytes);
+      }
+    }
+  }
+}
+
+/* Runs a block of ids in one pass and hands back one row of logits a lane, with
+ * the cache left in a state the caller can undo.  Row `i` is the distribution
+ * the model puts on the token after `id_list[i]`, so a proposer that guessed
+ * `id_list[1 .. id_count - 1]` checks its guesses against rows `0` upward.
+ *
+ * Nothing is committed until `session_guess_keep`, and until then the session
+ * refuses every other call that would move it. */
+const float *session_guess(app_session *session, const int32_t *id_list, int id_count) {
+  const float *logit_list;
+  model_form *form;
+  int layer_index;
+  if (!session || !id_list || session->guess_count > 0) return NULL;
+  if (id_count < 1 || id_count > KERN_LANE_LIMIT) return NULL;
+  if (id_count > guess_lane_room(session)) return NULL;
+  form = &session->model->form;
+  if (session->fill_count + id_count > form->window_limit) return NULL;
+  if (session_guess_room(session, id_count) != APP_OKAY) return NULL;
+
+  session->guess_from = session->fill_count;
+  session->guess_echo = session->echo_count;
+  session->guess_count = id_count;
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    session->guess_key_peak[layer_index] = session->key_peak[layer_index];
+    session->guess_value_peak[layer_index] = session->value_peak[layer_index];
+  }
+  guess_rows_move(session, 0, id_count, 1);
+
+  logit_list = session_pass(session, id_list, NULL, NULL, id_count, PASS_LOGIT_ALL);
+  if (!logit_list) {
+    /* The pass refused before it wrote anything, so there is nothing to undo
+     * beyond the block this call opened. */
+    session->guess_count = 0;
+    return NULL;
+  }
+  return logit_list;
+}
+
+/* Keeps the first `keep_count` lanes of the block in flight and puts the cache
+ * back where it was for the rest.  Zero undoes the whole block, which leaves
+ * the session bit-identical to one that never ran it. */
+app_code session_guess_keep(app_session *session, int keep_count) {
+  int layer_index;
+  if (!session || session->guess_count <= 0) return APP_FAIL_STATE;
+  if (keep_count < 0 || keep_count > session->guess_count) return APP_FAIL_ARGUMENT;
+  guess_rows_move(session, keep_count, session->guess_count, 0);
+  if (keep_count == 0)
+    for (layer_index = 0; layer_index < session->model->form.layer_count; ++layer_index) {
+      session->key_peak[layer_index] = session->guess_key_peak[layer_index];
+      session->value_peak[layer_index] = session->guess_value_peak[layer_index];
+    }
+  session->fill_count = session->guess_from + keep_count;
+  session->echo_count = session->guess_echo + keep_count;
+  if (session->echo_count > session->echo_limit) session->echo_count = session->echo_limit;
+  session->guess_count = 0;
+  return APP_OKAY;
+}
+
+/* Lanes of a block in flight, zero where none is. */
+int session_guess_span(const app_session *session) { return session ? session->guess_count : 0; }
+
+/* The longest block this session will accept, which is the lane limit on any
+ * checkpoint whose window is at least that. */
+int session_guess_limit(const app_session *session) {
+  int span_least;
+  if (!session) return 0;
+  span_least = guess_lane_room(session);
+  return span_least < KERN_LANE_LIMIT ? span_least : KERN_LANE_LIMIT;
 }
 
 static uint64_t draw_next(uint64_t *state) {
@@ -11907,6 +12198,7 @@ app_code session_save(const app_session *session, const char *path_text, uint64_
   int layer_index;
   app_code code = APP_OKAY;
   if (!session || !path_text) return APP_FAIL_ARGUMENT;
+  if (session->guess_count > 0) return APP_FAIL_STATE;
   if (kind_mark != APP_KEEP_PROMPT && kind_mark != APP_KEEP_TALK) return APP_FAIL_ARGUMENT;
   handle = fopen(path_text, "wb");
   if (!handle) return APP_FAIL_MISSING;
@@ -11959,6 +12251,7 @@ app_code session_load(app_session *session, const char *path_text, uint64_t *sta
   int layer_index, fill_count, echo_count;
   app_code code = APP_OKAY;
   if (!session || !path_text) return APP_FAIL_ARGUMENT;
+  if (session->guess_count > 0) return APP_FAIL_STATE;
   if (stamp_out) *stamp_out = 0;
   if (kind_out) *kind_out = APP_KEEP_PROMPT;
   handle = fopen(path_text, "rb");
@@ -12178,6 +12471,8 @@ app_code session_open(app_model *model, app_session **session_out) {
   session->sin_room = (float *)mem_clear(sizeof(float) * (size_t)half_peak);
   session->ple_seed = LANE_ROOM(session->ple_stride);
   session->ple_room = LANE_ROOM(session->ple_stride);
+  session->logit_lane = 1;
+  session->logit_span = 0;
   session->logit_room = (float *)mem_clear(sizeof(float) * (size_t)model->head_sheet.row_count);
   if (form->moe_flag) {
     session->route_room = (float *)mem_clear(sizeof(float) * (size_t)form->expert_count);
@@ -12220,6 +12515,9 @@ void session_close(app_session *session) {
 void session_reset(app_session *session) {
   int layer_index;
   if (!session) return;
+  /* A block in flight is dropped rather than refused: a reset is the caller
+   * saying it wants nothing this session holds, and that includes the guess. */
+  session->guess_count = 0;
   session->fill_count = 0;
   session->echo_count = 0;
   memset(&session->tally, 0, sizeof(session->tally));
@@ -12286,6 +12584,7 @@ app_code session_prime_media(app_session *session, const int32_t *id_list, int i
   int id_index;
   int state_size;
   if (!session || !id_list || id_count < 1) return APP_FAIL_ARGUMENT;
+  if (session->guess_count > 0) return APP_FAIL_STATE;
   if (session->fill_count + id_count > session->model->form.window_limit) return APP_FAIL_STATE;
   state_size = session->model->form.state_size;
   for (id_index = 0; id_index < id_count; ++id_index)
@@ -12313,7 +12612,7 @@ const float *session_step_state(app_session *session, int32_t id_value, const fl
   const float *logit_list;
   uint8_t state_mark = state_data ? 1u : 0u;
   double from_time;
-  if (!session) return NULL;
+  if (!session || session->guess_count > 0) return NULL;
   /* Counted before the clock starts, so the accounting is not in the timing it
    * is there to divide. */
   session->tally.serve_bytes += model_decode_bytes(session->model) + session_cache_bytes(session);

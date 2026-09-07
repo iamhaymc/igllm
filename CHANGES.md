@@ -5027,3 +5027,150 @@ threads, wide build:
 | mlp gate | 0.407 | 0.251 | -38.3% |
 
 Same weights, same answer to the byte.
+
+---
+
+## 0.9.0 — the verify side of speculative decoding, and what it is worth
+
+### Scope
+
+The three pieces of `TODO.md`'s speculative decoding entry that can be built and
+measured without a proposer, and which together decide whether the rest of it is
+worth building:
+
+1. **Every position's logits out of one pass**, which the engine did not have.
+2. **A cache that can be put back**, which is the entry's named correctness trap.
+3. **A measurement that brackets the payoff**, using two proposers that could
+   never be written for real work — one always right, one always wrong.
+
+No proposer is written here, and none should be until the number in the last
+section is looked at.
+
+### All-position logits
+
+`session_pass` computed the head for the last lane only, because a decode step
+wants one distribution and a prefill wants none until its final chunk.
+`PASS_LOGIT_ALL` runs it for every lane instead — normalising each lane into its
+own row of `scrap_room` and handing the whole block to `session_lift_many`, so
+the head is one batched product rather than a loop of single ones. That matters
+more than it looks: the batched code path decodes a row of the head once and
+reads it with every lane, so a block of eight sweeps the head's 96 MiB once and
+not eight times.
+
+`logit_room` grows from one row to one a lane the first time a caller asks. It
+is not grown at `session_open` because a row of this vocabulary is a megabyte
+and a session that never guesses should not carry sixteen of them.
+
+Ordinary decode is untouched: `logits` on the shipped export is byte for byte
+what it was.
+
+### The cache that can be put back
+
+`TODO.md` called this the correctness trap and it was right about why. A plain
+transformer appends its cache, so undoing a block is a counter. This one does
+not: **twenty-eight of thirty-five layers are sliding-window layers holding a
+ring of `slide_span` rows**, and a block written past the ring's length has
+overwritten rows an earlier position still needs. Seven layers are full
+attention and would be happy with the counter. Some layers read another layer's
+cache and own none, and unwinding those twice would corrupt the layer that does.
+
+What makes it tractable is a bound the entry did not name: **a block is at most
+`KERN_LANE_LIMIT` rows and a ring is at least `slide_span`, so a block never
+laps itself** and the rows it will overwrite are known before it runs. Saving
+them is sixteen rows a side a layer — a fixed scratch — and undoing is the same
+copy back. `session_guess_limit` reports the bound and `session_guess` refuses a
+block that would exceed it, which is what a checkpoint with a four row window
+needs and what this export never reaches.
+
+The API is three calls. `session_guess` runs a block and hands back a row of the
+vocabulary a lane; nothing else may touch the session until `session_guess_keep`
+says how many lanes to keep; zero puts the session back exactly where it was.
+
+The peaks are the one thing not restored on a partial keep. They are a
+high-water mark rather than an input to any sum, so a kept block may leave one
+carrying a rejected lane's magnitude — an overstatement of what the cache was
+asked to hold, which is the safe direction for a diagnostic about whether a
+calibrated range suffices. A full undo restores them, because a full undo has to
+leave nothing behind.
+
+### The test, and the bug it was checked against
+
+`test_guess` runs on the **synthetic** checkpoint and not the shipped one, for a
+specific reason: its sliding window is **four**. A block of four therefore
+overwrites every row of the ring, which is the case the undo exists for and the
+case a 512 row ring would not reach in a test of a few dozen tokens.
+
+The assertion is a hash of everything a block could have moved — every layer's
+key and value store, the peaks, both counters and the id history — taken before
+the block and after it is dropped. Byte for byte, not to a tolerance: a
+tolerance here would pass a cache that still held a rejected guess.
+
+It was checked by writing the bug the entry warns about. Replacing the row
+restore with nothing — trusting `fill_count`, as a plain transformer could —
+makes the suite fail on exactly that assertion. The test also covers the refusal
+of a block longer than the ring, that a step and a prime are refused mid-block,
+and that the same block run twice across a drop gives the same logits to the
+bit.
+
+### What a block is worth, bracketed
+
+`igllm guess` runs the same greedy continuation three ways: plain, with a
+proposer that always guesses right, and with one that always guesses wrong. The
+first is the ceiling of any proposer and the second is its floor. All three are
+held to the plain run's token stream, so the task checks the block path as much
+as it measures it.
+
+On the shipped export, four threads, 32 tokens, two prompts:
+
+| block | proposer | tok/s | ms a round | committed a round | vs plain |
+| --- | --- | --- | --- | --- | --- |
+| 2 | oracle | 27.6 | 72.5 | 2 | 1.06x |
+| 4 | oracle | 39.3 | 101.8 | 4 | **1.51x** |
+| 8 | oracle | 56.2 | 142.4 | 8 | **2.15x** |
+| 16 | oracle | 57.8 | 277.2 | 16 | 2.21x |
+| 4 | null | 9.8 | 102.4 | 1 | 0.38x |
+| 8 | null | 7.7 | 129.2 | 1 | 0.30x |
+
+Every row printed `matches plain`.
+
+**Two numbers come out of this and they are the whole answer.**
+
+**The ceiling is 2.2x.** A proposer that is never wrong doubles the engine and
+does not treble it, and past a block of eight it stops improving. That is far
+short of what the idea is worth on a memory-bound engine, and the reason is
+identifiable rather than mysterious.
+
+**Break-even needs about 40% of guesses accepted.** A round of eight costs 142.4
+ms against a plain step's 38.3, so it has to commit 3.7 tokens to pay, which is
+2.7 accepted of 7. At a block of four the bar is worse, 1.7 of 3.
+
+### Why the ceiling is 2.2 and not 6
+
+A block shares the weight *sweep* across its lanes and does not share the
+*arithmetic*. On an engine that is memory-bound the first is nearly all of the
+cost and an extra lane is nearly free; this one is not memory-bound — 0.8.15
+measured a bare four thread sweep at 49.80 GiB/s against a step floor that reads
+760 MiB in 35 ms — so the arithmetic is most of what a lane costs.
+
+Measured from the rounds above, **an extra lane costs about 13 ms against a
+plain step's 38**, so the asymptotic ceiling is about 3x and a block of eight
+reaches 2.2 of it.
+
+**Six of those 13 ms are the output head**, and that is the part worth naming.
+Verifying a position means asking what the model would have produced there,
+which means the full 262144 row head for every lane. `kern_row_code_many` shares
+the head's 96 MiB across the lanes correctly — it decodes a row once and every
+lane reads it — but this engine is arithmetic-bound and the 402 M multiply-adds
+a lane are not shared and cannot be.
+
+So the head is not merely one of the costs of speculative decoding here; it is
+half of the marginal lane. `TODO.md`'s "stop scoring 262144 rows to pick one"
+and this entry are the same piece of work seen from two sides, and the ordering
+below is written on that.
+
+### What this does not settle
+
+Whether any real proposer reaches 40% on this model. That needs the proposer,
+and `TODO.md` now says which one to write and what to hold it to. What is
+settled is that the verify side works, that it costs 13 ms a lane, and that the
+best it can ever be worth in this engine's present shape is 2.2x.
