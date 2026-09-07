@@ -739,6 +739,49 @@ static void test_level(void) {
         mem_free(block_list);
       }
 
+      { /* And the wide block, which closes sixteen rows together, is the same
+         * row for row.
+         *
+         * It differs from the block of four in more than its width: the zero
+         * point correction is taken in thirty-two bits rather than sixty-four,
+         * the sixteen gains are one load rather than sixteen, and the close is
+         * a vector of sixteen lanes rather than sixteen scalars.  None of that
+         * is a different sum — the bound `kern_level_wide_ready` checks is what
+         * says the narrower correction cannot wrap — so this is equality of
+         * floats too.  `row_count` is seventy, which is four whole wide blocks
+         * and six rows past them, so the block of four and the single row both
+         * take a share of the tail.
+         *
+         * The guard is checked as well as the path, because it is the guard
+         * that keeps the wide block off the shapes it cannot close: a column
+         * count that is not a whole number of blocks leaves a remainder the
+         * wide body never reads. */
+        float *wide_list = (float *)mem_clear(sizeof(float) * (size_t)row_count);
+        int ready_flag = kern_level_wide_ready(&kit.sheet);
+        okay_flag = 1;
+#if defined(APP_SIMD_AVX512VNNI)
+        test_true(ready_flag == (col_count % KERN_LEVEL_BLOCK == 0),
+                  "the wide block is offered exactly where a row is whole blocks");
+#else
+        test_true(!ready_flag, "a host without the integer dot product is offered no wide block");
+#endif
+        if (ready_flag) {
+          for (row_index = 0; row_index + KERN_ROW_WIDE <= row_count; row_index += KERN_ROW_WIDE)
+            kern_row_code_level_wide(&kit.sheet, row_index, level_list, isum_list, wide_list);
+          for (; row_index + KERN_ROW_BLOCK <= row_count; row_index += KERN_ROW_BLOCK)
+            kern_row_code_level_rows(&kit.sheet, row_index, level_list, isum_list, wide_list);
+          for (; row_index < row_count; ++row_index)
+            wide_list[row_index] =
+                kern_row_code_level(&kit.sheet, row_index, level_list, isum_list);
+          for (row_index = 0; row_index < row_count; ++row_index)
+            if (wide_list[row_index] !=
+                kern_row_code_level(&kit.sheet, row_index, level_list, isum_list))
+              okay_flag = 0;
+          test_true(okay_flag, "the wide block is the one row path bit for bit");
+        }
+        mem_free(wide_list);
+      }
+
       { /* One activation off the grid puts the whole product back on floats. */
         act_list[col_count / 2] += 0.5f * step_value;
         test_true(!kern_level_stage(&kit.sheet, act_list, level_list, isum_list),
