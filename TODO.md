@@ -109,35 +109,25 @@ the forks.
   against thirty-two dot products just as four rows is four against sixteen. The
   ratio only moves if the rows close together, and that is what 0.8.12 did.
 
-  **The next suspect is the dispatch, not the loop, and it is measured.**
-  `ple feed` is `per_layer_input_gate` and `per_layer_projection`, two planes of
-  384 KiB a layer, and each is its own `pool_run` — **seventy forks and joins a
-  step** for 1.42 ms of work. Timed against the engine's own pool on the second
-  host, 20000 rounds at four threads, an empty fork and join is **2.95 us**, so
-  those seventy are **0.21 ms**: a seventh of the phase, paid whatever the rows
-  do. The same measurement puts a 384 KiB read at 21.9 us across the pool
-  against 18.6 us of work, which is the same seventh from the other side.
+  **The dispatch was the next suspect, and 0.8.13 took it.** `ple feed` is
+  `per_layer_input_gate` and `per_layer_projection`, two planes of 384 KiB a
+  layer, and each is its own `pool_run` — **seventy forks and joins a step** for
+  1.42 ms of work, where a fork and join used to cost 2.95 us on the second host
+  and 3.06 on the third. 0.8.13 moved the publish and the collection off the
+  mutex onto atomics and left the lock for waking a thread that has actually
+  gone to sleep: an empty fork and join is **0.60 us at four threads** against
+  3.06, and `ple feed` is 1.533 ms to 1.310 with the step floor 2.9% behind it.
 
-  The whole step forks 277 times, so this is **0.82 ms of a 39.5 ms step** and
-  not only `ple feed`'s problem — but `ple feed` is where it is the largest
-  share, because its jobs are the smallest.
+  What is left in the plane is the rows, not the dispatch. At 1.31 ms it is
+  still short of the four planes that run at 50 to 61 G multiply-adds a second,
+  and the seventy forks it issues are now 0.04 ms rather than 0.21.
 
-  Two routes, and the second is the one worth having. Fusing the gate, the gelu
-  and the lift into one fork saves 35 of the 70, but they are sequential — the
-  lift needs the whole gate — so it needs a barrier inside a job, which
-  `pool_group` does not have and which is a real change to it.
-
-  The other is to make the fork itself cheap. On the spinning path, which is the
-  one a decode token is always on, a fork and join still takes about eight mutex
-  acquisitions and four condition broadcasts: the caller takes the lock to
-  publish, each worker takes it again to read what was published, each takes it
-  a third time to count itself done and broadcast, and the caller takes it once
-  more to confirm. A spinning worker needs none of that — publish the task with
-  a release store on `task_serial`, count completions with an atomic increment,
-  and touch the lock only when a waiter has actually gone to sleep, which a
-  guarded sleeper count can say. That is a rewrite of the engine's most
-  safety-critical primitive and should be landed with a stress test that runs it
-  hard against the sleeping path too, not measured once and shipped.
+  The entry's other route is still open and is worth less than it was. Fusing
+  the gate, the gelu and the lift into one fork saves 35 of the 70, but they are
+  sequential — the lift needs the whole gate — so it needs a barrier inside a
+  job, which `pool_group` does not have and which is a real change to it. Those
+  35 forks are now about 0.02 ms a step. Do not spend the barrier on them; spend
+  it only if something else wants one too.
 
   `ple lift` is a different thing and is not touched: `per_layer_model_projection`
   is bf16, so it is a float multiply-add path — eight lanes an instruction
@@ -415,3 +405,5 @@ the forks.
 | The batched path's four lanes closed with the same fold, which is where prefill's share of it came from | 0.8.12 |
 | Whether the page walk explains the output head's microbenchmark gap (answered: no — the same bytes cost the same with a gigabyte swept in between) | 0.8.12 |
 | Whether widening a block of rows can help on its own (answered: no, at any width — the ratio of close to work is fixed by the columns) | 0.8.12 |
+| The fork and the join off the mutex — a spinning worker publishes and collects on atomics, and the lock is only what a sleeper is woken through | 0.8.13 |
+| A stress test that grinds the pool on both paths and on the handoff between them, with both wakes checked by removing them | 0.8.13 |

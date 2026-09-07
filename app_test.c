@@ -122,6 +122,58 @@ static void test_pool_band(void *state, int slice_index, int slice_count) {
   for (slot = from_index; slot < upto_index; ++slot) tally_list[slot] += 1;
 }
 
+/* One round of the grind: stamp the round's own number across the span and
+ * leave a partial beside it, so the caller can check both that every slot was
+ * written this round and that what each worker wrote is visible to it. */
+typedef struct test_pool_load {
+  int  *tally_list;
+  long *part_list;
+  int   span_count;
+  int   round_mark;
+  int   hold_count; /* busy iterations inside a band, to outlast the join spin */
+} test_pool_load;
+
+static void test_pool_stamp(void *state, int slice_index, int slice_count) {
+  test_pool_load *load = (test_pool_load *)state;
+  int from_index, upto_index, slot;
+  long sum_value = 0;
+  volatile int hold_slot;
+  for (hold_slot = 0; hold_slot < load->hold_count; ++hold_slot) {}
+  slice_span(load->span_count, slice_index, slice_count, &from_index, &upto_index);
+  for (slot = from_index; slot < upto_index; ++slot) {
+    load->tally_list[slot] = load->round_mark;
+    sum_value += slot;
+  }
+  load->part_list[slice_index] = sum_value;
+}
+
+/* Returns the number of rounds that came back wrong, which should be zero.
+ * `idle_pauses` is how long the caller loiters before each fork; past the spin
+ * limit it puts every worker to sleep, so the next fork has to wake them. */
+static int test_pool_grind(pool_group *pool, test_pool_load *load, int round_count,
+                           int idle_pauses) {
+  int round_index, bad_count = 0;
+  for (round_index = 1; round_index <= round_count; ++round_index) {
+    int slot, pause_slot;
+    long sum_value = 0, want_value = 0;
+    for (pause_slot = 0; pause_slot < idle_pauses * (POOL_SPIN_LIMIT * 2); ++pause_slot)
+      pool_pause();
+    load->round_mark = round_index;
+    for (slot = 0; slot < pool_bands(pool); ++slot) load->part_list[slot] = -1;
+    pool_run(pool, test_pool_stamp, load);
+    for (slot = 0; slot < load->span_count; ++slot) {
+      if (load->tally_list[slot] != round_index) { bad_count += 1; break; }
+      want_value += slot;
+    }
+    for (slot = 0; slot < pool_bands(pool); ++slot) {
+      if (load->part_list[slot] < 0) { bad_count += 1; break; }
+      sum_value += load->part_list[slot];
+    }
+    if (sum_value != want_value) bad_count += 1;
+  }
+  return bad_count;
+}
+
 static void test_platform(void) {
   char path_text[64];
   test_open("platform");
@@ -181,6 +233,48 @@ static void test_platform(void) {
     test_true(sum_value == 1000, "pool_run covers every element once without the spin");
     pool_close(&pool);
     mem_free(tally_list);
+  }
+
+  /* The pool publishes a job and collects it on atomics rather than under the
+   * mutex, and takes the lock only to wake a thread that has actually gone to
+   * sleep.  What can go wrong with that is not a wrong answer once but a lost
+   * wake or a stale read once in a great many rounds, so it is ground rather
+   * than checked: thousands of rounds on the spinning path, thousands more on
+   * the sleeping one, and rounds where the caller idles past the spin limit so
+   * that the workers are asleep when the next job is published and the handoff
+   * between the two paths is the thing under test.
+   *
+   * Each round stamps its own number across the span and sums a partial per
+   * slice.  A lost wake hangs, which the suite reports as a hang; a stale read
+   * shows up as a slot carrying the round before it, or as a partial the caller
+   * cannot see. */
+  {
+    pool_group pool;
+    test_pool_load load;
+    int narrow_count = host_thread_count() < 4 ? host_thread_count() : 4;
+    int wide_count = host_thread_count() * 2 + 1;
+    load.span_count = 997; /* prime, so no round divides evenly across slices */
+    load.tally_list = (int *)mem_clear(sizeof(int) * (size_t)load.span_count);
+    load.part_list = (long *)mem_clear(sizeof(long) * (size_t)(wide_count + 1));
+    load.hold_count = 0;
+    if (load.tally_list && load.part_list) {
+      test_true(pool_open(&pool, narrow_count) == APP_OKAY, "pool_open succeeds for the grind");
+      test_true(test_pool_grind(&pool, &load, 4000, 0) == 0, "the spinning path holds over 4000 rounds");
+      test_true(test_pool_grind(&pool, &load, 64, 1) == 0,
+                "a job published to sleeping workers is seen by all of them");
+      load.hold_count = 20000;
+      test_true(test_pool_grind(&pool, &load, 64, 0) == 0,
+                "a caller that sleeps on the join is woken by the last worker");
+      load.hold_count = 0;
+      pool_close(&pool);
+
+      test_true(pool_open(&pool, wide_count) == APP_OKAY, "pool_open succeeds for the wide grind");
+      test_true(test_pool_grind(&pool, &load, 2000, 0) == 0,
+                "the sleeping path holds over 2000 rounds");
+      pool_close(&pool);
+    }
+    mem_free(load.tally_list);
+    mem_free(load.part_list);
   }
 }
 

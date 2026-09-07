@@ -552,10 +552,70 @@ static int host_thread_count(void) {
 /* A fork-join pool: every job splits one index range across the workers. */
 typedef void (*pool_task)(void *state, int slice_index, int slice_count);
 
+/* The counters a fork and a join are carried on, and the ordering each of them
+ * needs.
+ *
+ * The pool used to publish a job and collect it under the mutex, which put
+ * about eight lock acquisitions and four condition broadcasts on the path
+ * between one projection of a token and the next: the caller took the lock to
+ * publish, each worker took it again to read what was published, each took it a
+ * third time to count itself done and broadcast, and the caller took it once
+ * more to confirm.  A worker that is spinning needs none of that — it is
+ * already looking at the counter — so the counters became atomics and the lock
+ * became the thing a sleeper is woken through rather than the thing every fork
+ * goes through.
+ *
+ * Three orderings carry it, and the third is the one that is easy to get wrong.
+ * The publish is a release store on `task_serial` against an acquire on the
+ * worker's side, so a worker that sees the new serial sees the task written
+ * before it.  A completion is a release increment of `done_count` against the
+ * caller's acquire, so the caller that sees the count sees the work.  And the
+ * handoff between spinning and sleeping is a store-load pair in both
+ * directions — a worker publishes that it is about to sleep and then re-reads
+ * the serial, the caller publishes the serial and then reads the sleeper
+ * count — which is only safe if both sides are sequentially consistent.  With
+ * anything weaker each side may read the other's stale value and the wake is
+ * lost.  The same pair runs on the join, with `wait_flag` for the caller.
+ *
+ * `pool_atom` is a plain `int` everywhere the builtins exist and a `long` under
+ * MSVC, whose interlocked intrinsics are written for that width. */
+#if defined(_MSC_VER)
+typedef volatile long pool_atom;
+#define pool_atom_get(cell)      (*(cell))
+static long pool_atom_read(pool_atom *cell) {
+  long value = *cell;
+  MemoryBarrier();
+  return value;
+}
+static void pool_atom_put(pool_atom *cell, long value) { _InterlockedExchange(cell, value); }
+static void pool_atom_set(pool_atom *cell, long value) { _InterlockedExchange(cell, value); }
+static void pool_atom_bump(pool_atom *cell) { _InterlockedExchangeAdd(cell, 1); }
+static void pool_atom_drop(pool_atom *cell) { _InterlockedExchangeAdd(cell, -1); }
+static long pool_atom_grab(pool_atom *cell) {
+  long value = *cell;
+  MemoryBarrier();
+  return value;
+}
+#else
+typedef volatile int pool_atom;
+#define pool_atom_get(cell) __atomic_load_n((cell), __ATOMIC_RELAXED)
+static int pool_atom_read(pool_atom *cell) { return __atomic_load_n(cell, __ATOMIC_SEQ_CST); }
+/* The publish: release for the task beside it, sequential for the handoff. */
+static void pool_atom_put(pool_atom *cell, int value) {
+  __atomic_store_n(cell, value, __ATOMIC_SEQ_CST);
+}
+static void pool_atom_set(pool_atom *cell, int value) {
+  __atomic_store_n(cell, value, __ATOMIC_SEQ_CST);
+}
+static void pool_atom_bump(pool_atom *cell) { __atomic_fetch_add(cell, 1, __ATOMIC_SEQ_CST); }
+static void pool_atom_drop(pool_atom *cell) { __atomic_fetch_sub(cell, 1, __ATOMIC_SEQ_CST); }
+static int pool_atom_grab(pool_atom *cell) { return __atomic_load_n(cell, __ATOMIC_ACQUIRE); }
+#endif
+
 /* The hint a core gives the one beside it while it waits on a counter rather
  * than on the kernel.  It is a hint and not a barrier: what orders the memory
- * either side of a job is the mutex, which every waiter still takes before it
- * reads anything but the counter. */
+ * either side of a job is the acquire that closes the wait, which every waiter
+ * performs once it has seen the counter it was watching move. */
 static void pool_pause(void) {
 #if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
   YieldProcessor();
@@ -597,14 +657,18 @@ static void pool_pause(void) {
 typedef struct pool_group {
   int        worker_count;
   int        spin_limit; /* pauses before a waiter sleeps; zero when oversubscribed */
-  pool_task  task_call;
+  pool_task  task_call;  /* written before the publish, read after it */
   void      *task_state;
-  /* The three a waiter reads outside the lock while it spins, and every writer
-   * writes under it: `volatile` so a compiler cannot hoist the read out of the
-   * spin.  They are a hint there and are read again under the lock. */
-  volatile int stop_flag;
-  volatile int task_serial;
-  volatile int done_count;
+  /* The publish, the completion count, and the stop.  A spinning waiter reads
+   * these and nothing else, so none of them may be moved into the lock. */
+  pool_atom stop_flag;
+  pool_atom task_serial;
+  pool_atom done_count;
+  /* How many workers are asleep or about to be, and whether the caller is.
+   * A fork reads the first and a completion reads the second, each to decide
+   * whether the lock has to be touched at all. */
+  pool_atom sleep_count;
+  pool_atom wait_flag;
 #if defined(APP_HOST_WINDOWS)
   HANDLE            *worker_list;
   CRITICAL_SECTION   guard_lock;
@@ -639,6 +703,22 @@ static void pool_unlock(pool_group *group) {
 #endif
 }
 
+static void pool_wake_work(pool_group *group) {
+#if defined(APP_HOST_WINDOWS)
+  WakeAllConditionVariable(&group->work_wake);
+#else
+  pthread_cond_broadcast(&group->work_wake);
+#endif
+}
+
+static void pool_wake_done(pool_group *group) {
+#if defined(APP_HOST_WINDOWS)
+  WakeAllConditionVariable(&group->done_wake);
+#else
+  pthread_cond_broadcast(&group->done_wake);
+#endif
+}
+
 #if defined(APP_HOST_WINDOWS)
 static DWORD WINAPI pool_loop(LPVOID seat_data)
 #else
@@ -653,34 +733,49 @@ static void *pool_loop(void *seat_data)
     void *task_state;
     int slice_count;
     int spin_left;
-    for (spin_left = group->spin_limit;
-         spin_left > 0 && group->task_serial == seen_serial && !group->stop_flag; --spin_left)
+    for (spin_left = group->spin_limit; spin_left > 0 &&
+                                        pool_atom_get(&group->task_serial) == seen_serial &&
+                                        !pool_atom_get(&group->stop_flag);
+         --spin_left)
       pool_pause();
-    pool_lock(group);
-    while (group->task_serial == seen_serial && !group->stop_flag) {
+    /* Past the spin, say so before looking again.  The caller reads the count
+     * after it publishes, so between the two of them one always sees the
+     * other: either the caller finds a sleeper and wakes it, or this thread
+     * finds the serial already moved and never sleeps. */
+    if (pool_atom_get(&group->task_serial) == seen_serial &&
+        !pool_atom_get(&group->stop_flag)) {
+      pool_lock(group);
+      pool_atom_bump(&group->sleep_count);
+      while (pool_atom_read(&group->task_serial) == seen_serial &&
+             !pool_atom_get(&group->stop_flag)) {
 #if defined(APP_HOST_WINDOWS)
-      SleepConditionVariableCS(&group->work_wake, &group->guard_lock, INFINITE);
+        SleepConditionVariableCS(&group->work_wake, &group->guard_lock, INFINITE);
 #else
-      pthread_cond_wait(&group->work_wake, &group->guard_lock);
+        pthread_cond_wait(&group->work_wake, &group->guard_lock);
 #endif
+      }
+      pool_atom_drop(&group->sleep_count);
+      pool_unlock(group);
     }
-    if (group->stop_flag) { pool_unlock(group); break; }
-    seen_serial = group->task_serial;
+    if (pool_atom_get(&group->stop_flag)) break;
+    /* The acquire that pairs with the publish: everything the caller wrote
+     * before it moved the serial is visible from here down. */
+    seen_serial = pool_atom_grab(&group->task_serial);
     task_call = group->task_call;
     task_state = group->task_state;
     slice_count = group->worker_count + 1;
-    pool_unlock(group);
 
     if (task_call) task_call(task_state, seat->slice_index, slice_count);
 
-    pool_lock(group);
-    group->done_count += 1;
-#if defined(APP_HOST_WINDOWS)
-    WakeAllConditionVariable(&group->done_wake);
-#else
-    pthread_cond_broadcast(&group->done_wake);
-#endif
-    pool_unlock(group);
+    /* The completion, then the caller's flag.  Same pair as the fork, the
+     * other way round: the caller raises the flag and then reads the count, so
+     * a caller that has gone to sleep is always woken by whoever finishes. */
+    pool_atom_bump(&group->done_count);
+    if (pool_atom_read(&group->wait_flag)) {
+      pool_lock(group);
+      pool_wake_done(group);
+      pool_unlock(group);
+    }
   }
 #if defined(APP_HOST_WINDOWS)
   return 0;
@@ -744,44 +839,47 @@ static void pool_run(pool_group *group, pool_task task_call, void *task_state) {
     task_call(task_state, 0, 1);
     return;
   }
-  pool_lock(group);
   group->task_call = task_call;
   group->task_state = task_state;
-  group->done_count = 0;
-  group->task_serial += 1;
-#if defined(APP_HOST_WINDOWS)
-  WakeAllConditionVariable(&group->work_wake);
-#else
-  pthread_cond_broadcast(&group->work_wake);
-#endif
-  pool_unlock(group);
+  pool_atom_set(&group->done_count, 0);
+  /* The publish.  Sequentially consistent, so the sleeper count read on the
+   * next line cannot be answered from before it. */
+  pool_atom_put(&group->task_serial, pool_atom_get(&group->task_serial) + 1);
+  if (pool_atom_read(&group->sleep_count) > 0) {
+    pool_lock(group);
+    pool_wake_work(group);
+    pool_unlock(group);
+  }
 
   task_call(task_state, 0, slice_count);
 
-  for (spin_left = group->spin_limit; spin_left > 0 && group->done_count < group->worker_count;
-       --spin_left)
+  for (spin_left = group->spin_limit;
+       spin_left > 0 && pool_atom_get(&group->done_count) < group->worker_count; --spin_left)
     pool_pause();
-  pool_lock(group);
-  while (group->done_count < group->worker_count) {
+  if (pool_atom_get(&group->done_count) < group->worker_count) {
+    pool_lock(group);
+    pool_atom_set(&group->wait_flag, 1);
+    while (pool_atom_read(&group->done_count) < group->worker_count) {
 #if defined(APP_HOST_WINDOWS)
-    SleepConditionVariableCS(&group->done_wake, &group->guard_lock, INFINITE);
+      SleepConditionVariableCS(&group->done_wake, &group->guard_lock, INFINITE);
 #else
-    pthread_cond_wait(&group->done_wake, &group->guard_lock);
+      pthread_cond_wait(&group->done_wake, &group->guard_lock);
 #endif
+    }
+    pool_atom_set(&group->wait_flag, 0);
+    pool_unlock(group);
   }
-  pool_unlock(group);
+  /* The acquire that pairs with every completion: what the workers wrote is
+   * visible to the caller from here down. */
+  (void)pool_atom_grab(&group->done_count);
 }
 
 static void pool_close(pool_group *group) {
   int seat_index;
   if (group->worker_count <= 0) return;
   pool_lock(group);
-  group->stop_flag = 1;
-#if defined(APP_HOST_WINDOWS)
-  WakeAllConditionVariable(&group->work_wake);
-#else
-  pthread_cond_broadcast(&group->work_wake);
-#endif
+  pool_atom_set(&group->stop_flag, 1);
+  pool_wake_work(group);
   pool_unlock(group);
   for (seat_index = 0; seat_index < group->worker_count; ++seat_index) {
 #if defined(APP_HOST_WINDOWS)

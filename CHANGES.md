@@ -4545,3 +4545,162 @@ exactly where a row is a whole number of blocks, and that a host without the
 integer dot product is offered it nowhere. `row_count` in that test is seventy,
 which is four whole wide blocks and six rows past them, so the block of four
 and the single row each take a share of the tail behind it.
+
+---
+
+## 0.8.13 — the fork and the join, off the mutex
+
+### Scope
+
+The route `TODO.md`'s first speed entry named and 0.8.12 measured but did not
+take: **make the fork itself cheap.** The pool published a job and collected it
+under the mutex, so a fork and a join cost about eight lock acquisitions and
+four condition broadcasts — the caller took the lock to publish, each worker
+took it again to read what was published, each took it a third time to count
+itself done and broadcast, and the caller took it once more to confirm. A
+worker that is spinning needs none of that; it is already looking at the
+counter.
+
+A decode step forks **277 times**, so this is not `ple feed`'s problem alone —
+it is where `ple feed`'s share is largest only because its jobs are the
+smallest.
+
+### A note on the host
+
+A third machine, and the numbers are not 0.8.12's either: four cores of a Xeon
+at 2.1 GHz, AVX-512 and VNNI, wide build, but a virtualized one where the
+shipped export's step floor is **43.44 ms** against the second host's 40.55 and
+a decode step reads 760 MiB at 16.6 GiB/s. Ratios carry across hosts and
+absolute numbers do not, so every figure below is a ratio taken from eight runs
+a side with the two builds alternating, minimum per phase, checkpoint warm in
+the page cache.
+
+### What the counters carry now
+
+`task_serial`, `done_count`, `stop_flag` and two new cells — `sleep_count` and
+`wait_flag` — are atomics rather than mutex-guarded ints. Three orderings carry
+the whole thing, and the third is the one that is easy to get wrong.
+
+**The publish** is a sequentially consistent store on `task_serial` against an
+acquire load on the worker's side, so a worker that sees the new serial sees the
+`task_call` and `task_state` written before it.
+
+**The completion** is a release increment of `done_count` against the caller's
+acquire load, so a caller that sees the count sees the work.
+
+**The handoff between spinning and sleeping** is a store-load pair in both
+directions, and it is only safe because both sides are sequentially consistent.
+A worker past its spin publishes that it is about to sleep and *then* re-reads
+the serial; the caller publishes the serial and *then* reads the sleeper count.
+One of the two always sees the other — either the caller finds a sleeper and
+takes the lock to wake it, or the worker finds the serial already moved and
+never sleeps. With anything weaker than sequential consistency on both stores
+and both loads, each side may read the other's stale value and the wake is lost.
+The same pair runs on the join, with `wait_flag` for the caller.
+
+So the lock is now what a sleeper is woken *through* rather than what every fork
+goes *through*. On the spinning path — the path a decode token is always on — a
+fork is one exchange and a few loads, and a completion is one locked add.
+
+### The stress test, which is the point of the version
+
+A lost wake is not a wrong answer once; it is a hang once in a great many
+rounds, and a stale read is a wrong answer once in as many. Neither shows up in
+a suite that forks twice and checks the bands. `test_platform` now grinds the
+pool: 4000 rounds on the spinning path, 2000 on the sleeping one at a width the
+host is oversubscribed at, 64 rounds where the caller idles past the spin limit
+so every worker is asleep when the next job is published, and 64 where the band
+holds long enough that the caller sleeps on the join. Each round stamps its own
+number across a 997 element span — prime, so no round divides evenly across the
+slices — and leaves a partial beside it, so the caller checks both that every
+slot was written *this* round and that what each worker wrote is visible to it.
+
+The two wakes were checked by removing them. With the fork's wake disabled the
+suite hangs; with the completion's wake disabled it hangs. Both were confirmed
+before the version shipped, because a stress test that passes against a broken
+pool is worse than none. The suite also runs clean under ThreadSanitizer, which
+is why the acquire is an acquire *load* on each side rather than a relaxed load
+behind a fence — the two are equivalent on x86 and only one of them is
+something a race detector can follow.
+
+### An empty fork and join
+
+20000 rounds, minimum of five, the engine's own pool:
+
+| threads | before | after | |
+| --- | --- | --- | --- |
+| 2 | 0.642 us | **0.145** | -77% |
+| 3 | 1.312 us | **0.631** | -52% |
+| 4 | 3.063 us | **0.603** | -80% |
+| 9 (oversubscribed, sleeping) | 142.1 us | 137.5 | -3% |
+
+The last row is the one to read for what did *not* change. An oversubscribed
+pool has a spin limit of zero and sleeps on the first look, so it pays the
+condition variable exactly as it did; it is here to show that the sleeping path
+was not regressed to buy the spinning one.
+
+### The step
+
+A 3 id prompt, four threads, wide build, eight alternating runs a side:
+
+| part | before | after | |
+| --- | --- | --- | --- |
+| mlp | 20.564 | 20.232 | -1.6% |
+| final norm, head | 11.865 | 11.884 | +0.2% |
+| q k v | 3.662 | 3.347 | **-8.6%** |
+| attn out | 2.835 | 2.739 | -3.4% |
+| **ple feed** | 1.533 | **1.310** | **-14.5%** |
+| ple lift | 0.985 | 0.953 | -3.2% |
+| mlp gate | 0.407 | 0.259 | **-36.4%** |
+| step floor | 43.440 | **42.160** | **-2.9%** |
+| decode | 23.02 tok/s | **23.72** | +3.0% |
+
+And on a 449 id prompt, where the attention divides across the pool as well:
+
+| part | before | after | |
+| --- | --- | --- | --- |
+| score, softmax, blend | 4.352 | 4.029 | -7.4% |
+| q k v | 3.626 | 3.394 | -6.4% |
+| attn out | 2.903 | 2.771 | -4.5% |
+| **ple feed** | 1.444 | **1.267** | **-12.3%** |
+| mlp gate | 0.411 | 0.248 | **-39.7%** |
+| step floor | 47.390 | **46.180** | -2.6% |
+| decode | 21.10 tok/s | **21.65** | +2.6% |
+
+The ranking of the movers is the ranking of jobs-per-byte, which is what a
+change to the fork rather than to a kernel should produce. `mlp gate` is a
+plane that does almost no reading at all and it moves most; `ple feed` is two
+384 KiB planes and seventy forks and it moves next; `mlp` is 475 MiB of reading
+and moves least. Nothing moved that should not have — `final norm, head`,
+`sampler` and `logit cap` are one fork each or none, and all three are flat
+inside the noise.
+
+### What this leaves of the entry
+
+0.8.12 put the step's 277 forks at **0.82 ms of 39.5** on the second host. Here
+they were 3.06 us apiece, so **0.85 ms of 43.4**, and about 0.68 ms of that is
+now gone. The measured step floor moved 1.28 ms, which is more than the fork
+arithmetic alone predicts; the difference is that a worker that no longer takes
+a lock to read its task also no longer evicts the caller's line to get it, and
+that is not something the empty-fork number can see.
+
+`ple feed` is not closed. The plane is 1.31 ms where the four planes that are
+not behind run at 50 to 61 G multiply-adds a second, and what is left in it is
+the rows rather than the dispatch. The entry's other route — fusing the gate,
+the gelu and the lift into one fork, which needs a barrier inside a job that
+`pool_group` does not have — is now worth less than it was, because the 35 forks
+it would save are 35 times 0.6 us rather than 35 times 3.1.
+
+### Two things deliberately not done
+
+**`pool_seat_list` is still a single static.** It is overwritten by a second
+`pool_open` while a first pool is live, which nothing in the engine does and
+which the grind test does not provoke either. It is a real bug and it is not
+this version's; fixing it here would have put an unmeasured change in the same
+diff as the pool rewrite.
+
+**The atomics are builtins behind a shim, not `<stdatomic.h>`.** MSVC's C11
+atomics are recent and gated, and the engine builds under `cl`; five operations
+behind `_Interlocked*` on that compiler and `__atomic_*` on the others is
+smaller than the configuration test the header would need.
+
