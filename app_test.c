@@ -3776,6 +3776,27 @@ static void test_wing(void) {
       }
     }
 
+    /* The phase split is the same sweep counted a second way, so the two
+     * totals have to agree to the byte.  A sheet added to one and forgotten in
+     * the other is what this catches, and it is the only thing that keeps the
+     * rate a phase reports from being quietly wrong. */
+    {
+      size_t phase_list[APP_PHASE_COUNT];
+      size_t phase_total = 0;
+      int phase_slot;
+      model_phase_bytes(model, phase_list);
+      for (phase_slot = 0; phase_slot < APP_PHASE_COUNT; ++phase_slot)
+        phase_total += phase_list[phase_slot];
+      test_true(phase_total == model_decode_bytes(model),
+                "the phase split counts the same bytes as the sweep");
+      test_true(phase_list[APP_PHASE_MLP] > 0 && phase_list[APP_PHASE_HEAD] > 0,
+                "the sheets a step sweeps land in a named phase");
+      test_true(phase_list[APP_PHASE_PICK] == 0,
+                "the sampler reads no weights");
+      test_true((phase_list[APP_PHASE_MOE] > 0) == (moe_flag != 0),
+                "the mixture's bytes are the mixture's");
+    }
+
     test_true(session_open(model, &thin_session) == APP_OKAY, "a session opens");
     test_true(session_open(model, &wide_session) == APP_OKAY, "a second session opens");
     if (!thin_session || !wide_session) { model_free(model); return; }
@@ -3797,6 +3818,60 @@ static void test_wing(void) {
     test_true(okay_flag, "a batched prefill matches one token at a time");
     test_true(session_fill(wide_session) == session_fill(thin_session),
               "both routes land on the same position");
+
+    /* The timer is a partition, and the property that makes it worth reading is
+     * that the parts sum to the step rather than sample it.  A session that did
+     * not ask for it records nothing at all, which is the other half of the
+     * claim: a run that does not want the timer does not pay for it. */
+    {
+      app_phase_book quiet_book = session_phases(thin_session);
+      app_setup loud_setup = setup;
+      app_model *loud_model = NULL;
+      test_true(quiet_book.step_count == 0 && quiet_book.read_count == 0,
+                "the phase timer stays shut unless it is asked for");
+
+      loud_setup.verbose_level = 1;
+      if (model_load(test_yard_path, &loud_setup, &loud_model) == APP_OKAY && loud_model) {
+        app_session *loud_session = NULL;
+        if (session_open(loud_model, &loud_session) == APP_OKAY && loud_session) {
+          app_phase_book book;
+          double part_total = 0.0;
+          int phase_slot, name_count = 0;
+          for (slot = 0; slot < 4; ++slot) session_step(loud_session, id_list[slot]);
+          book = session_phases(loud_session);
+          for (phase_slot = 0; phase_slot < APP_PHASE_COUNT; ++phase_slot) {
+            part_total += book.seconds[phase_slot];
+            if (book.counts[phase_slot] > 0) ++name_count;
+            /* Every part is entered a whole number of times per step, and the
+             * count is the same every step, so this divides exactly. */
+            test_true(book.seconds[phase_slot] >= 0.0, "no part of a step takes negative time");
+          }
+          test_true(book.step_count == 4, "the timer divides every step and no other pass");
+          test_true(name_count >= 6, "the step is divided into parts, not left in one");
+          test_true(book.read_count > 0, "the timer reads the clock");
+          /* The sampler is outside the step's own span, so the parts of the
+           * pass cannot exceed it, and cannot fall far short of it either. */
+          test_true(part_total <= book.step_seconds * 1.001 + 1e-6,
+                    "the parts of a pass do not outrun the pass");
+          test_true(part_total >= book.step_seconds * 0.95,
+                    "the parts of a pass account for nearly all of it");
+          {
+            /* A reset clears the counts and leaves the timer armed, exactly as
+             * it does the tally beside it. */
+            app_phase_book after_book;
+            session_reset(loud_session);
+            after_book = session_phases(loud_session);
+            test_true(after_book.step_count == 0 && after_book.read_count == 0,
+                      "a reset clears the phase counts");
+            session_step(loud_session, id_list[0]);
+            after_book = session_phases(loud_session);
+            test_true(after_book.step_count == 1, "a reset leaves the timer armed");
+          }
+          session_close(loud_session);
+        }
+        model_free(loud_model);
+      }
+    }
     mem_free(want_list);
     session_close(wide_session);
     session_close(thin_session);

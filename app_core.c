@@ -76,6 +76,50 @@ typedef struct app_tally {
   size_t serve_bytes;  /* weights and cache read by the decode steps counted */
 } app_tally;
 
+/* The named parts of one decode step, for the phase timer.
+ *
+ * 0.8.9 closed the kernels: every code plane now streams at the memory's own
+ * rate, and yet a step takes three times what its bytes cost.  The question
+ * that leaves is where the rest of the step is, and it cannot be answered by
+ * reasoning about the graph — 0.8.8 found a third of a token in the fork and
+ * join, which nobody had thought to look at.  So the step is divided here,
+ * once and for all, into parts that name themselves.
+ *
+ * The division is a partition and not a sample: the timer closes one part as
+ * it opens the next, so the parts sum to the step exactly and nothing can hide
+ * between two of them.  Anything not marked is charged to the part that was
+ * open, which is why the catch-all parts exist and why they are named for what
+ * they catch rather than left blank. */
+#define APP_PHASE_COUNT 13
+
+#define APP_PHASE_EMBED    0  /* the token's embedding row, and its scale */
+#define APP_PHASE_PLE      1  /* the per-layer embedding lift, and its norms */
+#define APP_PHASE_QKV      2  /* the query, key and value projections */
+#define APP_PHASE_ROPE     3  /* the head norms, the rotary turn, the cache write */
+#define APP_PHASE_SCORE    4  /* the cached keys scored, the softmax, the values blended */
+#define APP_PHASE_EXIT     5  /* the attention output projection */
+#define APP_PHASE_MLP      6  /* the gate, rise and drop sheets, and the gelu between */
+#define APP_PHASE_MOE      7  /* the router and its experts, where the export has them */
+#define APP_PHASE_PLEFEED  8  /* the per-layer embedding gate and lift inside a layer */
+#define APP_PHASE_NORM     9  /* every other norm, residual add and layer gain */
+#define APP_PHASE_HEAD    10  /* the final norm, the output head, and the logit cap */
+#define APP_PHASE_PICK    11  /* the sampler */
+#define APP_PHASE_OTHER   12  /* the pass's own bookkeeping, outside every layer */
+
+/* What the timer collected, and what it cost to collect it.
+ *
+ * `step_seconds` is the same clock the decode rate is quoted from, so the sum
+ * of the parts can be held against it and the difference reported rather than
+ * assumed to be zero. */
+typedef struct app_phase_book {
+  double seconds[APP_PHASE_COUNT];
+  size_t counts[APP_PHASE_COUNT]; /* how many times each part was entered */
+  size_t read_count;              /* clock reads the timer spent */
+  size_t step_count;              /* decode steps divided */
+  double step_seconds;            /* wall clock of those steps, timer included */
+  int    live_flag;               /* whether the timer ran at all */
+} app_phase_book;
+
 /* One image or one clip, after a tower has turned it into embedding rows.  Each
  * row stands in for one placeholder token in the prompt. */
 typedef struct app_media {
@@ -113,6 +157,8 @@ size_t      model_memory_bytes(const app_model *model);
 /* Weight bytes one decode step reads, which on an export with large embedding
  * tables is a fraction of the mapped total `model_memory_bytes` reports. */
 size_t      model_decode_bytes(const app_model *model);
+void        model_phase_bytes(const app_model *model, size_t *byte_list);
+void        session_phase_bytes(const app_session *session, size_t *byte_list);
 
 /* token layer -------------------------------------------------------------*/
 /* `lead_marker` says this text begins a chunk rather than continuing one.  A
@@ -247,6 +293,8 @@ int         session_ids(const app_session *session, int32_t *id_list, int id_lim
 size_t       session_cache_room(const app_session *session);
 size_t       session_cache_room_at(const app_session *session, int cache_bits);
 app_tally    session_tally(const app_session *session);
+app_phase_book session_phases(const app_session *session);
+const char  *app_phase_text(int phase_slot);
 
 /* helper layer ------------------------------------------------------------*/
 const char *app_code_text(app_code code);
@@ -9084,6 +9132,10 @@ struct app_session {
   app_model *model;
   int        fill_count;
   app_tally  tally;
+  app_phase_book phase;
+  double     phase_mark; /* when the open part began */
+  int        phase_slot; /* the part that is open, -1 for none */
+  int        phase_on;   /* set while a decode step is being divided */
   uint64_t   draw_state;
 
   /* One row a slot, held either as floats or as the eight bit floats the
@@ -9140,6 +9192,34 @@ struct app_session {
   int      echo_count;
   int      echo_limit;
 };
+
+/* The phase timer.
+ *
+ * One clock read a boundary, not two: closing the part that is open and
+ * opening the next are the same act, so the read that ends one part begins
+ * the next and the parts join edge to edge with no gap to lose time in.  The
+ * cost of the read lands in the part it closes, which is the honest place for
+ * it — the sum of the parts is then the step, timer and all, and the report
+ * says how much of that sum the timer is.
+ *
+ * The whole thing is a load and a predicted branch when the timer is off,
+ * which is every run that did not ask for it. */
+static void phase_turn(app_session *session, int phase_slot) {
+  double now_time;
+  if (!session->phase_on) return;
+  now_time = time_now();
+  if (session->phase_slot >= 0) {
+    session->phase.seconds[session->phase_slot] += now_time - session->phase_mark;
+    session->phase.counts[session->phase_slot] += 1;
+  }
+  session->phase_slot = phase_slot;
+  session->phase_mark = now_time;
+  session->phase.read_count += 1;
+}
+
+/* Closes whatever part is open without opening another.  The read is charged
+ * to the part it closes, as every other read is. */
+static void phase_shut(app_session *session) { phase_turn(session, -1); }
 
 /* The session's view of `plane_lift_many`: the same rule, applied through the
  * staging room the session allocated once at open. */
@@ -9554,6 +9634,7 @@ static void session_attend(app_session *session, int layer_index, int place_from
   const float *value_grid = session->value_grid[owner_slot];
   int head_index, lane_index;
 
+  phase_turn(session, APP_PHASE_QKV);
   session_lift_many(session, &wing->query_sheet, enter_data, state_stride, lane_count,
                     session->query_room, head_stride);
   if (!wing->share_flag) {
@@ -9571,6 +9652,7 @@ static void session_attend(app_session *session, int layer_index, int place_from
     float *query_lane = session->query_room + (size_t)lane_index * (size_t)head_stride;
     float *blend_lane = session->blend_room + (size_t)lane_index * (size_t)head_stride;
     int place_start = 0;
+    phase_turn(session, APP_PHASE_ROPE);
     rope_wave(&form->rope_list[wing->kind_mark], place_index, session->cos_room, session->sin_room);
     for (head_index = 0; head_index < form->head_count; ++head_index) {
       float *head_data = query_lane + (size_t)head_index * head_size;
@@ -9602,6 +9684,7 @@ static void session_attend(app_session *session, int layer_index, int place_from
       place_start = place_index - form->slide_span + 1;
       if (place_start < 0) place_start = 0;
     }
+    phase_turn(session, APP_PHASE_SCORE);
     /* Blocked by cached row where a group of heads shares one, and head by
      * head where each head has its own.  The two reach the same numbers to the
      * bit; `session_attend_group` says why the first is the cheaper read. */
@@ -9656,6 +9739,7 @@ static void session_attend(app_session *session, int layer_index, int place_from
         }
     }
   }
+  phase_turn(session, APP_PHASE_EXIT);
   session_lift_many(session, &wing->exit_sheet, session->blend_room, head_stride, lane_count,
                     exit_data, session->lift_stride);
 }
@@ -9727,12 +9811,14 @@ static void session_layer(app_session *session, int layer_index, int place_from,
   int lift_stride = session->lift_stride;
   int lane_index;
 
+  phase_turn(session, APP_PHASE_NORM);
   for (lane_index = 0; lane_index < lane_count; ++lane_index)
     model->desk.norm_rms(&model->desk, session->state_room + (size_t)lane_index * state_stride,
                          wing->enter_norm, state_size, form->norm_eps,
                          session->scrap_room + (size_t)lane_index * state_stride);
   session_attend(session, layer_index, place_from, lane_count, session->scrap_room,
                  session->lift_room);
+  phase_turn(session, APP_PHASE_NORM);
   for (lane_index = 0; lane_index < lane_count; ++lane_index) {
     float *lift_data = session->lift_room + (size_t)lane_index * lift_stride;
     TRACE_LANE("attn", layer_index, place_from + lane_index, lift_data, state_size);
@@ -9744,6 +9830,7 @@ static void session_layer(app_session *session, int layer_index, int place_from,
                          session->scrap_room + (size_t)lane_index * state_stride);
   }
 
+  phase_turn(session, APP_PHASE_MLP);
   session_lift_many(session, &wing->gate_sheet, session->scrap_room, state_stride, lane_count,
                     session->gate_room, session->gate_stride);
   session_lift_many(session, &wing->rise_sheet, session->scrap_room, state_stride, lane_count,
@@ -9760,6 +9847,7 @@ static void session_layer(app_session *session, int layer_index, int place_from,
                session->lift_room + (size_t)lane_index * lift_stride, state_size);
 
   if (form->moe_flag) {
+    phase_turn(session, APP_PHASE_MOE);
     /* The dense mlp above is the shared expert; the mixture reads the residual
      * from before it, and the two branches are summed under a third norm.
      * Each lane picks its own experts, so this branch stays one lane wide. */
@@ -9780,6 +9868,7 @@ static void session_layer(app_session *session, int layer_index, int place_from,
     }
   }
 
+  phase_turn(session, APP_PHASE_NORM);
   for (lane_index = 0; lane_index < lane_count; ++lane_index) {
     float *lift_data = session->lift_room + (size_t)lane_index * lift_stride;
     model->desk.norm_rms(&model->desk, lift_data, wing->after_feed_norm, state_size, form->norm_eps,
@@ -9788,6 +9877,7 @@ static void session_layer(app_session *session, int layer_index, int place_from,
   }
 
   if (form->ple_size > 0) {
+    phase_turn(session, APP_PHASE_PLEFEED);
     session_lift_many(session, &wing->ple_gate_sheet, session->state_room, state_stride, lane_count,
                       session->gate_room, session->gate_stride);
     for (lane_index = 0; lane_index < lane_count; ++lane_index) {
@@ -9806,6 +9896,7 @@ static void session_layer(app_session *session, int layer_index, int place_from,
       kern_add(session->state_room + (size_t)lane_index * state_stride, lift_data, state_size);
     }
   }
+  phase_turn(session, APP_PHASE_NORM);
   if (wing->layer_gain != 1.0f)
     for (lane_index = 0; lane_index < lane_count; ++lane_index)
       kern_scale(session->state_room + (size_t)lane_index * state_stride, wing->layer_gain,
@@ -9838,6 +9929,7 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
    * the reference does not read the placeholder: it rewrites every media
    * position to the pad id first, so the token-identity half of the per-layer
    * input is the pad token's row and carries nothing of the placeholder. */
+  phase_turn(session, APP_PHASE_EMBED);
   for (lane_index = 0; lane_index < lane_count; ++lane_index) {
     float *state_data = session->state_room + (size_t)lane_index * session->state_stride;
     if (state_flag && state_flag[lane_index] && state_list) {
@@ -9852,6 +9944,7 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
 
   if (form->ple_size > 0) {
     float blend_gain = (float)(1.0 / sqrt(2.0));
+    phase_turn(session, APP_PHASE_PLE);
     int chunk_count = form->layer_count * form->ple_size;
     session_lift_many(session, &model->ple_lift_sheet, session->state_room, session->state_stride,
                       lane_count, session->ple_room, session->ple_stride);
@@ -9882,12 +9975,14 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
     session_layer(session, layer_index, place_from, lane_count,
                   session->ple_room + (size_t)layer_index * form->ple_size);
 
+  phase_turn(session, APP_PHASE_OTHER);
   session->fill_count += lane_count;
   for (lane_index = 0; lane_index < lane_count; ++lane_index)
     if (session->echo_count < session->echo_limit)
       session->echo_room[session->echo_count++] = id_list[lane_index];
 
   if (!want_logits) return NULL;
+  phase_turn(session, APP_PHASE_HEAD);
   model->desk.norm_rms(&model->desk,
                        session->state_room + (size_t)(lane_count - 1) * session->state_stride,
                        model->final_norm, form->state_size, form->norm_eps, session->scrap_room);
@@ -10197,6 +10292,74 @@ size_t model_memory_bytes(const app_model *model) { return model ? model->weight
  * of its own for them.  A bandwidth figure divided out of the mapped total
  * therefore overstates what the machine is asked to move, which is the whole
  * point of measuring it here rather than assuming it. */
+/* The same sweep as `model_decode_bytes`, split the way the phase timer splits
+ * the clock.
+ *
+ * A part's share of the clock says which part is worth looking at; a part's
+ * share of the bytes says whether there is anything in it to find.  Held
+ * together they give a rate a part, and a rate is the only thing that can be
+ * held against the memory's own — which is the whole question 0.8.9 left open.
+ *
+ * Every byte `model_decode_bytes` counts lands in exactly one bucket here, and
+ * the two are checked against each other by the suite, so a sheet added to one
+ * and forgotten in the other is a failing test rather than a quiet lie in a
+ * report.  The cache is not here: it belongs to the session's fill and is
+ * added by `session_phase_bytes`. */
+void model_phase_bytes(const app_model *model, size_t *byte_list) {
+  const model_form *form;
+  int layer_index;
+  if (!byte_list) return;
+  memset(byte_list, 0, sizeof(size_t) * APP_PHASE_COUNT);
+  if (!model) return;
+  form = &model->form;
+
+  byte_list[APP_PHASE_EMBED] += plane_row_bytes(&model->embed_sheet);
+  byte_list[APP_PHASE_PLE] += plane_row_bytes(&model->ple_embed_sheet);
+  byte_list[APP_PHASE_PLE] += plane_bytes(&model->ple_lift_sheet);
+  if (model->ple_norm) byte_list[APP_PHASE_PLE] += sizeof(float) * (size_t)form->ple_size;
+  byte_list[APP_PHASE_HEAD] += plane_bytes(&model->head_sheet);
+  if (model->final_norm) byte_list[APP_PHASE_HEAD] += sizeof(float) * (size_t)form->state_size;
+
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    const layer_wing *wing = &model->wing_list[layer_index];
+    byte_list[APP_PHASE_QKV] += plane_bytes(&wing->query_sheet);
+    byte_list[APP_PHASE_QKV] += plane_bytes(&wing->key_sheet);
+    byte_list[APP_PHASE_QKV] += plane_bytes(&wing->value_sheet);
+    byte_list[APP_PHASE_EXIT] += plane_bytes(&wing->exit_sheet);
+    byte_list[APP_PHASE_MLP] += plane_bytes(&wing->gate_sheet);
+    byte_list[APP_PHASE_MLP] += plane_bytes(&wing->rise_sheet);
+    byte_list[APP_PHASE_MLP] += plane_bytes(&wing->drop_sheet);
+    byte_list[APP_PHASE_PLEFEED] += plane_bytes(&wing->ple_gate_sheet);
+    byte_list[APP_PHASE_PLEFEED] += plane_bytes(&wing->ple_lift_sheet);
+    /* The head norms are read inside the rotary phase, the state norms in the
+     * phase whose kernel reads them next; both are kilobytes and the split is
+     * kept only so the two totals agree. */
+    if (wing->query_norm) byte_list[APP_PHASE_ROPE] += sizeof(float) * (size_t)wing->head_size;
+    if (wing->key_norm) byte_list[APP_PHASE_ROPE] += sizeof(float) * (size_t)wing->head_size;
+    if (wing->enter_norm) byte_list[APP_PHASE_NORM] += sizeof(float) * (size_t)form->state_size;
+    if (wing->after_attn_norm) byte_list[APP_PHASE_NORM] += sizeof(float) * (size_t)form->state_size;
+    if (wing->before_feed_norm) byte_list[APP_PHASE_NORM] += sizeof(float) * (size_t)form->state_size;
+    if (wing->after_feed_norm) byte_list[APP_PHASE_NORM] += sizeof(float) * (size_t)form->state_size;
+    if (wing->after_ple_norm) byte_list[APP_PHASE_NORM] += sizeof(float) * (size_t)form->state_size;
+    if (form->moe_flag) {
+      int pick_limit = form->expert_top < form->expert_count ? form->expert_top : form->expert_count;
+      int pick_index;
+      byte_list[APP_PHASE_MOE] += plane_bytes(&wing->route_sheet);
+      for (pick_index = 0; pick_index < pick_limit; ++pick_index) {
+        if (wing->expert_rise_list)
+          byte_list[APP_PHASE_MOE] += plane_bytes(&wing->expert_rise_list[pick_index]);
+        if (wing->expert_drop_list)
+          byte_list[APP_PHASE_MOE] += plane_bytes(&wing->expert_drop_list[pick_index]);
+      }
+      if (wing->route_scale) byte_list[APP_PHASE_MOE] += sizeof(float) * (size_t)form->state_size;
+      if (wing->route_gain) byte_list[APP_PHASE_MOE] += sizeof(float) * (size_t)form->expert_count;
+      if (wing->after_mlp_norm) byte_list[APP_PHASE_MOE] += sizeof(float) * (size_t)form->state_size;
+      if (wing->before_moe_norm) byte_list[APP_PHASE_MOE] += sizeof(float) * (size_t)form->state_size;
+      if (wing->after_moe_norm) byte_list[APP_PHASE_MOE] += sizeof(float) * (size_t)form->state_size;
+    }
+  }
+}
+
 size_t model_decode_bytes(const app_model *model) {
   const model_form *form;
   size_t total = 0;
@@ -10761,6 +10924,11 @@ app_code session_open(app_model *model, app_session **session_out) {
   session->model = model;
   form = &model->form;
   setup_bits = model->setup.cache_bits;
+  /* The timer is armed by the same flag that asks for detail, because what it
+   * reports is detail and because a run that did not ask for it should not pay
+   * even the branch on the caller's word alone. */
+  session->phase.live_flag = model->setup.verbose_level > 0;
+  session->phase_slot = -1;
 
   for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
     layer_wing *wing = &model->wing_list[layer_index];
@@ -10892,6 +11060,15 @@ void session_reset(app_session *session) {
   session->fill_count = 0;
   session->echo_count = 0;
   memset(&session->tally, 0, sizeof(session->tally));
+  {
+    /* The arming survives a reset; the counts do not, for the same reason the
+     * tally beside them does not. */
+    int live_flag = session->phase.live_flag;
+    memset(&session->phase, 0, sizeof(session->phase));
+    session->phase.live_flag = live_flag;
+    session->phase_slot = -1;
+    session->phase_on = 0;
+  }
   memset(session->key_peak, 0, sizeof(float) * (size_t)session->model->form.layer_count);
   memset(session->value_peak, 0, sizeof(float) * (size_t)session->model->form.layer_count);
   for (layer_index = 0; layer_index < session->model->form.layer_count; ++layer_index) {
@@ -10977,9 +11154,28 @@ const float *session_step_state(app_session *session, int32_t id_value, const fl
   /* Counted before the clock starts, so the accounting is not in the timing it
    * is there to divide. */
   session->tally.serve_bytes += model_decode_bytes(session->model) + session_cache_bytes(session);
+  /* Armed for the decode step and nothing else.  A prime pass runs the same
+   * graph sixteen lanes wide, and its parts answer a question about a batch
+   * rather than about a token; letting it into the same buckets would make
+   * both unreadable. */
+  session->phase_on = session->phase.live_flag;
+  session->phase_slot = -1;
   from_time = time_now();
   logit_list = session_pass(session, &id_value, state_data, &state_mark, 1, 1);
-  session->tally.serve_seconds += time_now() - from_time;
+  phase_shut(session);
+  session->phase_on = 0;
+  {
+    /* The same span the decode rate is quoted from, kept beside the parts so
+     * the report can say what the parts do not add up to rather than assert
+     * that they add up.  Only a decode step is divided: prefill is a batch and
+     * its parts would answer a different question. */
+    double step_seconds = time_now() - from_time;
+    session->tally.serve_seconds += step_seconds;
+    if (session->phase.live_flag) {
+      session->phase.step_seconds += step_seconds;
+      session->phase.step_count += 1;
+    }
+  }
   session->tally.serve_tokens += 1;
   session->tally.memory_bytes = app_total_bytes;
   return logit_list;
@@ -11030,7 +11226,11 @@ app_tally session_tally(const app_session *session) {
   return tally;
 }
 
-int32_t session_pick(app_session *session, const float *logit_list, const app_taste *taste) {
+/* The sampler proper.  It leaves by whichever of half a dozen returns the
+ * taste reaches first, so the clock that times it is put around the call
+ * rather than threaded through the body. */
+static int32_t session_pick_at(app_session *session, const float *logit_list,
+                               const app_taste *taste) {
   app_taste rule;
   int vocab_count;
   pick_slot *slot_list;
@@ -11120,6 +11320,58 @@ int32_t session_pick(app_session *session, const float *logit_list, const app_ta
     if (draw_value <= 0.0f) return slot_list[slot_index].id_value;
   }
   return slot_list[keep_count - 1].id_value;
+}
+
+/* The sampler is not in `session_step`, so it is not in the span the phase
+ * timer divides — and it reads all 262144 logits, which is not nothing.  It is
+ * charged to the same book here so a report of where a token goes covers the
+ * whole token and not just the forward. */
+int32_t session_pick(app_session *session, const float *logit_list, const app_taste *taste) {
+  double from_time;
+  int32_t id_value;
+  if (!session || !logit_list) return -1;
+  if (!session->phase.live_flag) return session_pick_at(session, logit_list, taste);
+  from_time = time_now();
+  id_value = session_pick_at(session, logit_list, taste);
+  session->phase.seconds[APP_PHASE_PICK] += time_now() - from_time;
+  session->phase.counts[APP_PHASE_PICK] += 1;
+  session->phase.read_count += 2;
+  return id_value;
+}
+
+/* The weights a step sweeps, plus the cache the attention scans, in the phase
+ * buckets.  The cache is all of it the scoring's, which is the only phase that
+ * reads it. */
+void session_phase_bytes(const app_session *session, size_t *byte_list) {
+  if (!byte_list) return;
+  if (!session) { memset(byte_list, 0, sizeof(size_t) * APP_PHASE_COUNT); return; }
+  model_phase_bytes(session->model, byte_list);
+  byte_list[APP_PHASE_SCORE] += session_cache_bytes(session);
+}
+
+app_phase_book session_phases(const app_session *session) {
+  app_phase_book book;
+  if (!session) { memset(&book, 0, sizeof(book)); return book; }
+  return session->phase;
+}
+
+const char *app_phase_text(int phase_slot) {
+  switch (phase_slot) {
+    case APP_PHASE_EMBED:   return "embed";
+    case APP_PHASE_PLE:     return "ple lift";
+    case APP_PHASE_QKV:     return "q k v";
+    case APP_PHASE_ROPE:    return "rope, cache write";
+    case APP_PHASE_SCORE:   return "score, softmax, blend";
+    case APP_PHASE_EXIT:    return "attn out";
+    case APP_PHASE_MLP:     return "mlp";
+    case APP_PHASE_MOE:     return "mixture";
+    case APP_PHASE_PLEFEED: return "ple feed";
+    case APP_PHASE_NORM:    return "norms, residuals";
+    case APP_PHASE_HEAD:    return "final norm, head";
+    case APP_PHASE_PICK:    return "sampler";
+    case APP_PHASE_OTHER:   return "pass bookkeeping";
+    default: return "";
+  }
 }
 
 #endif /* APP_CORE_IMPLEMENTED */
