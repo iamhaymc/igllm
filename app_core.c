@@ -2438,22 +2438,37 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
     {
       /* A dword is sixteen codes, which is the whole vector: the two halves
        * the AVX2 path below shifts out separately are one shift here, and a
-       * broadcast serves sixteen codes rather than eight. */
+       * broadcast serves sixteen codes rather than eight.
+       *
+       * The mask and the widening are one instruction rather than two, and the
+       * instruction is a lookup.  After the shift, a lane holds its own code in
+       * bits zero and one and the next code in bits two and three — so the low
+       * four bits of the lane are a number from zero to fifteen whose remainder
+       * on four is the code this lane wants.  That is exactly what `vpermps`
+       * indexes with, so a sixteen entry table of `0, 1, 2, 3` repeated four
+       * times returns the code already a float, with the mask implied by the
+       * table repeating and the conversion implied by the table's contents.
+       *
+       * Four instructions a vector rather than five: a broadcast, a shift, the
+       * lookup and the multiply-add.  The lanes, the codes, the accumulators
+       * and the order are what they were, so this is the same sum to the last
+       * bit — the head reads it, and the head is where it is worth anything. */
       const __m512i step_wide = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24,
                                                   26, 28, 30);
-      const __m512i code_mask = _mm512_set1_epi32(3);
+      const __m512 code_look = _mm512_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f,
+                                              0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f);
       __m512 part_a = _mm512_setzero_ps(), part_b = _mm512_setzero_ps();
       for (; slot + 32 <= span_count; slot += 32) {
         uint32_t word_a, word_b;
         memcpy(&word_a, byte_head + slot / 4, 4);
         memcpy(&word_b, byte_head + slot / 4 + 4, 4);
         part_a = _mm512_fmadd_ps(
-            _mm512_cvtepi32_ps(_mm512_and_si512(
-                _mm512_srlv_epi32(_mm512_set1_epi32((int)word_a), step_wide), code_mask)),
+            _mm512_permutexvar_ps(_mm512_srlv_epi32(_mm512_set1_epi32((int)word_a), step_wide),
+                                  code_look),
             _mm512_loadu_ps(act_data + slot), part_a);
         part_b = _mm512_fmadd_ps(
-            _mm512_cvtepi32_ps(_mm512_and_si512(
-                _mm512_srlv_epi32(_mm512_set1_epi32((int)word_b), step_wide), code_mask)),
+            _mm512_permutexvar_ps(_mm512_srlv_epi32(_mm512_set1_epi32((int)word_b), step_wide),
+                                  code_look),
             _mm512_loadu_ps(act_data + slot + 16), part_b);
       }
       total = kern_zmm_total(_mm512_add_ps(part_a, part_b));

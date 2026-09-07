@@ -4861,3 +4861,81 @@ both were measuring a kernel the head does not run. The first question to ask of
 any plane that looks anomalous is which of the two paths it is on, and
 `kern_mat_vec_band` is four lines of instrumentation away from saying so.
 
+---
+
+## 0.8.15 — the mask and the widening as one lookup, in the loop the head actually runs
+
+### Scope
+
+0.8.14 found that the output head runs `kern_dot_code`'s float spread rather
+than the integer path, and left three routes. This is the first and smallest of
+them: the two bit float loop, which had never had a version written for it, and
+which is 27% of a decode step on this host.
+
+### The host, and what it can actually do
+
+Third machine, four cores of a Xeon at 2.1 GHz, virtualized, AVX-512 with VNNI
+and GFNI. Eight alternating runs a side on a 3 id prompt and six on a 449 id
+one, minimum per phase, checkpoint warm.
+
+Worth writing down because every entry above reasons from a host's sweep and
+this host's had not been measured: **a bare four thread sweep of the mapped
+checkpoint reaches 49.80 GiB/s here**, 24.60 at two threads and 13.04 at one —
+linear, so the memory is not the bound at any width. A decode step reads 760 MiB,
+which at that rate would be 14.9 ms against the 43.79 ms the step floor actually
+is. Nothing in this engine on this host is memory-bound. That is the context for
+every phase that moved today.
+
+### Four instructions a vector rather than five
+
+The loop took a dword of packed codes, broadcast it across all sixteen lanes,
+shifted each lane down by its own code's bit position, masked two bits, widened
+to float and multiplied into the accumulator: `vpbroadcastd`, `vpsrlvd`,
+`vpandd`, `vcvtdq2ps`, `vfmadd132ps`.
+
+The mask and the widening are one instruction. After the shift, a lane holds its
+own code in bits zero and one — and the *next* code in bits two and three, since
+the shift moved the whole dword. So the low four bits of the lane are a number
+from zero to fifteen whose remainder on four is the code that lane wants. That
+is exactly the field `vpermps` indexes with. A sixteen entry table of
+`0, 1, 2, 3` repeated four times therefore returns the code already a float,
+with the mask implied by the table repeating and the conversion implied by the
+table's contents.
+
+The lanes, the codes, the two accumulators and the order they are added in are
+all what they were, so this is the same sum to the last bit. `logits` on the
+shipped export compares byte for byte against the previous build.
+
+### The step
+
+| part | 3 id prompt | | 449 id prompt | |
+| --- | --- | --- | --- | --- |
+| **final norm, head** | 12.232 to **11.216** | **-8.3%** | 12.185 to **11.172** | **-8.3%** |
+| step floor | 41.580 to **40.600** | -2.4% | 44.740 to **43.790** | -2.1% |
+| decode | 24.05 to **24.63** tok/s | +2.4% | 22.35 to **22.84** | +2.2% |
+
+Every other phase is inside the noise on both prompts, which is what a change to
+one loop that one plane reaches should look like. The head is the only plane in
+the step on the float path, and it is the only plane that moved.
+
+### What is left in the head, and why it is not here
+
+The loop is now four instructions per sixteen codes: a broadcast, a shift, the
+lookup, the multiply-add. Sixteen per sixty-four codes against the integer
+path's four.
+
+Three of those sixteen are broadcasts that could be one. `vbroadcasti32x4`
+takes sixteen bytes — sixty-four codes — and four shifts of it reach every code
+in them, which is thirteen instructions per sixty-four rather than sixteen. It
+is not done here because the four quarters come out in the unpack's order rather
+than the column's, so the activations would have to be laid down in that order
+the way `kern_level_stage` already lays down levels for the integer path. That
+is a new staging pass and a new correctness surface, and it belongs in a version
+that is about it rather than riding on a four line change that is provably the
+same arithmetic.
+
+Against the ceiling: the head reads 97 MiB, which at this host's 49.80 GiB/s is
+1.9 ms. It is 11.17. The loop at four instructions a vector, on the ports this
+machine has, is worth about 4.5 ms of that by arithmetic, and the gap between 4.5
+and 11.17 is not yet accounted for. `TODO.md` carries it with the other two
+routes.

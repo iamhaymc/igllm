@@ -181,17 +181,27 @@ the forks.
 
   **Three routes are open, in this order.**
 
-  *The float loop the head actually runs, which has never been written for.*
-  `kern_dot_code`'s two bit path spends five instructions per sixteen codes — a
-  broadcast of a dword, a variable shift, a mask, a convert and an fma — where
-  the integer path spends four per sixty-four. One `vbroadcasti32x4` of sixteen
-  bytes serving four shifts takes it to seventeen per sixty-four rather than
-  twenty, about fifteen percent of the loop. It costs a staging pass: the four
-  quarters come out in the unpack's order rather than the column's, so the
-  activations have to be laid down in that order, exactly as `kern_level_stage`
-  already does for the integer path. Keep the two accumulators and their slot
-  assignment and the sum is bit-identical. This is the smallest of the three and
-  the only one that costs nothing but work.
+  *The float loop the head actually runs, which 0.8.15 started on.* The mask and
+  the widening are now one `vpermps` against a sixteen entry table — four
+  instructions a vector rather than five, the head 8.3% and the step floor 2.1%,
+  bit-identical. What is left is the broadcast: three of the loop's sixteen
+  instructions per sixty-four codes are broadcasts that could be one, because
+  `vbroadcasti32x4` takes sixteen bytes and four shifts of it reach every code in
+  them. Thirteen per sixty-four rather than sixteen. It costs a staging pass —
+  the four quarters come out in the unpack's order rather than the column's, so
+  the activations have to be laid down in that order, exactly as
+  `kern_level_stage` already does for the integer path — and that is a new
+  correctness surface rather than a four line change.
+
+  And the arithmetic does not close even then. On this host the loop at four
+  instructions a vector is worth about 4.5 ms by port count and the head is
+  11.17, while a bare four thread sweep of the same 97 MiB would be 1.9 ms at
+  the 49.80 GiB/s this host reaches. So the head is bound by neither the memory
+  nor this loop's issue rate, which is where the *old* entry came in — except
+  that now it is the right loop being counted. Whoever takes this next should
+  count the per-row epilogue and the row-at-a-time dispatch before shaving the
+  loop further: `kern_row_code` closes every row on its own with a
+  `_mm512_reduce_add_ps`, and the integer path stopped doing that in 0.8.12.
 
   *Give the head a grid, and take the integer path.* This is the large one — the
   four bit planes run at 52 G multiply-adds a second against the head's 33, and
@@ -437,3 +447,4 @@ the forks.
 | The packed field taken with one bit matrix multiply rather than a variable shift and a mask, at two bits and at four | 0.8.14 |
 | Why the output head is slower than anything else per byte (answered: it runs the float kernel — the export's `lm_head.input_activation_scale` is `0.0`, so it can never be on the grid) | 0.8.14 |
 | Whether the four bit planes are memory-bound or issue-bound (answered: issue-bound — a quarter off the inner loop is ten to eighteen percent off the phase) | 0.8.14 |
+| The two bit float loop's mask and widening as one `vpermps` against a repeating table, in the loop the output head actually runs | 0.8.15 |
