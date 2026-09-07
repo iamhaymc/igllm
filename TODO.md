@@ -14,50 +14,57 @@ below: the eight lane block's open question was whether to reassociate a sum for
 
 It also puts a ceiling on the first group that is worth stating once, because
 every entry in it is a decode or prefill entry and none of them can pass it. A
-fourth host — four cores of a Xeon at 2.8 GHz, AVX-512 and VNNI, the wide build
-— gives a bare sweep of about 20 GiB/s at four threads and decodes at 10.04
-tokens a second, reading 7.48 GiB/s of the 763.3 MiB a token it reports. So the
-memory is 37% used and there is a little under three times left in the kernels,
-and a kernel that spent no instructions at all would decode at about 27 tokens a
-second on this host. That is the whole of what the first group can be worth. A
 token that costs one sweep of the weights cannot be made to cost less than the
-sweep, and every entry below is about the sweep. Whether to go past it is the
+sweep. On the fourth host — four cores of a Xeon at 2.8 GHz, AVX-512 and VNNI,
+the wide build — a bare sweep gives 32.18 GiB/s at four threads and a step reads
+784.4 MiB, so a token that spent nothing at all outside the memory would take
+24 ms: **41 tokens a second, and no more.** Whether to go past that is the
 question `RESEARCH.md` opens rather than one this file can answer.
+
+0.8.9 changed where in that gap the engine sits, and so changed what this list
+is for. Every kernel that reads a code plane is now at the memory — the three
+widths stream 25.90, 29.47 and 31.04 GiB/s of codes at four threads against the
+sweep's 32.18 — and decode runs at 12.57 tokens a second of the 41. So the
+kernels are no longer where a token goes, and the first entry below is a
+measurement rather than a kernel, because nothing here can name the next kernel
+until that measurement exists.
 
 ## On the shipped export
 
-- Spend fewer instructions in the two bit decode path, which is the one still
-  spending them. 0.8.8 read what each width waits on at four threads, on rows
-  streamed from memory against the same rows held in cache, and the three
-  answers differ. The eight bit path keeps half of its resident rate and lands
-  on the memory's own number — 23.95 GiB/s of the 26.27 a bare sweep gives on
-  the tuned build, 27.66 on the wide one — so it is done, and a quicker kernel
-  there buys nothing. The four bit path keeps 83% of its resident rate tuned and
-  68% wide: the memory is part of what it waits on and there is a little left in
-  it. The two bit path keeps 94% and 78%, and is 366 MiB of the 727.5 a step
-  sweeps, which makes it the one width where instructions are still most of the
-  cost and the only one worth another kernel.
+- Measure what a token spends outside the kernels, a part at a time. This is
+  what is left of the head item, and it is now the largest thing on this list.
 
-  What shape that kernel should be is the one place `RESEARCH.md` has something
-  to say about this list rather than past it. The path spreads codes into floats
-  and dots them — `kern_code_spread` then `kern_dot_real_many` — and four passes
-  have now been spent making that pair quicker. Its ideas 2 and 3 are the two
-  ways to stop doing it at all: hold the calibrated activation levels as
-  integers and accumulate integer products, or index activation tables with the
-  packed bits and never spread them. Both are a different kernel rather than a
-  wider one, both are measurable against the current path on a single plane
-  before anything else changes, and the fourth host has the VNNI instructions
-  the first of them wants. Neither reads fewer bytes, so the ceiling above holds
-  over both; what they are for is closing the distance to it in one step instead
-  of four.
+  0.8.9 took `RESEARCH.md` idea 2 and the kernels are finished: at four threads
+  the two bit path reads 25.90 GiB/s of codes, the four bit 29.47 and the eight
+  bit 31.04, against a bare sweep of 32.18 on the same host. All three are at
+  the memory. A quicker kernel buys nothing at any width now, and the ceiling
+  the paragraph above states is what is left of the whole group.
 
-  What that reading also says is that the kernels are no longer where a token
-  goes at four threads. Streamed through the rates above, the mix a step sweeps
-  is 38.9 ms of kernel a token, and the token is 63.7 ms on the wide build now
-  that the fork and the join are 4.8 ms of it rather than 33. The 25 ms outside
-  the kernels — the attention, the norms, the sampler, the bands that do not
-  divide evenly — have never been measured a part at a time, and on this host
-  they are now larger than anything left inside them.
+  What that leaves is the distance to it. Decode at four threads is 12.57 tokens
+  a second, reading 9.63 GiB/s of the 784.4 MiB a step sweeps; the memory would
+  hand those bytes over in 24 ms, which is 41 tokens a second, and the step takes
+  80. So more than two thirds of a token is now outside the kernels, where 0.8.8
+  left a third — the attention, the norms, the sampler, the 277 forks and joins,
+  and the bands that do not divide evenly, none of which has been measured a part
+  at a time on any host. That measurement is the next thing to do, and until it
+  exists nothing here can say what the next kernel should be, because there may
+  not be one.
+
+- The other widths of the same instruction. The integer path is written for
+  AVX-512 VNNI and nothing else. A host with `avx_vnni` and no AVX-512 —
+  everything from Alder Lake on — has the same instruction at 256 bits, and an
+  ARM host has `sdot`/`udot`, which is the same shape at 128. Both are the same
+  kernel at another width and neither is written, for the reason 0.8.7 gave for
+  AVX-512 itself: the path was written when a host with the instruction and the
+  headroom to show it turned up, and these wait for the same.
+
+  `RESEARCH.md` idea 3, the lookup table execution, belongs beside this rather
+  than before it. It answers the same question the integer path answered — how
+  to stop spreading codes into floats — so on a host that has an integer dot
+  product there is nothing left for it to win. On a host that has none, it is
+  the only route to the same place, and that is where the experiment now
+  belongs.
+
 - Hold the seam open as the prompt grows. All nine cases are judged on the
   shipped export now, each in a process of its own, and the longest is 664 ids
   with two pictures and a clip in it. What has not been tried is a prompt long
@@ -70,29 +77,28 @@ question `RESEARCH.md` opens rather than one this file can answer.
   is a footprint question rather than a decode one, as 0.8.1 established, and it
   is worth having on a small host. It is not a decode win and should not be
   scoped as one.
-- Speed up the towers further, and the batch under them. 0.8.8 profiled a
-  picture again — the tower is 39.1 s single threaded at the full patch budget,
-  of which the projections are 24.0, the scoring 6.5, the blend 5.0 and the
-  softmax 0.83 — and then took the one change that reading pointed at: four
-  lanes of a batch now share the row's load rather than each loading it again,
-  which is 8% of the projections and 23% of prefill on the default build.
+- The tower's own attention, which is what a picture is now mostly made of.
+  0.8.9 took the tower's projections with everything else — they are eight bit
+  and they are a batch, which is the shape that gained most — and that has moved
+  the balance inside a picture rather than only shortening it. On the fourth
+  host, one thread, the same 768 by 768 picture at the full patch budget: the
+  whole picture costs 48.3 s where it cost 105.0, of which prefilling the 256
+  soft tokens through the text stack is 16.3 s where it was 50.7. What is left
+  for the tower is about 32 s where it was about 54 — a third off, against the
+  text stack's two thirds.
 
-  What is left of that loop is the tower's own attention: the scoring at 6.5 s
-  and the blend at 5.0, neither touched since they were written, both already
-  vectorized by the compiler, and together a third of a tower. `RESEARCH.md`
-  idea 11 says what to do with them, and it is a schedule rather than a kernel —
-  score a tile, carry the running normalizer, accumulate the blend, and never
-  hold the whole score matrix. That moves the summation order too, which is the
-  same price the eight lane block was asked to pay and a better thing to spend
-  it on: it is 30% of a tower rather than 16% of one loop.
+  That is the reading `RESEARCH.md` idea 11 was waiting for, and it now points
+  at the tower's attention rather than at its projections: the scoring and the
+  blend are float, were never touched, and are a larger share of a tower than
+  they have ever been. Idea 11 is a schedule rather than a kernel — score a
+  tile, carry the running normalizer, accumulate the blend, and never hold the
+  whole score matrix.
 
-- The other half of a picture is the text stack, and nothing has been asked of
-  it. A picture at the full budget lays 256 soft tokens down, and prefilling
-  those through the text stack costs 40.1 s single threaded against the tower's
-  39.1 — half of what a picture costs, and outside every reading of a picture
-  taken before 0.8.8. It is the ordinary prefill path, so the item above is most
-  of what would move it, but it is worth stating that a tower made free would
-  halve a picture rather than remove it.
+  The two numbers above are a subtraction — the picture's wall clock against the
+  same run without it, minus the prefill the tally reports — rather than the
+  profile 0.8.8 took, which broke a tower into projections, scoring, blend and
+  softmax. That profile should be taken again before the schedule is written,
+  because the shares it recorded are the ones that just changed.
 
 One item is closed rather than carried here. The eight lane block asked whether
 16% of the batch loop was worth reassociating every sum in the engine — the
@@ -105,7 +111,10 @@ not. Once reassociation is on the table at all, the tower's attention above
 wants it for a third of a tower and `RESEARCH.md` idea 2 wants it for an integer
 accumulator that changes the arithmetic anyway, and both are larger than 16% of
 one loop. The engine's last bit is only worth moving once, so it should be moved
-for whichever of those two measures out, not here.
+for whichever of those two measures out, not here. 0.8.9 is that spending: the
+integer accumulator is in, it moved every code plane's last bit, and it moved
+the towers closer to the reference rather than merely elsewhere. The tower's
+attention is the other claimant and is still open.
 
 Two items were closed rather than carried in 0.8.4. The per-group gain mirror — a
 per-plane float copy of the group gains, traded against the conversions it

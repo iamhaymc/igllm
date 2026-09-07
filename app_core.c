@@ -288,12 +288,21 @@ app_setup   app_setup_plain(void);
  *
  * The four subsets named are the ones the kernels reach for — `bw` for the byte
  * shuffle, `dq` and `vl` for the narrower forms of it — and asking for all four
- * keeps the path off the early parts that have `f` alone. */
+ * keeps the path off the early parts that have `f` alone.
+ *
+ * `vnni` is asked for separately, and is the one subset a host with the other
+ * four may not have: it arrived two generations after them.  It buys one
+ * instruction — a dot product of four byte pairs into a thirty-two bit lane —
+ * and that instruction is what the integer path beside `kern_dot_code` is
+ * written around, so it names itself rather than riding on the tier. */
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && \
     defined(__AVX512VL__)
 #  include <immintrin.h>
 #  define APP_SIMD_AVX2 1
 #  define APP_SIMD_AVX512 1
+#  if defined(__AVX512VNNI__)
+#    define APP_SIMD_AVX512VNNI 1
+#  endif
 #elif defined(__AVX2__)
 #  include <immintrin.h>
 #  define APP_SIMD_AVX2 1
@@ -2368,6 +2377,283 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
   return total;
 }
 
+/* -- the calibrated integer grid ------------------------------------------ */
+
+/* Every code plane in a Gemma export ships an `input_activation_scale`, and
+ * `plane_lift_many` rounds what goes into the product onto that step before the
+ * kernel sees it.  So an activation reaching a code plane is not an arbitrary
+ * float: it is `level * step` for an integer `level` between -128 and 127, and
+ * the sum the kernel wants is
+ *
+ *     Σ code * act  =  step * Σ code * level
+ *
+ * with the right hand side an exact integer.  That is what this path computes.
+ * It reads the same bytes as `kern_dot_code` — nothing here saves a weight
+ * byte, and the memory floor over a token is what it was — and spends about a
+ * quarter of the instructions reaching them, because one `vpdpbusd` retires
+ * sixty-four products where the float loop unpacks, converts and multiplies.
+ * The activations shrink with it: a row reads a quarter of the bytes of its
+ * lane, which is the first level cache's own traffic rather than the tensor's.
+ *
+ * It is not the float path's answer to the last bit, and it is the better of
+ * the two: the integer sum is exact where a chain of a thousand float products
+ * is not, so a row is the value a wider accumulator would have reached.  Held
+ * against the reference's own tower modules on the shipped weights, both towers
+ * move towards it — the vision tower from 2.871 off to 2.049 where the
+ * reference moves 2.945 against itself.  The logits are thirty-five layers and
+ * as many roundings onto the export's grid further on, so they move by units
+ * rather than in a last bit, in both directions and inside the same bar the
+ * reference sets against itself; `CHANGES.md` 0.8.9 has both tables.
+ *
+ * Two things have to be true before it is taken, and both are checked rather
+ * than assumed.  The step has to be there, and every activation has to sit on
+ * it exactly — `kern_level_of` recomputes `level * step` and compares, so a
+ * caller that reached `mat_mat` without the rounding falls back to the float
+ * path for the whole product rather than answering from a grid it is not on.
+ * And the accumulator has to hold: a group of `n` columns sums at most
+ * `n * 255 * 128`, which is checked against what an `int32` lane can carry.
+ *
+ * The staging is paid once per product and read by every row of it, which is
+ * where the arithmetic goes: a row of the output head is one pass over 1536
+ * activations against 262144 rows of codes. */
+
+/* Columns one block of a width's unpack covers, on every width the packing
+ * divides evenly. */
+#define KERN_LEVEL_BLOCK 64
+
+/* The level a value sits on, or this when it sits between two of them. */
+#define KERN_LEVEL_OFF 256
+
+static int kern_level_of(float value, float step_value, float back_step) {
+  float level_value = rintf(value * back_step);
+  int level_index;
+  if (!(level_value >= -128.0f && level_value <= 127.0f)) return KERN_LEVEL_OFF;
+  level_index = (int)level_value;
+  /* The equality is exact by construction where `quant_step` wrote the value:
+   * it is the same product, rounded the same way.  Where it is not, this is
+   * what says so. */
+  if ((float)level_index * step_value != value) return KERN_LEVEL_OFF;
+  return level_index;
+}
+
+/* Whether a plane's product can be taken on the grid at all: a host with the
+ * integer dot product, a width whose codes divide a byte, a step to be on, and
+ * groups that begin where a block does. */
+static int kern_level_ready(const plane *sheet) {
+#if defined(APP_SIMD_AVX512VNNI)
+  int span_count;
+  if (sheet->form != PLANE_CODE) return 0;
+  if (sheet->bit_count != 2 && sheet->bit_count != 4 && sheet->bit_count != 8) return 0;
+  if (!(sheet->enter_gain > 0.0f)) return 0;
+  if (sheet->group_count > 1 && sheet->group_size % KERN_LEVEL_BLOCK) return 0;
+  /* The widest group, against what one `int32` lane of the accumulator can
+   * carry: the largest code times the largest level, over the whole span. */
+  span_count = sheet->group_count > 1 ? sheet->group_size : sheet->col_count;
+  if ((int64_t)span_count * (int64_t)((1 << sheet->bit_count) - 1) * 128 > (int64_t)INT32_MAX)
+    return 0;
+  return 1;
+#else
+  (void)sheet;
+  return 0;
+#endif
+}
+
+/* The activation vector as levels, in the order each width's unpack leaves its
+ * codes, with each group's integer sum beside it.
+ *
+ * A block of sixty-four columns comes out of the packing as `8 / bit_count`
+ * runs, one per bit position within a byte, each run holding every code that
+ * sits at that position.  Reordering the codes back would cost a shuffle a
+ * block on the side that is read by every row; reordering the activations costs
+ * nothing, because this side is read once.  So the levels are written where the
+ * codes will land rather than where they came from.
+ *
+ * Returns zero, having written nothing a caller may use, where any activation
+ * is off the grid. */
+static int kern_level_stage(const plane *sheet, const float *act_data, int8_t *level_data,
+                            int32_t *sum_data) {
+  float step_value = sheet->enter_gain;
+  float back_step = 1.0f / step_value;
+  int part_count = 8 / sheet->bit_count;                 /* codes a byte holds */
+  int run_wide = KERN_LEVEL_BLOCK / part_count;          /* codes a run holds */
+  int group_index;
+  for (group_index = 0; group_index < sheet->group_count; ++group_index) {
+    int from_index = group_index * sheet->group_size;
+    int span_count = sheet->col_count - from_index;
+    int slot = 0, part_index, run_index;
+    int32_t total = 0;
+    if (span_count > sheet->group_size) span_count = sheet->group_size;
+    for (; slot + KERN_LEVEL_BLOCK <= span_count; slot += KERN_LEVEL_BLOCK)
+      for (part_index = 0; part_index < part_count; ++part_index)
+        for (run_index = 0; run_index < run_wide; ++run_index) {
+          int from_slot = from_index + slot + part_count * run_index + part_index;
+          int level_index = kern_level_of(act_data[from_slot], step_value, back_step);
+          if (level_index == KERN_LEVEL_OFF) return 0;
+          level_data[from_index + slot + run_wide * part_index + run_index] = (int8_t)level_index;
+          total += level_index;
+        }
+    /* What is left of a group is under one block, and is read in the order it
+     * lies rather than the order a block wants. */
+    for (; slot < span_count; ++slot) {
+      int level_index = kern_level_of(act_data[from_index + slot], step_value, back_step);
+      if (level_index == KERN_LEVEL_OFF) return 0;
+      level_data[from_index + slot] = (int8_t)level_index;
+      total += level_index;
+    }
+    sum_data[group_index] = total;
+  }
+  return 1;
+}
+
+/* Sum of level times code over one group, as an integer.
+ *
+ * The blocks are `kern_level_stage`'s: sixty-four columns come out of one
+ * broadcast of the packed bytes, one variable shift and one mask, whatever the
+ * width, because a shift of a thirty-two bit lane moves every byte in it by the
+ * same places. */
+#if defined(APP_SIMD_AVX512VNNI)
+/* One block of sixty-four codes, out of the packed bytes and into a vector.
+ *
+ * Each width is a macro rather than a branch because the loops below are
+ * written out per width: `slot / part_count` with the count a literal is a
+ * shift, and with it a variable it is a sixty-four bit division inside the
+ * loop, which at eight bits cost more than the whole float path it replaces. */
+#  define KERN_LEVEL_TAKE_2(head)                                                                \
+    _mm512_and_si512(                                                                            \
+        _mm512_srlv_epi32(                                                                       \
+            _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(const void *)(head))),       \
+            step_wide),                                                                          \
+        code_mask)
+#  define KERN_LEVEL_TAKE_4(head)                                                                \
+    _mm512_and_si512(                                                                            \
+        _mm512_srlv_epi32(                                                                       \
+            _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *)(const void *)(head))),    \
+            step_wide),                                                                          \
+        code_mask)
+#  define KERN_LEVEL_TAKE_8(head) _mm512_xor_si512(_mm512_loadu_si512((const void *)(head)), flip_wide)
+
+/* The one lane loop: two accumulators, for the same reason the float paths
+ * carry two — a single chain waits on the dot product's own latency. */
+#  define KERN_LEVEL_ONE_LOOP(TAKE, PART)                                                        \
+    do {                                                                                         \
+      for (; slot + 2 * KERN_LEVEL_BLOCK <= span_count; slot += 2 * KERN_LEVEL_BLOCK) {          \
+        const uint8_t *word_head = byte_head + (size_t)slot / (PART);                            \
+        part_a = _mm512_dpbusd_epi32(                                                            \
+            part_a, TAKE(word_head),                                                             \
+            _mm512_loadu_si512((const void *)(lane_head + slot)));                               \
+        part_b = _mm512_dpbusd_epi32(                                                            \
+            part_b, TAKE(word_head + KERN_LEVEL_BLOCK / (PART)),                                 \
+            _mm512_loadu_si512((const void *)(lane_head + slot + KERN_LEVEL_BLOCK)));            \
+      }                                                                                          \
+      for (; slot + KERN_LEVEL_BLOCK <= span_count; slot += KERN_LEVEL_BLOCK) {                  \
+        const uint8_t *word_head = byte_head + (size_t)slot / (PART);                            \
+        part_a = _mm512_dpbusd_epi32(                                                            \
+            part_a, TAKE(word_head),                                                             \
+            _mm512_loadu_si512((const void *)(lane_head + slot)));                               \
+      }                                                                                          \
+    } while (0)
+
+/* And the four lane one: the block is decoded once and four lanes read it. */
+#  define KERN_LEVEL_MANY_LOOP(TAKE, PART)                                                       \
+    do {                                                                                         \
+      for (; slot + KERN_LEVEL_BLOCK <= span_count; slot += KERN_LEVEL_BLOCK) {                  \
+        __m512i code_wide = TAKE(byte_head + (size_t)slot / (PART));                             \
+        part_a = _mm512_dpbusd_epi32(part_a, code_wide,                                          \
+                                     _mm512_loadu_si512((const void *)(lane_a + slot)));         \
+        part_b = _mm512_dpbusd_epi32(part_b, code_wide,                                          \
+                                     _mm512_loadu_si512((const void *)(lane_b + slot)));         \
+        part_c = _mm512_dpbusd_epi32(part_c, code_wide,                                          \
+                                     _mm512_loadu_si512((const void *)(lane_c + slot)));         \
+        part_d = _mm512_dpbusd_epi32(part_d, code_wide,                                          \
+                                     _mm512_loadu_si512((const void *)(lane_d + slot)));         \
+      }                                                                                          \
+    } while (0)
+
+/* The constants every width's block is taken with.  Two bits shifts each
+ * quarter of the broadcast down by its own bit position, four bits each half;
+ * eight has nothing to shift and takes the flip instead. */
+#  define KERN_LEVEL_PLAN(bit_count)                                                             \
+    const __m512i step_wide =                                                                    \
+        (bit_count) == 2                                                                         \
+            ? _mm512_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2, 4, 4, 4, 4, 6, 6, 6, 6)                  \
+            : _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4);                 \
+    const __m512i code_mask = _mm512_set1_epi8((char)(uint8_t)((1u << (bit_count)) - 1u));       \
+    const __m512i flip_wide = _mm512_set1_epi8((char)(uint8_t)code_flip)
+#endif
+
+static int32_t kern_dot_level(const uint8_t *code_row, int from_index, int span_count,
+                              const int8_t *level_data, int bit_count, int code_flip) {
+  int32_t total = 0;
+  int slot = 0;
+#if defined(APP_SIMD_AVX512VNNI)
+  {
+    const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
+    const int8_t *lane_head = level_data + from_index;
+    __m512i part_a = _mm512_setzero_si512(), part_b = _mm512_setzero_si512();
+    KERN_LEVEL_PLAN(bit_count);
+    if (bit_count == 2)
+      KERN_LEVEL_ONE_LOOP(KERN_LEVEL_TAKE_2, 4);
+    else if (bit_count == 4)
+      KERN_LEVEL_ONE_LOOP(KERN_LEVEL_TAKE_4, 2);
+    else
+      KERN_LEVEL_ONE_LOOP(KERN_LEVEL_TAKE_8, 1);
+    total = _mm512_reduce_add_epi32(_mm512_add_epi32(part_a, part_b));
+  }
+#endif
+  /* The blocks the vector path did not take, which on a host without the dot
+   * product is all of them.  It walks the staging the way the staging was
+   * written — level `run_wide * part + run` of a block belongs to column
+   * `part_count * run + part` of it — so the two paths read the same bytes in
+   * the same pairs, and this is what the unit tests hold the vector one
+   * against. */
+  {
+    int part_count = 8 / bit_count;
+    int run_wide = KERN_LEVEL_BLOCK / part_count;
+    int part_index, run_index;
+    for (; slot + KERN_LEVEL_BLOCK <= span_count; slot += KERN_LEVEL_BLOCK)
+      for (part_index = 0; part_index < part_count; ++part_index)
+        for (run_index = 0; run_index < run_wide; ++run_index) {
+          int col_index = slot + part_count * run_index + part_index;
+          total += (int32_t)(pack_read(code_row, (size_t)(from_index + col_index), bit_count) ^
+                             (uint32_t)code_flip) *
+                   (int32_t)level_data[from_index + slot + run_wide * part_index + run_index];
+        }
+  }
+  /* And the columns past the last whole block, which are staged where they lie
+   * because there is no block for them to be ordered by. */
+  for (; slot < span_count; ++slot)
+    total += (int32_t)(pack_read(code_row, (size_t)(from_index + slot), bit_count) ^
+                       (uint32_t)code_flip) *
+             (int32_t)level_data[from_index + slot];
+  return total;
+}
+
+/* One row against the staged levels.  The group's whole correction is taken in
+ * integers — the zero point times the group's level sum is exact, and so is the
+ * difference — so the only rounding left in a row is the two multiplies that
+ * put it back in the activation's units. */
+static float kern_row_code_level(const plane *sheet, int row_index, const int8_t *level_data,
+                                 const int32_t *sum_data) {
+  const uint8_t *code_row = sheet->code_data + (size_t)row_index * sheet->row_stride;
+  size_t gain_base = (size_t)row_index * (size_t)sheet->group_count;
+  float total = 0.0f;
+  int group_index;
+  for (group_index = 0; group_index < sheet->group_count; ++group_index) {
+    int from_index = group_index * sheet->group_size;
+    int span_count = sheet->col_count - from_index;
+    float gain_value = plane_gain(sheet, gain_base + (size_t)group_index);
+    int32_t bias_value = (int32_t)sheet->code_bias +
+                         (sheet->bias_data ? (int32_t)sheet->bias_data[gain_base + (size_t)group_index] : 0);
+    int64_t part_value;
+    if (span_count > sheet->group_size) span_count = sheet->group_size;
+    part_value = (int64_t)kern_dot_level(code_row, from_index, span_count, level_data,
+                                         sheet->bit_count, sheet->code_flip);
+    part_value -= (int64_t)bias_value * (int64_t)sum_data[group_index];
+    total += gain_value * sheet->enter_gain * (float)part_value;
+  }
+  return total;
+}
+
 /* The same decode `kern_dot_code` performs, written out into floats instead of
  * summed against one activation vector.
  *
@@ -2616,6 +2902,12 @@ typedef struct kern_job {
   const float *act_data;  /* lane_count rows of col_count, act_stride apart */
   const float *sum_data;  /* lane_count rows of group_count, sum_stride apart */
   float       *out_data;  /* lane_count rows of row_count, out_stride apart */
+  /* The same activations as levels on the plane's own step, and their integer
+   * group sums, where `kern_level_stage` found every one of them on it.  NULL
+   * says the product is the float one. */
+  const int8_t  *level_data;
+  const int32_t *isum_data;
+  int          level_stride;
   int          act_stride;
   int          sum_stride;
   int          out_stride;
@@ -2786,6 +3078,101 @@ static void kern_row_code_many(const plane *sheet, int row_index, const kern_job
   }
 }
 
+/* One row of codes against several lanes of staged levels.
+ *
+ * The batch's shape is the float path's: the row is decoded once and every lane
+ * reads what that leaves.  What is different is where the decoded block lives.
+ * The float path writes it out into scratch because a spread is what the dot it
+ * feeds wants; here the block never leaves the vector, so there is nothing to
+ * write and nothing to read back, and a lane costs one load and one dot
+ * product.
+ *
+ * Four lanes at a time rather than all sixteen, and the block decoded once per
+ * four rather than once per row.  A block is three instructions and a lane is
+ * two, so decoding it four times over spends three where sharing it across all
+ * sixteen would spend none — against sixteen accumulators live at once, their
+ * loads, and a spill on any host narrower than this one.  The four are the
+ * float path's four for the same reason it has them.
+ *
+ * One accumulator a lane rather than the one lane path's two: four chains are
+ * already enough to cover the dot product's latency, and eight would be four
+ * more registers for nothing. */
+static void kern_dot_level_many(const uint8_t *code_row, int from_index, int span_count,
+                                const int8_t *level_data, int level_stride, int lane_count,
+                                int bit_count, int code_flip, int32_t *part_list) {
+  int lane_index = 0;
+#if defined(APP_SIMD_AVX512VNNI)
+  {
+    const uint8_t *byte_head = code_row + (size_t)from_index * (size_t)bit_count / 8u;
+    KERN_LEVEL_PLAN(bit_count);
+    for (; lane_index + 4 <= lane_count; lane_index += 4) {
+      const int8_t *lane_a = level_data + (size_t)lane_index * (size_t)level_stride + from_index;
+      const int8_t *lane_b = lane_a + level_stride;
+      const int8_t *lane_c = lane_b + level_stride;
+      const int8_t *lane_d = lane_c + level_stride;
+      __m512i part_a = _mm512_setzero_si512(), part_b = _mm512_setzero_si512();
+      __m512i part_c = _mm512_setzero_si512(), part_d = _mm512_setzero_si512();
+      int slot = 0;
+      if (bit_count == 2)
+        KERN_LEVEL_MANY_LOOP(KERN_LEVEL_TAKE_2, 4);
+      else if (bit_count == 4)
+        KERN_LEVEL_MANY_LOOP(KERN_LEVEL_TAKE_4, 2);
+      else
+        KERN_LEVEL_MANY_LOOP(KERN_LEVEL_TAKE_8, 1);
+      part_list[lane_index] = _mm512_reduce_add_epi32(part_a);
+      part_list[lane_index + 1] = _mm512_reduce_add_epi32(part_b);
+      part_list[lane_index + 2] = _mm512_reduce_add_epi32(part_c);
+      part_list[lane_index + 3] = _mm512_reduce_add_epi32(part_d);
+      /* The columns past the last whole block, staged where they lie. */
+      for (; slot < span_count; ++slot) {
+        int32_t code_value = (int32_t)(pack_read(code_row, (size_t)(from_index + slot), bit_count) ^
+                                       (uint32_t)code_flip);
+        part_list[lane_index] += code_value * (int32_t)lane_a[slot];
+        part_list[lane_index + 1] += code_value * (int32_t)lane_b[slot];
+        part_list[lane_index + 2] += code_value * (int32_t)lane_c[slot];
+        part_list[lane_index + 3] += code_value * (int32_t)lane_d[slot];
+      }
+    }
+  }
+#endif
+  /* The lanes past the last block of four, and every lane on a host without the
+   * dot product, go through the one lane form — which is the same arithmetic by
+   * construction, because integers do not care in what order they are added. */
+  for (; lane_index < lane_count; ++lane_index)
+    part_list[lane_index] =
+        kern_dot_level(code_row, from_index, span_count,
+                       level_data + (size_t)lane_index * (size_t)level_stride, bit_count,
+                       code_flip);
+}
+
+static void kern_row_code_level_many(const plane *sheet, int row_index, const kern_job *job) {
+  const uint8_t *code_row = sheet->code_data + (size_t)row_index * sheet->row_stride;
+  size_t gain_base = (size_t)row_index * (size_t)sheet->group_count;
+  int32_t part_list[KERN_LANE_LIMIT];
+  int lane_index, group_index;
+  for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
+    job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] = 0.0f;
+  for (group_index = 0; group_index < sheet->group_count; ++group_index) {
+    int from_index = group_index * sheet->group_size;
+    int span_count = sheet->col_count - from_index;
+    float gain_value = plane_gain(sheet, gain_base + (size_t)group_index) * sheet->enter_gain;
+    int32_t bias_value =
+        (int32_t)sheet->code_bias +
+        (sheet->bias_data ? (int32_t)sheet->bias_data[gain_base + (size_t)group_index] : 0);
+    if (span_count > sheet->group_size) span_count = sheet->group_size;
+    kern_dot_level_many(code_row, from_index, span_count, job->level_data, job->level_stride,
+                        job->lane_count, sheet->bit_count, sheet->code_flip, part_list);
+    for (lane_index = 0; lane_index < job->lane_count; ++lane_index) {
+      int64_t whole_value =
+          (int64_t)part_list[lane_index] -
+          (int64_t)bias_value * (int64_t)job->isum_data[(size_t)lane_index * (size_t)job->sum_stride +
+                                                        (size_t)group_index];
+      job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] +=
+          gain_value * (float)whole_value;
+    }
+  }
+}
+
 static void kern_mat_vec_band(void *state, int slice_index, int slice_count) {
   kern_job *job = (kern_job *)state;
   const plane *sheet = job->sheet;
@@ -2801,6 +3188,13 @@ static void kern_mat_vec_band(void *state, int slice_index, int slice_count) {
                           job->act_data + (size_t)lane_index * (size_t)job->act_stride,
                           sheet->col_count);
     }
+  } else if (job->level_data && job->lane_count > 1) {
+    for (row_index = row_from; row_index < row_upto; ++row_index)
+      kern_row_code_level_many(sheet, row_index, job);
+  } else if (job->lane_count == 1 && job->level_data) {
+    for (row_index = row_from; row_index < row_upto; ++row_index)
+      job->out_data[row_index] =
+          kern_row_code_level(sheet, row_index, job->level_data, job->isum_data);
   } else if (job->lane_count == 1) {
     for (row_index = row_from; row_index < row_upto; ++row_index)
       job->out_data[row_index] = kern_row_code(sheet, row_index, job->act_data, job->sum_data);
@@ -3297,6 +3691,13 @@ typedef struct back_desk {
   pool_group *pool_ref;
   float      *sum_room; /* scratch for per-group activation sums */
   int         sum_limit;
+  /* The same activations as levels, and their integer group sums, staged once
+   * per product for every row of it to read.  Sized at open from the widest
+   * code plane the model binds, so the token loop still allocates nothing. */
+  int8_t     *level_room;
+  int32_t    *isum_room;
+  int         level_limit; /* columns one lane's staging holds */
+  int         level_live;  /* the host has the integer dot product */
   void (*mat_vec)(struct back_desk *desk, const plane *sheet, const float *act_data, float *out_data);
   void (*mat_mat)(struct back_desk *desk, const plane *sheet, const float *act_data, int act_stride,
                   int lane_count, float *out_data, int out_stride);
@@ -3323,12 +3724,32 @@ static void back_mat_mat(back_desk *desk, const plane *sheet, const float *act_d
     job.sum_stride = sheet->group_count;
     job.lane_count = chunk_count;
     job.sum_data = NULL;
+    job.level_data = NULL;
+    job.isum_data = NULL;
+    job.level_stride = desk->level_limit;
     if (sheet->form == PLANE_CODE) {
+      /* One product is on the calibrated grid or it is not: a lane that falls
+       * off it puts the whole batch back on the float path, so every lane of
+       * one call is answered the same way.  The staging is tried first because
+       * where it succeeds the float group sums are not wanted, and they are the
+       * same pass over the same activations. */
+      int level_flag = desk->level_live && sheet->col_count <= desk->level_limit &&
+                       kern_level_ready(sheet);
       int lane_index;
-      for (lane_index = 0; lane_index < chunk_count; ++lane_index)
-        kern_group_sum(sheet, job.act_data + (size_t)lane_index * (size_t)act_stride,
-                       desk->sum_room + (size_t)lane_index * (size_t)sheet->group_count);
-      job.sum_data = desk->sum_room;
+      for (lane_index = 0; lane_index < chunk_count && level_flag; ++lane_index)
+        level_flag = kern_level_stage(
+            sheet, job.act_data + (size_t)lane_index * (size_t)act_stride,
+            desk->level_room + (size_t)lane_index * (size_t)desk->level_limit,
+            desk->isum_room + (size_t)lane_index * (size_t)sheet->group_count);
+      if (level_flag) {
+        job.level_data = desk->level_room;
+        job.isum_data = desk->isum_room;
+      } else {
+        for (lane_index = 0; lane_index < chunk_count; ++lane_index)
+          kern_group_sum(sheet, job.act_data + (size_t)lane_index * (size_t)act_stride,
+                         desk->sum_room + (size_t)lane_index * (size_t)sheet->group_count);
+        job.sum_data = desk->sum_room;
+      }
     }
     if (desk->pool_ref && sheet->row_count >= 64)
       pool_run(desk->pool_ref, kern_mat_vec_band, &job);
@@ -3382,13 +3803,27 @@ static const char *back_flavor(void) {
 #endif
 }
 
-static app_code back_open(back_desk *desk, pool_group *pool_ref, int sum_limit) {
+static app_code back_open(back_desk *desk, pool_group *pool_ref, int sum_limit, int col_limit) {
   memset(desk, 0, sizeof(*desk));
   desk->name_text = back_flavor();
   desk->pool_ref = pool_ref;
   desk->sum_limit = sum_limit > 0 ? sum_limit : 1;
   desk->sum_room = (float *)mem_clear(sizeof(float) * (size_t)desk->sum_limit * KERN_LANE_LIMIT);
   if (!desk->sum_room) return APP_FAIL_MEMORY;
+#if defined(APP_SIMD_AVX512VNNI)
+  desk->level_live = 1;
+#endif
+  if (desk->level_live && col_limit > 0) {
+    /* One lane's columns, and a plane wider than the peak the model reported —
+     * which there is none of — falls back rather than overruns.  Both sides of
+     * a block are bounded by the span, so nothing here reads past its end and
+     * the staging needs no room beyond the columns themselves. */
+    desk->level_limit = col_limit;
+    desk->level_room = (int8_t *)mem_clear((size_t)col_limit * KERN_LANE_LIMIT);
+    desk->isum_room =
+        (int32_t *)mem_clear(sizeof(int32_t) * (size_t)desk->sum_limit * KERN_LANE_LIMIT);
+    if (!desk->level_room || !desk->isum_room) return APP_FAIL_MEMORY;
+  }
   desk->mat_vec = back_mat_vec;
   desk->mat_mat = back_mat_mat;
   desk->norm_rms = back_norm_rms;
@@ -3402,6 +3837,10 @@ static void back_close(back_desk *desk) {
   if (!desk) return;
   mem_free(desk->sum_room);
   desk->sum_room = NULL;
+  mem_free(desk->level_room);
+  desk->level_room = NULL;
+  mem_free(desk->isum_room);
+  desk->isum_room = NULL;
 }
 
 /* ======================================================================== */
@@ -5683,6 +6122,7 @@ struct app_model {
   pool_group pool;
   back_desk  desk;
   size_t     weight_bytes;
+  int        code_col_peak; /* widest code plane bound, for the backend's staging */
 };
 
 /* Rounds the activation onto whatever grid the checkpoint declares, multiplies,
@@ -5820,6 +6260,8 @@ static app_code plane_bind_gemma(app_model *model, const char *stem, const store
   sheet_out->group_size = col_count / group_count;
   if (part_index == 0) model->weight_bytes += span->data_bytes + gain_span->data_bytes;
 
+  if (col_count > model->code_col_peak) model->code_col_peak = col_count;
+
   snprintf(step_text, sizeof(step_text), "%s.input_activation_scale", stem);
   step_span = store_find(&model->store, step_text);
   if (step_span) sheet_out->enter_gain = real_read(step_span->data_base, step_span->type_kind, 0);
@@ -5924,6 +6366,7 @@ static app_code plane_bind_part(app_model *model, const char *stem, int part_ind
     sheet_out->code_bias = 1 << (bit_count - 1);
     sheet_out->group_count = group_count;
     sheet_out->group_size = (col_count + group_count - 1) / group_count;
+    if (col_count > model->code_col_peak) model->code_col_peak = col_count;
     if (part_index == 0) model->weight_bytes += span->data_bytes + gain_span->data_bytes;
 
     snprintf(other_text, sizeof(other_text), "%s.weight_zero_point", stem);
@@ -9671,7 +10114,7 @@ app_code model_load(const char *folder_path, const app_setup *setup, app_model *
           group_peak = wing_list[sheet_index]->group_count;
     }
   }
-  code = back_open(&model->desk, &model->pool, group_peak);
+  code = back_open(&model->desk, &model->pool, group_peak, model->code_col_peak);
   if (code != APP_OKAY) { model_free(model); return code; }
 
   *model_out = model;

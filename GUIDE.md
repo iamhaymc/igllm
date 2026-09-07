@@ -219,6 +219,14 @@ name first, or a wide build reports itself as the tier it stands on.
 `-mprefer-vector-width=256` so that the compiler's own vectorization stays
 narrow while the kernels written for sixteen lanes get them.
 
+`APP_SIMD_AVX512VNNI` is a fifth name beside those four rather than part of the
+tier, because `vnni` arrived two generations after them: a host with AVX-512 may
+not have it. `run.py --wide` asks the compiler what `-march=native` would define
+on the build host and adds `-mavx512vnni` only where the answer says
+`__AVX512VNNI__`. Where it does not, `kern_level_ready` returns zero, the
+integer path below is never selected, and every result is the float path's to
+the bit.
+
 Three kernels have a wide path, and they are the fused dot at the two, four and
 eight bit widths the shipped export packs. Which three is a measurement rather
 than a plan: the spread was written wide at two and four bits, measured quicker
@@ -382,9 +390,60 @@ in isolation and slower in the engine, and taken out again — see
   arrives here at all — `kern_mat_vec_band` sends a single lane to
   `kern_row_code` and its fused dot — which is why the fused dot keeps a wide
   path and this does not.
+- `kern_level_of`, `kern_level_ready`, `kern_level_stage`, `kern_dot_level`,
+  `kern_dot_level_many`, `kern_row_code_level`, `kern_row_code_level_many` —
+  the same products taken on the calibrated integer grid instead, which is
+  0.8.9 and `RESEARCH.md` idea 2.
+
+  Every code plane in a Gemma export carries an `input_activation_scale`, and
+  `plane_lift_many` rounds what goes into the product onto that step before any
+  kernel sees it. So an activation reaching a code plane is `level * step` for
+  an integer `level` in `[-128, 127]`, and `Σ code·act` is `step` times an exact
+  integer of two byte-sized factors. One `vpdpbusd` takes sixty-four of those
+  products into sixteen `int32` lanes, where the float path unpacked, converted
+  and multiplied sixteen at a time.
+
+  A block is sixty-four columns at every width, because two, four and eight all
+  divide a byte: the packed bytes are broadcast — sixteen of them to four
+  quarters at two bits, thirty-two to two halves at four, sixty-four as
+  themselves at eight — then one variable shift moves each part down by its own
+  bit position and one mask keeps the width. A shift of a thirty-two bit lane
+  moves every byte in it by the same places, which is what makes one shift serve
+  a whole block.
+
+  That leaves the codes ordered by bit position rather than by column: at two
+  bits, byte `16r + k` of the block holds column `4k + r`. Putting them back
+  would be a shuffle paid by every row of the plane. So `kern_level_stage`
+  writes the *activations* in that order instead — a permutation of a vector
+  that is read once against rows that read it 262144 times for the output head —
+  and keeps each group's integer level sum beside them, so the zero point
+  correction is exact too. The columns past the last whole block are staged
+  where they lie and read by a scalar loop, which is also the whole kernel on a
+  host without the dot product and what the unit tests hold the vector path
+  against.
+
+  Nothing is assumed. `kern_level_of` recomputes `level * step` and compares, so
+  an activation that never went through `quant_step` refuses the staging and the
+  whole product falls back to the float path — every lane of one call the same
+  way, so a batch is never half on the grid. `kern_level_ready` holds
+  `span * 255 * 128` against `INT32_MAX` before a lane can overflow, and refuses
+  a group that does not begin where a block does.
+
+  The loops are written out once per width rather than parameterized by it. With
+  the codes-per-byte a runtime value, a block's `slot / part_count` is a
+  sixty-four bit division inside the loop, and at eight bits that division cost
+  more than the whole float path it replaces.
+
+  This is not the float path's answer to the last bit, and it is the better of
+  the two: the integer sum is exact, so a row's only rounding is the two gains
+  at the end of it. Held against the reference's own tower modules on the
+  shipped weights, the vision tower goes from 2.871 off to 2.049 where the
+  reference moves 2.945 against itself, and the audio tower from 7.739 to 7.086
+  against its own 7.213.
 - `kern_mat_vec_band` — one band of rows, the unit of work given to the pool.
   It carries a lane count, so the same band function serves a matrix-vector
-  product and a matrix-matrix product.
+  product and a matrix-matrix product, and a staged level vector, so the same
+  band serves the integer path and the float one.
 
   It is also the whole of what the pool is asked to do, and a decode token asks
   277 times — nine planes a layer, the output head, the per-layer projection.
@@ -417,6 +476,10 @@ typedef struct back_desk {
   pool_group *pool_ref;
   float      *sum_room;
   int         sum_limit;
+  int8_t     *level_room;
+  int32_t    *isum_room;
+  int         level_limit;
+  int         level_live;
   void (*mat_vec)(struct back_desk *, const plane *, const float *, float *);
   void (*mat_mat)(struct back_desk *, const plane *, const float *, int, int,
                   float *, int);
@@ -428,7 +491,13 @@ typedef struct back_desk {
 ```
 
 `mat_vec` is `mat_mat` with one lane, so there is a single implementation to
-replace. `back_open` binds the CPU implementation. The model and session layers never
+replace. `back_open` binds the CPU implementation, and sizes both scratches from
+the model: `sum_limit` is the widest group count any plane binds and
+`level_limit` the widest column count, both walked at load, so the token loop
+allocates nothing. `back_mat_mat` is where a product decides which arithmetic it
+is taken in — it stages the levels first and computes the float group sums only
+if the staging refused, since the two are the same pass over the same
+activations. The model and session layers never
 call a kernel by name — they call `desk->mat_vec` and its siblings. A GPU or
 NPU backend therefore needs three things and touches nothing else:
 

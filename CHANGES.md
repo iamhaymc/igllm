@@ -3640,3 +3640,300 @@ memory and has been measured there — and the two bit path, which is more than
 half of what a step sweeps and still spending instructions. And the 25 ms
 outside them want the same treatment this release gave the fork: measured
 rather than guessed at.
+
+---
+
+## 0.8.9 — the product on the grid the export already rounds to
+
+### Scope
+
+The head item on `TODO.md`, taken by the first of the two routes `RESEARCH.md`
+named for it — its idea 2, the integer matrix kernel — rather than by another
+pass over the float one.
+
+The item was scoped as a two bit kernel, because two bits is the width where
+the float path was still spending most of its time on instructions rather than
+on memory. What the route turns out to give is all three widths the export
+packs, both halves of the engine, and the memory as the only thing left in any
+of them. At four threads the two bit path now reads 25.90 GiB/s of codes where
+the bare sweep gives 32.18, the four bit path 29.47 and the eight bit path
+31.04. Before this the same three were 12.26, 17.37 and 23.17.
+
+On the shipped export, at four threads on the host below: decode 8.92 tokens a
+second to 12.57, prefill 15.19 to 33.96, and a picture from 36.3 seconds to
+20.7. At one thread, where the memory is further away, prefill is 5.21 to 16.86
+— three and a quarter times.
+
+It moves the numbers, and where the numbers can be held against something that
+is not another float summation it moves them the right way. Against the
+reference's own tower modules on the shipped weights, the vision tower goes from
+2.871 off to 2.049, where the reference moves 2.945 against itself; the audio
+tower from 7.739 to 7.086 against its own 7.213. The float sum was the
+approximation and the integer one is exact.
+
+### What the export already guarantees, and what nobody was using
+
+`quantization_config` in this checkpoint gives 548 planes an
+`input_activation_scale`, and `plane_lift_many` has always applied it: before
+any code plane's product, `quant_step` rounds every activation onto that step,
+clamps it to the eight bit range, and writes back `level * step`.
+
+So the activations entering a code plane are not arbitrary floats. Each one is
+an integer between -128 and 127 times a scalar the plane carries. The sum the
+kernel wants is
+
+    Σ code · act  =  step · Σ code · level
+
+and the right hand side is an exact integer, of an integer code and an integer
+level, both of which fit in a byte.
+
+The float path spent its instructions undoing that. It unpacked each code,
+converted it to a float, and multiplied it by an activation that was itself an
+integer wearing a float's clothes — three vector operations and a
+multiply-add for every sixteen codes at two bits, and the same again for the
+next sixteen. The integer path does not undo it: one `vpdpbusd` takes
+sixty-four codes against sixty-four levels and adds their products into sixteen
+`int32` lanes, and the whole block costs one load, one variable shift, one mask
+and that instruction.
+
+The eight bit levels also shrink the other side of the loop. A row of 12288
+columns read the activation vector as 48 kilobytes of floats and now reads it as
+12 kilobytes of bytes — first level cache traffic that a row pays every time,
+against a staging that the product pays once.
+
+### The activations are reordered, not the codes
+
+Sixty-four codes come out of the packing in one broadcast. Two bits: sixteen
+packed bytes are broadcast to the four quarters of a vector, each quarter
+shifted down by its own bit position within a byte, and masked. Four bits:
+thirty-two bytes to two halves, shifted by zero and four. Eight bits: the bytes
+are the codes and only the flip is taken. A shift of a thirty-two bit lane moves
+every byte inside it by the same places, which is why one variable shift serves
+a whole block whatever the width.
+
+What that leaves is a block whose codes are in the order *bit position first*:
+at two bits, byte `16r + k` of the vector holds the code of column `4k + r`. The
+obvious repair is a shuffle to put them back. That shuffle would be paid by
+every row of the plane — 262144 of them for the output head.
+
+So the codes are left where they land and the activations are written where the
+codes will be. `kern_level_stage` walks a block and writes level `4k + r` into
+slot `16r + k`, which is a permutation of a vector that is read once and costs
+nothing measurable against the rows that read it. Sixty-four is one block for
+every width, because two, four and eight all divide a byte.
+
+The columns past the last whole block — a plane of 194 columns has two — are
+staged where they lie, because there is no block for them to be ordered by.
+
+Everything else has to be read in the staged order, and the scalar path is the
+part of that which is easy to get wrong: it was written to walk the columns and
+read the levels beside them, which is right for the tail and wrong for every
+whole block. On the host this was developed on the vector path consumes every
+whole block and the mistake is unreachable, so the unit tests passed. Built for
+SSE2, AVX2 and AVX-512 without `vnni` — where the scalar loop is the whole
+kernel — twenty-four of them failed. The scalar loop now walks the same
+`run_wide * part + run` to `part_count * run + part` map the staging wrote, so
+the two paths read the same bytes in the same pairs, and it is the reference the
+vector path is held against on every tier rather than only on the one that
+skips it.
+
+### Two things are checked rather than assumed
+
+The kernel does not trust the caller to have rounded. `kern_level_of`
+recomputes `level * step` in single precision and compares it to the activation
+it came from: where `quant_step` wrote the value this is the same product
+rounded the same way, so it is exact by construction, and where it is not, the
+comparison says so. One activation off the step refuses the staging for the
+whole product and it falls back to the float path — every lane of one call
+answered the same way, so a batch is never half on the grid.
+
+The accumulator is checked too. `kern_level_ready` holds `span · 255 · 128`
+against `INT32_MAX` before the path is taken, which is the whole group's sum
+against what one of the sixteen lanes that share it can carry — deliberately
+sixteen times stricter than it needs to be, because the slack is free. On this
+export the widest group is 12288 columns, so the bound it is held to is 401
+million against 2147, and every plane passes; the check is written for a plane
+that would not.
+
+The correction is integers as well. A group's whole term is
+`Σ code·level − (bias + zero) · Σ level`, and both sums and the zero point are
+exact integers, so the difference is taken in `int64` and only the two gains are
+floats. What used to be a chain of a thousand rounded products is now two
+roundings.
+
+### `vnni` is asked of the host rather than of the tier
+
+`APP_SIMD_AVX512VNNI` is its own name beside `APP_SIMD_AVX512`, and this is not
+tidiness. The four subsets 0.8.7 asked for arrived together; `vnni` arrived two
+generations later, so a machine with all four may still not have it and a build
+that assumed it would stop with an illegal instruction rather than fall back.
+`run.py --wide` asks the compiler what `-march=native` would define on the build
+host and adds `-mavx512vnni` only where the answer says so. Where it does not,
+`kern_level_ready` returns zero, the staging never runs, and the float kernels
+are the whole of the engine.
+
+That is checkable and was checked: on this host a `--tuned` build and a
+`--wide` build with the flag withheld both produce the shipped export's `logits`
+output byte for byte identical to 0.8.8's. Only the build that has the
+instruction changes, and it changes only by being exact.
+
+### The host
+
+The same machine as 0.8.8: four cores of a virtual machine, an Intel Xeon at
+2.8 GHz with AVX-512 and VNNI, a mebibyte of L2 a core, 33 MiB of L3 between
+them and 15 GiB of memory. A read only sweep of a 2.34 GiB buffer, best of four:
+
+| threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| sequential read | 9.62 GiB/s | 18.21 | 25.29 | **32.18** |
+
+That is faster than the 26.27 the same sweep gave in 0.8.8, on the same host and
+the same code. It is a virtual machine and its neighbours are not this
+repository's; every pair of numbers below was taken in one sitting against its
+own control, and none of them should be read against 0.8.8's column.
+
+### The kernels, measured the way 0.8.8 measured them
+
+The same `kern_dot_code` over the same 12288 wide rows, against
+`kern_dot_level` over the same rows and the staged levels of the same
+activations: once over half a mebibyte of codes read five hundred times, which
+never leaves the cache, and once over two gibibytes read once, which never stays
+in it. In GiB/s of codes read, best of three:
+
+| width | path | resident, 1 | streaming, 1 | resident, 4 | streaming, 4 |
+| --- | --- | --- | --- | --- | --- |
+| 2 bits | float | 3.59 | 3.05 | 13.52 | 12.26 |
+| 2 bits | **integer** | **15.36** | **7.50** | **59.92** | **25.90** |
+| 4 bits | float | 6.06 | 4.70 | 21.51 | 17.37 |
+| 4 bits | **integer** | **30.77** | **8.69** | **118.17** | **29.47** |
+| 8 bits | float | 13.18 | 6.05 | 45.75 | 23.17 |
+| 8 bits | **integer** | **68.08** | **8.31** | **229.50** | **31.04** |
+
+Resident, the integer path is four to five times the float one at every width.
+Streaming, it is not, and that is the finding rather than a disappointment: at
+four threads all three widths land between 25.90 and 31.04 GiB/s against the
+32.18 the sweep gives, which is the memory handing back its own number. At one
+thread they land between 7.50 and 8.69 against 9.62, which is the same thing
+said again with less headroom. 0.8.8 could say that of the eight bit path alone.
+It is now true of all three, and the question the kernels answer is closed:
+there is nothing further to win in them without reading fewer bytes.
+
+Eight bits is the width that says the loop shape matters. Written with the
+width as a runtime value, the block's `slot / codes_per_byte` is a sixty-four
+bit division inside the loop, and at eight bits — where the float path is
+already quick — that division cost more than the whole path it replaced: 7.44
+GiB/s resident where the float path measured 13.2 in the same sitting. The loops
+are written out per width instead, so the divisor is a literal and the division
+is a shift, and the table above is what that is worth at every width.
+
+### The engine, on the shipped export
+
+A 288 id prompt, 32 tokens served, wide build, one run each taken back to
+back:
+
+| threads | prefill before | prefill after | decode before | decode after |
+| --- | --- | --- | --- | --- |
+| 1 | 5.21 tok/s | **16.86** | 3.97 tok/s | **6.09** |
+| 2 | 9.10 | **25.98** | 5.91 | **9.06** |
+| 4 | 15.19 | **33.96** | 8.92 | **12.57** |
+
+Prefill gains more than decode, and by more the fewer threads there are. Both
+follow from the same fact: a batch reads each code byte sixteen times and a
+decode step reads it once, so prefill was the more instruction bound of the two
+and had the more to give up. Decode at four threads is now reading 9.63 GiB/s of
+the 784.4 MiB it sweeps a token, against 6.83 before.
+
+A picture, which is both halves at once — the tower, and the 256 soft tokens it
+lays down prefilled through the text stack. Wall clock of the same run with the
+image and without it:
+
+| threads | before | after |
+| --- | --- | --- |
+| 1 | 105.0 s | **48.3 s** |
+| 4 | 36.3 s | **20.7 s** |
+
+The tower is eight bit throughout, which is the width the item did not expect to
+gain anything, and it is a batch, which is where the gain is largest.
+
+### What moves in the numbers, and what says which way
+
+Every result of a code plane moves, because the summation is not the float
+path's. What the change is worth numerically is not a matter of opinion, because
+the towers can be held against the reference's own modules on the same weights:
+
+| tower | float path, off by | integer path, off by | the reference against itself |
+| --- | --- | --- | --- |
+| vision | 2.871 | **2.049** | 2.945 |
+| audio | 7.739 | **7.086** | 7.213 |
+
+Both moved towards the reference. The vision tower was inside the reference's
+own movement before and is further inside it now; the audio tower was just
+outside it and is now inside. That is the expected direction and the reason is
+not subtle: the integer sum is exact, so the only rounding left in a row is the
+two gains at the end of it, where the float sum rounded every one of a thousand
+products.
+
+The text stack does not say the same thing, and it is worth being exact about
+why. `run.py check --model model --wide`, run on both builds against the same
+reference on the same host:
+
+| prompt | float gap | integer gap | the reference against itself | float top 16 | integer top 16 |
+| --- | --- | --- | --- | --- | --- |
+| `Hello!` | 0.8251 | 1.4239 | 0.9074 | 94% | 81% |
+| `Write one sentence about the sea.` | 1.2234 | 1.3379 | 1.3961 | 94% | 81% |
+| `What is the capital of France?` | 0.7999 | 0.8981 | 0.5981 | 81% | 88% |
+| `Explain gravity to a child in two sentences.` | 1.7376 | 1.8306 | 1.1180 | 88% | 94% |
+
+Both builds pass every check — the leading token matched, the greedy
+continuation followed, every gap inside twice the reference's own movement,
+which is the bar this repository has used since the checkpoint's activation grid
+made per tensor equality meaningless. The integer build's gaps are a little
+larger on all four prompts and its top sixteen share moves both ways.
+
+That does not contradict the tower result; the two measure different distances.
+A tower's rows are one pass and are compared where they come out, so "closer to
+the reference" there is a statement about arithmetic and nothing else. The
+logits are 35 layers away, each of which rounds its input onto the export's
+grid: a
+last-bit difference in a sum that lands on a half step becomes a whole step, and
+a whole step at layer three is a different residual for every layer after it.
+`app_diff.py` has said this since it was written — the reference in double
+precision does not reproduce the reference in single by that measure either.
+Being exact does not buy agreement with a float32 reference downstream of a
+grid; it buys not being wrong, and the tower is where that shows.
+
+What it also buys is that the greedy continuations are unchanged and the leading
+token is the reference's on every prompt, before and after.
+
+The three recorded prompts in `app_test.c` pass unchanged, every recorded id
+still inside the sixteen ranks it is allowed to move within. That was not true
+of an intermediate version of this change, and the reason is worth keeping.
+With decode on the grid and prefill left on floats, the weakest of the recorded
+ids — `17531` on "Say hello.", recorded at rank 7 and already at rank 11 on
+0.8.8's wide build — fell to rank 17. With both halves on the same arithmetic it
+sits at rank 11 again, scoring 20.039 where 0.8.8 scored it 20.014. A graph that
+is exact in one half and rounded in the other is not half way between them; it
+is a third thing, and it drifts further than either. That is why the batch path
+is in this change rather than a later one.
+
+### What was not taken
+
+`RESEARCH.md`'s idea 3, the lookup table execution, is not here. It was the
+other route named for this item and it is the one that answers the same
+question — how to stop spreading codes into floats — so with the integer path
+in, the case for it is a different case: it would have to beat a kernel that is
+already at the memory. On this host it cannot, because nothing can. On a host
+without an integer dot product it might, and that is where the experiment now
+belongs.
+
+The 256 bit `vnni` of hosts that have `avx_vnni` without AVX-512, and the ARM
+dot product instructions, are both the same kernel at another width and neither
+is written. This is the rule 0.8.7 set for AVX-512 and it applies to its own
+successor: the path was written when a host with the instruction and the
+headroom to show it turned up, and the others wait for the same.
+
+Nothing was done to the staging's own cost. It is a scalar loop with a `rintf`,
+a multiply and a compare per column, run once per product per lane — one pass
+over 1536 activations against the output head's 262144 rows of them, so it is
+the row count smaller than what it saves. It would be a vector loop in a day and
+would not be measurable.

@@ -602,6 +602,203 @@ static void test_gemma(void) {
   mem_free(model);
 }
 
+/* The calibrated integer grid: the staging, the dot it feeds, and the product
+ * the two make.
+ *
+ * Every check here holds the integer path against a reference computed in
+ * integers, so it is exact rather than near: `kern_dot_level` returns the sum a
+ * plain loop over the same codes and levels returns, or it is wrong.  The
+ * comparison against the float path is the other way round and is deliberately
+ * loose — the two are not the same arithmetic, and which is closer to the truth
+ * is the point of the change rather than something to assert to the last bit.
+ *
+ * The tail past the last whole block is what most of the column counts below
+ * are for: a block is sixty-four columns and the staging orders them by the bit
+ * position they sit at, so a span that ends inside one has to be read the way
+ * it lies.  Off by one either way and the sums stop matching. */
+static void test_level(void) {
+  int bit_list[3] = {2, 4, 8};
+  int col_list[6] = {64, 128, 192, 130, 100, 67};
+  float step_value = 0.017384f;
+  int bit_slot, col_slot;
+  test_open("level");
+
+  { /* A value on the step comes back as its level; one between two steps says
+     * so rather than rounding to the nearer. */
+    float back_step = 1.0f / step_value;
+    int okay_flag = 1, level_index;
+    for (level_index = -128; level_index <= 127; ++level_index)
+      if (kern_level_of((float)level_index * step_value, step_value, back_step) != level_index)
+        okay_flag = 0;
+    test_true(okay_flag, "every level of the grid is recovered exactly");
+    test_true(kern_level_of(0.5f * step_value, step_value, back_step) == KERN_LEVEL_OFF,
+              "a value between two levels is refused");
+    test_true(kern_level_of(129.0f * step_value, step_value, back_step) == KERN_LEVEL_OFF,
+              "a value past the top of the grid is refused");
+    test_true(kern_level_of(-129.0f * step_value, step_value, back_step) == KERN_LEVEL_OFF,
+              "and past the bottom of it");
+  }
+
+  for (bit_slot = 0; bit_slot < 3; ++bit_slot) {
+    for (col_slot = 0; col_slot < 6; ++col_slot) {
+      int bit_count = bit_list[bit_slot];
+      int col_count = col_list[col_slot];
+      int row_count = 70;
+      test_plane_kit kit;
+      float *act_list = (float *)mem_clear(sizeof(float) * (size_t)col_count);
+      int8_t *level_list = (int8_t *)mem_clear((size_t)col_count);
+      int32_t *isum_list = (int32_t *)mem_clear(sizeof(int32_t));
+      int32_t *want_level = (int32_t *)mem_clear(sizeof(int32_t) * (size_t)col_count);
+      int col_index, row_index, stage_flag, okay_flag = 1;
+
+      test_plane_open(&kit, row_count, col_count, bit_count, col_count, 1);
+      kit.sheet.enter_gain = step_value;
+      for (col_index = 0; col_index < col_count; ++col_index) {
+        want_level[col_index] = ((col_index * 37 + bit_count * 11) % 255) - 127;
+        act_list[col_index] = (float)want_level[col_index] * step_value;
+      }
+      stage_flag = kern_level_stage(&kit.sheet, act_list, level_list, isum_list);
+      test_true(stage_flag, "activations on the step stage as levels");
+
+      { /* The staging is a permutation of the levels, and its sum is theirs. */
+        int32_t sum_want = 0;
+        int part_count = 8 / bit_count, run_wide = 64 / part_count;
+        int base_index, part_index, run_index;
+        for (col_index = 0; col_index < col_count; ++col_index) sum_want += want_level[col_index];
+        for (base_index = 0; base_index + 64 <= col_count; base_index += 64)
+          for (part_index = 0; part_index < part_count; ++part_index)
+            for (run_index = 0; run_index < run_wide; ++run_index)
+              if (level_list[base_index + run_wide * part_index + run_index] !=
+                  (int8_t)want_level[base_index + part_count * run_index + part_index])
+                okay_flag = 0;
+        for (col_index = base_index; col_index < col_count; ++col_index)
+          if (level_list[col_index] != (int8_t)want_level[col_index]) okay_flag = 0;
+        test_true(okay_flag, "each level lands where its code will");
+        test_true(isum_list[0] == sum_want, "and the group's integer sum is the levels' own");
+      }
+
+      { /* The dot against a plain integer loop over the same codes. */
+        okay_flag = 1;
+        for (row_index = 0; row_index < row_count; ++row_index) {
+          const uint8_t *code_row = kit.sheet.code_data + (size_t)row_index * kit.sheet.row_stride;
+          int32_t want_value = 0;
+          for (col_index = 0; col_index < col_count; ++col_index)
+            want_value += (int32_t)pack_read(code_row, (size_t)col_index, bit_count) *
+                          want_level[col_index];
+          if (kern_dot_level(code_row, 0, col_count, level_list, bit_count, 0) != want_value)
+            okay_flag = 0;
+        }
+        test_true(okay_flag, "kern_dot_level is the integer sum, exactly");
+      }
+
+      { /* And the row it makes agrees with the dense matrix it encodes. */
+        okay_flag = 1;
+        for (row_index = 0; row_index < row_count; ++row_index) {
+          double want_value = 0.0;
+          float have_value = kern_row_code_level(&kit.sheet, row_index, level_list, isum_list);
+          float gap;
+          for (col_index = 0; col_index < col_count; ++col_index)
+            want_value += (double)kit.dense_list[row_index * col_count + col_index] *
+                          (double)act_list[col_index];
+          gap = have_value - (float)want_value;
+          if (gap < 0.0f) gap = -gap;
+          if (gap > 1e-3f) okay_flag = 0;
+        }
+        test_true(okay_flag, "kern_row_code_level matches the dense product");
+      }
+
+      { /* One activation off the grid puts the whole product back on floats. */
+        act_list[col_count / 2] += 0.5f * step_value;
+        test_true(!kern_level_stage(&kit.sheet, act_list, level_list, isum_list),
+                  "one activation off the step refuses the whole staging");
+        act_list[col_count / 2] -= 0.5f * step_value;
+      }
+
+      mem_free(act_list);
+      mem_free(level_list);
+      mem_free(isum_list);
+      mem_free(want_level);
+      test_plane_close(&kit);
+    }
+  }
+
+  { /* The whole product, through the backend, on a plane that carries a step:
+     * every lane count from one up, so the batch's blocks of four and the lanes
+     * past them are both reached, and against the same rows fed one at a time. */
+    int lane_list[4] = {1, 4, 7, 16};
+    int lane_slot;
+    for (bit_slot = 0; bit_slot < 3; ++bit_slot) {
+      for (lane_slot = 0; lane_slot < 4; ++lane_slot) {
+        int bit_count = bit_list[bit_slot];
+        int lane_count = lane_list[lane_slot];
+        int row_count = 70, col_count = 194;
+        test_plane_kit kit;
+        float *act_list = (float *)mem_clear(sizeof(float) * (size_t)(col_count * lane_count));
+        float *many_list = (float *)mem_clear(sizeof(float) * (size_t)(row_count * lane_count));
+        pool_group pool;
+        back_desk desk;
+        int lane_index, row_index, col_index, okay_flag = 1;
+
+        test_plane_open(&kit, row_count, col_count, bit_count, col_count, 1);
+        kit.sheet.enter_gain = step_value;
+        for (lane_index = 0; lane_index < lane_count; ++lane_index)
+          for (col_index = 0; col_index < col_count; ++col_index)
+            act_list[lane_index * col_count + col_index] =
+                (float)(((lane_index * 53 + col_index * 29) % 255) - 127) * step_value;
+        pool_open(&pool, 3);
+        back_open(&desk, &pool, kit.sheet.group_count, kit.sheet.col_count);
+        desk.mat_mat(&desk, &kit.sheet, act_list, col_count, lane_count, many_list, row_count);
+        for (lane_index = 0; lane_index < lane_count; ++lane_index)
+          for (row_index = 0; row_index < row_count; ++row_index) {
+            double want_value = 0.0;
+            float gap;
+            for (col_index = 0; col_index < col_count; ++col_index)
+              want_value += (double)kit.dense_list[row_index * col_count + col_index] *
+                            (double)act_list[lane_index * col_count + col_index];
+            gap = many_list[lane_index * row_count + row_index] - (float)want_value;
+            if (gap < 0.0f) gap = -gap;
+            if (gap > 1e-3f) okay_flag = 0;
+          }
+        test_true(okay_flag, "a product on the grid matches the dense one at every lane count");
+        back_close(&desk);
+        pool_close(&pool);
+        mem_free(act_list);
+        mem_free(many_list);
+        test_plane_close(&kit);
+      }
+    }
+  }
+
+  { /* A plane whose activations are not on its step is answered by the float
+     * path, and answers the same thing. */
+    test_plane_kit kit;
+    int row_count = 70, col_count = 194;
+    float *act_list = (float *)mem_clear(sizeof(float) * (size_t)col_count);
+    float *grid_list = (float *)mem_clear(sizeof(float) * (size_t)row_count);
+    float *free_list = (float *)mem_clear(sizeof(float) * (size_t)row_count);
+    pool_group pool;
+    back_desk desk;
+    int col_index, row_index, okay_flag = 1;
+    test_plane_open(&kit, row_count, col_count, 4, col_count, 1);
+    for (col_index = 0; col_index < col_count; ++col_index)
+      act_list[col_index] = (float)sin((double)col_index * 0.19);
+    pool_open(&pool, 3);
+    back_open(&desk, &pool, kit.sheet.group_count, kit.sheet.col_count);
+    desk.mat_vec(&desk, &kit.sheet, act_list, free_list);
+    kit.sheet.enter_gain = step_value; /* claimed, but the activations are not on it */
+    desk.mat_vec(&desk, &kit.sheet, act_list, grid_list);
+    for (row_index = 0; row_index < row_count; ++row_index)
+      if (grid_list[row_index] != free_list[row_index]) okay_flag = 0;
+    test_true(okay_flag, "a step the activations are not on changes nothing");
+    back_close(&desk);
+    pool_close(&pool);
+    mem_free(act_list);
+    mem_free(grid_list);
+    mem_free(free_list);
+    test_plane_close(&kit);
+  }
+}
+
 /* Binds one slice of a stacked expert tensor and checks the view lands right. */
 static void test_expert(void) {
   const char header_text[] =
@@ -908,7 +1105,7 @@ static void test_kernel(void) {
       for (col_index = 0; col_index < col_count; ++col_index)
         act_list[col_index] = (float)sin((double)col_index * 0.21);
       pool_open(&pool, 3);
-      back_open(&desk, &pool, kit.sheet.group_count);
+      back_open(&desk, &pool, kit.sheet.group_count, kit.sheet.col_count);
       desk.mat_vec(&desk, &kit.sheet, act_list, out_list);
       for (row_index = 0; row_index < row_count; ++row_index) {
         double want_value = 0.0;
@@ -946,7 +1143,7 @@ static void test_kernel(void) {
       for (lane_index = 0; lane_index < lane_count * col_count; ++lane_index)
         act_list[lane_index] = (float)sin((double)lane_index * 0.13);
       pool_open(&pool, 3);
-      back_open(&desk, &pool, kit.sheet.group_count);
+      back_open(&desk, &pool, kit.sheet.group_count, kit.sheet.col_count);
       desk.mat_mat(&desk, &kit.sheet, act_list, col_count, lane_count, many_list, row_count);
       for (lane_index = 0; lane_index < lane_count; ++lane_index) {
         desk.mat_vec(&desk, &kit.sheet, act_list + lane_index * col_count, one_list);
@@ -4878,6 +5075,7 @@ int main(void) {
   test_number();
   test_pack();
   test_plane();
+  test_level();
   test_expert();
   test_gemma();
   test_kernel();

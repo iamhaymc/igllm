@@ -158,6 +158,13 @@ sanitizers, `--tuned` to allow host specific instructions, `--wide` for the
 AVX-512 kernels beside the AVX2 ones (which implies `--tuned`), or `--trace` to
 compile in the activation dump the parity harness reads.
 
+`--wide` asks one thing of the build host rather than of the tier: AVX-512 VNNI
+arrived two generations after the rest of AVX-512, so `run.py` asks the compiler
+what `-march=native` would define here and adds `-mavx512vnni` only where the
+answer says the host has it. That flag is what selects the integer kernels; a
+host without it builds every other AVX-512 path and produces the float path's
+results to the bit.
+
 ## Files
 
 | file          | purpose                                        |
@@ -292,3 +299,33 @@ the tuned one and 17.75 to 18.41 on the wide one — the order being the argumen
 since the default build has no fused multiply-add and so the loads are the
 largest share of what it does. Every lane's sum is the float it was, bit for
 bit. `CHANGES.md` says which three were refused and why.
+
+The sixth pass is 0.8.9's, on the same machine as the fifth, and it stops
+spending instructions on arithmetic the checkpoint had already done. Every code
+plane in this export ships an `input_activation_scale`, and the engine has
+always rounded what goes into the product onto it — so an activation reaching a
+code plane is an integer between -128 and 127 times that step, and the sum the
+kernel wants is that step times an exact integer of two byte-sized factors. On a
+host with AVX-512 VNNI one instruction takes sixty-four of those products where
+the float loop unpacked, converted and multiplied sixteen. Against a bare sweep
+of 32.18 GiB/s at four threads, the two bit path goes from 12.26 GiB/s of codes
+to 25.90, the four bit from 17.37 to 29.47 and the eight bit from 23.17 to
+31.04: all three are now at the memory, which is the question the kernels can
+answer closed. On the shipped export at four threads, decode goes from 8.92
+tokens a second to 12.57 and prefill from 15.19 to 33.96; at one thread prefill
+is 5.21 to 16.86. A picture — the tower and the 256 soft tokens it lays down,
+prefilled — goes from 36.3 seconds to 20.7 at four threads and 105.0 to 48.3 at
+one.
+
+This one moves the numbers, and the integer sum is the exact one where a chain
+of a thousand float products is not. Held against the reference's own tower
+modules on the same weights, the vision tower goes from 2.871 off to 2.049,
+where the reference moves 2.945 against itself, and the audio tower from 7.739
+to 7.086 against its own 7.213. The logits are 35 layers and as many roundings
+onto the export's grid further on, so exactness buys no agreement there and does
+not claim any: both builds pass every check against the reference on the same
+four prompts, matching its leading token and following its greedy continuation,
+with gaps a little wider than before and inside the same bar. `CHANGES.md` 0.8.9
+gives both tables. Builds without the instruction — every `--tuned` build, and a
+`--wide` build on a host that lacks VNNI — produce the export's logits byte for
+byte as they did before.
