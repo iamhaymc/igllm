@@ -1,0 +1,4 @@
+{"prompt":"A box has three red balls and two blue balls. How many balls are there?","response":"There are 3 + 2 = 5 balls."}
+{"prompt":"What should an assistant do before deleting a user's files?","response":"Explain which files would be deleted and ask the user to confirm before taking action."}
+{"prompt":"Rewrite this sentence more clearly: The report was done by me yesterday.","response":"I completed the report yesterday."}
+{"prompt":"A tool request failed because its input was missing a required field. What should you do next?","response":"Check the tool's input schema, supply the missing field using verified information, and retry only when the request is valid."}

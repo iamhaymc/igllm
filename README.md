@@ -158,6 +158,45 @@ sanitizers, `--tuned` to allow host specific instructions, `--wide` for the
 AVX-512 kernels beside the AVX2 ones (which implies `--tuned`), or `--trace` to
 compile in the activation dump the parity harness reads.
 
+### Fine-tune the local weights
+
+`weights_train.py` reads the checkpoint in `model/` and the four illustrative
+prompt/response pairs in `weights_train.jsonl`. Replace or extend that JSONL
+file with your own training examples; keep evaluation data separate.
+
+```sh
+# Install a PyTorch build appropriate for your hardware.
+python3 -m pip install torch==2.14.0 transformers==5.16.1 safetensors==0.8.0
+python3 weights_train.py --dry-run
+python3 weights_train.py
+python3 -m unittest weights_train_test
+```
+
+Defaults are one epoch, at most four optimizer steps, batch size one, seed 42,
+and text normalization-weight tuning. Prompt tokens are masked out of the loss.
+Overlong examples are rejected, not silently truncated; use `--max-length` to
+change the limit. Use `--dataset`, `--epochs`, `--max-steps`, `--learning-rate`,
+`--device`, and `--dtype` to customize the run. `--trainable all-text` also
+optimizes text embeddings, projections, and the output head; the vision and
+audio towers remain frozen. This tiny text-only dataset is a workflow example,
+not evidence of improved reasoning, tool use, or vision performance.
+
+**Memory matters:** the shipped weights use packed Gemma QAT tensors, which are
+not directly trainable. The script expands them into dense floating-point layers
+and removes static activation rounding before optimization. This is **not QAT**
+and does not preserve quantized inference numerics. Allow tens of GB of RAM
+(and GPU memory when using CUDA), plus disk space for the larger dense checkpoint;
+all-text training needs substantially more. `--dtype bfloat16` can reduce memory
+on supported hardware. Even the normalization-only mode expands the entire model.
+
+The original `model/` is never modified. The complete dense checkpoint, tokenizer,
+processor configuration, and training metadata are saved to the new directory
+`build/model-finetuned/`. Existing output directories and any output overlapping
+the source model are rejected. Use `--output` for subsequent runs. The saved
+checkpoint can be selected with `--model` in the engine and benchmark runner;
+it is not an adapter and needs no merge step. No checkpoint or custom model code
+is downloaded. `--dry-run` only validates paths and JSONL, not model execution.
+
 ## Files
 
 | file          | purpose                                        |
@@ -169,6 +208,9 @@ compile in the activation dump the parity harness reads.
 | `app_fake.py` | builds a synthetic checkpoint and quantizes it |
 | `app_diff.py` | layer by layer comparison against the reference |
 | `run.py`      | install, build, test, run workflows            |
+| `weights_train.py` | safe local floating-point text fine-tuning |
+| `weights_train.jsonl` | tiny editable prompt/response dataset  |
+| `weights_train_test.py` | offline training-workflow tests     |
 | `GUIDE.md`    | a complete tour of the implementation          |
 | `CHANGES.md`  | development progress and rationale             |
 | `TODO.md`     | open development tasks                         |
