@@ -90,7 +90,7 @@ typedef struct app_tally {
  * between two of them.  Anything not marked is charged to the part that was
  * open, which is why the catch-all parts exist and why they are named for what
  * they catch rather than left blank. */
-#define APP_PHASE_COUNT 13
+#define APP_PHASE_COUNT 15
 
 #define APP_PHASE_EMBED    0  /* the token's embedding row, and its scale */
 #define APP_PHASE_PLE      1  /* the per-layer embedding lift, and its norms */
@@ -105,6 +105,11 @@ typedef struct app_tally {
 #define APP_PHASE_HEAD    10  /* the final norm, the output head, and the logit cap */
 #define APP_PHASE_PICK    11  /* the sampler */
 #define APP_PHASE_OTHER   12  /* the pass's own bookkeeping, outside every layer */
+/* Two parts that read no weights at all, split out of the kernels they sit
+ * inside, because a phase that mixes a code plane with a transcendental over
+ * every element reports a rate that is neither one's. */
+#define APP_PHASE_GELU    13  /* the gate the feed-forward's two halves meet in */
+#define APP_PHASE_CAP     14  /* the tanh over all 262144 logits */
 
 /* What the timer collected, and what it cost to collect it.
  *
@@ -3823,9 +3828,43 @@ static void back_soft_max(back_desk *desk, float *value_list, int value_count) {
   kern_soft_max(value_list, value_count);
 }
 
+typedef struct gelu_job {
+  float       *gate_list;
+  const float *rise_list;
+  int          value_count;
+} gelu_job;
+
+static void kern_gelu_band(void *state, int slice_index, int slice_count) {
+  gelu_job *job = (gelu_job *)state;
+  int from_slot = (int)((long long)job->value_count * slice_index / slice_count);
+  int upto_slot = (int)((long long)job->value_count * (slice_index + 1) / slice_count);
+  kern_gelu_gate(job->gate_list + from_slot, job->rise_list + from_slot, upto_slot - from_slot);
+}
+
+/* The gate the feed-forward's two halves meet in, across the pool.
+ *
+ * It reads no weights, so it never appeared in a byte count and nothing looked
+ * at it; the phase timer put it at an eighth of a decode step and a fifth of a
+ * prefill batch, on one core, while the projections either side of it had the
+ * whole pool.  It is an elementwise map — every output depends on its own input
+ * and nothing else — so dividing it is not a summation order question and
+ * cannot move a bit.
+ *
+ * The threshold is the argument the matrix product makes at `row_count`: below
+ * it the fork costs more than the work.  This export's inner width is 6144 and
+ * its per-layer embedding gate is 256, so the two fall either side of it. */
+#define GELU_BAND_COUNT 1024
+
 static void back_gelu_gate(back_desk *desk, float *gate_list, const float *rise_list,
                            int value_count) {
-  (void)desk;
+  if (desk->pool_ref && value_count >= GELU_BAND_COUNT) {
+    gelu_job job;
+    job.gate_list = gate_list;
+    job.rise_list = rise_list;
+    job.value_count = value_count;
+    pool_run(desk->pool_ref, kern_gelu_band, &job);
+    return;
+  }
   kern_gelu_gate(gate_list, rise_list, value_count);
 }
 
@@ -9978,11 +10017,13 @@ static void session_layer(app_session *session, int layer_index, int place_from,
                     session->gate_room, session->gate_stride);
   session_lift_many(session, &wing->rise_sheet, session->scrap_room, state_stride, lane_count,
                     session->rise_room, session->rise_stride);
+  phase_turn(session, APP_PHASE_GELU);
   for (lane_index = 0; lane_index < lane_count; ++lane_index)
     model->desk.gelu_gate(&model->desk,
                           session->gate_room + (size_t)lane_index * session->gate_stride,
                           session->rise_room + (size_t)lane_index * session->rise_stride,
                           wing->inner_size);
+  phase_turn(session, APP_PHASE_MLP);
   session_lift_many(session, &wing->drop_sheet, session->gate_room, session->gate_stride, lane_count,
                     session->lift_room, lift_stride);
   for (lane_index = 0; lane_index < lane_count; ++lane_index)
@@ -10048,6 +10089,22 @@ static void session_layer(app_session *session, int layer_index, int place_from,
   for (lane_index = 0; lane_index < lane_count; ++lane_index)
     TRACE_LANE("out", layer_index, place_from + lane_index,
                session->state_room + (size_t)lane_index * state_stride, state_size);
+}
+
+typedef struct cap_job {
+  float *logit_list;
+  int    value_count;
+  float  cap_value;
+} cap_job;
+
+static void session_cap_band(void *state, int slice_index, int slice_count) {
+  cap_job *job = (cap_job *)state;
+  int from_slot = (int)((long long)job->value_count * slice_index / slice_count);
+  int upto_slot = (int)((long long)job->value_count * (slice_index + 1) / slice_count);
+  int value_index;
+  for (value_index = from_slot; value_index < upto_slot; ++value_index)
+    job->logit_list[value_index] =
+        tanhf(job->logit_list[value_index] / job->cap_value) * job->cap_value;
 }
 
 /* A batch of tokens through the whole graph.  Logits are produced for the last
@@ -10132,10 +10189,18 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
   TRACE_LANE("final", -1, place_from + lane_count - 1, session->scrap_room, form->state_size);
   session_lift(session, &model->head_sheet, session->scrap_room, session->logit_room);
   if (form->logit_cap > 0.0f) {
-    int value_index;
-    for (value_index = 0; value_index < model->head_sheet.row_count; ++value_index)
-      session->logit_room[value_index] =
-          tanhf(session->logit_room[value_index] / form->logit_cap) * form->logit_cap;
+    /* A `tanhf` for each of 262144 logits, which the timer put at a sixteenth
+     * of a decode step spent on the one thread that got here.  Elementwise, so
+     * the pool changes nothing but who runs it. */
+    cap_job job;
+    phase_turn(session, APP_PHASE_CAP);
+    job.logit_list = session->logit_room;
+    job.value_count = model->head_sheet.row_count;
+    job.cap_value = form->logit_cap;
+    if (model->pool.worker_count > 0 && job.value_count >= GELU_BAND_COUNT)
+      pool_run(&model->pool, session_cap_band, &job);
+    else
+      session_cap_band(&job, 0, 1);
   }
   TRACE_LANE("logits", -1, place_from + lane_count - 1, session->logit_room,
              model->head_sheet.row_count);
@@ -11518,6 +11583,8 @@ const char *app_phase_text(int phase_slot) {
     case APP_PHASE_HEAD:    return "final norm, head";
     case APP_PHASE_PICK:    return "sampler";
     case APP_PHASE_OTHER:   return "pass bookkeeping";
+    case APP_PHASE_GELU:    return "mlp gate";
+    case APP_PHASE_CAP:     return "logit cap";
     default: return "";
   }
 }
