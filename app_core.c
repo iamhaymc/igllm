@@ -3674,18 +3674,6 @@ static float kern_soft_plus(float value) {
   return value > 20.0f ? value : logf(1.0f + expf(value));
 }
 
-static float kern_gelu_tanh(float value) {
-  const float root_value = 0.7978845608028654f; /* sqrt(2/pi) */
-  float cube_value = value * value * value;
-  return 0.5f * value * (1.0f + tanhf(root_value * (value + 0.044715f * cube_value)));
-}
-
-static void kern_gelu_gate(float *gate_list, const float *rise_list, int value_count) {
-  int value_index;
-  for (value_index = 0; value_index < value_count; ++value_index)
-    gate_list[value_index] = kern_gelu_tanh(gate_list[value_index]) * rise_list[value_index];
-}
-
 /* The exponential a softmax needs, to within a bit of the last, without a call
  * into libm.
  *
@@ -4050,6 +4038,123 @@ static void kern_logit_cap(float *value_list, int value_count, float cap_value) 
 #endif
   for (; value_index < value_count; ++value_index)
     value_list[value_index] = kern_logit_cap_one(value_list[value_index], cap_value, back_cap);
+}
+
+/* The gate the feed-forward's two halves meet in.
+ *
+ * The tanh form of the gelu, and the tanh is the same exponential the cap above
+ * is:
+ *
+ *     0.5 x (1 + tanh y)  =  x t / (t + 1),      t = e^{2y}
+ *
+ * which is the same value written without the subtraction — `t / (t + 1)` has
+ * nothing to cancel at either end, where `1 + tanh y` loses the low bits of a
+ * small result.  So this is not merely faster than the call it replaces; where
+ * the two differ, over a gate that has gone deeply negative, it is the more
+ * accurate of the two.
+ *
+ * The argument is clamped where `tanh` has already reached one to the last bit
+ * a float carries, which is also what keeps `t` a number rather than an
+ * infinity: `t / (t + 1)` at an infinite `t` is a nan, and the clamp is what
+ * says the answer there is one.
+ *
+ * Under the clamp the gate is zero rather than `x t / (t + 1)`, and that is
+ * stated rather than left to the clamped `t`.  A saturated `tanh` is exactly
+ * minus one, so the gate there is exactly `0.5 x (1 - 1) = 0`; the clamped `t`
+ * would instead give `x e^{-30}`, which is nothing for a gate of any size a
+ * layer produces and is not nothing for one of `1e30`.  Two instructions say
+ * so, and the kernel has no argument it answers absurdly.
+ *
+ * It moved down the file to sit under `kern_exp_wide` rather than over it.  It
+ * is the same kernel it was and nothing else calls it in between. */
+#define KERN_GELU_REACH 30.0f /* `2y` past which `t / (t + 1)` is one to the bit */
+#define KERN_GELU_ROOT 0.7978845608028654f /* sqrt(2/pi) */
+#define KERN_GELU_BEND 0.044715f
+
+static float kern_gelu_tanh(float value) {
+  float cube_value = value * value * value;
+  float turn_value = 2.0f * KERN_GELU_ROOT * (value + KERN_GELU_BEND * cube_value);
+  float rise_value;
+  if (!(turn_value > -KERN_GELU_REACH)) return value * 0.0f;
+  if (turn_value > KERN_GELU_REACH) turn_value = KERN_GELU_REACH;
+  rise_value = kern_exp_near(turn_value);
+  return value * (rise_value / (rise_value + 1.0f));
+}
+
+static void kern_gelu_gate(float *gate_list, const float *rise_list, int value_count) {
+  int value_index = 0;
+#if defined(APP_SIMD_AVX2)
+  {
+    const __m256 wide_root = _mm256_set1_ps(2.0f * KERN_GELU_ROOT);
+    const __m256 wide_bend = _mm256_set1_ps(KERN_GELU_BEND);
+    const __m256 wide_reach = _mm256_set1_ps(KERN_GELU_REACH);
+    const __m256 wide_one = _mm256_set1_ps(1.0f);
+    for (; value_index + 8 <= value_count; value_index += 8) {
+      __m256 gate_value = _mm256_loadu_ps(gate_list + value_index);
+      __m256 cube_value = _mm256_mul_ps(_mm256_mul_ps(gate_value, gate_value), gate_value);
+      __m256 turn_value =
+          _mm256_mul_ps(wide_root, _mm256_fmadd_ps(wide_bend, cube_value, gate_value));
+      __m256 rise_value;
+      __m256 sunk_flag = _mm256_cmp_ps(turn_value, _mm256_sub_ps(_mm256_setzero_ps(), wide_reach),
+                                       _CMP_GT_OQ);
+      turn_value = _mm256_min_ps(turn_value, wide_reach);
+      turn_value = _mm256_max_ps(turn_value, _mm256_sub_ps(_mm256_setzero_ps(), wide_reach));
+      rise_value = kern_exp_wide(turn_value);
+      rise_value = _mm256_div_ps(rise_value, _mm256_add_ps(rise_value, wide_one));
+      rise_value = _mm256_and_ps(rise_value, sunk_flag);
+      _mm256_storeu_ps(gate_list + value_index,
+                       _mm256_mul_ps(_mm256_mul_ps(gate_value, rise_value),
+                                     _mm256_loadu_ps(rise_list + value_index)));
+    }
+  }
+#elif defined(APP_SIMD_SSE2)
+  {
+    const __m128 wide_root = _mm_set1_ps(2.0f * KERN_GELU_ROOT);
+    const __m128 wide_bend = _mm_set1_ps(KERN_GELU_BEND);
+    const __m128 wide_reach = _mm_set1_ps(KERN_GELU_REACH);
+    const __m128 wide_one = _mm_set1_ps(1.0f);
+    for (; value_index + 4 <= value_count; value_index += 4) {
+      __m128 gate_value = _mm_loadu_ps(gate_list + value_index);
+      __m128 cube_value = _mm_mul_ps(_mm_mul_ps(gate_value, gate_value), gate_value);
+      __m128 turn_value =
+          _mm_mul_ps(wide_root, _mm_add_ps(gate_value, _mm_mul_ps(wide_bend, cube_value)));
+      __m128 rise_value;
+      __m128 sunk_flag = _mm_cmpgt_ps(turn_value, _mm_sub_ps(_mm_setzero_ps(), wide_reach));
+      turn_value = _mm_min_ps(turn_value, wide_reach);
+      turn_value = _mm_max_ps(turn_value, _mm_sub_ps(_mm_setzero_ps(), wide_reach));
+      rise_value = kern_exp_wide(turn_value);
+      rise_value = _mm_div_ps(rise_value, _mm_add_ps(rise_value, wide_one));
+      rise_value = _mm_and_ps(rise_value, sunk_flag);
+      _mm_storeu_ps(gate_list + value_index,
+                    _mm_mul_ps(_mm_mul_ps(gate_value, rise_value),
+                               _mm_loadu_ps(rise_list + value_index)));
+    }
+  }
+#elif defined(APP_SIMD_NEON) && defined(__aarch64__)
+  {
+    const float32x4_t wide_root = vdupq_n_f32(2.0f * KERN_GELU_ROOT);
+    const float32x4_t wide_bend = vdupq_n_f32(KERN_GELU_BEND);
+    const float32x4_t wide_reach = vdupq_n_f32(KERN_GELU_REACH);
+    const float32x4_t wide_one = vdupq_n_f32(1.0f);
+    for (; value_index + 4 <= value_count; value_index += 4) {
+      float32x4_t gate_value = vld1q_f32(gate_list + value_index);
+      float32x4_t cube_value = vmulq_f32(vmulq_f32(gate_value, gate_value), gate_value);
+      float32x4_t turn_value =
+          vmulq_f32(wide_root, vmlaq_f32(gate_value, wide_bend, cube_value));
+      float32x4_t rise_value;
+      uint32x4_t sunk_flag = vcgtq_f32(turn_value, vnegq_f32(wide_reach));
+      turn_value = vminq_f32(turn_value, wide_reach);
+      turn_value = vmaxq_f32(turn_value, vnegq_f32(wide_reach));
+      rise_value = kern_exp_wide(turn_value);
+      rise_value = vdivq_f32(rise_value, vaddq_f32(rise_value, wide_one));
+      rise_value = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(rise_value), sunk_flag));
+      vst1q_f32(gate_list + value_index,
+                vmulq_f32(vmulq_f32(gate_value, rise_value), vld1q_f32(rise_list + value_index)));
+    }
+  }
+#endif
+  for (; value_index < value_count; ++value_index)
+    gate_list[value_index] = kern_gelu_tanh(gate_list[value_index]) * rise_list[value_index];
 }
 
 /* Rotary turn using the reference rotate-half convention. */

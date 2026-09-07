@@ -1270,6 +1270,52 @@ static void test_kernel(void) {
     }
   }
 
+  { /* And over a whole row, against the closed form in double.
+     *
+     * The gate is the exponential series rather than a call to `tanhf`, so what
+     * is asked of it is a bound; the bound is the one the call itself meets,
+     * because writing `0.5 x (1 + tanh y)` as `x t / (t + 1)` removes the
+     * subtraction that was losing the low bits.  The row is long enough that
+     * the vector path, its tail and the scalar loop are all reached. */
+    int value_count = 501;
+    float *gate_list = (float *)mem_clear(sizeof(float) * (size_t)value_count);
+    float *rise_list = (float *)mem_clear(sizeof(float) * (size_t)value_count);
+    double worst_gap = 0.0;
+    int slot;
+    for (slot = 0; slot < value_count; ++slot) {
+      gate_list[slot] = -20.0f + 40.0f * (float)slot / (float)(value_count - 1);
+      rise_list[slot] = 1.0f;
+    }
+    kern_gelu_gate(gate_list, rise_list, value_count);
+    for (slot = 0; slot < value_count; ++slot) {
+      double value = (double)(-20.0f + 40.0f * (float)slot / (float)(value_count - 1));
+      double inner = 0.7978845608028654 * (value + 0.044715 * value * value * value);
+      double gap = (double)gate_list[slot] - 0.5 * value * (1.0 + tanh(inner));
+      if (gap < 0.0) gap = -gap;
+      if (gap > worst_gap) worst_gap = gap;
+    }
+    test_true(worst_gap < 1e-5, "kern_gelu_gate is the closed form over a whole row");
+    mem_free(gate_list);
+    mem_free(rise_list);
+  }
+
+  { /* Where the `tanh` has saturated the gate is exactly nothing or exactly
+     * the value, and says so rather than reporting the clamp it used.  The
+     * arguments below overflow the cube on the way in, which is what makes the
+     * far end worth stating: a clamped exponent times a gate of `1e30` is not a
+     * small number. */
+    float gate_list[6] = {0.0f, -40.0f, 40.0f, -1e30f, 1e30f, -6.0f};
+    float rise_list[6] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    kern_gelu_gate(gate_list, rise_list, 6);
+    test_true(gate_list[0] == 0.0f, "the gate at zero is zero");
+    test_true(gate_list[1] == 0.0f && gate_list[3] == 0.0f,
+              "a saturated gate is nothing, however far past the clamp it is");
+    test_true(gate_list[2] == 40.0f && gate_list[4] == 1e30f,
+              "and at the other end it is the value itself");
+    test_true(gate_list[5] > -1e-8f && gate_list[5] <= 0.0f,
+              "and near the clamp it is still the small negative it should be");
+  }
+
   { /* Gated MLP activation. */
     float gate_list[3] = {1.0f, -1.0f, 0.25f};
     float rise_list[3] = {2.0f, 3.0f, -4.0f};
