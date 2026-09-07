@@ -122,6 +122,58 @@ static void test_pool_band(void *state, int slice_index, int slice_count) {
   for (slot = from_index; slot < upto_index; ++slot) tally_list[slot] += 1;
 }
 
+/* One round of the grind: stamp the round's own number across the span and
+ * leave a partial beside it, so the caller can check both that every slot was
+ * written this round and that what each worker wrote is visible to it. */
+typedef struct test_pool_load {
+  int  *tally_list;
+  long *part_list;
+  int   span_count;
+  int   round_mark;
+  int   hold_count; /* busy iterations inside a band, to outlast the join spin */
+} test_pool_load;
+
+static void test_pool_stamp(void *state, int slice_index, int slice_count) {
+  test_pool_load *load = (test_pool_load *)state;
+  int from_index, upto_index, slot;
+  long sum_value = 0;
+  volatile int hold_slot;
+  for (hold_slot = 0; hold_slot < load->hold_count; ++hold_slot) {}
+  slice_span(load->span_count, slice_index, slice_count, &from_index, &upto_index);
+  for (slot = from_index; slot < upto_index; ++slot) {
+    load->tally_list[slot] = load->round_mark;
+    sum_value += slot;
+  }
+  load->part_list[slice_index] = sum_value;
+}
+
+/* Returns the number of rounds that came back wrong, which should be zero.
+ * `idle_pauses` is how long the caller loiters before each fork; past the spin
+ * limit it puts every worker to sleep, so the next fork has to wake them. */
+static int test_pool_grind(pool_group *pool, test_pool_load *load, int round_count,
+                           int idle_pauses) {
+  int round_index, bad_count = 0;
+  for (round_index = 1; round_index <= round_count; ++round_index) {
+    int slot, pause_slot;
+    long sum_value = 0, want_value = 0;
+    for (pause_slot = 0; pause_slot < idle_pauses * (POOL_SPIN_LIMIT * 2); ++pause_slot)
+      pool_pause();
+    load->round_mark = round_index;
+    for (slot = 0; slot < pool_bands(pool); ++slot) load->part_list[slot] = -1;
+    pool_run(pool, test_pool_stamp, load);
+    for (slot = 0; slot < load->span_count; ++slot) {
+      if (load->tally_list[slot] != round_index) { bad_count += 1; break; }
+      want_value += slot;
+    }
+    for (slot = 0; slot < pool_bands(pool); ++slot) {
+      if (load->part_list[slot] < 0) { bad_count += 1; break; }
+      sum_value += load->part_list[slot];
+    }
+    if (sum_value != want_value) bad_count += 1;
+  }
+  return bad_count;
+}
+
 static void test_platform(void) {
   char path_text[64];
   test_open("platform");
@@ -181,6 +233,48 @@ static void test_platform(void) {
     test_true(sum_value == 1000, "pool_run covers every element once without the spin");
     pool_close(&pool);
     mem_free(tally_list);
+  }
+
+  /* The pool publishes a job and collects it on atomics rather than under the
+   * mutex, and takes the lock only to wake a thread that has actually gone to
+   * sleep.  What can go wrong with that is not a wrong answer once but a lost
+   * wake or a stale read once in a great many rounds, so it is ground rather
+   * than checked: thousands of rounds on the spinning path, thousands more on
+   * the sleeping one, and rounds where the caller idles past the spin limit so
+   * that the workers are asleep when the next job is published and the handoff
+   * between the two paths is the thing under test.
+   *
+   * Each round stamps its own number across the span and sums a partial per
+   * slice.  A lost wake hangs, which the suite reports as a hang; a stale read
+   * shows up as a slot carrying the round before it, or as a partial the caller
+   * cannot see. */
+  {
+    pool_group pool;
+    test_pool_load load;
+    int narrow_count = host_thread_count() < 4 ? host_thread_count() : 4;
+    int wide_count = host_thread_count() * 2 + 1;
+    load.span_count = 997; /* prime, so no round divides evenly across slices */
+    load.tally_list = (int *)mem_clear(sizeof(int) * (size_t)load.span_count);
+    load.part_list = (long *)mem_clear(sizeof(long) * (size_t)(wide_count + 1));
+    load.hold_count = 0;
+    if (load.tally_list && load.part_list) {
+      test_true(pool_open(&pool, narrow_count) == APP_OKAY, "pool_open succeeds for the grind");
+      test_true(test_pool_grind(&pool, &load, 4000, 0) == 0, "the spinning path holds over 4000 rounds");
+      test_true(test_pool_grind(&pool, &load, 64, 1) == 0,
+                "a job published to sleeping workers is seen by all of them");
+      load.hold_count = 20000;
+      test_true(test_pool_grind(&pool, &load, 64, 0) == 0,
+                "a caller that sleeps on the join is woken by the last worker");
+      load.hold_count = 0;
+      pool_close(&pool);
+
+      test_true(pool_open(&pool, wide_count) == APP_OKAY, "pool_open succeeds for the wide grind");
+      test_true(test_pool_grind(&pool, &load, 2000, 0) == 0,
+                "the sleeping path holds over 2000 rounds");
+      pool_close(&pool);
+    }
+    mem_free(load.tally_list);
+    mem_free(load.part_list);
   }
 }
 
@@ -3893,6 +3987,154 @@ static int test_wing_write(int moe_flag) {
 }
 
 /* A batched prefill has to land on exactly the same state as a token at a time. */
+/* Every byte a session holds that a block could have moved, folded into one
+ * number: the cache stores of every layer that owns one, the peaks beside them,
+ * and the two counters.  A dropped block has to leave all of it exactly as it
+ * was, and "exactly" is the point — a tolerance here would pass a cache that
+ * still held a rejected guess. */
+static uint64_t test_guess_mark(const app_session *session) {
+  const model_form *form = &session->model->form;
+  uint64_t mark = 1469598103934665603ull;
+  int layer_index;
+  size_t byte_index;
+  const uint8_t *walk;
+#define TEST_GUESS_FOLD(base, bytes)                                                             \
+  do {                                                                                           \
+    walk = (const uint8_t *)(base);                                                              \
+    for (byte_index = 0; byte_index < (size_t)(bytes); ++byte_index)                             \
+      mark = (mark ^ walk[byte_index]) * 1099511628211ull;                                       \
+  } while (0)
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    const layer_wing *wing = &session->model->wing_list[layer_index];
+    size_t slot_count;
+    if (wing->share_flag) continue;
+    slot_count = (size_t)wing->cache_span * (size_t)wing->kv_count * (size_t)wing->head_size;
+    TEST_GUESS_FOLD(session->key_store[layer_index],
+                    slot_count * cache_slot_bytes(session->key_grid[layer_index]));
+    TEST_GUESS_FOLD(session->value_store[layer_index],
+                    slot_count * cache_slot_bytes(session->value_grid[layer_index]));
+  }
+  TEST_GUESS_FOLD(session->key_peak, sizeof(float) * (size_t)form->layer_count);
+  TEST_GUESS_FOLD(session->value_peak, sizeof(float) * (size_t)form->layer_count);
+  TEST_GUESS_FOLD(&session->fill_count, sizeof(session->fill_count));
+  TEST_GUESS_FOLD(&session->echo_count, sizeof(session->echo_count));
+  TEST_GUESS_FOLD(session->echo_room, sizeof(int32_t) * (size_t)session->echo_count);
+#undef TEST_GUESS_FOLD
+  return mark;
+}
+
+/* The block path: every position's logits out of one pass, and a cache that can
+ * be put back.
+ *
+ * The synthetic checkpoint is the right place for this and not the shipped one,
+ * because its sliding window is **four**.  A block of four starting anywhere
+ * past the fourth token therefore overwrites every row of the ring, which is
+ * the case the undo exists for and the case a 512 row ring would never reach in
+ * a test of a few dozen tokens. */
+static void test_guess(void) {
+  static const int32_t seed_list[13] = {1, 7, 8, 9, 10, 11, 12, 13, 7, 8, 9, 10, 11};
+  static const int32_t want_list[4] = {12, 13, 7, 8};
+  app_setup setup = app_setup_plain();
+  app_model *model = NULL;
+  app_session *session = NULL;
+  app_session *other = NULL;
+  test_open("guess");
+  if (!test_wing_write(0)) { test_true(0, "the synthetic checkpoint is written"); return; }
+  if (model_load(test_yard_path, &setup, &model) != APP_OKAY || !model) {
+    test_true(0, "a checkpoint loads for the block path");
+    return;
+  }
+  if (session_open(model, &session) != APP_OKAY || !session ||
+      session_open(model, &other) != APP_OKAY || !other) {
+    test_true(0, "two sessions open for the block path");
+    model_free(model);
+    return;
+  }
+
+  test_true(session_guess_limit(session) == 4,
+            "a four row ring caps a block at four, whatever the lane limit is");
+  test_true(session_guess(session, want_list, 5) == NULL, "a block longer than the ring is refused");
+  test_true(session_guess_span(session) == 0, "a refused block leaves nothing in flight");
+
+  test_true(session_prime(session, seed_list, 13) == APP_OKAY, "a prompt primes");
+  session_step(session, seed_list[12]);
+  test_true(session_fill(session) > 4, "the prompt has lapped the sliding ring");
+
+  {
+    /* A block run and dropped, against the mark taken before it. */
+    uint64_t before_mark = test_guess_mark(session);
+    const float *logit_list = session_guess(session, want_list, 4);
+    test_true(logit_list != NULL, "a block of four runs");
+    test_true(session_guess_span(session) == 4, "the block is in flight");
+    test_true(session_step(session, want_list[0]) == NULL, "a step is refused mid-block");
+    test_true(session_prime(session, want_list, 2) == APP_FAIL_STATE, "a prime is refused mid-block");
+    test_true(session_guess_keep(session, 0) == APP_OKAY, "the block is dropped");
+    test_true(session_guess_span(session) == 0, "nothing is left in flight");
+    test_true(test_guess_mark(session) == before_mark,
+              "a dropped block leaves the session byte for byte where it was");
+  }
+
+  {
+    /* And a block run twice over: dropping it must leave the second run able to
+     * reach the same logits as the first, which is what a proposer that guesses
+     * twice depends on. */
+    float first_row[27];
+    const float *logit_list = session_guess(session, want_list, 4);
+    int slot, same_flag = 1;
+    if (logit_list) memcpy(first_row, logit_list + 3 * 27, sizeof(first_row));
+    session_guess_keep(session, 0);
+    logit_list = session_guess(session, want_list, 4);
+    if (logit_list)
+      for (slot = 0; slot < 27; ++slot)
+        if (logit_list[3 * 27 + slot] != first_row[slot]) same_flag = 0;
+    test_true(same_flag, "the same block run after a drop gives the same logits to the bit");
+    session_guess_keep(session, 0);
+  }
+
+  {
+    /* A partial keep against the ordinary path: keeping two lanes of a block has
+     * to leave the session where feeding those two ids one at a time would.
+     *
+     * The cache rows are held to a tolerance rather than to the bit, and the
+     * reason is worth stating because it decides what speculative decoding can
+     * claim here.  A batched pass answers every lane the same way — one lane
+     * off the calibrated grid puts the whole batch on the float path — while a
+     * lane stepped alone is judged alone, so the two can take different kernels
+     * and sum in a different order.  The logits agree to a tolerance, not to
+     * the bit, and a proposer's accepted token is therefore the token the model
+     * would have produced rather than the same arithmetic that would have
+     * produced it. */
+    const float *block_row;
+    float step_row[27];
+    const float *step_list;
+    int slot, okay_flag = 1, keep_count = 2;
+    session_reset(other);
+    test_true(session_prime(other, seed_list, 13) == APP_OKAY, "the second session primes");
+    session_step(other, seed_list[12]);
+
+    block_row = session_guess(session, want_list, 4);
+    if (block_row) memcpy(step_row, block_row + (size_t)(keep_count - 1) * 27, sizeof(step_row));
+    test_true(session_guess_keep(session, keep_count) == APP_OKAY, "two lanes are kept");
+    test_true(session_fill(session) == session_fill(other) + keep_count,
+              "a kept block advances the fill by what it kept");
+
+    for (slot = 0; slot < keep_count; ++slot) step_list = session_step(other, want_list[slot]);
+    if (step_list)
+      for (slot = 0; slot < 27; ++slot) {
+        float gap = step_list[slot] - step_row[slot];
+        if (gap < 0.0f) gap = -gap;
+        if (gap > 1e-3f) okay_flag = 0;
+      }
+    test_true(okay_flag, "a block's row agrees with the same tokens stepped one at a time");
+    test_true(session_fill(session) == session_fill(other),
+              "and leaves the two sessions holding the same count");
+  }
+
+  session_close(other);
+  session_close(session);
+  model_free(model);
+}
+
 static void test_wing(void) {
   static const int32_t id_list[21] = {1, 7, 8, 9, 10, 11, 12, 13, 7,  8, 9,
                                       10, 11, 12, 13, 7, 8, 9, 10, 11, 12};
@@ -5360,6 +5602,7 @@ int main(void) {
   test_wave();
   test_mel();
   test_wing();
+  test_guess();
   test_tower();
   test_turn();
   test_keep();

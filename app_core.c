@@ -252,6 +252,23 @@ app_code     session_prime_media(app_session *session, const int32_t *id_list, i
                                  const float *state_list, const uint8_t *state_flag);
 const float *session_step(app_session *session, int32_t id_value);
 const float *session_step_state(app_session *session, int32_t id_value, const float *state_data);
+
+/* A block of ids run in one pass, with every position's logits, and undone
+ * where the caller does not want it.
+ *
+ * `session_guess` runs `id_count` ids — at most `KERN_LANE_LIMIT` — and hands
+ * back one row of the vocabulary a lane, row `i` being what the model puts
+ * after `id_list[i]`.  The cache carries the block, and no other call may touch
+ * the session, until `session_guess_keep` says how many of the lanes to keep:
+ * zero puts the session back exactly where it was, and anything less than the
+ * whole block undoes the rest of it.
+ *
+ * This is the verify side of speculative decoding, and it is useful on its own
+ * to anything that wants to score a branch and abandon it. */
+const float *session_guess(app_session *session, const int32_t *id_list, int id_count);
+app_code     session_guess_keep(app_session *session, int keep_count);
+int          session_guess_span(const app_session *session);
+int          session_guess_limit(const app_session *session);
 int32_t      session_pick(app_session *session, const float *logit_list, const app_taste *taste);
 int          session_fill(const app_session *session); /* tokens held in cache */
 
@@ -351,7 +368,15 @@ app_setup   app_setup_plain(void);
  * four may not have: it arrived two generations after them.  It buys one
  * instruction — a dot product of four byte pairs into a thirty-two bit lane —
  * and that instruction is what the integer path beside `kern_dot_code` is
- * written around, so it names itself rather than riding on the tier. */
+ * written around, so it names itself rather than riding on the tier.
+ *
+ * `gfni` is asked for on the same terms and for the same kind of reason, and a
+ * host with `vnni` may or may not have it — Cascade Lake has the one and not
+ * the other, Ice Lake has both.  It buys `vgf2p8affineqb`, a bit matrix
+ * multiply applied to every byte of a vector independently, which is exactly
+ * what taking a two or four bit field out of a packed byte is: one instruction
+ * where the shift and the mask were two.  It is a strict extra, so where it is
+ * missing the shift and the mask are still there. */
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && \
     defined(__AVX512VL__)
 #  include <immintrin.h>
@@ -359,6 +384,9 @@ app_setup   app_setup_plain(void);
 #  define APP_SIMD_AVX512 1
 #  if defined(__AVX512VNNI__)
 #    define APP_SIMD_AVX512VNNI 1
+#    if defined(__GFNI__)
+#      define APP_SIMD_AVX512GFNI 1
+#    endif
 #  endif
 #elif defined(__AVX2__)
 #  include <immintrin.h>
@@ -552,10 +580,70 @@ static int host_thread_count(void) {
 /* A fork-join pool: every job splits one index range across the workers. */
 typedef void (*pool_task)(void *state, int slice_index, int slice_count);
 
+/* The counters a fork and a join are carried on, and the ordering each of them
+ * needs.
+ *
+ * The pool used to publish a job and collect it under the mutex, which put
+ * about eight lock acquisitions and four condition broadcasts on the path
+ * between one projection of a token and the next: the caller took the lock to
+ * publish, each worker took it again to read what was published, each took it a
+ * third time to count itself done and broadcast, and the caller took it once
+ * more to confirm.  A worker that is spinning needs none of that — it is
+ * already looking at the counter — so the counters became atomics and the lock
+ * became the thing a sleeper is woken through rather than the thing every fork
+ * goes through.
+ *
+ * Three orderings carry it, and the third is the one that is easy to get wrong.
+ * The publish is a release store on `task_serial` against an acquire on the
+ * worker's side, so a worker that sees the new serial sees the task written
+ * before it.  A completion is a release increment of `done_count` against the
+ * caller's acquire, so the caller that sees the count sees the work.  And the
+ * handoff between spinning and sleeping is a store-load pair in both
+ * directions — a worker publishes that it is about to sleep and then re-reads
+ * the serial, the caller publishes the serial and then reads the sleeper
+ * count — which is only safe if both sides are sequentially consistent.  With
+ * anything weaker each side may read the other's stale value and the wake is
+ * lost.  The same pair runs on the join, with `wait_flag` for the caller.
+ *
+ * `pool_atom` is a plain `int` everywhere the builtins exist and a `long` under
+ * MSVC, whose interlocked intrinsics are written for that width. */
+#if defined(_MSC_VER)
+typedef volatile long pool_atom;
+#define pool_atom_get(cell)      (*(cell))
+static long pool_atom_read(pool_atom *cell) {
+  long value = *cell;
+  MemoryBarrier();
+  return value;
+}
+static void pool_atom_put(pool_atom *cell, long value) { _InterlockedExchange(cell, value); }
+static void pool_atom_set(pool_atom *cell, long value) { _InterlockedExchange(cell, value); }
+static void pool_atom_bump(pool_atom *cell) { _InterlockedExchangeAdd(cell, 1); }
+static void pool_atom_drop(pool_atom *cell) { _InterlockedExchangeAdd(cell, -1); }
+static long pool_atom_grab(pool_atom *cell) {
+  long value = *cell;
+  MemoryBarrier();
+  return value;
+}
+#else
+typedef volatile int pool_atom;
+#define pool_atom_get(cell) __atomic_load_n((cell), __ATOMIC_RELAXED)
+static int pool_atom_read(pool_atom *cell) { return __atomic_load_n(cell, __ATOMIC_SEQ_CST); }
+/* The publish: release for the task beside it, sequential for the handoff. */
+static void pool_atom_put(pool_atom *cell, int value) {
+  __atomic_store_n(cell, value, __ATOMIC_SEQ_CST);
+}
+static void pool_atom_set(pool_atom *cell, int value) {
+  __atomic_store_n(cell, value, __ATOMIC_SEQ_CST);
+}
+static void pool_atom_bump(pool_atom *cell) { __atomic_fetch_add(cell, 1, __ATOMIC_SEQ_CST); }
+static void pool_atom_drop(pool_atom *cell) { __atomic_fetch_sub(cell, 1, __ATOMIC_SEQ_CST); }
+static int pool_atom_grab(pool_atom *cell) { return __atomic_load_n(cell, __ATOMIC_ACQUIRE); }
+#endif
+
 /* The hint a core gives the one beside it while it waits on a counter rather
  * than on the kernel.  It is a hint and not a barrier: what orders the memory
- * either side of a job is the mutex, which every waiter still takes before it
- * reads anything but the counter. */
+ * either side of a job is the acquire that closes the wait, which every waiter
+ * performs once it has seen the counter it was watching move. */
 static void pool_pause(void) {
 #if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
   YieldProcessor();
@@ -597,14 +685,18 @@ static void pool_pause(void) {
 typedef struct pool_group {
   int        worker_count;
   int        spin_limit; /* pauses before a waiter sleeps; zero when oversubscribed */
-  pool_task  task_call;
+  pool_task  task_call;  /* written before the publish, read after it */
   void      *task_state;
-  /* The three a waiter reads outside the lock while it spins, and every writer
-   * writes under it: `volatile` so a compiler cannot hoist the read out of the
-   * spin.  They are a hint there and are read again under the lock. */
-  volatile int stop_flag;
-  volatile int task_serial;
-  volatile int done_count;
+  /* The publish, the completion count, and the stop.  A spinning waiter reads
+   * these and nothing else, so none of them may be moved into the lock. */
+  pool_atom stop_flag;
+  pool_atom task_serial;
+  pool_atom done_count;
+  /* How many workers are asleep or about to be, and whether the caller is.
+   * A fork reads the first and a completion reads the second, each to decide
+   * whether the lock has to be touched at all. */
+  pool_atom sleep_count;
+  pool_atom wait_flag;
 #if defined(APP_HOST_WINDOWS)
   HANDLE            *worker_list;
   CRITICAL_SECTION   guard_lock;
@@ -639,6 +731,22 @@ static void pool_unlock(pool_group *group) {
 #endif
 }
 
+static void pool_wake_work(pool_group *group) {
+#if defined(APP_HOST_WINDOWS)
+  WakeAllConditionVariable(&group->work_wake);
+#else
+  pthread_cond_broadcast(&group->work_wake);
+#endif
+}
+
+static void pool_wake_done(pool_group *group) {
+#if defined(APP_HOST_WINDOWS)
+  WakeAllConditionVariable(&group->done_wake);
+#else
+  pthread_cond_broadcast(&group->done_wake);
+#endif
+}
+
 #if defined(APP_HOST_WINDOWS)
 static DWORD WINAPI pool_loop(LPVOID seat_data)
 #else
@@ -653,34 +761,49 @@ static void *pool_loop(void *seat_data)
     void *task_state;
     int slice_count;
     int spin_left;
-    for (spin_left = group->spin_limit;
-         spin_left > 0 && group->task_serial == seen_serial && !group->stop_flag; --spin_left)
+    for (spin_left = group->spin_limit; spin_left > 0 &&
+                                        pool_atom_get(&group->task_serial) == seen_serial &&
+                                        !pool_atom_get(&group->stop_flag);
+         --spin_left)
       pool_pause();
-    pool_lock(group);
-    while (group->task_serial == seen_serial && !group->stop_flag) {
+    /* Past the spin, say so before looking again.  The caller reads the count
+     * after it publishes, so between the two of them one always sees the
+     * other: either the caller finds a sleeper and wakes it, or this thread
+     * finds the serial already moved and never sleeps. */
+    if (pool_atom_get(&group->task_serial) == seen_serial &&
+        !pool_atom_get(&group->stop_flag)) {
+      pool_lock(group);
+      pool_atom_bump(&group->sleep_count);
+      while (pool_atom_read(&group->task_serial) == seen_serial &&
+             !pool_atom_get(&group->stop_flag)) {
 #if defined(APP_HOST_WINDOWS)
-      SleepConditionVariableCS(&group->work_wake, &group->guard_lock, INFINITE);
+        SleepConditionVariableCS(&group->work_wake, &group->guard_lock, INFINITE);
 #else
-      pthread_cond_wait(&group->work_wake, &group->guard_lock);
+        pthread_cond_wait(&group->work_wake, &group->guard_lock);
 #endif
+      }
+      pool_atom_drop(&group->sleep_count);
+      pool_unlock(group);
     }
-    if (group->stop_flag) { pool_unlock(group); break; }
-    seen_serial = group->task_serial;
+    if (pool_atom_get(&group->stop_flag)) break;
+    /* The acquire that pairs with the publish: everything the caller wrote
+     * before it moved the serial is visible from here down. */
+    seen_serial = pool_atom_grab(&group->task_serial);
     task_call = group->task_call;
     task_state = group->task_state;
     slice_count = group->worker_count + 1;
-    pool_unlock(group);
 
     if (task_call) task_call(task_state, seat->slice_index, slice_count);
 
-    pool_lock(group);
-    group->done_count += 1;
-#if defined(APP_HOST_WINDOWS)
-    WakeAllConditionVariable(&group->done_wake);
-#else
-    pthread_cond_broadcast(&group->done_wake);
-#endif
-    pool_unlock(group);
+    /* The completion, then the caller's flag.  Same pair as the fork, the
+     * other way round: the caller raises the flag and then reads the count, so
+     * a caller that has gone to sleep is always woken by whoever finishes. */
+    pool_atom_bump(&group->done_count);
+    if (pool_atom_read(&group->wait_flag)) {
+      pool_lock(group);
+      pool_wake_done(group);
+      pool_unlock(group);
+    }
   }
 #if defined(APP_HOST_WINDOWS)
   return 0;
@@ -744,44 +867,47 @@ static void pool_run(pool_group *group, pool_task task_call, void *task_state) {
     task_call(task_state, 0, 1);
     return;
   }
-  pool_lock(group);
   group->task_call = task_call;
   group->task_state = task_state;
-  group->done_count = 0;
-  group->task_serial += 1;
-#if defined(APP_HOST_WINDOWS)
-  WakeAllConditionVariable(&group->work_wake);
-#else
-  pthread_cond_broadcast(&group->work_wake);
-#endif
-  pool_unlock(group);
+  pool_atom_set(&group->done_count, 0);
+  /* The publish.  Sequentially consistent, so the sleeper count read on the
+   * next line cannot be answered from before it. */
+  pool_atom_put(&group->task_serial, pool_atom_get(&group->task_serial) + 1);
+  if (pool_atom_read(&group->sleep_count) > 0) {
+    pool_lock(group);
+    pool_wake_work(group);
+    pool_unlock(group);
+  }
 
   task_call(task_state, 0, slice_count);
 
-  for (spin_left = group->spin_limit; spin_left > 0 && group->done_count < group->worker_count;
-       --spin_left)
+  for (spin_left = group->spin_limit;
+       spin_left > 0 && pool_atom_get(&group->done_count) < group->worker_count; --spin_left)
     pool_pause();
-  pool_lock(group);
-  while (group->done_count < group->worker_count) {
+  if (pool_atom_get(&group->done_count) < group->worker_count) {
+    pool_lock(group);
+    pool_atom_set(&group->wait_flag, 1);
+    while (pool_atom_read(&group->done_count) < group->worker_count) {
 #if defined(APP_HOST_WINDOWS)
-    SleepConditionVariableCS(&group->done_wake, &group->guard_lock, INFINITE);
+      SleepConditionVariableCS(&group->done_wake, &group->guard_lock, INFINITE);
 #else
-    pthread_cond_wait(&group->done_wake, &group->guard_lock);
+      pthread_cond_wait(&group->done_wake, &group->guard_lock);
 #endif
+    }
+    pool_atom_set(&group->wait_flag, 0);
+    pool_unlock(group);
   }
-  pool_unlock(group);
+  /* The acquire that pairs with every completion: what the workers wrote is
+   * visible to the caller from here down. */
+  (void)pool_atom_grab(&group->done_count);
 }
 
 static void pool_close(pool_group *group) {
   int seat_index;
   if (group->worker_count <= 0) return;
   pool_lock(group);
-  group->stop_flag = 1;
-#if defined(APP_HOST_WINDOWS)
-  WakeAllConditionVariable(&group->work_wake);
-#else
-  pthread_cond_broadcast(&group->work_wake);
-#endif
+  pool_atom_set(&group->stop_flag, 1);
+  pool_wake_work(group);
   pool_unlock(group);
   for (seat_index = 0; seat_index < group->worker_count; ++seat_index) {
 #if defined(APP_HOST_WINDOWS)
@@ -2329,22 +2455,37 @@ static float kern_dot_code(const uint8_t *code_row, int from_index, int span_cou
     {
       /* A dword is sixteen codes, which is the whole vector: the two halves
        * the AVX2 path below shifts out separately are one shift here, and a
-       * broadcast serves sixteen codes rather than eight. */
+       * broadcast serves sixteen codes rather than eight.
+       *
+       * The mask and the widening are one instruction rather than two, and the
+       * instruction is a lookup.  After the shift, a lane holds its own code in
+       * bits zero and one and the next code in bits two and three — so the low
+       * four bits of the lane are a number from zero to fifteen whose remainder
+       * on four is the code this lane wants.  That is exactly what `vpermps`
+       * indexes with, so a sixteen entry table of `0, 1, 2, 3` repeated four
+       * times returns the code already a float, with the mask implied by the
+       * table repeating and the conversion implied by the table's contents.
+       *
+       * Four instructions a vector rather than five: a broadcast, a shift, the
+       * lookup and the multiply-add.  The lanes, the codes, the accumulators
+       * and the order are what they were, so this is the same sum to the last
+       * bit — the head reads it, and the head is where it is worth anything. */
       const __m512i step_wide = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24,
                                                   26, 28, 30);
-      const __m512i code_mask = _mm512_set1_epi32(3);
+      const __m512 code_look = _mm512_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f,
+                                              0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f);
       __m512 part_a = _mm512_setzero_ps(), part_b = _mm512_setzero_ps();
       for (; slot + 32 <= span_count; slot += 32) {
         uint32_t word_a, word_b;
         memcpy(&word_a, byte_head + slot / 4, 4);
         memcpy(&word_b, byte_head + slot / 4 + 4, 4);
         part_a = _mm512_fmadd_ps(
-            _mm512_cvtepi32_ps(_mm512_and_si512(
-                _mm512_srlv_epi32(_mm512_set1_epi32((int)word_a), step_wide), code_mask)),
+            _mm512_permutexvar_ps(_mm512_srlv_epi32(_mm512_set1_epi32((int)word_a), step_wide),
+                                  code_look),
             _mm512_loadu_ps(act_data + slot), part_a);
         part_b = _mm512_fmadd_ps(
-            _mm512_cvtepi32_ps(_mm512_and_si512(
-                _mm512_srlv_epi32(_mm512_set1_epi32((int)word_b), step_wide), code_mask)),
+            _mm512_permutexvar_ps(_mm512_srlv_epi32(_mm512_set1_epi32((int)word_b), step_wide),
+                                  code_look),
             _mm512_loadu_ps(act_data + slot + 16), part_b);
       }
       total = kern_zmm_total(_mm512_add_ps(part_a, part_b));
@@ -2681,18 +2822,49 @@ static int kern_level_stage(const plane *sheet, const float *act_data, int8_t *l
  * written out per width: `slot / part_count` with the count a literal is a
  * shift, and with it a variable it is a sixty-four bit division inside the
  * loop, which at eight bits cost more than the whole float path it replaces. */
-#  define KERN_LEVEL_TAKE_2(head)                                                                \
-    _mm512_and_si512(                                                                            \
-        _mm512_srlv_epi32(                                                                       \
-            _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(const void *)(head))),       \
-            step_wide),                                                                          \
-        code_mask)
-#  define KERN_LEVEL_TAKE_4(head)                                                                \
-    _mm512_and_si512(                                                                            \
-        _mm512_srlv_epi32(                                                                       \
-            _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *)(const void *)(head))),    \
-            step_wide),                                                                          \
-        code_mask)
+#  if defined(APP_SIMD_AVX512GFNI)
+/* The shift and the mask, as one bit matrix a byte.
+ *
+ * `vgf2p8affineqb` gives every byte of the result as a matrix product over
+ * GF(2) of an eight by eight matrix with that byte of the source: output bit
+ * `k` is the parity of `matrix.byte[7 - k]` against the source byte.  Taking
+ * bit `shift + k` of the source into bit `k` of the result is therefore the
+ * matrix whose byte `7 - k` is `1 << (shift + k)`, and every other byte zero —
+ * bits above the field's width have no row and come out zero, which is the
+ * mask.
+ *
+ * The matrix is a per-qword operand, so the four shifts a two bit block needs
+ * are four matrices in one vector, laid out to match `step_wide`: quarters of
+ * the broadcast, two qwords each. */
+static uint64_t kern_level_matrix(int shift, int width) {
+  uint64_t rows = 0;
+  int bit_index;
+  for (bit_index = 0; bit_index < width; ++bit_index)
+    rows |= (uint64_t)(1u << (shift + bit_index)) << (8 * (7 - bit_index));
+  return rows;
+}
+#    define KERN_LEVEL_TAKE_2(head)                                                              \
+      _mm512_gf2p8affine_epi64_epi8(                                                             \
+          _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(const void *)(head))),         \
+          code_take, 0)
+#    define KERN_LEVEL_TAKE_4(head)                                                              \
+      _mm512_gf2p8affine_epi64_epi8(                                                             \
+          _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *)(const void *)(head))),      \
+          code_take, 0)
+#  else
+#    define KERN_LEVEL_TAKE_2(head)                                                              \
+      _mm512_and_si512(                                                                          \
+          _mm512_srlv_epi32(                                                                     \
+              _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(const void *)(head))),     \
+              step_wide),                                                                        \
+          code_mask)
+#    define KERN_LEVEL_TAKE_4(head)                                                              \
+      _mm512_and_si512(                                                                          \
+          _mm512_srlv_epi32(                                                                     \
+              _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *)(const void *)(head))),  \
+              step_wide),                                                                        \
+          code_mask)
+#  endif
 #  define KERN_LEVEL_TAKE_8(head) _mm512_xor_si512(_mm512_loadu_si512((const void *)(head)), flip_wide)
 
 /* The one lane loop: two accumulators, for the same reason the float paths
@@ -2767,13 +2939,36 @@ static int kern_level_stage(const plane *sheet, const float *act_data, int8_t *l
 /* The constants every width's block is taken with.  Two bits shifts each
  * quarter of the broadcast down by its own bit position, four bits each half;
  * eight has nothing to shift and takes the flip instead. */
-#  define KERN_LEVEL_PLAN(bit_count)                                                             \
-    const __m512i step_wide =                                                                    \
-        (bit_count) == 2                                                                         \
-            ? _mm512_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2, 4, 4, 4, 4, 6, 6, 6, 6)                  \
-            : _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4);                 \
-    const __m512i code_mask = _mm512_set1_epi8((char)(uint8_t)((1u << (bit_count)) - 1u));       \
-    const __m512i flip_wide = _mm512_set1_epi8((char)(uint8_t)code_flip)
+#  if defined(APP_SIMD_AVX512GFNI)
+#    define KERN_LEVEL_PLAN(bit_count)                                                           \
+      const __m512i code_take =                                                                  \
+          (bit_count) == 2                                                                       \
+              ? _mm512_set_epi64((long long)kern_level_matrix(6, 2),                             \
+                                 (long long)kern_level_matrix(6, 2),                             \
+                                 (long long)kern_level_matrix(4, 2),                             \
+                                 (long long)kern_level_matrix(4, 2),                             \
+                                 (long long)kern_level_matrix(2, 2),                             \
+                                 (long long)kern_level_matrix(2, 2),                             \
+                                 (long long)kern_level_matrix(0, 2),                             \
+                                 (long long)kern_level_matrix(0, 2))                             \
+              : _mm512_set_epi64((long long)kern_level_matrix(4, 4),                             \
+                                 (long long)kern_level_matrix(4, 4),                             \
+                                 (long long)kern_level_matrix(4, 4),                             \
+                                 (long long)kern_level_matrix(4, 4),                             \
+                                 (long long)kern_level_matrix(0, 4),                             \
+                                 (long long)kern_level_matrix(0, 4),                             \
+                                 (long long)kern_level_matrix(0, 4),                             \
+                                 (long long)kern_level_matrix(0, 4));                            \
+      const __m512i flip_wide = _mm512_set1_epi8((char)(uint8_t)code_flip)
+#  else
+#    define KERN_LEVEL_PLAN(bit_count)                                                           \
+      const __m512i step_wide =                                                                  \
+          (bit_count) == 2                                                                       \
+              ? _mm512_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2, 4, 4, 4, 4, 6, 6, 6, 6)                \
+              : _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4);               \
+      const __m512i code_mask = _mm512_set1_epi8((char)(uint8_t)((1u << (bit_count)) - 1u));     \
+      const __m512i flip_wide = _mm512_set1_epi8((char)(uint8_t)code_flip)
+#  endif
 #endif
 
 /* The blocks a vector path did not take, from `slot` on, which on a host
@@ -3363,6 +3558,122 @@ static float kern_row_code(const plane *sheet, int row_index, const float *act_d
   return total;
 }
 
+/* Output rows the float path takes together, and why it needs to take any.
+ *
+ * A row of the output head is 1536 columns, which is 96 vectors, and the loop
+ * above carries two accumulators.  Each of them is therefore a chain of 48
+ * dependent multiply-adds, and a multiply-add is four cycles deep against two a
+ * cycle of throughput: the row is bound by the depth of its own chain at about
+ * four times what the ports would allow.  More accumulators would fix it and
+ * would change which slots are added to which, and the sum would move.
+ *
+ * Four rows at a time fixes it without touching the sum.  Each row keeps its
+ * own two accumulators, its own slots and its own order — the arithmetic is
+ * `kern_row_code`'s term for term — and the eight chains cover each other.  The
+ * activation vector is loaded once for the four, which is the same trade the
+ * integer path's row block makes.
+ *
+ * Two bits only, and AVX-512 only.  That is the width and the host the one
+ * plane on this path has, and writing the other widths out would be four more
+ * loops for planes that take the integer path anyway. */
+#define KERN_CODE_BLOCK 4
+
+#if defined(APP_SIMD_AVX512)
+/* Whether a plane's rows can be taken four at a time here: the width the block
+ * is written for, no flip, and groups that begin on a byte. */
+static int kern_code_rows_ready(const plane *sheet) {
+  return sheet->form == PLANE_CODE && sheet->bit_count == 2 && sheet->code_flip == 0 &&
+         (sheet->group_size & 3) == 0;
+}
+
+/* Four rows of two bit codes against one span of activations.
+ *
+ * The body is `kern_dot_code`'s two bit loop with the row as the inner index,
+ * so the constants, the lanes, the lookup and each row's pair of accumulators
+ * are the ones that loop has.  The tail below is its tail, run once a row,
+ * added onto that row's vector total in the same order. */
+static void kern_dot_code_two_rows(const uint8_t *code_head, size_t row_stride, int from_index,
+                                   int span_count, const float *act_data, float *total_list) {
+  const __m512i step_wide =
+      _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+  const __m512 code_look = _mm512_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f, 0.0f,
+                                          1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f);
+  const uint8_t *head_list[KERN_CODE_BLOCK];
+  __m512 part_a[KERN_CODE_BLOCK], part_b[KERN_CODE_BLOCK];
+  int slot = 0, block_slot;
+  for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot) {
+    head_list[block_slot] =
+        code_head + (size_t)block_slot * row_stride + (size_t)from_index / 4u;
+    part_a[block_slot] = _mm512_setzero_ps();
+    part_b[block_slot] = _mm512_setzero_ps();
+  }
+  for (; slot + 32 <= span_count; slot += 32) {
+    __m512 act_a = _mm512_loadu_ps(act_data + slot);
+    __m512 act_b = _mm512_loadu_ps(act_data + slot + 16);
+    for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot) {
+      uint32_t word_a, word_b;
+      memcpy(&word_a, head_list[block_slot] + slot / 4, 4);
+      memcpy(&word_b, head_list[block_slot] + slot / 4 + 4, 4);
+      part_a[block_slot] = _mm512_fmadd_ps(
+          _mm512_permutexvar_ps(_mm512_srlv_epi32(_mm512_set1_epi32((int)word_a), step_wide),
+                                code_look),
+          act_a, part_a[block_slot]);
+      part_b[block_slot] = _mm512_fmadd_ps(
+          _mm512_permutexvar_ps(_mm512_srlv_epi32(_mm512_set1_epi32((int)word_b), step_wide),
+                                code_look),
+          act_b, part_b[block_slot]);
+    }
+  }
+  for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot) {
+    const uint8_t *byte_head = head_list[block_slot];
+    float total = kern_zmm_total(_mm512_add_ps(part_a[block_slot], part_b[block_slot]));
+    int rest = slot;
+    for (; rest + 4 <= span_count; rest += 4) {
+      uint8_t quad = byte_head[rest / 4];
+      total += (float)(quad & 3u) * act_data[rest];
+      total += (float)((quad >> 2) & 3u) * act_data[rest + 1];
+      total += (float)((quad >> 4) & 3u) * act_data[rest + 2];
+      total += (float)((quad >> 6) & 3u) * act_data[rest + 3];
+    }
+    for (; rest < span_count; ++rest)
+      total += (float)((byte_head[rest / 4] >> (2 * (rest & 3))) & 3u) * act_data[rest];
+    total_list[block_slot] = total;
+  }
+}
+
+/* A block of rows against the activations, each row closing as it always did.
+ *
+ * Term for term `kern_row_code`'s, four rows over: the same group order, the
+ * same gain, the same zero point correction and the same running total. */
+static void kern_row_code_rows(const plane *sheet, int row_index, const float *act_data,
+                               const float *sum_data, float *out_data) {
+  const uint8_t *code_head = sheet->code_data + (size_t)row_index * sheet->row_stride;
+  size_t gain_base = (size_t)row_index * (size_t)sheet->group_count;
+  float total_list[KERN_CODE_BLOCK];
+  int group_index, block_slot;
+  for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot) total_list[block_slot] = 0.0f;
+  for (group_index = 0; group_index < sheet->group_count; ++group_index) {
+    int from_index = group_index * sheet->group_size;
+    int span_count = sheet->col_count - from_index;
+    float part_list[KERN_CODE_BLOCK];
+    if (span_count > sheet->group_size) span_count = sheet->group_size;
+    kern_dot_code_two_rows(code_head, sheet->row_stride, from_index, span_count,
+                           act_data + from_index, part_list);
+    for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot) {
+      size_t gain_slot =
+          gain_base + (size_t)block_slot * (size_t)sheet->group_count + (size_t)group_index;
+      float gain_value = plane_gain(sheet, gain_slot);
+      float bias_value =
+          (float)(sheet->code_bias + (sheet->bias_data ? sheet->bias_data[gain_slot] : 0));
+      total_list[block_slot] +=
+          gain_value * (part_list[block_slot] - bias_value * sum_data[group_index]);
+    }
+  }
+  for (block_slot = 0; block_slot < KERN_CODE_BLOCK; ++block_slot)
+    out_data[row_index + block_slot] = total_list[block_slot];
+}
+#endif
+
 typedef struct kern_job {
   const plane *sheet;
   const float *act_data;  /* lane_count rows of col_count, act_stride apart */
@@ -3678,7 +3989,16 @@ static void kern_mat_vec_band(void *state, int slice_index, int slice_count) {
       job->out_data[row_index] =
           kern_row_code_level(sheet, row_index, job->level_data, job->isum_data);
   } else if (job->lane_count == 1) {
-    for (row_index = row_from; row_index < row_upto; ++row_index)
+    /* The block of four where the plane admits it, then a row at a time for
+     * what is left — the same arithmetic either way, and the block is the one
+     * the output head is on. */
+    row_index = row_from;
+#if defined(APP_SIMD_AVX512)
+    if (kern_code_rows_ready(sheet))
+      for (; row_index + KERN_CODE_BLOCK <= row_upto; row_index += KERN_CODE_BLOCK)
+        kern_row_code_rows(sheet, row_index, job->act_data, job->sum_data, job->out_data);
+#endif
+    for (; row_index < row_upto; ++row_index)
       job->out_data[row_index] = kern_row_code(sheet, row_index, job->act_data, job->sum_data);
   } else {
     for (row_index = row_from; row_index < row_upto; ++row_index)
@@ -9862,6 +10182,28 @@ struct app_session {
   float *ple_seed;
   float *ple_room;
   float *logit_room;
+  /* Rows of the vocabulary `logit_room` can hold, and what a block of ids in
+   * flight is holding back.  Ordinary decode wants one row and gets one; the
+   * block path below wants one a lane and grows the room the first time it is
+   * asked, because a row of this vocabulary is a megabyte and a session that
+   * never guesses should not carry sixteen of them. */
+  int    logit_lane;
+  int    logit_span; /* rows the last pass actually wrote */
+
+  /* A block of ids run into the cache that the caller has not yet decided to
+   * keep.  `guess_room` holds the cached rows the block is about to overwrite,
+   * one run of `KERN_LANE_LIMIT` a side a layer, so undoing the block is a copy
+   * back rather than a replay.  `guess_count` above zero says a block is in
+   * flight and nothing else may touch the session until it is resolved. */
+  uint8_t *guess_room;
+  size_t  *guess_at;    /* byte offset into `guess_room`, key then value a layer */
+  size_t  *guess_step;  /* bytes one saved row occupies, key then value a layer */
+  float   *guess_key_peak;
+  float   *guess_value_peak;
+  int      guess_lane;  /* lanes `guess_room` was sized for, zero where unbuilt */
+  int      guess_count; /* lanes in flight, zero where none */
+  int      guess_from;  /* `fill_count` before the block */
+  int      guess_echo;  /* `echo_count` before the block */
   float *route_room;    /* router probabilities, one per expert */
   float *expert_room;   /* stacked gate and rise activations of one expert */
   float *expert_drop;   /* one expert's contribution, state width */
@@ -9952,6 +10294,11 @@ static void session_free_rooms(app_session *session) {
   mem_free(session->ple_seed);
   mem_free(session->ple_room);
   mem_free(session->logit_room);
+  mem_free(session->guess_room);
+  mem_free(session->guess_at);
+  mem_free(session->guess_step);
+  mem_free(session->guess_key_peak);
+  mem_free(session->guess_value_peak);
   mem_free(session->route_room);
   mem_free(session->expert_room);
   mem_free(session->expert_drop);
@@ -10747,6 +11094,11 @@ static void session_cap_band(void *state, int slice_index, int slice_count) {
 
 /* A batch of tokens through the whole graph.  Logits are produced for the last
  * token only, and skipped entirely when the caller is still filling the prompt. */
+/* What `session_pass` is asked to leave in `logit_room`. */
+#define PASS_LOGIT_NONE 0
+#define PASS_LOGIT_LAST 1 /* the last lane only, which is what a step wants */
+#define PASS_LOGIT_ALL  2 /* one row a lane, which is what verifying a block wants */
+
 static const float *session_pass(app_session *session, const int32_t *id_list,
                                  const float *state_list, const uint8_t *state_flag, int lane_count,
                                  int want_logits) {
@@ -10819,13 +11171,32 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
     if (session->echo_count < session->echo_limit)
       session->echo_room[session->echo_count++] = id_list[lane_index];
 
-  if (!want_logits) return NULL;
-  phase_turn(session, APP_PHASE_HEAD);
-  model->desk.norm_rms(&model->desk,
-                       session->state_room + (size_t)(lane_count - 1) * session->state_stride,
-                       model->final_norm, form->state_size, form->norm_eps, session->scrap_room);
-  TRACE_LANE("final", -1, place_from + lane_count - 1, session->scrap_room, form->state_size);
-  session_lift(session, &model->head_sheet, session->scrap_room, session->logit_room);
+  if (want_logits == PASS_LOGIT_NONE) return NULL;
+  /* One lane's logits or every lane's, and the head runs once either way: the
+   * batched path decodes a row of codes once and reads it with every lane, so
+   * verifying a block of sixteen costs the sweep once rather than sixteen
+   * times.  That sharing is the whole reason a block is cheaper than the
+   * tokens in it taken one at a time, and it is why this is a lane count
+   * handed to `session_lift_many` rather than a loop around `session_lift`. */
+  {
+    int logit_from = want_logits == PASS_LOGIT_ALL ? 0 : lane_count - 1;
+    int logit_span = lane_count - logit_from;
+    int logit_slot;
+    if (logit_span > session->logit_lane) return NULL;
+    phase_turn(session, APP_PHASE_HEAD);
+    for (logit_slot = 0; logit_slot < logit_span; ++logit_slot)
+      model->desk.norm_rms(
+          &model->desk,
+          session->state_room + (size_t)(logit_from + logit_slot) * session->state_stride,
+          model->final_norm, form->state_size, form->norm_eps,
+          session->scrap_room + (size_t)logit_slot * session->state_stride);
+    TRACE_LANE("final", -1, place_from + lane_count - 1,
+               session->scrap_room + (size_t)(logit_span - 1) * session->state_stride,
+               form->state_size);
+    session_lift_many(session, &model->head_sheet, session->scrap_room, session->state_stride,
+                      logit_span, session->logit_room, model->head_sheet.row_count);
+    session->logit_span = logit_span;
+  }
   if (form->logit_cap > 0.0f) {
     /* A `tanhf` for each of 262144 logits, and the timer puts it at a
      * fourteenth of a decode step on the one thread that gets here.  It is an
@@ -10843,15 +11214,238 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
      * 262144 times: `RESEARCH.md`'s series, which 0.8.6 already put in the
      * picture's softmax, or capping only the rows the sampler will look at. */
     cap_job job;
+    int cap_slot;
     phase_turn(session, APP_PHASE_CAP);
-    job.logit_list = session->logit_room;
-    job.value_count = model->head_sheet.row_count;
-    job.cap_value = form->logit_cap;
-    session_cap_band(&job, 0, 1);
+    for (cap_slot = 0; cap_slot < session->logit_span; ++cap_slot) {
+      job.logit_list =
+          session->logit_room + (size_t)cap_slot * (size_t)model->head_sheet.row_count;
+      job.value_count = model->head_sheet.row_count;
+      job.cap_value = form->logit_cap;
+      session_cap_band(&job, 0, 1);
+    }
   }
   TRACE_LANE("logits", -1, place_from + lane_count - 1, session->logit_room,
              model->head_sheet.row_count);
   return session->logit_room;
+}
+
+/* -- a block of ids the caller has not committed to ----------------------- */
+
+/* Speculative decoding needs two things this engine did not have: every
+ * position's logits out of one pass, which `PASS_LOGIT_ALL` above is, and a way
+ * to put the cache back where it was when the guesses turn out wrong.  This is
+ * the second, and it is the harder of the two here.
+ *
+ * A plain transformer appends its cache, so undoing a block is a counter.  This
+ * one does not.  Twenty-eight of the thirty-five layers of this export are
+ * sliding-window layers holding a ring of `slide_span` rows, and a block
+ * written past the ring's length has overwritten rows an earlier position still
+ * needs — so restoring `fill_count` would leave the ring holding the guesses
+ * and the model reading them.  Seven layers are full-attention and would be
+ * happy with the counter; some layers read another layer's cache and write
+ * none of their own, and unwinding those twice would corrupt the layer that
+ * owns the rows.
+ *
+ * What makes it tractable is that a block is at most `KERN_LANE_LIMIT` rows and
+ * a ring is at least `slide_span`, so a block never laps itself and the rows it
+ * will overwrite are known before it runs.  Saving them is a bounded copy —
+ * sixteen rows a side a layer — rather than a copy of the cache, and undoing is
+ * the same copy back.  `guess_step` is what one such row costs, which is a byte
+ * a value where the layer holds its cache quantized and a float where it does
+ * not.
+ *
+ * The peaks are a high-water mark rather than an input to any sum, so a partial
+ * keep leaves them alone: they may then carry a rejected lane's magnitude,
+ * which overstates what the cache was asked to hold, and overstating is the
+ * safe direction for a diagnostic about whether a calibrated range suffices.
+ * A full undo restores them, because a full undo has to leave nothing behind. */
+
+/* The largest block this session can undo: a block whose lanes all land on
+ * different slots of every ring.  A block as long as the shortest ring is the
+ * most that can be saved, because a longer one would lap the ring and the rows
+ * it overwrote first would already be its own.
+ *
+ * On this export the shortest ring is `slide_span`, 512, so the lane limit is
+ * what binds and this never refuses.  On a checkpoint with a window of four it
+ * is four, and refusing is the right answer rather than saving a ring twice. */
+static int guess_lane_room(const app_session *session) {
+  const model_form *form = &session->model->form;
+  int layer_index, span_least = KERN_LANE_LIMIT;
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    const layer_wing *wing = &session->model->wing_list[layer_index];
+    if (wing->share_flag) continue;
+    if (wing->cache_span < span_least) span_least = wing->cache_span;
+  }
+  return span_least;
+}
+
+/* Bytes one cached row of a layer's key or value side occupies. */
+static size_t guess_row_bytes(const app_session *session, int layer_index, int value_side) {
+  const layer_wing *wing = &session->model->wing_list[layer_index];
+  const float *grid =
+      (value_side ? session->value_grid : session->key_grid)[layer_index];
+  if (wing->share_flag) return 0;
+  return (size_t)wing->kv_count * (size_t)wing->head_size * cache_slot_bytes(grid);
+}
+
+/* The undo room and the logit rows, built the first time a caller guesses.
+ *
+ * Neither is small — sixteen rows of this vocabulary is sixteen megabytes — and
+ * a session that only ever steps needs neither, so they are not part of what
+ * `session_open` lays down. */
+static app_code session_guess_room(app_session *session, int lane_want) {
+  model_form *form = &session->model->form;
+  int vocab_count = session->model->head_sheet.row_count;
+  size_t total_bytes = 0;
+  int layer_index;
+  if (lane_want < 1 || lane_want > KERN_LANE_LIMIT) return APP_FAIL_ARGUMENT;
+
+  if (lane_want > session->logit_lane) {
+    float *room = (float *)mem_clear(sizeof(float) * (size_t)vocab_count * (size_t)lane_want);
+    if (!room) return APP_FAIL_MEMORY;
+    mem_free(session->logit_room);
+    session->logit_room = room;
+    session->logit_lane = lane_want;
+    session->logit_span = 0;
+  }
+  if (session->guess_lane >= lane_want) return APP_OKAY;
+
+  mem_free(session->guess_room);
+  mem_free(session->guess_at);
+  mem_free(session->guess_step);
+  mem_free(session->guess_key_peak);
+  mem_free(session->guess_value_peak);
+  session->guess_room = NULL;
+  session->guess_lane = 0;
+  session->guess_at = (size_t *)mem_clear(sizeof(size_t) * 2u * (size_t)form->layer_count);
+  session->guess_step = (size_t *)mem_clear(sizeof(size_t) * 2u * (size_t)form->layer_count);
+  session->guess_key_peak = (float *)mem_clear(sizeof(float) * (size_t)form->layer_count);
+  session->guess_value_peak = (float *)mem_clear(sizeof(float) * (size_t)form->layer_count);
+  if (!session->guess_at || !session->guess_step || !session->guess_key_peak ||
+      !session->guess_value_peak)
+    return APP_FAIL_MEMORY;
+
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    int side_index;
+    for (side_index = 0; side_index < 2; ++side_index) {
+      size_t row_bytes = guess_row_bytes(session, layer_index, side_index);
+      session->guess_step[2 * layer_index + side_index] = row_bytes;
+      session->guess_at[2 * layer_index + side_index] = total_bytes;
+      total_bytes += row_bytes * (size_t)lane_want;
+    }
+  }
+  if (total_bytes == 0) total_bytes = 1;
+  session->guess_room = (uint8_t *)mem_clear(total_bytes);
+  if (!session->guess_room) return APP_FAIL_MEMORY;
+  session->guess_lane = lane_want;
+  return APP_OKAY;
+}
+
+/* One side of one layer: where the block's row `lane_index` lives in the store,
+ * and where its copy lives in the undo room. */
+static void guess_row_pair(app_session *session, int layer_index, int side_index, int place_index,
+                           int lane_index, uint8_t **store_out, uint8_t **saved_out) {
+  const layer_wing *wing = &session->model->wing_list[layer_index];
+  size_t row_bytes = session->guess_step[2 * layer_index + side_index];
+  void *base_data =
+      (side_index ? session->value_store : session->key_store)[layer_index];
+  *store_out = (uint8_t *)base_data + (size_t)(place_index % wing->cache_span) * row_bytes;
+  *saved_out = session->guess_room + session->guess_at[2 * layer_index + side_index] +
+               (size_t)lane_index * row_bytes;
+}
+
+/* Copies the rows a block is about to overwrite out of the cache, or the other
+ * way round.  `lane_from` is the first lane to move, so undoing a block that
+ * kept its first two lanes moves lanes two upward and leaves the rest. */
+static void guess_rows_move(app_session *session, int lane_from, int lane_upto, int save_flag) {
+  model_form *form = &session->model->form;
+  int layer_index, lane_index, side_index;
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    if (session->model->wing_list[layer_index].share_flag) continue;
+    for (side_index = 0; side_index < 2; ++side_index) {
+      size_t row_bytes = session->guess_step[2 * layer_index + side_index];
+      if (row_bytes == 0) continue;
+      for (lane_index = lane_from; lane_index < lane_upto; ++lane_index) {
+        uint8_t *store_row;
+        uint8_t *saved_row;
+        guess_row_pair(session, layer_index, side_index, session->guess_from + lane_index,
+                       lane_index, &store_row, &saved_row);
+        if (save_flag)
+          memcpy(saved_row, store_row, row_bytes);
+        else
+          memcpy(store_row, saved_row, row_bytes);
+      }
+    }
+  }
+}
+
+/* Runs a block of ids in one pass and hands back one row of logits a lane, with
+ * the cache left in a state the caller can undo.  Row `i` is the distribution
+ * the model puts on the token after `id_list[i]`, so a proposer that guessed
+ * `id_list[1 .. id_count - 1]` checks its guesses against rows `0` upward.
+ *
+ * Nothing is committed until `session_guess_keep`, and until then the session
+ * refuses every other call that would move it. */
+const float *session_guess(app_session *session, const int32_t *id_list, int id_count) {
+  const float *logit_list;
+  model_form *form;
+  int layer_index;
+  if (!session || !id_list || session->guess_count > 0) return NULL;
+  if (id_count < 1 || id_count > KERN_LANE_LIMIT) return NULL;
+  if (id_count > guess_lane_room(session)) return NULL;
+  form = &session->model->form;
+  if (session->fill_count + id_count > form->window_limit) return NULL;
+  if (session_guess_room(session, id_count) != APP_OKAY) return NULL;
+
+  session->guess_from = session->fill_count;
+  session->guess_echo = session->echo_count;
+  session->guess_count = id_count;
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    session->guess_key_peak[layer_index] = session->key_peak[layer_index];
+    session->guess_value_peak[layer_index] = session->value_peak[layer_index];
+  }
+  guess_rows_move(session, 0, id_count, 1);
+
+  logit_list = session_pass(session, id_list, NULL, NULL, id_count, PASS_LOGIT_ALL);
+  if (!logit_list) {
+    /* The pass refused before it wrote anything, so there is nothing to undo
+     * beyond the block this call opened. */
+    session->guess_count = 0;
+    return NULL;
+  }
+  return logit_list;
+}
+
+/* Keeps the first `keep_count` lanes of the block in flight and puts the cache
+ * back where it was for the rest.  Zero undoes the whole block, which leaves
+ * the session bit-identical to one that never ran it. */
+app_code session_guess_keep(app_session *session, int keep_count) {
+  int layer_index;
+  if (!session || session->guess_count <= 0) return APP_FAIL_STATE;
+  if (keep_count < 0 || keep_count > session->guess_count) return APP_FAIL_ARGUMENT;
+  guess_rows_move(session, keep_count, session->guess_count, 0);
+  if (keep_count == 0)
+    for (layer_index = 0; layer_index < session->model->form.layer_count; ++layer_index) {
+      session->key_peak[layer_index] = session->guess_key_peak[layer_index];
+      session->value_peak[layer_index] = session->guess_value_peak[layer_index];
+    }
+  session->fill_count = session->guess_from + keep_count;
+  session->echo_count = session->guess_echo + keep_count;
+  if (session->echo_count > session->echo_limit) session->echo_count = session->echo_limit;
+  session->guess_count = 0;
+  return APP_OKAY;
+}
+
+/* Lanes of a block in flight, zero where none is. */
+int session_guess_span(const app_session *session) { return session ? session->guess_count : 0; }
+
+/* The longest block this session will accept, which is the lane limit on any
+ * checkpoint whose window is at least that. */
+int session_guess_limit(const app_session *session) {
+  int span_least;
+  if (!session) return 0;
+  span_least = guess_lane_room(session);
+  return span_least < KERN_LANE_LIMIT ? span_least : KERN_LANE_LIMIT;
 }
 
 static uint64_t draw_next(uint64_t *state) {
@@ -11604,6 +12198,7 @@ app_code session_save(const app_session *session, const char *path_text, uint64_
   int layer_index;
   app_code code = APP_OKAY;
   if (!session || !path_text) return APP_FAIL_ARGUMENT;
+  if (session->guess_count > 0) return APP_FAIL_STATE;
   if (kind_mark != APP_KEEP_PROMPT && kind_mark != APP_KEEP_TALK) return APP_FAIL_ARGUMENT;
   handle = fopen(path_text, "wb");
   if (!handle) return APP_FAIL_MISSING;
@@ -11656,6 +12251,7 @@ app_code session_load(app_session *session, const char *path_text, uint64_t *sta
   int layer_index, fill_count, echo_count;
   app_code code = APP_OKAY;
   if (!session || !path_text) return APP_FAIL_ARGUMENT;
+  if (session->guess_count > 0) return APP_FAIL_STATE;
   if (stamp_out) *stamp_out = 0;
   if (kind_out) *kind_out = APP_KEEP_PROMPT;
   handle = fopen(path_text, "rb");
@@ -11875,6 +12471,8 @@ app_code session_open(app_model *model, app_session **session_out) {
   session->sin_room = (float *)mem_clear(sizeof(float) * (size_t)half_peak);
   session->ple_seed = LANE_ROOM(session->ple_stride);
   session->ple_room = LANE_ROOM(session->ple_stride);
+  session->logit_lane = 1;
+  session->logit_span = 0;
   session->logit_room = (float *)mem_clear(sizeof(float) * (size_t)model->head_sheet.row_count);
   if (form->moe_flag) {
     session->route_room = (float *)mem_clear(sizeof(float) * (size_t)form->expert_count);
@@ -11917,6 +12515,9 @@ void session_close(app_session *session) {
 void session_reset(app_session *session) {
   int layer_index;
   if (!session) return;
+  /* A block in flight is dropped rather than refused: a reset is the caller
+   * saying it wants nothing this session holds, and that includes the guess. */
+  session->guess_count = 0;
   session->fill_count = 0;
   session->echo_count = 0;
   memset(&session->tally, 0, sizeof(session->tally));
@@ -11983,6 +12584,7 @@ app_code session_prime_media(app_session *session, const int32_t *id_list, int i
   int id_index;
   int state_size;
   if (!session || !id_list || id_count < 1) return APP_FAIL_ARGUMENT;
+  if (session->guess_count > 0) return APP_FAIL_STATE;
   if (session->fill_count + id_count > session->model->form.window_limit) return APP_FAIL_STATE;
   state_size = session->model->form.state_size;
   for (id_index = 0; id_index < id_count; ++id_index)
@@ -12010,7 +12612,7 @@ const float *session_step_state(app_session *session, int32_t id_value, const fl
   const float *logit_list;
   uint8_t state_mark = state_data ? 1u : 0u;
   double from_time;
-  if (!session) return NULL;
+  if (!session || session->guess_count > 0) return NULL;
   /* Counted before the clock starts, so the accounting is not in the timing it
    * is there to divide. */
   session->tally.serve_bytes += model_decode_bytes(session->model) + session_cache_bytes(session);

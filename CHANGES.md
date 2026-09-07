@@ -4545,3 +4545,632 @@ exactly where a row is a whole number of blocks, and that a host without the
 integer dot product is offered it nowhere. `row_count` in that test is seventy,
 which is four whole wide blocks and six rows past them, so the block of four
 and the single row each take a share of the tail behind it.
+
+---
+
+## 0.8.13 — the fork and the join, off the mutex
+
+### Scope
+
+The route `TODO.md`'s first speed entry named and 0.8.12 measured but did not
+take: **make the fork itself cheap.** The pool published a job and collected it
+under the mutex, so a fork and a join cost about eight lock acquisitions and
+four condition broadcasts — the caller took the lock to publish, each worker
+took it again to read what was published, each took it a third time to count
+itself done and broadcast, and the caller took it once more to confirm. A
+worker that is spinning needs none of that; it is already looking at the
+counter.
+
+A decode step forks **277 times**, so this is not `ple feed`'s problem alone —
+it is where `ple feed`'s share is largest only because its jobs are the
+smallest.
+
+### A note on the host
+
+A third machine, and the numbers are not 0.8.12's either: four cores of a Xeon
+at 2.1 GHz, AVX-512 and VNNI, wide build, but a virtualized one where the
+shipped export's step floor is **43.44 ms** against the second host's 40.55 and
+a decode step reads 760 MiB at 16.6 GiB/s. Ratios carry across hosts and
+absolute numbers do not, so every figure below is a ratio taken from eight runs
+a side with the two builds alternating, minimum per phase, checkpoint warm in
+the page cache.
+
+### What the counters carry now
+
+`task_serial`, `done_count`, `stop_flag` and two new cells — `sleep_count` and
+`wait_flag` — are atomics rather than mutex-guarded ints. Three orderings carry
+the whole thing, and the third is the one that is easy to get wrong.
+
+**The publish** is a sequentially consistent store on `task_serial` against an
+acquire load on the worker's side, so a worker that sees the new serial sees the
+`task_call` and `task_state` written before it.
+
+**The completion** is a release increment of `done_count` against the caller's
+acquire load, so a caller that sees the count sees the work.
+
+**The handoff between spinning and sleeping** is a store-load pair in both
+directions, and it is only safe because both sides are sequentially consistent.
+A worker past its spin publishes that it is about to sleep and *then* re-reads
+the serial; the caller publishes the serial and *then* reads the sleeper count.
+One of the two always sees the other — either the caller finds a sleeper and
+takes the lock to wake it, or the worker finds the serial already moved and
+never sleeps. With anything weaker than sequential consistency on both stores
+and both loads, each side may read the other's stale value and the wake is lost.
+The same pair runs on the join, with `wait_flag` for the caller.
+
+So the lock is now what a sleeper is woken *through* rather than what every fork
+goes *through*. On the spinning path — the path a decode token is always on — a
+fork is one exchange and a few loads, and a completion is one locked add.
+
+### The stress test, which is the point of the version
+
+A lost wake is not a wrong answer once; it is a hang once in a great many
+rounds, and a stale read is a wrong answer once in as many. Neither shows up in
+a suite that forks twice and checks the bands. `test_platform` now grinds the
+pool: 4000 rounds on the spinning path, 2000 on the sleeping one at a width the
+host is oversubscribed at, 64 rounds where the caller idles past the spin limit
+so every worker is asleep when the next job is published, and 64 where the band
+holds long enough that the caller sleeps on the join. Each round stamps its own
+number across a 997 element span — prime, so no round divides evenly across the
+slices — and leaves a partial beside it, so the caller checks both that every
+slot was written *this* round and that what each worker wrote is visible to it.
+
+The two wakes were checked by removing them. With the fork's wake disabled the
+suite hangs; with the completion's wake disabled it hangs. Both were confirmed
+before the version shipped, because a stress test that passes against a broken
+pool is worse than none. The suite also runs clean under ThreadSanitizer, which
+is why the acquire is an acquire *load* on each side rather than a relaxed load
+behind a fence — the two are equivalent on x86 and only one of them is
+something a race detector can follow.
+
+### An empty fork and join
+
+20000 rounds, minimum of five, the engine's own pool:
+
+| threads | before | after | |
+| --- | --- | --- | --- |
+| 2 | 0.642 us | **0.145** | -77% |
+| 3 | 1.312 us | **0.631** | -52% |
+| 4 | 3.063 us | **0.603** | -80% |
+| 9 (oversubscribed, sleeping) | 142.1 us | 137.5 | -3% |
+
+The last row is the one to read for what did *not* change. An oversubscribed
+pool has a spin limit of zero and sleeps on the first look, so it pays the
+condition variable exactly as it did; it is here to show that the sleeping path
+was not regressed to buy the spinning one.
+
+### The step
+
+A 3 id prompt, four threads, wide build, eight alternating runs a side:
+
+| part | before | after | |
+| --- | --- | --- | --- |
+| mlp | 20.564 | 20.232 | -1.6% |
+| final norm, head | 11.865 | 11.884 | +0.2% |
+| q k v | 3.662 | 3.347 | **-8.6%** |
+| attn out | 2.835 | 2.739 | -3.4% |
+| **ple feed** | 1.533 | **1.310** | **-14.5%** |
+| ple lift | 0.985 | 0.953 | -3.2% |
+| mlp gate | 0.407 | 0.259 | **-36.4%** |
+| step floor | 43.440 | **42.160** | **-2.9%** |
+| decode | 23.02 tok/s | **23.72** | +3.0% |
+
+And on a 449 id prompt, where the attention divides across the pool as well:
+
+| part | before | after | |
+| --- | --- | --- | --- |
+| score, softmax, blend | 4.352 | 4.029 | -7.4% |
+| q k v | 3.626 | 3.394 | -6.4% |
+| attn out | 2.903 | 2.771 | -4.5% |
+| **ple feed** | 1.444 | **1.267** | **-12.3%** |
+| mlp gate | 0.411 | 0.248 | **-39.7%** |
+| step floor | 47.390 | **46.180** | -2.6% |
+| decode | 21.10 tok/s | **21.65** | +2.6% |
+
+The ranking of the movers is the ranking of jobs-per-byte, which is what a
+change to the fork rather than to a kernel should produce. `mlp gate` is a
+plane that does almost no reading at all and it moves most; `ple feed` is two
+384 KiB planes and seventy forks and it moves next; `mlp` is 475 MiB of reading
+and moves least. Nothing moved that should not have — `final norm, head`,
+`sampler` and `logit cap` are one fork each or none, and all three are flat
+inside the noise.
+
+### What this leaves of the entry
+
+0.8.12 put the step's 277 forks at **0.82 ms of 39.5** on the second host. Here
+they were 3.06 us apiece, so **0.85 ms of 43.4**, and about 0.68 ms of that is
+now gone. The measured step floor moved 1.28 ms, which is more than the fork
+arithmetic alone predicts; the difference is that a worker that no longer takes
+a lock to read its task also no longer evicts the caller's line to get it, and
+that is not something the empty-fork number can see.
+
+`ple feed` is not closed. The plane is 1.31 ms where the four planes that are
+not behind run at 50 to 61 G multiply-adds a second, and what is left in it is
+the rows rather than the dispatch. The entry's other route — fusing the gate,
+the gelu and the lift into one fork, which needs a barrier inside a job that
+`pool_group` does not have — is now worth less than it was, because the 35 forks
+it would save are 35 times 0.6 us rather than 35 times 3.1.
+
+### Two things deliberately not done
+
+**`pool_seat_list` is still a single static.** It is overwritten by a second
+`pool_open` while a first pool is live, which nothing in the engine does and
+which the grind test does not provoke either. It is a real bug and it is not
+this version's; fixing it here would have put an unmeasured change in the same
+diff as the pool rewrite.
+
+**The atomics are builtins behind a shim, not `<stdatomic.h>`.** MSVC's C11
+atomics are recent and gated, and the engine builds under `cl`; five operations
+behind `_Interlocked*` on that compiler and `__atomic_*` on the others is
+smaller than the configuration test the header would need.
+
+---
+
+## 0.8.14 — one bit matrix where the shift and the mask were two, and what the output head has actually been doing
+
+### Scope
+
+Two things, and the second is worth more than the first even though it is not a
+change to the engine at all.
+
+The first is a kernel: the packed field a code plane's inner loop takes out of
+a byte is a per-byte linear map over GF(2), so `vgf2p8affineqb` does it in one
+instruction where a variable shift and a mask did it in two.
+
+The second is a diagnosis. Making that change and watching which planes moved
+answered `TODO.md`'s second speed entry — the output head reading a third of a
+bare sweep with neither the memory nor the instruction count able to explain
+it — and the answer is that **the head has never been running the integer
+kernel.**
+
+### The host
+
+The third machine again — four cores of a Xeon at 2.1 GHz, virtualized, step
+floor 43.44 ms before this version. Eight alternating runs a side, minimum per
+phase, checkpoint warm. Output is bit-identical either way: `logits` and a
+48 token greedy `chat` compare byte for byte.
+
+### The affine take
+
+`KERN_LEVEL_TAKE_2` broadcast sixteen packed bytes, shifted each quarter of the
+broadcast down by its own bit position and masked two bits out of every byte.
+The shift is by 0, 2, 4 or 6 places and the mask keeps the low two bits, so
+although `_mm512_srlv_epi32` shifts a whole dword, **the low two bits of output
+byte `b` come from bits `[s, s+2)` of input byte `b` and from nowhere else.**
+Every field is taken from within its own byte, which is precisely the shape
+`vgf2p8affineqb` is for: it gives each byte of the result as an eight by eight
+bit matrix multiplied by that byte of the source, with the matrix a per-qword
+operand so the four quarters can each have their own.
+
+Output bit `k` is the parity of `matrix.byte[7 - k]` against the source byte, so
+taking source bit `s + k` into result bit `k` is the matrix whose byte `7 - k`
+is `1 << (s + k)` and whose other bytes are zero. Bits above the field's width
+have no row and come out zero, which is the mask, for free. `kern_level_matrix`
+writes that; `KERN_LEVEL_PLAN` lays four of them out to match the quarters the
+old `step_wide` addressed, and the same construction serves four bits with two
+rows apiece.
+
+The two bit inner loop is now `vbroadcasti32x4`, `vgf2p8affineqb`, `vpdpbusd` —
+three instructions per sixty-four codes against four. Eight bit codes need no
+unpack and are untouched.
+
+`gfni` is asked of the host the way `vnni` already was, because it does not
+travel with it: Cascade Lake has `vnni` and no `gfni`, Ice Lake has both. Where
+the compiler says `-march=native` would not define `__GFNI__`, the shift and the
+mask are still there.
+
+### What moved, and what did not
+
+| part | before | after | |
+| --- | --- | --- | --- |
+| mlp (4 bit) | 21.137 | **19.021** | **-10.0%** |
+| q k v (4 bit) | 3.695 | **3.015** | **-18.4%** |
+| attn out (4 bit) | 2.875 | **2.526** | **-12.1%** |
+| ple feed (8 bit) | 1.339 | 1.302 | -2.8% |
+| **final norm, head (2 bit)** | 12.073 | 12.356 | **+2.3%** |
+| step floor | 47.550 | **44.740** | **-5.9%** |
+| decode | 21.03 tok/s | **22.35** | **+6.3%** |
+| prefill | 84.00 tok/s | 86.12 | +2.5% |
+
+On a 3 id prompt the same eight runs give the step floor 43.110 to 41.340 and
+decode 23.20 to 24.19.
+
+Two of those rows are the result and the third is the finding. The four bit
+planes are a quarter of their inner loop lighter and move by ten to eighteen
+percent, which settles that they were issue-bound rather than memory-bound —
+they read 475 MiB a step at 22 GiB/s where a bare four thread sweep on this host
+reaches 32 to 43, and now they read the same bytes faster without reading fewer
+of them. `ple feed` is eight bit, has no unpack, and correctly does not move.
+
+**And the head, which is two bit and has the unpack, does not move either.**
+
+### The output head, answered
+
+`TODO.md`'s second speed entry has been open across three versions. 0.8.11
+removed the row epilogue's calls and the head did not move. 0.8.12 folded
+sixteen rows into one close and the head was the one plane it did not move.
+0.8.12 also killed the page walk hypothesis outright. The entry's own summary
+was that the head is bound by neither of the two things it could be bound by,
+and that the next step was to count retired instructions rather than estimate
+them.
+
+This version removed an instruction from the head's supposed inner loop — a
+quarter of it — and the head did not move. That is the counting experiment in
+the only form this host allows, and it says the loop under test is not the loop
+being run.
+
+It is not. Instrumenting `kern_mat_vec_band` by plane shows the 262144 row
+plane taking the **float fallback**, `kern_row_code`, on every decode step —
+1610612736 column-products over four steps, which is 4 × 262144 × 1536 exactly.
+The integer path never sees it.
+
+The reason is one number in the export. `kern_level_ready` requires
+`sheet->enter_gain > 0`, the plane's `input_activation_scale`, because the
+integer path works by rounding the activation onto that step's grid and
+requiring it to land exactly. Every other projection has one — `q_proj` 0.0728,
+the audio tower's first 0.1591, and so on. **`lm_head.input_activation_scale` is
+0.0.** The export ships the head with no calibrated input step, so the head's
+input is not quantized, so the plane can never be on a grid, so it takes the
+float path, every token, by construction.
+
+Everything the entry could not explain follows from that:
+
+- **The GiB/s gap.** The head reads 97 MiB at 7.8 GiB/s where the four bit
+  planes read at 20 to 22. That is not two bit against four bit; it is
+  `kern_dot_code`'s float spread against `vpdpbusd`. In multiply-adds the head
+  gives 33 G a second against the mlp's 52 on this host.
+- **The microbenchmark that ran faster than the engine.** The entry's 22.7
+  GiB/s was "the same kernel on the same shape" — but it was the integer
+  kernel, and the engine runs the float one. The two were never the same
+  measurement.
+- **Every fix that did not move it.** 0.8.11's epilogue, 0.8.12's fold and this
+  version's affine take are all in the integer path. The head is not in the
+  integer path.
+
+The entry is closed as a question. What is left is a different and much better
+posed one, which `TODO.md` now carries: the head runs `kern_dot_code`'s two bit
+loop at five instructions per sixteen codes — a broadcast, a variable shift, a
+mask, a convert and an fma — where the integer path spends four per sixty-four,
+and that loop has never had a version written for it.
+
+### Why the head was not fixed here as well
+
+Three routes were considered and none of them belongs in this version.
+
+**Quantizing the head's input to a step the engine picks.** That is what would
+put it on the integer path, and it is not exact: the export declined to
+calibrate this activation, and choosing a step here would change the logits for
+a speed win, which is a decision about output quality rather than a kernel
+change. It wants its own version and its own measurement of what it costs.
+
+**A cheaper float loop.** Real and available — a broadcast amortized over
+sixty-four codes rather than sixteen takes the loop from twenty instructions to
+seventeen — but it needs the activations staged in the unpack's order, the way
+`kern_level_stage` already stages levels for the integer path, and that is a
+new staging pass and a new correctness surface. Also its own version.
+
+**Not scoring 262144 rows at all.** `TODO.md`'s fourth speed entry, unchanged by
+any of this except that the plane it would prune is now known to be five times
+more expensive per byte than the entry assumed.
+
+### A note for whoever reads the old entry
+
+Do not re-derive the head's cost from GiB/s, and do not re-derive it from the
+integer path's instruction count either. Both were done, both were careful, and
+both were measuring a kernel the head does not run. The first question to ask of
+any plane that looks anomalous is which of the two paths it is on, and
+`kern_mat_vec_band` is four lines of instrumentation away from saying so.
+
+---
+
+## 0.8.15 — the mask and the widening as one lookup, in the loop the head actually runs
+
+### Scope
+
+0.8.14 found that the output head runs `kern_dot_code`'s float spread rather
+than the integer path, and left three routes. This is the first and smallest of
+them: the two bit float loop, which had never had a version written for it, and
+which is 27% of a decode step on this host.
+
+### The host, and what it can actually do
+
+Third machine, four cores of a Xeon at 2.1 GHz, virtualized, AVX-512 with VNNI
+and GFNI. Eight alternating runs a side on a 3 id prompt and six on a 449 id
+one, minimum per phase, checkpoint warm.
+
+Worth writing down because every entry above reasons from a host's sweep and
+this host's had not been measured: **a bare four thread sweep of the mapped
+checkpoint reaches 49.80 GiB/s here**, 24.60 at two threads and 13.04 at one —
+linear, so the memory is not the bound at any width. A decode step reads 760 MiB,
+which at that rate would be 14.9 ms against the 43.79 ms the step floor actually
+is. Nothing in this engine on this host is memory-bound. That is the context for
+every phase that moved today.
+
+### Four instructions a vector rather than five
+
+The loop took a dword of packed codes, broadcast it across all sixteen lanes,
+shifted each lane down by its own code's bit position, masked two bits, widened
+to float and multiplied into the accumulator: `vpbroadcastd`, `vpsrlvd`,
+`vpandd`, `vcvtdq2ps`, `vfmadd132ps`.
+
+The mask and the widening are one instruction. After the shift, a lane holds its
+own code in bits zero and one — and the *next* code in bits two and three, since
+the shift moved the whole dword. So the low four bits of the lane are a number
+from zero to fifteen whose remainder on four is the code that lane wants. That
+is exactly the field `vpermps` indexes with. A sixteen entry table of
+`0, 1, 2, 3` repeated four times therefore returns the code already a float,
+with the mask implied by the table repeating and the conversion implied by the
+table's contents.
+
+The lanes, the codes, the two accumulators and the order they are added in are
+all what they were, so this is the same sum to the last bit. `logits` on the
+shipped export compares byte for byte against the previous build.
+
+### The step
+
+| part | 3 id prompt | | 449 id prompt | |
+| --- | --- | --- | --- | --- |
+| **final norm, head** | 12.232 to **11.216** | **-8.3%** | 12.185 to **11.172** | **-8.3%** |
+| step floor | 41.580 to **40.600** | -2.4% | 44.740 to **43.790** | -2.1% |
+| decode | 24.05 to **24.63** tok/s | +2.4% | 22.35 to **22.84** | +2.2% |
+
+Every other phase is inside the noise on both prompts, which is what a change to
+one loop that one plane reaches should look like. The head is the only plane in
+the step on the float path, and it is the only plane that moved.
+
+### What is left in the head, and why it is not here
+
+The loop is now four instructions per sixteen codes: a broadcast, a shift, the
+lookup, the multiply-add. Sixteen per sixty-four codes against the integer
+path's four.
+
+Three of those sixteen are broadcasts that could be one. `vbroadcasti32x4`
+takes sixteen bytes — sixty-four codes — and four shifts of it reach every code
+in them, which is thirteen instructions per sixty-four rather than sixteen. It
+is not done here because the four quarters come out in the unpack's order rather
+than the column's, so the activations would have to be laid down in that order
+the way `kern_level_stage` already lays down levels for the integer path. That
+is a new staging pass and a new correctness surface, and it belongs in a version
+that is about it rather than riding on a four line change that is provably the
+same arithmetic.
+
+Against the ceiling: the head reads 97 MiB, which at this host's 49.80 GiB/s is
+1.9 ms. It is 11.17. The loop at four instructions a vector, on the ports this
+machine has, is worth about 4.5 ms of that by arithmetic, and the gap between 4.5
+and 11.17 is not yet accounted for. `TODO.md` carries it with the other two
+routes.
+
+---
+
+## 0.8.16 — the output head was waiting on its own accumulator
+
+### Scope
+
+The rest of `TODO.md`'s head entry, and it was not the instruction count after
+all. 0.8.15 took the two bit float loop from five instructions a vector to four
+and got 8.3%; the arithmetic said the loop should then be worth about 4.5 ms and
+it was 11.17. This is the missing factor, and it is latency.
+
+### The chain
+
+A row of the output head is 1536 columns, which is 96 vectors, and
+`kern_dot_code` carries **two** accumulators. So each of them is a chain of
+forty-eight dependent `vfmadd132ps`, and a multiply-add is four cycles deep
+against two a cycle of throughput. The row's floor is the depth of its chain —
+about 192 cycles — where its ports would allow about 48. **Four times, and it is
+not the loop body at all.**
+
+More accumulators fix it and change which slot is added to which, so the sum
+moves. Four rows at a time fix it without touching the sum: each row keeps its
+own pair of accumulators, its own slots and its own order, and the eight chains
+cover each other. The activation vector is loaded once for the four, which is
+the same trade the integer path's row block already makes.
+
+This is exactly what 0.8.12 did to the integer path — and the head was the one
+plane 0.8.12 could not reach, because the head is not on that path. It took
+0.8.14 to find that out and 0.8.15 to make the float loop worth blocking.
+
+### The step
+
+Eight alternating runs a side on a 3 id prompt, six on a 449 id one, minimum per
+phase, checkpoint warm:
+
+| part | 3 id prompt | | 449 id prompt | |
+| --- | --- | --- | --- | --- |
+| **final norm, head** | 11.203 to **5.994** | **-46.5%** | 11.298 to **5.896** | **-47.8%** |
+| step floor | 41.100 to **34.950** | **-15.0%** | 43.880 to **38.310** | **-12.7%** |
+| decode | 24.33 to **28.61** tok/s | **+17.6%** | 22.79 to **26.10** | **+14.5%** |
+
+Nothing else moves outside the noise: the block is reached by one plane. The
+head is 97 MiB at **16.2 GiB/s** where it was 8.7, and 67 G multiply-adds a
+second where it was 33.
+
+`logits` and a 48 token greedy `chat` on the shipped export are byte for byte
+what the build at the start of this session produced, across all four of
+0.8.13 to 0.8.16.
+
+### Four rows, and eight measured against them
+
+Eight was built and run, and it is worse on the plane it is for: the head 5.989
+ms against 6.240, six alternating rounds a side, with the step floor inside the
+noise either way. Sixteen live accumulators plus the two activation vectors and
+the constants is most of the register file, and four chains a row already cover
+a four cycle multiply-add. That agrees with 0.8.8 and 0.8.11, which found the
+same wash at eight for the same reason on the other path.
+
+### Where the head stands now
+
+5.99 ms of a 34.95 ms step, 17.1% against 27.3% before this version. A bare four
+thread sweep of the same 97 MiB on this host is 1.9 ms, so the plane is now
+about three times its memory floor rather than six.
+
+What is left in it is the loop, and `TODO.md` carries it: three of the sixteen
+instructions per sixty-four codes are broadcasts that one `vbroadcasti32x4`
+could replace, at the price of staging the activations in the unpack's order.
+That is now a change to a loop that is no longer latency-bound, so for the first
+time the instruction count is the thing to count.
+
+### The four versions together
+
+From the build at the start of this session to this one, on a 3 id prompt, four
+threads, wide build:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| decode | 23.02 tok/s | **28.61** | **+24.3%** |
+| step floor | 43.440 ms | **34.950** | **-19.5%** |
+| final norm, head | 11.865 | **5.994** | -49.5% |
+| mlp | 20.564 | 19.312 | -6.1% |
+| q k v | 3.662 | 3.069 | -16.2% |
+| attn out | 2.835 | 2.524 | -11.0% |
+| ple feed | 1.533 | 1.281 | -16.4% |
+| mlp gate | 0.407 | 0.251 | -38.3% |
+
+Same weights, same answer to the byte.
+
+---
+
+## 0.9.0 — the verify side of speculative decoding, and what it is worth
+
+### Scope
+
+The three pieces of `TODO.md`'s speculative decoding entry that can be built and
+measured without a proposer, and which together decide whether the rest of it is
+worth building:
+
+1. **Every position's logits out of one pass**, which the engine did not have.
+2. **A cache that can be put back**, which is the entry's named correctness trap.
+3. **A measurement that brackets the payoff**, using two proposers that could
+   never be written for real work — one always right, one always wrong.
+
+No proposer is written here, and none should be until the number in the last
+section is looked at.
+
+### All-position logits
+
+`session_pass` computed the head for the last lane only, because a decode step
+wants one distribution and a prefill wants none until its final chunk.
+`PASS_LOGIT_ALL` runs it for every lane instead — normalising each lane into its
+own row of `scrap_room` and handing the whole block to `session_lift_many`, so
+the head is one batched product rather than a loop of single ones. That matters
+more than it looks: the batched code path decodes a row of the head once and
+reads it with every lane, so a block of eight sweeps the head's 96 MiB once and
+not eight times.
+
+`logit_room` grows from one row to one a lane the first time a caller asks. It
+is not grown at `session_open` because a row of this vocabulary is a megabyte
+and a session that never guesses should not carry sixteen of them.
+
+Ordinary decode is untouched: `logits` on the shipped export is byte for byte
+what it was.
+
+### The cache that can be put back
+
+`TODO.md` called this the correctness trap and it was right about why. A plain
+transformer appends its cache, so undoing a block is a counter. This one does
+not: **twenty-eight of thirty-five layers are sliding-window layers holding a
+ring of `slide_span` rows**, and a block written past the ring's length has
+overwritten rows an earlier position still needs. Seven layers are full
+attention and would be happy with the counter. Some layers read another layer's
+cache and own none, and unwinding those twice would corrupt the layer that does.
+
+What makes it tractable is a bound the entry did not name: **a block is at most
+`KERN_LANE_LIMIT` rows and a ring is at least `slide_span`, so a block never
+laps itself** and the rows it will overwrite are known before it runs. Saving
+them is sixteen rows a side a layer — a fixed scratch — and undoing is the same
+copy back. `session_guess_limit` reports the bound and `session_guess` refuses a
+block that would exceed it, which is what a checkpoint with a four row window
+needs and what this export never reaches.
+
+The API is three calls. `session_guess` runs a block and hands back a row of the
+vocabulary a lane; nothing else may touch the session until `session_guess_keep`
+says how many lanes to keep; zero puts the session back exactly where it was.
+
+The peaks are the one thing not restored on a partial keep. They are a
+high-water mark rather than an input to any sum, so a kept block may leave one
+carrying a rejected lane's magnitude — an overstatement of what the cache was
+asked to hold, which is the safe direction for a diagnostic about whether a
+calibrated range suffices. A full undo restores them, because a full undo has to
+leave nothing behind.
+
+### The test, and the bug it was checked against
+
+`test_guess` runs on the **synthetic** checkpoint and not the shipped one, for a
+specific reason: its sliding window is **four**. A block of four therefore
+overwrites every row of the ring, which is the case the undo exists for and the
+case a 512 row ring would not reach in a test of a few dozen tokens.
+
+The assertion is a hash of everything a block could have moved — every layer's
+key and value store, the peaks, both counters and the id history — taken before
+the block and after it is dropped. Byte for byte, not to a tolerance: a
+tolerance here would pass a cache that still held a rejected guess.
+
+It was checked by writing the bug the entry warns about. Replacing the row
+restore with nothing — trusting `fill_count`, as a plain transformer could —
+makes the suite fail on exactly that assertion. The test also covers the refusal
+of a block longer than the ring, that a step and a prime are refused mid-block,
+and that the same block run twice across a drop gives the same logits to the
+bit.
+
+### What a block is worth, bracketed
+
+`igllm guess` runs the same greedy continuation three ways: plain, with a
+proposer that always guesses right, and with one that always guesses wrong. The
+first is the ceiling of any proposer and the second is its floor. All three are
+held to the plain run's token stream, so the task checks the block path as much
+as it measures it.
+
+On the shipped export, four threads, 32 tokens, two prompts:
+
+| block | proposer | tok/s | ms a round | committed a round | vs plain |
+| --- | --- | --- | --- | --- | --- |
+| 2 | oracle | 27.6 | 72.5 | 2 | 1.06x |
+| 4 | oracle | 39.3 | 101.8 | 4 | **1.51x** |
+| 8 | oracle | 56.2 | 142.4 | 8 | **2.15x** |
+| 16 | oracle | 57.8 | 277.2 | 16 | 2.21x |
+| 4 | null | 9.8 | 102.4 | 1 | 0.38x |
+| 8 | null | 7.7 | 129.2 | 1 | 0.30x |
+
+Every row printed `matches plain`.
+
+**Two numbers come out of this and they are the whole answer.**
+
+**The ceiling is 2.2x.** A proposer that is never wrong doubles the engine and
+does not treble it, and past a block of eight it stops improving. That is far
+short of what the idea is worth on a memory-bound engine, and the reason is
+identifiable rather than mysterious.
+
+**Break-even needs about 40% of guesses accepted.** A round of eight costs 142.4
+ms against a plain step's 38.3, so it has to commit 3.7 tokens to pay, which is
+2.7 accepted of 7. At a block of four the bar is worse, 1.7 of 3.
+
+### Why the ceiling is 2.2 and not 6
+
+A block shares the weight *sweep* across its lanes and does not share the
+*arithmetic*. On an engine that is memory-bound the first is nearly all of the
+cost and an extra lane is nearly free; this one is not memory-bound — 0.8.15
+measured a bare four thread sweep at 49.80 GiB/s against a step floor that reads
+760 MiB in 35 ms — so the arithmetic is most of what a lane costs.
+
+Measured from the rounds above, **an extra lane costs about 13 ms against a
+plain step's 38**, so the asymptotic ceiling is about 3x and a block of eight
+reaches 2.2 of it.
+
+**Six of those 13 ms are the output head**, and that is the part worth naming.
+Verifying a position means asking what the model would have produced there,
+which means the full 262144 row head for every lane. `kern_row_code_many` shares
+the head's 96 MiB across the lanes correctly — it decodes a row once and every
+lane reads it — but this engine is arithmetic-bound and the 402 M multiply-adds
+a lane are not shared and cannot be.
+
+So the head is not merely one of the costs of speculative decoding here; it is
+half of the marginal lane. `TODO.md`'s "stop scoring 262144 rows to pick one"
+and this entry are the same piece of work seen from two sides, and the ordering
+below is written on that.
+
+### What this does not settle
+
+Whether any real proposer reaches 40% on this model. That needs the proposer,
+and `TODO.md` now says which one to write and what to hold it to. What is
+settled is that the verify side works, that it costs 13 ms a lane, and that the
+best it can ever be worth in this engine's present shape is 2.2x.

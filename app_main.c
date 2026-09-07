@@ -98,7 +98,8 @@ static void main_usage(void) {
   printf("  tokens     print the token ids of the prompt\n");
   printf("  logits     print the next token distribution as json\n");
   printf("  probe      print the resolved model shape\n");
-  printf("  cache      print the calibrated cache ranges against a prompt\n\n");
+  printf("  cache      print the calibrated cache ranges against a prompt\n");
+  printf("  guess      what a block of guesses would be worth, bracketed\n\n");
   printf("options:\n");
   printf("  --model <folder>    checkpoint folder in huggingface layout\n");
   printf("  --prompt <text>     prompt text, defaults to a short greeting\n");
@@ -909,6 +910,168 @@ static int main_tokens(app_model *model, const main_flag *flag) {
  * cache is actually asked to carry: a peak above the range clips, and a peak
  * far below it spends levels on room nothing uses.  Both are printed a layer,
  * with the fill the ratio comes to. */
+/* -- what a block of guesses would be worth ------------------------------- */
+
+/* Speculative decoding is a bet: propose a short block, check the whole block
+ * in one pass, and keep the guesses the model agrees with.  Whether it pays
+ * turns on two numbers that multiply — what a block costs against the tokens it
+ * commits, and how often a proposer is right — and only the first of them is a
+ * property of this engine.
+ *
+ * So this task measures the first alone and brackets the second rather than
+ * guessing at it.  Two proposers that could never be written for real work are
+ * exactly what is wanted: one that is always right, which is the most any
+ * proposer could ever be worth, and one that is always wrong, which is what a
+ * proposer costs when it never helps.  Every real proposer lands between them.
+ *
+ * Both runs are held to the tokens a plain greedy decode produced, so this
+ * checks the block path as much as it measures it: a block that verified
+ * wrongly, or an undo that left a guess behind in the cache, shows up as a
+ * stream that does not match. */
+
+static int32_t main_guess_top(const float *logit_list, int vocab_count) {
+  int32_t best_id = 0;
+  int slot;
+  for (slot = 1; slot < vocab_count; ++slot)
+    if (logit_list[slot] > logit_list[best_id]) best_id = (int32_t)slot;
+  return best_id;
+}
+
+/* One speculative run.  `oracle_flag` picks the cheat: the true continuation,
+ * or an id that is deliberately not it. */
+static double main_guess_run(app_session *session, main_reel *reel, int block_span,
+                             const int32_t *true_list, int serve_count, int oracle_flag,
+                             int32_t *made_list, int vocab_count, long *round_out,
+                             long *commit_out) {
+  int32_t block_list[16];
+  int32_t last_id = reel->id_list[reel->id_count - 1];
+  int made_count = 0;
+  long round_count = 0, commit_count = 0;
+  double from_time;
+
+  session_reset(session);
+  if (session_prime_media(session, reel->id_list, reel->id_count, reel->state_list,
+                          reel->state_flag) != APP_OKAY)
+    return -1.0;
+  from_time = time_now();
+  while (made_count < serve_count) {
+    const float *rows;
+    int span_count = block_span;
+    int slot, take_count = 0;
+    if (span_count > serve_count - made_count + 1) span_count = serve_count - made_count + 1;
+    if (span_count < 1) span_count = 1;
+    block_list[0] = last_id;
+    for (slot = 1; slot < span_count; ++slot) {
+      /* The oracle proposes what the plain run produced; the other proposes
+       * something that is not it, so the first guess of every block fails and
+       * the block commits exactly the one token it was always going to. */
+      int32_t want_id = made_count + slot - 1 < serve_count ? true_list[made_count + slot - 1] : 0;
+      block_list[slot] = oracle_flag ? want_id : (int32_t)((want_id + 1) % vocab_count);
+    }
+    rows = session_guess(session, block_list, span_count);
+    if (!rows) return -1.0;
+    round_count += 1;
+    /* The leading guesses the model agrees with, and then the token after the
+     * last of those, which is true whatever the guesses were. */
+    while (take_count + 1 < span_count &&
+           main_guess_top(rows + (size_t)take_count * (size_t)vocab_count, vocab_count) ==
+               block_list[take_count + 1])
+      take_count += 1;
+    for (slot = 0; slot <= take_count && made_count < serve_count; ++slot) {
+      int32_t made_id = slot < take_count
+                            ? block_list[slot + 1]
+                            : main_guess_top(rows + (size_t)slot * (size_t)vocab_count, vocab_count);
+      made_list[made_count++] = made_id;
+      last_id = made_id;
+      commit_count += 1;
+    }
+    if (session_guess_keep(session, take_count + 1) != APP_OKAY) return -1.0;
+  }
+  *round_out = round_count;
+  *commit_out = commit_count;
+  return time_now() - from_time;
+}
+
+static int main_guess(app_model *model, const main_flag *flag) {
+  static const int span_list[4] = {2, 4, 8, 16};
+  app_session *session = NULL;
+  main_reel reel;
+  int vocab_count = model_vocab_count(model);
+  int serve_count = flag->serve_limit > 0 ? flag->serve_limit : 32;
+  int span_slot, slot;
+  int32_t *true_list;
+  int32_t *made_list;
+  double plain_seconds;
+  int32_t last_id;
+
+  if (session_open(model, &session) != APP_OKAY || !session) {
+    fprintf(stderr, "session failed\n");
+    return 1;
+  }
+  if (!main_reel_build(model, flag, &reel, 1)) { session_close(session); return 1; }
+  true_list = (int32_t *)calloc((size_t)serve_count, sizeof(int32_t));
+  made_list = (int32_t *)calloc((size_t)serve_count, sizeof(int32_t));
+  if (!true_list || !made_list) {
+    free(true_list); free(made_list); main_reel_free(&reel); session_close(session);
+    return 1;
+  }
+
+  /* The plain run, which is both the baseline and the answer the two cheats are
+   * held to. */
+  if (session_prime_media(session, reel.id_list, reel.id_count, reel.state_list,
+                          reel.state_flag) != APP_OKAY) {
+    fprintf(stderr, "prime failed\n");
+    free(true_list); free(made_list); main_reel_free(&reel); session_close(session);
+    return 1;
+  }
+  last_id = reel.id_list[reel.id_count - 1];
+  plain_seconds = time_now();
+  for (slot = 0; slot < serve_count; ++slot) {
+    const float *logit_list = session_step(session, last_id);
+    if (!logit_list) { fprintf(stderr, "step failed\n"); break; }
+    last_id = main_guess_top(logit_list, vocab_count);
+    true_list[slot] = last_id;
+  }
+  plain_seconds = time_now() - plain_seconds;
+
+  printf("prompt  %d ids, %d tokens greedily\n", reel.id_count, serve_count);
+  printf("plain   %.2f tok/s, %.2f ms a token\n", (double)serve_count / plain_seconds,
+         plain_seconds / (double)serve_count * 1000.0);
+  printf("block   at most %d lanes\n\n", session_guess_limit(session));
+  printf("%-6s %-8s %8s %11s %10s %9s  %s\n", "block", "proposer", "tok/s", "ms a round",
+         "committed", "vs plain", "stream");
+  for (span_slot = 0; span_slot < 4; ++span_slot) {
+    int block_span = span_list[span_slot];
+    int oracle_flag;
+    if (block_span > session_guess_limit(session)) continue;
+    for (oracle_flag = 1; oracle_flag >= 0; --oracle_flag) {
+      long round_count = 0, commit_count = 0;
+      double seconds = main_guess_run(session, &reel, block_span, true_list, serve_count,
+                                      oracle_flag, made_list, vocab_count, &round_count,
+                                      &commit_count);
+      int same_flag = 1;
+      if (seconds < 0.0 || round_count < 1) {
+        printf("%-6d %-8s   run failed\n", block_span, oracle_flag ? "oracle" : "null");
+        continue;
+      }
+      for (slot = 0; slot < serve_count; ++slot)
+        if (made_list[slot] != true_list[slot]) { same_flag = 0; break; }
+      printf("%-6d %-8s %8.2f %11.2f %10.2f %8.2fx  %s\n", block_span,
+             oracle_flag ? "oracle" : "null", (double)serve_count / seconds,
+             seconds / (double)round_count * 1000.0,
+             (double)commit_count / (double)round_count, plain_seconds / seconds,
+             same_flag ? "matches plain" : "DIVERGES");
+    }
+  }
+  printf("\noracle is the ceiling of any proposer, null is its floor.  A real proposer\n");
+  printf("pays where its accepted guesses a round carry the round's cost past a plain step.\n");
+  session_close(session);
+  free(true_list);
+  free(made_list);
+  main_reel_free(&reel);
+  return 0;
+}
+
 static int main_cache(app_model *model, const main_flag *flag) {
   app_session *session = NULL;
   main_reel reel;
@@ -1038,6 +1201,8 @@ int main(int argc, char **argv) {
     result_code = main_probe(model);
   else if (strcmp(flag.task_text, "cache") == 0)
     result_code = main_cache(model, &flag);
+  else if (strcmp(flag.task_text, "guess") == 0)
+    result_code = main_guess(model, &flag);
   else {
     main_usage();
     result_code = 1;
