@@ -2835,6 +2835,45 @@ static int32_t kern_dot_level(const uint8_t *code_row, int from_index, int span_
                                      code_flip);
 }
 
+/* Four accumulators of sixteen lanes each, into four sums in one vector.
+ *
+ * `_mm512_reduce_add_epi32` is a fold of its own — two extracts and two adds
+ * down to a quarter of the register, then two shuffles and two adds, then a
+ * move into a general register — and four of them are four such folds that
+ * share none of their work and land in four general registers, from which the
+ * epilogue has to put every one back into a float.
+ *
+ * Taken together the four cost about half of that, because the four folds are
+ * the same fold and can be done to all four at once.  Three rounds of pick and
+ * add put each accumulator's four quarters into one lane of a single register —
+ * a hundred and twenty-eight bits a row, four rows side by side — and two more
+ * sum each lane within itself.  One gather then takes the four sums down to the
+ * low four lanes.  Fourteen instructions against the four calls' near forty,
+ * and the result is in a vector where the epilogue can use it rather than in
+ * general registers it would have to come back out of.
+ *
+ * The lane order is the row order — sum of row `a` in lane zero — which is what
+ * lets four of these stack into one vector of sixteen rows below. */
+#if defined(APP_SIMD_AVX512VNNI)
+static __m128i kern_level_fold(__m512i part_a, __m512i part_b, __m512i part_c, __m512i part_d) {
+  /* `[a0+a2, a1+a3, b0+b2, b1+b3]` and the same of `c` and `d`, a quarter of a
+   * register each, where `aN` is the Nth quarter of `part_a`. */
+  __m512i pair_ab = _mm512_add_epi32(_mm512_shuffle_i32x4(part_a, part_b, 0x44),
+                                     _mm512_shuffle_i32x4(part_a, part_b, 0xee));
+  __m512i pair_cd = _mm512_add_epi32(_mm512_shuffle_i32x4(part_c, part_d, 0x44),
+                                     _mm512_shuffle_i32x4(part_c, part_d, 0xee));
+  /* And then one quarter a row: every lane of quarter zero belongs to `a`. */
+  __m512i quad_wide = _mm512_add_epi32(_mm512_shuffle_i32x4(pair_ab, pair_cd, 0x88),
+                                       _mm512_shuffle_i32x4(pair_ab, pair_cd, 0xdd));
+  /* Each quarter summed within itself, by the two swaps that reach every lane
+   * of it: the halves against each other, then the pairs. */
+  quad_wide = _mm512_add_epi32(quad_wide, _mm512_shuffle_epi32(quad_wide, _MM_PERM_BADC));
+  quad_wide = _mm512_add_epi32(quad_wide, _mm512_shuffle_epi32(quad_wide, _MM_PERM_CDAB));
+  return _mm512_castsi512_si128(_mm512_permutexvar_epi32(
+      _mm512_setr_epi32(0, 4, 8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), quad_wide));
+}
+#endif
+
 /* A block of consecutive rows against one staged level vector.
  *
  * `part_list` comes back with one sum a row, in row order.  The block is
@@ -2944,6 +2983,141 @@ static void kern_row_code_level_rows(const plane *sheet, int row_index, const in
   }
   for (block_slot = 0; block_slot < KERN_ROW_BLOCK; ++block_slot)
     out_data[row_index + block_slot] = total_list[block_slot];
+}
+
+/* How many rows a narrow plane's block carries.
+ *
+ * Four rows of a 1536 column row is twenty-four blocks of the unpack against
+ * one epilogue, and the epilogue disappears into them.  Four rows of a 256
+ * column row is four blocks against the same epilogue, and it does not: on
+ * `per_layer_projection`, 1536 rows of 256 columns, the reductions and the
+ * scalar close cost more than the dot products they close.  0.8.11 measured
+ * eight rows a block against four and found a wash, and it was right to —
+ * widening the block alone does not change the ratio at all, because eight rows
+ * of four blocks is eight reductions against thirty-two dot products just as
+ * four rows is four against sixteen.
+ *
+ * What changes the ratio is closing the rows *together*.  Sixteen rows fold
+ * into one vector of sixteen sums, the zero point correction is one subtract of
+ * sixteen lanes, the sixteen gains are one load, and the sixteen results are one
+ * store — so a block's whole epilogue is a handful of instructions rather than
+ * sixteen reductions and sixteen rows of scalar arithmetic.  The width is
+ * sixteen because that is what one vector of floats holds and what the fold
+ * above stacks into; the dot products are still taken four rows at a time, so
+ * no more than four accumulators are ever live and the register pressure that
+ * made eight a wash never arises. */
+#define KERN_ROW_WIDE 16
+
+/* Whether a plane can take the wide block, which is narrower than
+ * `kern_level_ready` on four counts, each of which buys a whole epilogue.
+ *
+ * One group a row, so the gains of sixteen consecutive rows are sixteen
+ * consecutive floats and the close is a load rather than a gather — and so
+ * there is no group loop for the fold to sit inside.  `F32` gains, for the same
+ * reason `plane_gain_line` wants them.  A whole number of blocks a row, so the
+ * remainder path is not reached and nothing is called from inside the block.
+ * And the correction taken in thirty-two bits rather than sixty-four, which the
+ * bound here is what permits.  A level is at most 128 in size and a code is at
+ * most `2^bits - 1`, so the integer sum is under `128 (2^bits - 1) span`; a zero
+ * point is `2^(bits-1)` plus a signed byte and so at most 256, and the level sum
+ * it multiplies is under `128 span`.  Their difference fits an `int32` wherever
+ * the sum of those two bounds does, which on the widest plane this export has —
+ * 3072 columns of eight bit codes — it does by a factor of ten. */
+static int kern_level_wide_ready(const plane *sheet) {
+#if defined(APP_SIMD_AVX512VNNI)
+  int64_t reach;
+  if (!kern_level_ready(sheet)) return 0;
+  if (sheet->group_count != 1) return 0;
+  if (sheet->gain_type != STORE_F32) return 0;
+  if (sheet->col_count % KERN_LEVEL_BLOCK) return 0;
+  reach = (int64_t)sheet->col_count * 128 * (((1 << sheet->bit_count) - 1) + 256);
+  if (reach > (int64_t)INT32_MAX) return 0;
+  return 1;
+#else
+  (void)sheet;
+  return 0;
+#endif
+}
+
+/* `KERN_ROW_WIDE` rows closed as one.
+ *
+ * The arithmetic is `kern_row_code_level`'s row for row.  The integer sum is
+ * the same sum — a dot product does not care in what order it is taken — and
+ * the correction is the same correction, taken in thirty-two bits under the
+ * bound `kern_level_wide_ready` checks rather than in sixty-four.  The float
+ * close is the same product in the same order: the row's gain times the plane's
+ * activation step, and that times the corrected sum, one rounding each, sixteen
+ * lanes at a time instead of one row at a time.  There is one group by the
+ * guard, so the running total the row form carries is the single term and is
+ * not carried at all.
+ *
+ * The dot products are taken four rows at a time, four times, so no more than
+ * four accumulators are ever live: the width here is a width of the *close*,
+ * not of the loop.  The branch on the code width is outside all of it, because
+ * inside it would put three copies of the block loop where one belongs. */
+#define KERN_LEVEL_WIDE_BODY(TAKE, PART)                                                         \
+  do {                                                                                           \
+    for (block_slot = 0; block_slot < KERN_ROW_WIDE / KERN_ROW_BLOCK; ++block_slot) {             \
+      const uint8_t *head_a = code_head + (size_t)(block_slot * KERN_ROW_BLOCK) * row_stride;     \
+      const uint8_t *head_b = head_a + row_stride;                                               \
+      const uint8_t *head_c = head_b + row_stride;                                               \
+      const uint8_t *head_d = head_c + row_stride;                                               \
+      __m512i part_a = _mm512_setzero_si512(), part_b = _mm512_setzero_si512();                  \
+      __m512i part_c = _mm512_setzero_si512(), part_d = _mm512_setzero_si512();                  \
+      int slot = 0;                                                                              \
+      KERN_LEVEL_ROWS_LOOP(TAKE, PART);                                                          \
+      quad_list[block_slot] = kern_level_fold(part_a, part_b, part_c, part_d);                   \
+    }                                                                                            \
+  } while (0)
+
+static void kern_row_code_level_wide(const plane *sheet, int row_index, const int8_t *level_data,
+                                     const int32_t *sum_data, float *out_data) {
+#if defined(APP_SIMD_AVX512VNNI)
+  const uint8_t *code_head = sheet->code_data + (size_t)row_index * sheet->row_stride;
+  const int8_t *lane_head = level_data;
+  const float *gain_line = (const float *)sheet->gain_data;
+  size_t row_stride = sheet->row_stride;
+  int span_count = sheet->col_count;
+  int code_flip = sheet->code_flip;
+  __m512i whole_wide, bias_wide;
+  __m512 gain_wide;
+  __m128i quad_list[KERN_ROW_WIDE / KERN_ROW_BLOCK];
+  int block_slot;
+  KERN_LEVEL_PLAN(sheet->bit_count);
+
+  if (sheet->bit_count == 2)
+    KERN_LEVEL_WIDE_BODY(KERN_LEVEL_TAKE_2, 4);
+  else if (sheet->bit_count == 4)
+    KERN_LEVEL_WIDE_BODY(KERN_LEVEL_TAKE_4, 2);
+  else
+    KERN_LEVEL_WIDE_BODY(KERN_LEVEL_TAKE_8, 1);
+
+  whole_wide = _mm512_castsi128_si512(quad_list[0]);
+  whole_wide = _mm512_inserti32x4(whole_wide, quad_list[1], 1);
+  whole_wide = _mm512_inserti32x4(whole_wide, quad_list[2], 2);
+  whole_wide = _mm512_inserti32x4(whole_wide, quad_list[3], 3);
+
+  /* The zero point of each of the sixteen rows, times the one group's level
+   * sum, which every row shares.  Where the export is symmetric the plane's own
+   * offset is the whole of it and the sixteen are one broadcast. */
+  bias_wide = _mm512_set1_epi32(sheet->code_bias);
+  if (sheet->bias_data)
+    bias_wide = _mm512_add_epi32(
+        bias_wide, _mm512_cvtepi8_epi32(_mm_loadu_si128(
+                       (const __m128i *)(const void *)(sheet->bias_data + (size_t)row_index))));
+  whole_wide = _mm512_sub_epi32(
+      whole_wide, _mm512_mullo_epi32(bias_wide, _mm512_set1_epi32(sum_data[0])));
+
+  gain_wide = _mm512_mul_ps(_mm512_loadu_ps(gain_line + (size_t)row_index),
+                            _mm512_set1_ps(sheet->enter_gain));
+  _mm512_storeu_ps(out_data + (size_t)row_index,
+                   _mm512_mul_ps(gain_wide, _mm512_cvtepi32_ps(whole_wide)));
+#else
+  int block_slot;
+  for (block_slot = 0; block_slot < KERN_ROW_WIDE; ++block_slot)
+    out_data[row_index + block_slot] =
+        kern_row_code_level(sheet, row_index + block_slot, level_data, sum_data);
+#endif
 }
 
 /* The same decode `kern_dot_code` performs, written out into floats instead of
@@ -3204,6 +3378,10 @@ typedef struct kern_job {
   int          sum_stride;
   int          out_stride;
   int          lane_count;
+  /* Whether the one lane path may close a block of `KERN_ROW_WIDE` rows
+   * together.  Asked once a product rather than once a block of rows, because
+   * it is a question about the plane and not about the block. */
+  int          wide_flag;
 } kern_job;
 
 /* One row of floats against four activation vectors at once.
@@ -3411,10 +3589,12 @@ static void kern_dot_level_many(const uint8_t *code_row, int from_index, int spa
         KERN_LEVEL_MANY_LOOP(KERN_LEVEL_TAKE_4, 2);
       else
         KERN_LEVEL_MANY_LOOP(KERN_LEVEL_TAKE_8, 1);
-      part_list[lane_index] = _mm512_reduce_add_epi32(part_a);
-      part_list[lane_index + 1] = _mm512_reduce_add_epi32(part_b);
-      part_list[lane_index + 2] = _mm512_reduce_add_epi32(part_c);
-      part_list[lane_index + 3] = _mm512_reduce_add_epi32(part_d);
+      /* The four accumulators closed together rather than one at a time, for
+       * the reason `kern_level_fold` is written: four calls are four folds that
+       * share none of their work.  Here the sums are wanted in memory rather
+       * than in a vector, so the fold ends in one store of four. */
+      _mm_storeu_si128((__m128i *)(void *)(part_list + lane_index),
+                       kern_level_fold(part_a, part_b, part_c, part_d));
       /* The columns past the last whole block, staged where they lie. */
       for (; slot < span_count; ++slot) {
         int32_t code_value = (int32_t)(pack_read(code_row, (size_t)(from_index + slot), bit_count) ^
@@ -3484,7 +3664,15 @@ static void kern_mat_vec_band(void *state, int slice_index, int slice_count) {
     for (row_index = row_from; row_index < row_upto; ++row_index)
       kern_row_code_level_many(sheet, row_index, job);
   } else if (job->lane_count == 1 && job->level_data) {
-    for (row_index = row_from; row_index + KERN_ROW_BLOCK <= row_upto; row_index += KERN_ROW_BLOCK)
+    /* The wide block first where the plane admits it, then the block of four
+     * for what is left of the slice, then a row at a time for the tail — three
+     * forms of the same arithmetic, and a slice takes each of them at most as
+     * far as the next one's width. */
+    row_index = row_from;
+    if (job->wide_flag)
+      for (; row_index + KERN_ROW_WIDE <= row_upto; row_index += KERN_ROW_WIDE)
+        kern_row_code_level_wide(sheet, row_index, job->level_data, job->isum_data, job->out_data);
+    for (; row_index + KERN_ROW_BLOCK <= row_upto; row_index += KERN_ROW_BLOCK)
       kern_row_code_level_rows(sheet, row_index, job->level_data, job->isum_data, job->out_data);
     for (; row_index < row_upto; ++row_index)
       job->out_data[row_index] =
@@ -4231,6 +4419,7 @@ static void back_mat_mat(back_desk *desk, const plane *sheet, const float *act_d
     job.level_data = NULL;
     job.isum_data = NULL;
     job.level_stride = desk->level_limit;
+    job.wide_flag = 0;
     if (sheet->form == PLANE_CODE) {
       /* One product is on the calibrated grid or it is not: a lane that falls
        * off it puts the whole batch back on the float path, so every lane of
@@ -4248,6 +4437,7 @@ static void back_mat_mat(back_desk *desk, const plane *sheet, const float *act_d
       if (level_flag) {
         job.level_data = desk->level_room;
         job.isum_data = desk->isum_room;
+        job.wide_flag = chunk_count == 1 && kern_level_wide_ready(sheet);
       } else {
         for (lane_index = 0; lane_index < chunk_count; ++lane_index)
           kern_group_sum(sheet, job.act_data + (size_t)lane_index * (size_t)act_stride,

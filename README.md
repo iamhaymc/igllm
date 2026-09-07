@@ -430,3 +430,50 @@ output head is the *fastest* plane in the step — 60.6 G a second against the
 mlp's 59.0 — and the two that are really behind are the two smallest,
 `ple feed` at 18.0 and `ple lift` at 12.5. That is the first entry on `TODO.md`
 now.
+
+## How a block of rows closes
+
+0.8.12 took the first half of that entry, and the answer was in the last four
+instructions of a row rather than in its loop. A row of the integer path ends in
+a horizontal sum of its accumulator, a zero point correction, two multiplies and
+a store, and a block of four rows was closing each of its rows on its own —
+four `_mm512_reduce_add_epi32`, four sums arriving in general registers, four
+rows of scalar arithmetic to put them back into floats. On a 1536 column row
+that close is one epilogue against twenty-four blocks of dot product and it
+vanishes into them. On `per_layer_projection`, **1536 rows of 256 columns**, it
+is one against four and it costs more than what it closes.
+
+Widening the block does nothing on its own, which is why 0.8.11 measured eight
+rows against four and got a wash: eight rows of four blocks is eight closes
+against thirty-two dot products exactly as four rows is four against sixteen.
+The ratio is fixed by the columns. What moves it is closing the rows
+*together* — four accumulators folded into one vector of four sums in fourteen
+instructions instead of four reductions in near forty, four of those folds
+stacked into one vector of sixteen rows, and then one subtract, one load of
+sixteen gains, one broadcast and one store for the whole block. The dot products
+are still taken four rows at a time, so no more than four accumulators are ever
+live and the register pressure that made eight a wash never arises.
+
+The same fold closes the batched path's four lanes, which is where prefill's
+share comes from. On a second host — four cores of a Xeon at 2.1 GHz rather than
+the 2.8 the figures above were taken on, so these ratios are comparable and
+these absolute numbers are not — `ple feed` fell **9.8%**, `q k v` 5.5 to 6.8%,
+the step floor 2.4%, prefill went **87.2 tokens a second to 93.8** and decode
+24.7 to 25.3. Every logit gap the reference comparison reports is 0.8.11's to
+the last digit printed.
+
+It is not the entry closed. `ple feed` is 17.5 G multiply-adds a second to 19.4
+against the 50 to 61 the other four planes reach, and what is left of it is not
+the kernel at all. Two planes of 384 KiB a layer, each its own fork and join, is
+seventy of them a step, and an empty fork and join of the engine's own pool
+measures **2.95 us** — so 0.21 ms of the phase's 1.42, and 0.82 ms of the whole
+step's 277 forks. `TODO.md` carries the measurement and what the fix would have
+to be.
+
+0.8.12 also took the one hypothesis `TODO.md` had left for the output head — that
+the microbenchmark's 96 MiB stays swept because its page table entries stay hot,
+where the engine's is swept once with thirty-five layers in between — and tested
+it. The same 96 MiB of the mapped checkpoint costs **32.4 GiB/s back to back and
+43.4 with a gigabyte of the rest of the file swept in between**: no penalty, and
+anonymous memory of the same size is no faster than the file. The hypothesis is
+gone and the puzzle is not.

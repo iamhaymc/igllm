@@ -440,6 +440,48 @@ in isolation and slower in the engine, and taken out again — see
   shipped weights, the vision tower goes from 2.871 off to 2.049 where the
   reference moves 2.945 against itself, and the audio tower from 7.739 to 7.086
   against its own 7.213.
+- `kern_level_fold`, `kern_level_wide_ready`, `kern_row_code_level_wide` — how
+  a block of rows *closes*, which 0.8.12 found was most of what the narrow
+  planes were spending.
+
+  A row of the integer path ends in a horizontal sum of the accumulator, a zero
+  point correction, two multiplies and a store. On a 1536 column row that close
+  is one epilogue against twenty-four blocks of dot product and vanishes into
+  them; on `per_layer_projection`, 1536 rows of **256 columns**, it is one
+  against four and does not. Widening the block does nothing on its own —
+  0.8.11 measured eight rows against four and got a wash — because eight rows of
+  four blocks is eight closes against thirty-two dot products exactly as four
+  rows is four against sixteen. The ratio only moves if the rows close
+  *together*.
+
+  `kern_level_fold` is that. Four accumulators of sixteen lanes go in and four
+  sums come out side by side in one vector: three rounds of pick and add put
+  each accumulator's four quarters into one quarter of a single register, two
+  more sum each quarter within itself, and one gather takes the four down to the
+  low four lanes. Fourteen instructions where four `_mm512_reduce_add_epi32`
+  are near forty, and the sums land in a vector rather than in four general
+  registers the epilogue would have to bring them back out of.
+
+  `kern_row_code_level_wide` stacks four of those into one vector of sixteen
+  rows and closes all sixteen at once: the zero point correction is one subtract
+  of sixteen lanes, the sixteen gains are one load, the activation step is one
+  broadcast, and the sixteen results are one store. The dot products are still
+  taken four rows at a time, four times, so no more than four accumulators are
+  ever live — the width is a width of the close and not of the loop, which is
+  why the register pressure that made eight rows a wash never arises.
+
+  `kern_level_wide_ready` is what the shape has to satisfy: one group a row, so
+  sixteen gains are sixteen consecutive floats and there is no group loop for the
+  fold to sit inside; `F32` gains, for the reason `plane_gain_line` wants them; a
+  whole number of blocks a row, so the remainder path is never reached from
+  inside a block; and a span narrow enough that the correction is exact in
+  thirty-two bits rather than sixty-four. `kern_mat_vec_band` then takes the
+  wide block as far as it goes, the block of four for what is left of the slice,
+  and a row at a time for the tail — three forms of one arithmetic, each taking
+  the slice at most as far as the next one's width.
+
+  `kern_dot_level_many` closes its four lanes with the same fold, which is where
+  most of prefill's share of it comes from.
 - `kern_mat_vec_band` — one band of rows, the unit of work given to the pool.
   It carries a lane count, so the same band function serves a matrix-vector
   product and a matrix-matrix product, and a staged level vector, so the same
