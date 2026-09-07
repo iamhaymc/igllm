@@ -16,6 +16,20 @@ VNNI, the wide build — a bare sweep gives **32.18 GiB/s** at four threads and 
 decode step reads **784.4 MiB**, so a token that spent nothing at all outside
 the memory would take 24 ms: **41 tokens a second, and no more.**
 
+**That ceiling is a host's and not the engine's, and it is the one number here
+most often misread.** The third host — four cores of a Xeon at 2.1 GHz,
+virtualized, AVX-512 with VNNI and GFNI — sweeps at **49.80 GiB/s** at four
+threads, 24.60 at two and 13.04 at one, so its own sweep ceiling is 14.9 ms a
+token, or **67 tokens a second**. The engine reaches 28.61 there. Whichever host
+a measurement is taken on, quote its sweep beside the step or the ratio means
+nothing; 0.8.15 measured this one because no entry above had.
+
+0.8.13 to 0.8.16 took the step floor on that host from 43.44 ms to **34.95** and
+decode from 23.02 tokens a second to **28.61**, with `logits` and a greedy
+`chat` byte for byte unchanged. Where those went, largest first: the output head
+11.87 ms to 5.99, the four bit planes ten to eighteen percent on the unpack, and
+every plane a little on the fork and the join. `CHANGES.md` has each of them.
+
 0.8.10 divided the step. 0.8.11 acted on the division, and the two things it
 settles both move this list.
 

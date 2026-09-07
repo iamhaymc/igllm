@@ -3561,19 +3561,14 @@ static float kern_row_code(const plane *sheet, int row_index, const float *act_d
  * loops for planes that take the integer path anyway. */
 #define KERN_CODE_BLOCK 4
 
+#if defined(APP_SIMD_AVX512)
 /* Whether a plane's rows can be taken four at a time here: the width the block
  * is written for, no flip, and groups that begin on a byte. */
 static int kern_code_rows_ready(const plane *sheet) {
-#if defined(APP_SIMD_AVX512)
   return sheet->form == PLANE_CODE && sheet->bit_count == 2 && sheet->code_flip == 0 &&
          (sheet->group_size & 3) == 0;
-#else
-  (void)sheet;
-  return 0;
-#endif
 }
 
-#if defined(APP_SIMD_AVX512)
 /* Four rows of two bit codes against one span of activations.
  *
  * The body is `kern_dot_code`'s two bit loop with the row as the inner index,
