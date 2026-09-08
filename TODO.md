@@ -458,13 +458,42 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      an ordinary `session_step` rather than a block of one lane, which is the
      other half of why the flag is nearly free when it does not help.
 
-  4. **Then sampling.** Everything above is greedy: `session_guess`'s
-     verification is an argmax comparison. Speculative decoding under a
-     temperature needs the modified rejection rule — accept a guess with
-     probability `min(1, p/q)` and resample from the difference — and an n-gram
-     proposer has no `q` to divide by. So either the feature is greedy-only and
-     says so, or it needs a proposer that carries a distribution. Decide which
-     before plumbing it into `chat`.
+  4. **Done, 0.9.8: sampling, and the choice this step posed was a false one.**
+     The step read that an n-gram proposer has no `q` to divide by, so the
+     feature was either greedy-only or wanted a proposer that carries a
+     distribution. It has one: the scout names a token, so `q` is a **point
+     mass** on it. Put `q(t) = 1` into the modified rejection rule and both
+     halves collapse — accept with probability `p(t)`, and on a rejection draw
+     from `p` with the guess taken out and the rest renormalized. Nothing is
+     approximated and no second model is carried.
+
+     `p` is the caller's whole taste rather than a bare softmax, and each lane
+     is shaped against the history it would have if the guesses before it were
+     kept. `--guess` above `--heat 0` used to be refused outright, and the
+     default taste is `--heat 1`, so the flag was unusable unless asked for.
+
+     **Acceptance under a temperature is the model's own certainty**, where
+     greedy acceptance only asks whether the guess was the argmax — so it pays
+     better where the model is sure and worse where it is not. Repeating a
+     passage back verbatim at `--heat 1` is 33.55 tok/s to **68.32 at a block of
+     four and 79.15 at eight**, 100% of 63 guesses kept and 96% of 77, which is
+     *above* the greedy path's 1.69x and 1.80x. Free generation costs about 6%,
+     the same place greedy sits. So it stays a flag.
+
+     A greedy block is still byte for byte a greedy run. A sampled one is not
+     and cannot be: a round takes one draw where its guess is accepted and two
+     where it is not, so the streams diverge from the first rejection. The
+     distribution is equal, which is what speculative sampling guarantees, and
+     `CHANGES.md` 0.9.8 says how that is tested rather than asserted.
+
+     **What is left of it is a proposer that carries a real `q`.** The point
+     mass is the strongest possible proposal and therefore the harshest: it
+     stakes everything on one token, so acceptance can never exceed `p(t)`. A
+     proposer offering a distribution — a small draft model, or the scout's own
+     counts turned into one — is accepted with `min(1, p/q)`, which can be 1
+     over a whole region rather than only at a near-certain token. That is the
+     route to raising acceptance under a temperature, and the rule it needs is
+     already built and already tested; only the proposer is missing.
 
   5. **Done, 0.9.3: the plumbing.** `--guess <lanes>` on `chat` and `complete`,
      the block path inside `main_serve`, and a tally line counting committed
@@ -778,3 +807,5 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | The fused multiply-add in the tower's blend (refused, and deliberately: 0.6x more, at the cost of a picture's rows no longer being the rows that ship) | 0.9.6 |
 | A picture's rows kept against the picture, on a hundred and twenty-eight bit identity of the decoded samples and the tower's configuration | 0.9.7 |
 | Where that identity has to be taken, so the decoder and the container stay out of it (answered: on the decoded raster, which makes a lossless re-encode one entry and a lossy one two) | 0.9.7 |
+| Speculative decoding under a temperature (answered: the scout's proposal is a point mass, which is a `q` like any other — accept with `p(t)`, resample from `p` with the guess removed) | 0.9.8 |
+| The sampler's shaped distribution, lifted out of the draw so two paths sit on one definition of what a taste means | 0.9.8 |

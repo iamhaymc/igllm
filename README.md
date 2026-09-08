@@ -62,13 +62,24 @@ Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
 `--echo-penalty`, `--seed`, `--guess`, `--loop`, `--keep`, `--raw`,
 `--verbose`. Run `igllm --help` for the full list.
 
-`--guess <lanes>` is speculative decoding, and it is greedy only. A proposer
-guesses the next few tokens out of the stream's own history, the model checks
-the whole block in one pass, and the guesses it agrees with are kept — so the
-text is byte for byte the text a plain greedy run produces, and the only thing
-that changes is how many sweeps of the weights it took. The proposer carries no
-second model and no training: it asks what followed the last time this stream
-said what it has just said.
+`--guess <lanes>` is speculative decoding. A proposer guesses the next few
+tokens out of the stream's own history, the model checks the whole block in one
+pass, and the guesses it agrees with are kept — the only thing that changes is
+how many sweeps of the weights it took. The proposer carries no second model and
+no training: it asks what followed the last time this stream said what it has
+just said.
+
+**Greedy and sampled decoding give different guarantees here, and the difference
+matters.** Under `--heat 0` a guess is kept when it is the argmax, so the text is
+**byte for byte** the text a plain greedy run produces. Under a temperature a
+guess is kept with probability `p(t)` — the model's own probability of it — and
+a rejected guess is replaced by a draw from the same distribution with that
+guess taken out, which is speculative sampling's rejection rule for a proposer
+that names one token. That draws each token from **exactly the distribution the
+plain sampler draws from**, but it is not the same *sample*: a round takes one
+draw when its guess is accepted and two when it is not, so the same seed gives a
+different stream at a different `--guess`, and the same stream only at the same
+one. Same distribution, different sample.
 
 That makes it worth a great deal on an answer that quotes its prompt —
 summarising, editing, answering about a document, repairing code that is in the
@@ -86,7 +97,18 @@ free generation                    27.63 tok/s plain, 26.32 with --guess 4
 guess   3.08 tokens a round over 12 rounds, 100% of 27 guesses kept
 ```
 
-`guess` is where that is measured rather than asserted. It runs the same greedy
+Under a temperature the same shape holds, with the ends further apart, because
+acceptance is the model's own certainty rather than a comparison against one
+token. At `--heat 1` with the default top-k 64 and top-p 0.95, repeating a
+passage back verbatim — where the model is nearly certain — runs 33.55 tok/s
+plain, **68.32 with `--guess 4` and 79.15 with `--guess 8`**, keeping 100% of 63
+guesses and 96% of 77. That is above what the greedy path reaches on its own
+quoting prompt. Free generation costs about 6%, which is where greedy sits too,
+so `--guess` is a flag under a temperature for the same reason it is one without.
+
+`guess` is where that is measured rather than asserted, and it is greedy: the
+bracket it prints is about the proposer, and holding all three proposers to one
+token stream is what makes the rows comparable. It runs the same greedy
 continuation with three proposers — one that is always right, the n-gram
 proposer that ships, and one that is always wrong — and holds all three to the
 plain run's token stream, so it checks the block path as much as it measures it.

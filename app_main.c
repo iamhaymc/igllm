@@ -437,8 +437,12 @@ static void main_answer_guess(app_model *model, const main_flag *flag, app_sessi
                               main_bet *bet) {
   int32_t block_list[16];
   int32_t id_value = reel->id_list[reel->id_count - 1];
+  int32_t after_id = 0;
   int block_want = flag->guess_span;
   int shut_flag = 0;
+  /* Greedy verification is an argmax comparison; anything else is the
+   * rejection rule. */
+  int taste_flag = flag->taste.heat_value > 0.0f;
   if (block_want > session_guess_limit(session)) block_want = session_guess_limit(session);
   if (block_want < 1) block_want = 1;
   /* This turn's ids, which in a conversation are the new turn's alone: the
@@ -461,7 +465,8 @@ static void main_answer_guess(app_model *model, const main_flag *flag, app_sessi
       int32_t made_id;
       if (!logit_list) break;
       bet->round_count += 1;
-      made_id = main_guess_top(logit_list, model_vocab_count(model));
+      made_id = taste_flag ? session_pick(session, logit_list, &flag->taste)
+                           : main_guess_top(logit_list, model_vocab_count(model));
       if (token_is_close(model, made_id)) break;
       id_value = made_id;
       if (!quiet_flag) main_emit(model, made_id);
@@ -473,16 +478,24 @@ static void main_answer_guess(app_model *model, const main_flag *flag, app_sessi
     if (!rows) break;
     bet->round_count += 1;
     bet->draw_count += span_count - 1;
-    while (take_count + 1 < span_count &&
-           main_guess_top(rows + (size_t)take_count * (size_t)model_vocab_count(model),
-                          model_vocab_count(model)) == block_list[take_count + 1])
-      take_count += 1;
+    if (taste_flag) {
+      /* Under a temperature the block is verified by speculative sampling's
+       * modified rejection rule, which hands back both the prefix it kept and
+       * the token that follows it. */
+      take_count = session_guess_taste(session, rows, block_list, span_count, &flag->taste,
+                                       &after_id);
+      if (take_count < 0) break;
+    } else {
+      while (take_count + 1 < span_count &&
+             main_guess_top(rows + (size_t)take_count * (size_t)model_vocab_count(model),
+                            model_vocab_count(model)) == block_list[take_count + 1])
+        take_count += 1;
+      after_id = main_guess_top(rows + (size_t)take_count * (size_t)model_vocab_count(model),
+                                model_vocab_count(model));
+    }
     bet->take_count += take_count;
     for (slot = 0; slot <= take_count && bet->token_count < flag->serve_limit; ++slot) {
-      int32_t made_id =
-          slot < take_count ? block_list[slot + 1]
-                            : main_guess_top(rows + (size_t)slot * (size_t)model_vocab_count(model),
-                                             model_vocab_count(model));
+      int32_t made_id = slot < take_count ? block_list[slot + 1] : after_id;
       if (token_is_close(model, made_id)) {
         shut_flag = 1;
         /* The block is kept up to the token before the close, so the cache
@@ -615,13 +628,6 @@ static int main_serve(app_model *model, const main_flag *flag, int quiet_flag) {
 
   memset(&bet, 0, sizeof(bet));
   guess_flag = flag->guess_span > 1;
-  /* Greedy only, and said out loud rather than quietly ignored: verification
-   * is an argmax comparison and there is no rejection rule here for a
-   * temperature to be sampled under. */
-  if (guess_flag && flag->taste.heat_value > 0.0f) {
-    fprintf(stderr, "--guess is greedy only; use --heat 0\n");
-    return 1;
-  }
 
   code = session_open(model, &session);
   if (code != APP_OKAY) {

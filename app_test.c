@@ -4271,6 +4271,196 @@ static void test_guess(void) {
     session_guess_keep(session, 0);
   }
 
+  { /* Speculative sampling's rejection rule, held to the theorem it claims.
+     *
+     * `session_guess_taste` says a block verified under a temperature draws the
+     * token at each position from exactly the distribution the plain sampler
+     * draws from.  That is a statement about a distribution and nothing weaker,
+     * so it is checked as one: the shaped distribution at lane 0 is computed
+     * directly, and then a hundred thousand rounds are run through the
+     * rejection rule with a different seed each and the tokens they commit at
+     * position 0 are counted.
+     *
+     * The token committed at position 0 is the guess where the guess was
+     * accepted and the resampled token where it was not, so the histogram is
+     * the mixture `p(t)*[t] + (1 - p(t))*residual` — and the theorem is that
+     * this equals `p`.  A rule that simply took the guess whenever the model
+     * gave it any mass at all, or one that resampled without removing the
+     * guess, would sit far outside the bar below.
+     *
+     * A hundred thousand rounds over twenty-seven tokens puts the standard
+     * error of a bucket under 0.0016, so a bar of 0.01 is six sigma: wide
+     * enough never to flake, narrow enough that no wrong rule fits under it. */
+    const int round_count = 100000;
+    int32_t block_list[3];
+    const float *rows;
+    int case_index;
+
+    block_list[0] = want_list[0];
+    block_list[1] = want_list[1];
+    block_list[2] = want_list[2];
+    /* The guess is chosen rather than taken from the fixture, because what this
+     * has to exercise is the *mixture* — some rounds keeping the guess and some
+     * resampling — and an arbitrary token is usually one top-k has already cut,
+     * which only ever rejects.  A lane 0 logit row is the same whatever follows
+     * it in the block, so a block of one gives the row the guess is picked out
+     * of before the real block is opened on it. */
+    rows = session_guess(session, block_list, 1);
+    if (rows) {
+      app_taste look = app_taste_plain();
+      pick_slot *slot_list = (pick_slot *)session->pick_room;
+      int keep_count;
+      look.heat_value = 1.0f;
+      look.top_count = 12;
+      look.top_portion = 0.9f;
+      look.echo_penalty = 1.0f;
+      keep_count = pick_shape(session, rows, &look, session->guess_echo + 1, slot_list);
+      /* Not the strongest, so the accept rate is well away from both ends. */
+      if (keep_count > 1) block_list[1] = slot_list[keep_count / 2].id_value;
+      session_guess_keep(session, 0);
+    }
+    rows = session_guess(session, block_list, 3);
+    test_true(rows != NULL, "a block runs for the rejection rule");
+    /* Twice over: once on a bare softmax, and once with the whole taste on.
+     * The second is what holds the *history* the rule shapes each lane against
+     * — lane 0 is judged against the stream as it would be with none of the
+     * guesses kept, not as the session holds it with all of them in flight —
+     * and with the echo penalty off there is nothing for that to move. */
+    for (case_index = 0; rows && case_index < 2; ++case_index) {
+      app_taste rule = app_taste_plain();
+      pick_slot *slot_list = (pick_slot *)session->pick_room;
+      float want_share[27];
+      int tally_list[27];
+      int slot, round_index, keep_count, bad_count = 0, take_total = 0;
+      double worst_gap = 0.0;
+      rule.heat_value = 1.0f;
+      if (case_index == 0) {
+        rule.top_count = 0;
+        rule.top_portion = 1.0f;
+        rule.echo_penalty = 1.0f;
+      } else {
+        rule.top_count = 12;
+        rule.top_portion = 0.9f;
+        rule.echo_penalty = 1.4f;
+        rule.echo_window = 64;
+      }
+      for (slot = 0; slot < 27; ++slot) { want_share[slot] = 0.0f; tally_list[slot] = 0; }
+      keep_count = pick_shape(session, rows, &rule, session->guess_echo + 1, slot_list);
+      for (slot = 0; slot < keep_count; ++slot)
+        if (slot_list[slot].id_value >= 0 && slot_list[slot].id_value < 27)
+          want_share[slot_list[slot].id_value] = slot_list[slot].weight_value;
+
+      for (round_index = 0; round_index < round_count; ++round_index) {
+        int32_t made_id = -1;
+        int take_count;
+        rule.seed_value = (uint64_t)round_index * 2654435761ull + 12345ull;
+        take_count = session_guess_taste(session, rows, block_list, 3, &rule, &made_id);
+        if (take_count < 0 || take_count > 2) { bad_count += 1; continue; }
+        take_total += take_count;
+        {
+          int32_t at_zero = take_count >= 1 ? block_list[1] : made_id;
+          if (at_zero < 0 || at_zero >= 27) bad_count += 1;
+          else tally_list[at_zero] += 1;
+        }
+      }
+      test_true(bad_count == 0, case_index == 0
+                                    ? "every round of the rejection rule returns a usable prefix"
+                                    : "the same with the whole taste applied");
+      test_true(take_total > 0 && take_total < 2 * round_count,
+                case_index == 0 ? "the guesses are neither always kept nor never kept"
+                                : "the same under top-k, top-p and the echo penalty");
+      for (slot = 0; slot < 27; ++slot) {
+        double have_share = (double)tally_list[slot] / (double)round_count;
+        double gap_value = fabs(have_share - (double)want_share[slot]);
+        if (gap_value > worst_gap) worst_gap = gap_value;
+      }
+      test_true(worst_gap < 0.01,
+                case_index == 0
+                    ? "a block under a temperature draws position 0 from the plain sampler's "
+                      "own distribution"
+                    : "and does so against each lane's own history, not the block's");
+    }
+    if (rows) session_guess_keep(session, 0);
+  }
+
+  { /* The two edges of the rule, which are where a wrong one hides.
+     *
+     * A guess the taste has already cut has `p(t) = 0` and can never be
+     * accepted; a guess that holds every slot the taste kept has a residual
+     * with nothing in it, and the rule has to hand back the guess rather than
+     * divide by zero. */
+    int32_t block_list[2];
+    const float *rows;
+    app_taste rule = app_taste_plain();
+    int round_index, take_total = 0;
+    rule.heat_value = 1.0f;
+    rule.top_count = 1; /* one slot kept, so all but the strongest token has no mass */
+    rule.top_portion = 1.0f;
+    rule.echo_penalty = 1.0f;
+    block_list[0] = want_list[0];
+    rows = session_guess(session, block_list, 1);
+    if (rows) {
+      pick_slot *slot_list = (pick_slot *)session->pick_room;
+      int32_t best_id, other_id;
+      session_guess_keep(session, 0);
+      pick_shape(session, rows, &rule, session->guess_echo + 1, slot_list);
+      best_id = slot_list[0].id_value;
+      other_id = best_id == 0 ? 1 : 0;
+
+      block_list[0] = want_list[0];
+      block_list[1] = other_id;
+      rows = session_guess(session, block_list, 2);
+      test_true(rows != NULL, "a block runs for the cut guess");
+      if (rows) {
+        for (round_index = 0; round_index < 256; ++round_index) {
+          int32_t made_id = -1;
+          rule.seed_value = (uint64_t)round_index * 6364136223846793005ull + 1ull;
+          take_total += session_guess_taste(session, rows, block_list, 2, &rule, &made_id);
+        }
+        test_true(take_total == 0, "a guess the taste has cut is never accepted");
+        session_guess_keep(session, 0);
+      }
+
+      block_list[1] = best_id;
+      rows = session_guess(session, block_list, 2);
+      test_true(rows != NULL, "a block runs for the whole-mass guess");
+      if (rows) {
+        int32_t made_id = -1;
+        int take_count;
+        take_total = 0;
+        for (round_index = 0; round_index < 256; ++round_index) {
+          rule.seed_value = (uint64_t)round_index * 6364136223846793005ull + 1ull;
+          take_count = session_guess_taste(session, rows, block_list, 2, &rule, &made_id);
+          take_total += take_count;
+          if (take_count == 0 && made_id != best_id) take_total = -1000000;
+        }
+        test_true(take_total == 256,
+                  "a guess holding every slot the taste kept is always accepted");
+        session_guess_keep(session, 0);
+      }
+    } else {
+      test_true(0, "a block runs for the taste edges");
+    }
+  }
+
+  { /* Greedy does not come here at all, which is what keeps `--heat 0 --guess`
+     * byte for byte the run it has always been. */
+    int32_t block_list[2];
+    int32_t made_id = -1;
+    app_taste rule = app_taste_plain();
+    const float *rows;
+    rule.heat_value = 0.0f;
+    block_list[0] = want_list[0];
+    block_list[1] = want_list[1];
+    rows = session_guess(session, block_list, 2);
+    test_true(rows != NULL, "a block runs for the greedy refusal");
+    if (rows) {
+      test_true(session_guess_taste(session, rows, block_list, 2, &rule, &made_id) < 0,
+                "the rejection rule refuses a greedy taste rather than inventing one");
+      session_guess_keep(session, 0);
+    }
+  }
+
   {
     /* A partial keep against the ordinary path: keeping two lanes of a block has
      * to leave the session where feeding those two ids one at a time would.

@@ -6170,3 +6170,143 @@ call — the first draft of this one did, and it was rewritten when setting
 
 809 pass on the wide build, 800 on a build without the integer dot product and
 800 on SSE2.
+
+---
+
+## 0.9.8 — the block verified under a temperature, by the rule that makes it exact
+
+### Scope
+
+The speculative entry's step 4, which had been open since 0.9.0 and read: *so
+either the feature is greedy-only and says so, or it needs a proposer that
+carries a distribution. Decide which before plumbing it into `chat`.*
+
+It turns out to be a false choice, and that is the whole of this version. A
+proposer needs a distribution only because the rejection rule divides by it —
+and the scout's distribution is a **point mass**, which is a distribution like
+any other and the easiest one to divide by.
+
+`--guess` was refused outright above `--heat 0`, and the default taste is
+`--heat 1`, so the flag was unusable without being asked for explicitly. It now
+works under any taste.
+
+### The rule, and why it needs nothing the scout does not have
+
+Speculative sampling accepts a proposal `t` with probability `min(1, p(t)/q(t))`
+and, on a rejection, draws from the residual `norm((p - q)+)`. The scout names
+one token and nothing else, so `q(t) = 1` and `q` is zero everywhere else. Put
+that in:
+
+- accept with probability `min(1, p(t)/1)`, which is **`p(t)`**;
+- on a rejection the residual is `p(x)` for every `x` other than `t`, and
+  `max(0, p(t) - 1) = 0` at `t` itself — so it is **`p` with the guess taken out
+  and what is left renormalized**.
+
+Both halves are exactly computable from `p` alone. There is nothing to
+approximate and no second model to carry, and the token that comes out is drawn
+from `p` exactly.
+
+**`p` is the caller's whole taste**, not a bare softmax: heat, the echo penalty,
+top-k and top-p, all of it. So `session_pick_at`'s body is lifted out into
+`pick_shape`, which builds the shaped distribution, and `pick_draw`, which takes
+a token out of one. Both paths now sit on one definition of what a taste means,
+and the sampled text of a plain run is byte for byte what it was — checked on
+three seeds.
+
+**Each lane is shaped against its own history.** Lane `j` is judged as a plain
+run would judge it having committed the first `j` guesses: `guess_echo + j + 1`
+echo entries and cache position `guess_from + j + 1`, neither of which is what
+the session holds while the whole block is in flight. Reading the echo history
+off the session instead is the kind of mistake that changes a distribution
+slightly and silently; there is a test below that fails on it.
+
+**The draws are derived rather than sequential.** `session_pick_at` reseeds from
+`seed ^ fill_count` and draws once, which fits a path that takes one draw per
+position. A block fits it twice over — its lanes share one `fill_count`, and a
+lane that rejects takes two draws rather than one — so a block derives each draw
+from the seed, the position, and which of the two it is, through splitmix64's
+finalizer. The finalizer is not decoration: `draw_next` is an xorshift64, and
+xorshift's first word out of two nearly equal seeds is nearly equal too, so the
+accept draw and the resample draw would otherwise be a constant apart.
+
+### What it promises, and what it does not
+
+A greedy block is byte for byte a greedy run, and 0.9.8 does not touch that —
+`--heat 0 --guess 4` and `--guess 8` are identical to 0.9.7's.
+
+**A sampled block is not, and cannot be.** A round takes one draw where its
+guess is accepted and two where it is not, so the block path and the plain path
+consume randomness at different rates and diverge from the first rejection: the
+same seed gives a different stream at a different `--guess`, and the same stream
+only at the same one. What is equal is the **distribution** the stream is drawn
+from, which is the guarantee speculative sampling makes and the only one it
+makes. This is stated in the README rather than left for someone to discover.
+
+### What it is worth
+
+Acceptance under a temperature is `p(t)` — the model's own probability of the
+guessed token — so it tracks how certain the continuation is, where greedy
+acceptance only asks whether the guess was the argmax. That cuts both ways, and
+both ways were measured on the reference host at four threads, `--heat 1` with
+the default top-k 64 and top-p 0.95:
+
+| workload | plain | `--guess 4` | `--guess 8` |
+| --- | --- | --- | --- |
+| repeat a passage back verbatim | 33.55 tok/s | **68.32** (2.04x) | **79.15** (2.36x) |
+| free generation | 33.99 | 31.92 (0.94x) | — |
+
+On the quoting workload it keeps **100% of 63 guesses** at a block of four and
+96% of 77 at eight, and 2.04x and 2.36x are *better* than the greedy path's
+1.69x and 1.80x on its own quoting prompt — because verbatim repetition is
+where the model is nearly certain, and near-certainty is exactly what this
+acceptance rule rewards. Where the model is not certain it rejects, so a
+paraphrasing prompt sits between the two rows above.
+
+Free generation costs about 6% over three alternating runs, which is the same
+place greedy sits (0.92 to 0.95), and for the same reason: the scout draws
+nothing at all most rounds, and a round it draws nothing in is an ordinary step.
+So `--guess` stays a flag rather than a default under a temperature, exactly as
+it is without one.
+
+### Code
+
+- `pick_shape` and `pick_draw`: `session_pick_at`'s body, lifted out whole so a
+  second caller can have the distribution rather than a token from it.
+- `session_guess_taste`: the rejection rule, public beside `session_guess`.
+- `guess_draw_state`, `GUESS_DRAW_TAKE`, `GUESS_DRAW_MAKE`: a block's draws.
+- `pick_share`: what a shaped distribution gives one token, zero where the taste
+  has already cut it.
+- `main_answer_guess`: the rule where the taste has a temperature, the argmax
+  comparison where it does not, and a plain step drawn with the caller's taste
+  where the scout proposes nothing.
+- `main_serve`: the refusal above `--heat 0` is gone.
+
+### Tests
+
+The `guess` group grew six cases, and the first is the one that matters.
+
+**The theorem is held as a theorem.** The shaped distribution at lane 0 is
+computed directly, then a hundred thousand rounds are run through the rejection
+rule with a different seed each and the tokens they commit at position 0 are
+counted. What is being checked is that the mixture `p(t)*[t] + (1 - p(t))*residual`
+**is** `p`. A hundred thousand rounds over twenty-seven tokens puts a bucket's
+standard error under 0.0016, so the bar of 0.01 is six sigma — wide enough never
+to flake and narrow enough that no wrong rule fits under it. Two of them were
+built and neither does: resampling without removing the guess fails it, and
+accepting whenever the model gives the guess any mass at all fails it twice.
+
+It runs **twice**, once on a bare softmax and once with top-k, top-p and the
+echo penalty on. The second is what holds the per-lane history, and it was added
+because the first draft passed with the history read off the session — the
+penalty was switched off, so there was nothing for the mistake to move. The
+guess is now chosen out of the shaped row rather than taken from the fixture,
+because an arbitrary token is usually one top-k has already cut, and a guess
+that can only ever be rejected exercises half the rule.
+
+Three more hold the edges and the boundary: a guess the taste has cut is never
+accepted, a guess holding every slot the taste kept is always accepted and never
+divides by an empty residual, and a greedy taste is refused rather than given an
+invented rule.
+
+822 pass on the wide build, 813 on a build without the integer dot product and
+813 on SSE2.

@@ -267,6 +267,13 @@ const float *session_step_state(app_session *session, int32_t id_value, const fl
  * to anything that wants to score a branch and abandon it. */
 const float *session_guess(app_session *session, const int32_t *id_list, int id_count);
 app_code     session_guess_keep(app_session *session, int keep_count);
+/* A block verified under a temperature, by speculative sampling's modified
+ * rejection rule: the guesses kept, and the token that follows them, drawn from
+ * exactly the distribution the plain sampler draws from.  Greedy verification
+ * is an argmax comparison and does not come here. */
+int          session_guess_taste(app_session *session, const float *row_list,
+                                 const int32_t *id_list, int id_count, const app_taste *taste,
+                                 int32_t *made_out);
 int          session_guess_span(const app_session *session);
 int          session_guess_limit(const app_session *session);
 
@@ -13660,36 +13667,37 @@ app_tally session_tally(const app_session *session) {
 /* The sampler proper.  It leaves by whichever of half a dozen returns the
  * taste reaches first, so the clock that times it is put around the call
  * rather than threaded through the body. */
-static int32_t session_pick_at(app_session *session, const float *logit_list,
-                               const app_taste *taste) {
-  app_taste rule;
-  int vocab_count;
-  pick_slot *slot_list;
+/* The distribution a draw is actually taken from: the logits with the caller's
+ * whole taste applied, sorted, softmaxed and normalized, written into
+ * `slot_list` and cut to the returned length.
+ *
+ * This is the body `session_pick_at` used to be, lifted out whole and not
+ * otherwise touched, because a second caller needs the distribution itself
+ * rather than a token drawn from it — speculative decoding under a temperature
+ * has to ask what the model's probability of a *proposed* token is, and then to
+ * draw from the same distribution with that token taken out of it.  Splitting
+ * it is what keeps the two paths on one definition of what the taste means.
+ *
+ * `echo_count` is passed rather than read off the session because a block's
+ * lanes each have a history of their own: lane `j` is judged against the tokens
+ * the stream would hold if the first `j` guesses were kept, which is not what
+ * the session holds while the block is in flight. */
+static int pick_shape(app_session *session, const float *logit_list, const app_taste *rule_ref,
+                      int echo_count, pick_slot *slot_list) {
+  const app_taste rule = *rule_ref;
+  int vocab_count = session->model->head_sheet.row_count;
   int slot_index, keep_count;
-  float total_value = 0.0f, draw_value;
-
-  if (!session || !logit_list) return -1;
-  rule = taste ? *taste : app_taste_plain();
-  vocab_count = session->model->head_sheet.row_count;
-  slot_list = (pick_slot *)session->pick_room;
-  if (rule.seed_value) session->draw_state = rule.seed_value ^ (uint64_t)session->fill_count;
-
-  if (rule.heat_value <= 0.0f) {
-    int best_slot = 0;
-    for (slot_index = 1; slot_index < vocab_count; ++slot_index)
-      if (logit_list[slot_index] > logit_list[best_slot]) best_slot = slot_index;
-    return best_slot;
-  }
+  float total_value = 0.0f;
 
   for (slot_index = 0; slot_index < vocab_count; ++slot_index) {
     slot_list[slot_index].weight_value = logit_list[slot_index];
     slot_list[slot_index].id_value = slot_index;
   }
   if (rule.echo_penalty != 1.0f && rule.echo_window > 0) {
-    int echo_from = session->echo_count - rule.echo_window;
+    int echo_from = echo_count - rule.echo_window;
     int echo_index;
     if (echo_from < 0) echo_from = 0;
-    for (echo_index = echo_from; echo_index < session->echo_count; ++echo_index) {
+    for (echo_index = echo_from; echo_index < echo_count; ++echo_index) {
       int32_t id_value = session->echo_room[echo_index];
       if (id_value < 0 || id_value >= vocab_count) continue;
       if (slot_list[id_value].weight_value > 0.0f)
@@ -13728,7 +13736,13 @@ static int32_t session_pick_at(app_session *session, const float *logit_list,
       total_value += slot_list[slot_index].weight_value;
     }
   }
-  if (total_value <= 0.0f) return slot_list[0].id_value;
+  /* Every weight underflowed, which leaves nothing to divide by.  One slot of
+   * all the mass is the strongest logit, which is what the draw below would
+   * have landed on anyway. */
+  if (total_value <= 0.0f) {
+    slot_list[0].weight_value = 1.0f;
+    return 1;
+  }
   for (slot_index = 0; slot_index < keep_count; ++slot_index)
     slot_list[slot_index].weight_value /= total_value;
 
@@ -13745,12 +13759,195 @@ static int32_t session_pick_at(app_session *session, const float *logit_list,
       slot_list[slot_index].weight_value /= total_value;
   }
 
-  draw_value = draw_unit(&session->draw_state);
+  return keep_count;
+}
+
+/* One token out of a shaped distribution, for a draw already taken. */
+static int32_t pick_draw(const pick_slot *slot_list, int keep_count, float draw_value) {
+  int slot_index;
   for (slot_index = 0; slot_index < keep_count; ++slot_index) {
     draw_value -= slot_list[slot_index].weight_value;
     if (draw_value <= 0.0f) return slot_list[slot_index].id_value;
   }
   return slot_list[keep_count - 1].id_value;
+}
+
+static int32_t session_pick_at(app_session *session, const float *logit_list,
+                               const app_taste *taste) {
+  app_taste rule;
+  int vocab_count;
+  pick_slot *slot_list;
+  int slot_index, keep_count;
+
+  if (!session || !logit_list) return -1;
+  rule = taste ? *taste : app_taste_plain();
+  vocab_count = session->model->head_sheet.row_count;
+  slot_list = (pick_slot *)session->pick_room;
+  if (rule.seed_value) session->draw_state = rule.seed_value ^ (uint64_t)session->fill_count;
+
+  if (rule.heat_value <= 0.0f) {
+    int best_slot = 0;
+    for (slot_index = 1; slot_index < vocab_count; ++slot_index)
+      if (logit_list[slot_index] > logit_list[best_slot]) best_slot = slot_index;
+    return best_slot;
+  }
+  keep_count = pick_shape(session, logit_list, &rule, session->echo_count, slot_list);
+  return pick_draw(slot_list, keep_count, draw_unit(&session->draw_state));
+}
+
+/* -- speculative decoding under a temperature ----------------------------- */
+
+/* A draw's starting state, for a block that needs more than one of them.
+ *
+ * `session_pick_at` reseeds from `seed ^ fill_count` and draws once, which is a
+ * clean contract for a path that takes exactly one draw at each position.  A
+ * block does not fit it twice over: its lanes share one `fill_count` while the
+ * block is in flight, and a lane that rejects its guess takes two draws rather
+ * than one.  So a block derives its own state from the seed, the position the
+ * lane stands at, and which of the two draws it is.
+ *
+ * The mix matters here in a way it does not there.  `draw_next` is an
+ * xorshift64, and xorshift's first word out of two nearly equal seeds is nearly
+ * equal too — which the one draw path gets away with because consecutive
+ * positions are consecutive tokens and nobody compares them, and which a block
+ * would not, because its accept draw and its resample draw would be a constant
+ * apart.  splitmix64's finalizer over the three parts fixes that before the
+ * chain starts. */
+#define GUESS_DRAW_TAKE 0x9E3779B97F4A7C15ull /* the accept-or-reject draw */
+#define GUESS_DRAW_MAKE 0xC2B2AE3D27D4EB4Full /* the draw that replaces a rejected guess */
+
+static uint64_t guess_draw_state(uint64_t seed_value, uint64_t place_value, uint64_t part_value) {
+  uint64_t state = seed_value ^ (place_value * 0xD1342543DE82EF95ull) ^ part_value;
+  state ^= state >> 30;
+  state *= 0xBF58476D1CE4E5B9ull;
+  state ^= state >> 27;
+  state *= 0x94D049BB133111EBull;
+  state ^= state >> 31;
+  return state ? state : 0x2545F4914F6CDD1Dull; /* an xorshift chain must not start at zero */
+}
+
+/* What a shaped distribution gives a particular token.  Zero where the taste
+ * has already cut it, which is the right answer: a guess top-k or top-p has
+ * thrown away is a guess the plain sampler could not have made. */
+static float pick_share(const pick_slot *slot_list, int keep_count, int32_t id_value) {
+  int slot_index;
+  for (slot_index = 0; slot_index < keep_count; ++slot_index)
+    if (slot_list[slot_index].id_value == id_value) return slot_list[slot_index].weight_value;
+  return 0.0f;
+}
+
+/* A block verified under a temperature, by the modified rejection rule.
+ *
+ * **What makes this exact.** Speculative sampling accepts a proposal `t` with
+ * probability `min(1, p(t)/q(t))` and, on a rejection, draws from the residual
+ * `norm((p - q)+)`.  The proposer here carries no distribution at all — the
+ * scout names one token and nothing else — so `q` is a point mass on that
+ * token: `q(t) = 1`, and zero everywhere else.  Put that in and both halves
+ * collapse to something with nothing left to approximate:
+ *
+ * - accept with probability `min(1, p(t)/1)`, which is **`p(t)`**;
+ * - on a rejection the residual is `p(x)` for every `x` other than `t` and
+ *   `max(0, p(t) - 1) = 0` at `t` itself, so it is **`p` with the guess taken
+ *   out and what is left renormalized**.
+ *
+ * So a deterministic proposer needs no distribution of its own to be sampled
+ * under correctly, and the token this hands back is drawn from `p` exactly.
+ * That is the theorem rather than an approximation of it, and `test_guess`
+ * holds it as one: a hundred thousand rounds through this path against a
+ * hundred thousand through the plain sampler, on the same shaped row.
+ *
+ * **What it does not promise.** A greedy block is byte for byte a greedy run;
+ * this is not, and cannot be.  A round takes one draw where its guess is
+ * accepted and two where it is not, so the block path and the plain path
+ * consume randomness at different rates and diverge from the first rejection —
+ * the same seed gives a different stream at a different `--guess`, and the same
+ * stream only at the same one.  What is equal is the distribution the stream is
+ * drawn from, which is the guarantee speculative sampling actually makes.
+ *
+ * `p` is the caller's whole taste, not the bare softmax: heat, the echo
+ * penalty, top-k and top-p, all of it, and each lane against the history it
+ * would have if the guesses before it were kept.  Anything less and the block
+ * would be sampling from a distribution the plain path never uses.
+ *
+ * Returns how many of the `id_count - 1` guesses were kept and writes the token
+ * that follows them into `made_out` — the resampled one where a guess was
+ * rejected, and an ordinary draw from the last lane where none was. */
+int session_guess_taste(app_session *session, const float *row_list, const int32_t *id_list,
+                        int id_count, const app_taste *taste, int32_t *made_out) {
+  app_taste rule;
+  pick_slot *slot_list;
+  int vocab_count, take_count = 0, lane_index;
+  if (!session || !row_list || !id_list || !made_out) return -1;
+  if (id_count < 1 || session->guess_count != id_count) return -1;
+  rule = taste ? *taste : app_taste_plain();
+  if (rule.heat_value <= 0.0f) return -1; /* greedy has its own comparison and does not come here */
+  vocab_count = session->model->head_sheet.row_count;
+  slot_list = (pick_slot *)session->pick_room;
+
+  for (lane_index = 0; lane_index < id_count; ++lane_index) {
+    const float *logit_list = row_list + (size_t)lane_index * (size_t)vocab_count;
+    /* Lane `j` stands where a plain run would stand having committed the first
+     * `j` guesses: one cache row and one echo entry per lane before it, plus
+     * the id the block was opened on. */
+    int echo_count = session->guess_echo + lane_index + 1;
+    uint64_t place_value = (uint64_t)(session->guess_from + lane_index + 1);
+    int keep_count;
+    if (echo_count > session->echo_limit) echo_count = session->echo_limit;
+    keep_count = pick_shape(session, logit_list, &rule, echo_count, slot_list);
+
+    if (lane_index + 1 < id_count) {
+      int32_t want_id = id_list[lane_index + 1];
+      float want_share = pick_share(slot_list, keep_count, want_id);
+      uint64_t take_state;
+      float take_value;
+      if (rule.seed_value) {
+        take_state = guess_draw_state(rule.seed_value, place_value, GUESS_DRAW_TAKE);
+      } else {
+        take_state = session->draw_state;
+      }
+      take_value = draw_unit(&take_state);
+      if (!rule.seed_value) session->draw_state = take_state;
+      if (take_value < want_share) {
+        take_count += 1;
+        continue;
+      }
+      /* Rejected, so the guess is taken out of the distribution and what is
+       * left is renormalized — which is `(p - q)+` for a point mass `q`, and
+       * the only place this differs from an ordinary draw. */
+      {
+        int slot_index, fill_count = 0;
+        float total_value = 0.0f;
+        for (slot_index = 0; slot_index < keep_count; ++slot_index) {
+          if (slot_list[slot_index].id_value == want_id) continue;
+          slot_list[fill_count++] = slot_list[slot_index];
+          total_value += slot_list[slot_index].weight_value;
+        }
+        if (fill_count < 1 || !(total_value > 0.0f)) {
+          /* The guess held every one of the kept slots' mass, so the residual
+           * is empty.  Nothing else was reachable, so the guess is the draw. */
+          *made_out = want_id;
+          return take_count;
+        }
+        for (slot_index = 0; slot_index < fill_count; ++slot_index)
+          slot_list[slot_index].weight_value /= total_value;
+        keep_count = fill_count;
+      }
+    }
+    {
+      uint64_t make_state;
+      float make_value;
+      if (rule.seed_value) {
+        make_state = guess_draw_state(rule.seed_value, place_value, GUESS_DRAW_MAKE);
+      } else {
+        make_state = session->draw_state;
+      }
+      make_value = draw_unit(&make_state);
+      if (!rule.seed_value) session->draw_state = make_state;
+      *made_out = pick_draw(slot_list, keep_count, make_value);
+    }
+    return take_count;
+  }
+  return take_count;
 }
 
 /* The sampler is not in `session_step`, so it is not in the span the phase

@@ -1183,7 +1183,10 @@ question only a real prompt answers, and `session_cache_peak` beside
 
 `session_pick` draws a token: repetition penalty over a recent window,
 temperature, top-k, top-p, then a draw from an xorshift stream. A
-temperature of zero short-circuits to the maximum.
+temperature of zero short-circuits to the maximum. The shaping and the draw are
+two functions rather than one — `pick_shape` builds the distribution the taste
+describes and `pick_draw` takes a token out of it — because the block path needs
+the distribution itself rather than a token from it.
 
 **The block path.** `session_guess` runs several ids as one batch and hands back
 one row of the vocabulary a lane, so a caller can ask what the model would have
@@ -1199,6 +1202,20 @@ least `slide_span`, so a block never laps itself: the rows it will overwrite are
 known before it runs, saving them is a fixed scratch, and undoing is the same
 copy back. `session_guess_limit` reports the bound and a longer block is
 refused.
+
+Verifying the block is two rules, one per kind of decoding. Greedy is an argmax
+comparison, and the text it produces is byte for byte a greedy run's. Under a
+temperature `session_guess_taste` applies speculative sampling's modified
+rejection rule, and the shape the scout has makes it unusually simple: a
+proposer that names one token is a **point mass**, so accepting with
+`min(1, p/q)` is accepting with `p(t)`, and the residual `(p - q)+` is `p` with
+the guess removed and the rest renormalized. Each lane is shaped against the
+history it would have if the guesses before it were kept — one echo entry and
+one cache row per lane before it — and each takes its draws from a state derived
+from the seed and the position, because a block's lanes share one `fill_count`
+and a rejecting lane needs two draws. The token drawn is from the plain
+sampler's distribution exactly; it is not the plain sampler's *sample*, and
+`README.md` says so where a caller will see it.
 
 `app_scout` is the other half: an n-gram proposer over the ids it has been told
 about, which are the prompt and then only the tokens the model has agreed to.
