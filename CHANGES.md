@@ -6054,3 +6054,119 @@ which was the loose one, is now spent. The remaining routes are in `TODO.md`.
 
 The `kernel` group grew the two equality cases described above. 799 pass on the
 wide build, 788 on a build without the integer dot product and 788 on SSE2.
+
+---
+
+## 0.9.7 — a picture's rows kept against the picture
+
+### Scope
+
+`TODO.md`'s *reuse a picture's rows when it is the same picture* — `RESEARCH.md`
+idea 12. Exact, cheap and narrow, and worth more after 0.9.6 than before it only
+in the sense that a picture is now 8 s rather than 10.6: asking three questions
+about one photograph is the ordinary case, and until now every one of them paid
+the whole tower.
+
+**This is not fresh-image acceleration and must not be reported as one.** A
+picture the engine has not seen costs exactly what it cost before. What changes
+is the second time.
+
+### What is kept, and where
+
+The **post-projector rows** — `soft_limit` by the text stack's width, 256 by
+1536 on the shipped export, 1.5 MiB a picture. Those are the last thing the
+vision path produces and the first thing the text stack consumes, so keeping
+them skips the resize, the patch cut, all sixteen encoder layers, the pooling
+and the projector at once, and leaves the caller holding exactly the
+`app_media` it would have held.
+
+It lives on the **model** and not on a session. The rows are the weights' answer
+to a picture rather than a conversation's, so a second conversation about the
+same photograph has them too — which is the case `--keep` and `chat --loop`
+cannot reach, because both of those match on rows the tower has already been run
+to produce. Like everything else hanging off a model it assumes one caller at a
+time, which is the assumption `pool_group` already makes.
+
+Four pictures, fixed, least-wanted evicted. That is the working set the ordinary
+case has — a photograph and some questions, or a handful of pictures compared
+against each other — and depth beyond a working set does nothing for it. The
+1.5 MiB an entry costs is reported without being asked for, because it comes out
+of the engine's own allocator: `bench` with a picture goes from 2205.5 MiB
+allocated to 2207.0.
+
+### The identity, which is the whole of the risk
+
+A cache like this has exactly one failure mode that matters: handing back rows
+for a picture the caller never showed, silently. So the identity is the part
+that got the attention.
+
+**It is taken on the decoded raster**, after `image_read` and before anything
+else, so the container and the decoder are out of it: the same photograph as a
+png and as a lossless bmp is one entry, a lossy re-encode of it is not, and both
+of those are the right answer. Reading and decoding the file is still paid on a
+hit; what is saved is the tower, which is all but the whole of what a picture
+costs.
+
+**Into it go** every decoded sample, the raster's own shape, and the tower
+configuration that decides what the samples become — the patch and pool sizes
+and the soft token budget, which together fix the resized grid and the pooling
+geometry; the tower's depth and width; the text stack's width, which is what the
+projector lifts into; and the checkpoint's mapped size, the way `keep_mark` uses
+it, so two exports of the same shape are not one identity.
+
+**Two independent mixes, not one.** Sixty-four bits puts a birthday collision
+somewhere around four billion pictures, which is not a number to rest a silent
+wrong answer on. The samples go through an FNV-1a and through `keep_mix` with a
+different seed at the same time, which is a hundred and twenty-eight bits, and
+the raster's shape is compared exactly beside them, so a collision has to agree
+on that as well. Over a 6.8 MiB raster both mixes together measure **2.5 to 5.1
+ms**.
+
+**The backend is deliberately not in it, and that is written down rather than
+left to be noticed.** This store is never put in a file, so a backend cannot
+change under an entry — it is fixed for the life of the process that made it.
+Anything that gives these rows a life beyond one process has to put the backend
+and an encoder version in first.
+
+### What it is worth
+
+The case the entry names, end to end: a photograph, a question about it, `/new`,
+the same photograph, another question — **53.53 s to 39.72 s**, and the two
+conversations are byte for byte identical. The same picture twice in one prompt
+is 9.12 s against 9.18 s for one; two different pictures is 17.19 s, which is
+both towers, as it should be.
+
+A miss costs the identity and the copy. Over three alternating runs a single
+picture measured 8.79 s without the store and 8.94 with — under 2%, and the
+identity is 5 ms of it.
+
+`logits` after a picture, a clip, both and neither is byte for byte what it was
+on every case tried, and a hit hands back the tower's rows bit for bit.
+
+### Code
+
+- `MEDIA_KEEP_COUNT`, `media_note`, and `vision_note` / `media_turn` on
+  `app_model`: the store.
+- `media_mark`, `media_recall`, `media_keep`, `media_keep_free`.
+- `media_image`: the identity taken on the decoded raster, the store consulted
+  before the tower and written after it.
+- `keep_mix` moved up the file, so the store and `keep_mark` share one mixer.
+
+### Tests
+
+Six cases in the `tower` group. The store's arithmetic is held for **equality**
+— a hit hands back the tower's rows bit for bit, and copied out rather than
+lent, so the caller owns them either way. The identity is held three ways: one
+sample moved is a different identity in *both* mixes, the same samples are the
+same identity whatever the call around them, and another picture gets rows of
+its own.
+
+The eviction cases ask `media_recall` directly rather than going through
+`media_image`, and that is the point rather than a convenience: **the tower is
+deterministic, so a miss that re-runs it hands back exactly the rows a hit would
+have.** A test written on the rows passes with the store emptied between every
+call — the first draft of this one did, and it was rewritten when setting
+`MEDIA_KEEP_COUNT` to 1 failed to fail it.
+
+809 pass on the wide build, 800 on a build without the integer dot product and
+800 on SSE2.

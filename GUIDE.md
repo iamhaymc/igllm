@@ -354,6 +354,13 @@ in isolation and slower in the engine, and taken out again — see
   on that build, so the towers reach the numbers they reached before. Both
   towers use it; the stride argument is the head width where the rows are heads
   of a wider array and the head size where they have been gathered into a run.
+- `media_mark`, `media_recall` and `media_keep` — a picture's post-projector
+  rows, kept on the model against a hundred and twenty-eight bit identity of the
+  decoded samples and of every part of the tower configuration that decides what
+  they become. Four pictures, least-wanted evicted. The identity is taken after
+  the decoder, so the container is out of it; the backend is out of it too, and
+  may be only because the store never reaches a file — `TODO.md` says what has
+  to go in before it does.
 - `kern_score_block` and `kern_blend_rows_many` — the same two things for a
   block of `KERN_GRID_LANE` queries at once, which is what a tower's
   bidirectional attention wants: every query in a band scores against the same

@@ -597,3 +597,39 @@ feed-forward appeared to move five to ten percent between the two builds, in
 code neither of them touches; running the same series with the order of the
 builds reversed put the first run of *whichever* build went first ahead of the
 runs after it. That is the host drifting over a series, not the change.
+
+## Asking twice about one photograph
+
+A picture costs the tower once. Since 0.9.7 it costs it once *in total*: the
+rows the projector hands the text stack are kept on the model against an
+identity of the picture, so the second question about the same photograph skips
+the resize, the patch cut, all sixteen encoder layers, the pooling and the
+projector, and gets the rows the tower made bit for bit.
+
+**This is not fresh-image acceleration.** A picture the engine has not seen
+costs exactly what it cost before, and a miss costs under 2% more for taking the
+identity and copying the rows in. What changes is the second time. A photograph,
+a question, `/new`, the same photograph and another question goes **53.53 s to
+39.72 s**, with the two conversations byte for byte identical.
+
+It lives on the model rather than on a session, because the rows are the
+weights' answer to a picture and not a conversation's — so a second conversation
+has them, which is the case `--keep` and `chat --loop` cannot reach: both of
+those match on rows the tower has already been run to make. Four pictures are
+kept, least-wanted first out, and each costs 1.5 MiB of the engine's own
+allocator, which `bench` reports without being asked.
+
+The identity is the whole of the risk, because the one thing a cache like this
+must never do is hand back rows for a picture that was never shown. It is taken
+on the **decoded raster** — so the container and the decoder are out of it, and
+the same photograph as a png and as a lossless bmp is one entry — over every
+sample, the raster's shape, and every part of the tower configuration that
+decides what the samples become. Two independent mixes run over the same bytes
+rather than one, which is a hundred and twenty-eight bits instead of sixty-four,
+and the raster's shape is compared exactly beside them. Both mixes together cost
+2.5 to 5.1 ms on a 6.8 MiB raster.
+
+The backend is deliberately not in the identity, and the reason is worth knowing
+before anyone extends this: the store is never written to a file, so a backend
+cannot change under an entry. `TODO.md` says what has to go in first if it ever
+is.

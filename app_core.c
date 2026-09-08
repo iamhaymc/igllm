@@ -7622,6 +7622,33 @@ static void rope_grid_turn(float *value_list, int head_size, const float *cos_li
 
 typedef struct token_book token_book; /* defined in the token layer */
 
+/* -- a picture's rows, kept against the picture ---------------------------- */
+
+/* How many pictures' rows the model keeps.
+ *
+ * A picture's rows are `soft_limit` by the text stack's width — 256 by 1536 on
+ * the shipped export, so 1.5 MiB each — against the 8 s the tower spends making
+ * them.  Four is the ordinary case this exists for: a photograph and a couple
+ * of questions about it, or a handful of pictures compared against each other
+ * in one loop.  It is deliberately small and fixed rather than a caller's
+ * tunable: what makes this worth having is that asking twice costs once, and no
+ * depth beyond a working set does anything for that. */
+#define MEDIA_KEEP_COUNT 4
+
+/* One kept picture: the identity of the pixels that made the rows, and the
+ * rows. */
+typedef struct media_note {
+  uint64_t low_mark;   /* the identity, as two independent mixes */
+  uint64_t high_mark;
+  int      wide_count; /* the source raster, compared exactly beside the mix */
+  int      high_count;
+  int      band_count;
+  int      row_count;
+  int      state_size;
+  uint64_t turn_value; /* when it was last wanted, for the eviction pick */
+  float   *state_data;
+} media_note;
+
 struct app_model {
   app_setup  setup;
   model_form form;
@@ -7646,6 +7673,14 @@ struct app_model {
   back_desk  desk;
   size_t     weight_bytes;
   int        code_col_peak; /* widest code plane bound, for the backend's staging */
+
+  /* A picture's rows, kept against the picture that made them.  It lives on the
+   * model rather than on a session because the rows are the weights' answer and
+   * not a conversation's, so a second conversation about the same photograph
+   * has it too.  Like everything else hanging off a model, it assumes one
+   * caller at a time — the same assumption `pool_group` already makes. */
+  media_note vision_note[MEDIA_KEEP_COUNT];
+  uint64_t   media_turn;
 };
 
 /* Rounds the activation onto whatever grid the checkpoint declares, multiplies,
@@ -12422,11 +12457,20 @@ app_code model_load(const char *folder_path, const app_setup *setup, app_model *
   return APP_OKAY;
 }
 
+static void media_keep_free(app_model *model) {
+  int note_index;
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    mem_free(model->vision_note[note_index].state_data);
+    model->vision_note[note_index].state_data = NULL;
+  }
+}
+
 void model_free(app_model *model) {
   int layer_index;
   if (!model) return;
   back_close(&model->desk);
   pool_close(&model->pool);
+  media_keep_free(model);
   token_free(model->book_ref);
   if (model->wing_list) {
     for (layer_index = 0; layer_index < model->form.layer_count; ++layer_index) {
@@ -12673,19 +12717,187 @@ int model_audio_span_ms(const app_model *model) {
   return model->tower_list[TOWER_AUDIO].form.token_ms;
 }
 
+/* One value folded into a running mix.  Both the picture store above and
+ * `keep_mark` below build an identity out of this. */
+static uint64_t keep_mix(uint64_t mark_value, uint64_t value_now) {
+  mark_value ^= value_now + 0x9E3779B97F4A7C15ull + (mark_value << 6) + (mark_value >> 2);
+  return mark_value;
+}
+
+/* The identity of a picture, and of everything about this engine that decides
+ * what rows it turns into.
+ *
+ * **What is in it.** Every decoded sample, the raster's own shape, and the
+ * tower configuration the rows depend on: the patch and pool sizes and the soft
+ * token budget, which together fix the resized grid and the pooling geometry;
+ * the tower's depth and width; and the text stack's width, which is what the
+ * projector lifts into.  The checkpoint's mapped size goes in as well, the way
+ * `keep_mark` uses it, so two exports of the same shape are not the same
+ * identity.
+ *
+ * **What is deliberately not in it.** The file path, the container and the
+ * decoder: the pixels are hashed after decoding, so the same photograph as a
+ * png and as a lossless bmp is one entry and a lossy re-encode of it is not,
+ * which is the right answer both times.  The backend is not in it either, and
+ * that is worth saying rather than leaving to be noticed: this store lives on a
+ * model and is never written to a file, so a backend cannot change under an
+ * entry — it is fixed for the life of the process that made it.  Anything that
+ * gives these rows a life beyond one process has to put the backend and an
+ * encoder version in here first.
+ *
+ * **Why two mixes and not one.** A hit hands back rows for a picture the caller
+ * never showed if two pictures collide, and it does it silently, which is the
+ * one failure mode a cache like this must not have.  Sixty-four bits is a
+ * birthday collision somewhere around four billion pictures; two independent
+ * mixes over the same bytes, with different seeds and different multipliers,
+ * make it a hundred and twenty-eight and put it out of reach.  The raster's
+ * shape is compared exactly beside them, so a collision has to agree on that
+ * too. */
+static void media_mark(const app_model *model, const flat_grid *grid, uint64_t *low_out,
+                       uint64_t *high_out) {
+  const tower_form *form = &model->tower_list[TOWER_VISION].form;
+  uint64_t low_value = 0xCBF29CE484222325ull;
+  uint64_t high_value = 0x9E3779B97F4A7C15ull;
+  size_t value_count = (size_t)grid->wide_count * (size_t)grid->high_count *
+                       (size_t)grid->band_count;
+  const unsigned char *byte_data = (const unsigned char *)grid->value_data;
+  size_t byte_count = value_count * sizeof(float);
+  size_t byte_index;
+
+  /* Eight bytes at a time over the samples, because a picture is megabytes of
+   * them and a byte at a time is a measurable share of what this saves.  The
+   * word is assembled rather than loaded through a cast so that the mix does
+   * not depend on the host's alignment rules or its byte order. */
+  for (byte_index = 0; byte_index + 8 <= byte_count; byte_index += 8) {
+    uint64_t word_value = (uint64_t)byte_data[byte_index] |
+                          ((uint64_t)byte_data[byte_index + 1] << 8) |
+                          ((uint64_t)byte_data[byte_index + 2] << 16) |
+                          ((uint64_t)byte_data[byte_index + 3] << 24) |
+                          ((uint64_t)byte_data[byte_index + 4] << 32) |
+                          ((uint64_t)byte_data[byte_index + 5] << 40) |
+                          ((uint64_t)byte_data[byte_index + 6] << 48) |
+                          ((uint64_t)byte_data[byte_index + 7] << 56);
+    low_value = (low_value ^ word_value) * 1099511628211ull;
+    high_value = keep_mix(high_value, word_value);
+  }
+  for (; byte_index < byte_count; ++byte_index) {
+    low_value = (low_value ^ (uint64_t)byte_data[byte_index]) * 1099511628211ull;
+    high_value = keep_mix(high_value, (uint64_t)byte_data[byte_index]);
+  }
+
+  {
+    /* The shape of the picture and everything about the engine that decides
+     * what it becomes, into both mixes. */
+    uint64_t part_list[11];
+    int part_index;
+    part_list[0] = (uint64_t)grid->wide_count;
+    part_list[1] = (uint64_t)grid->high_count;
+    part_list[2] = (uint64_t)grid->band_count;
+    part_list[3] = (uint64_t)form->patch_size;
+    part_list[4] = (uint64_t)form->pool_size;
+    part_list[5] = (uint64_t)form->soft_limit;
+    part_list[6] = (uint64_t)form->layer_count;
+    part_list[7] = (uint64_t)form->state_size;
+    part_list[8] = (uint64_t)form->head_count;
+    part_list[9] = (uint64_t)model->form.state_size;
+    part_list[10] = (uint64_t)model_memory_bytes(model);
+    for (part_index = 0; part_index < 11; ++part_index) {
+      low_value = (low_value ^ part_list[part_index]) * 1099511628211ull;
+      high_value = keep_mix(high_value, part_list[part_index]);
+    }
+  }
+  *low_out = low_value;
+  *high_out = high_value;
+}
+
+/* Hands back a kept picture's rows, or says there are none.
+ *
+ * The rows are copied out rather than lent, so the caller owns and frees an
+ * `app_media` exactly as it does for a picture the tower ran: nothing about the
+ * calling side changes according to whether this hit. */
+static int media_recall(app_model *model, uint64_t low_mark, uint64_t high_mark,
+                        const flat_grid *grid, app_media *media_out) {
+  int note_index;
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    media_note *note = &model->vision_note[note_index];
+    float *state_data;
+    if (!note->state_data) continue;
+    if (note->low_mark != low_mark || note->high_mark != high_mark) continue;
+    if (note->wide_count != grid->wide_count || note->high_count != grid->high_count ||
+        note->band_count != grid->band_count)
+      continue;
+    state_data = (float *)mem_clear(sizeof(float) * (size_t)note->row_count *
+                                    (size_t)note->state_size);
+    if (!state_data) return 0; /* out of memory is a miss, not a failure */
+    memcpy(state_data, note->state_data,
+           sizeof(float) * (size_t)note->row_count * (size_t)note->state_size);
+    media_out->state_data = state_data;
+    media_out->row_count = note->row_count;
+    media_out->state_size = note->state_size;
+    note->turn_value = ++model->media_turn;
+    return 1;
+  }
+  return 0;
+}
+
+/* Keeps a picture's rows, over the entry that was wanted longest ago.
+ *
+ * Failing to keep them is not an error and is not reported: the rows the caller
+ * asked for are already made and already handed over, and all that is lost is
+ * the next question about the same picture. */
+static void media_keep(app_model *model, uint64_t low_mark, uint64_t high_mark,
+                       const flat_grid *grid, const app_media *media_in) {
+  media_note *pick = &model->vision_note[0];
+  int note_index;
+  size_t row_bytes;
+  float *state_data;
+  if (media_in->row_count < 1 || media_in->state_size < 1) return;
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    media_note *note = &model->vision_note[note_index];
+    if (!note->state_data) { pick = note; break; }
+    if (note->turn_value < pick->turn_value) pick = note;
+  }
+  row_bytes = sizeof(float) * (size_t)media_in->row_count * (size_t)media_in->state_size;
+  state_data = (float *)mem_clear(row_bytes);
+  if (!state_data) return;
+  memcpy(state_data, media_in->state_data, row_bytes);
+  mem_free(pick->state_data);
+  pick->low_mark = low_mark;
+  pick->high_mark = high_mark;
+  pick->wide_count = grid->wide_count;
+  pick->high_count = grid->high_count;
+  pick->band_count = grid->band_count;
+  pick->row_count = media_in->row_count;
+  pick->state_size = media_in->state_size;
+  pick->state_data = state_data;
+  pick->turn_value = ++model->media_turn;
+}
+
 app_code media_image(app_model *model, const char *path_text, app_media *media_out) {
   flat_grid grid;
+  uint64_t low_mark = 0, high_mark = 0;
   app_code code;
   if (!model || !path_text || !media_out) return APP_FAIL_ARGUMENT;
   memset(media_out, 0, sizeof(*media_out));
   if (!model->tower_list[TOWER_VISION].form.live_flag) return APP_FAIL_SUPPORT;
   code = image_read(path_text, &grid);
   if (code != APP_OKAY) return code;
+  /* The identity is taken on the decoded raster, so the decoder and the
+   * container are out of it and the same photograph twice is one entry however
+   * it arrived.  Reading and decoding the file is still paid on a hit; what is
+   * saved is the tower, which is all but the whole of what a picture costs. */
+  media_mark(model, &grid, &low_mark, &high_mark);
+  if (media_recall(model, low_mark, high_mark, &grid, media_out)) {
+    grid_free(&grid);
+    return APP_OKAY;
+  }
   code = vision_run(model, &grid, &media_out->state_data, &media_out->row_count);
+  if (code == APP_OKAY) {
+    media_out->state_size = model->form.state_size;
+    media_keep(model, low_mark, high_mark, &grid, media_out);
+  }
   grid_free(&grid);
-  if (code != APP_OKAY) return code;
-  media_out->state_size = model->form.state_size;
-  return APP_OKAY;
+  return code;
 }
 
 app_code media_audio(app_model *model, const char *path_text, app_media *media_out) {
@@ -12907,11 +13119,6 @@ static int token_frame_inner(const app_model *model, const app_part *part_list, 
  * might not be. */
 #define KEEP_MARK_TEXT "igllm cache 2\n\0\0"
 #define KEEP_MARK_SIZE 16
-
-static uint64_t keep_mix(uint64_t mark_value, uint64_t value_now) {
-  mark_value ^= value_now + 0x9E3779B97F4A7C15ull + (mark_value << 6) + (mark_value >> 2);
-  return mark_value;
-}
 
 /* Everything about a model and a session that decides how the cache is laid
  * out, and enough about the checkpoint to tell two of the same shape apart. */

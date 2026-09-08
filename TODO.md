@@ -624,28 +624,48 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   versus coarse understanding, not a single latency number; a fast path that
   falls back to full resolution half the time is not a fast path.
 
-- **Reuse a picture's rows when it is the same picture.** Exact, cheap, and
-  narrow: cache the post-projector rows against a collision-resistant identity
-  of the pixels plus the preprocessing and model configuration, so a second
-  question about the same image costs nothing. `RESEARCH.md` idea 12.
+- **Give a picture's rows a life beyond one process.** 0.9.6's entry above is
+  built and ships — 0.9.7 — and this is what it left.
 
-  *llama.cpp has a narrower form of this.* Its server pushes a placeholder for
-  an encoded media chunk into the slot's prompt tokens — "the chunk is already
-  in the KV cache at this point, so we don't need to keep its data around"
-  (`tools/server/server-context.cpp`) — so a picture is reused by an ordinary
-  **prompt-prefix match within one slot**, keyed by the caller's bitmap id. That
-  covers the follow-up turn and nothing else: not the same picture in another
-  conversation, not with different text in front of it, not after a restart.
-  There is no content-addressed store of post-projector rows anywhere in the
-  tree. The gap is worth having, and the prefix form is worth having too — this
-  engine's `--keep` already matches a prompt with a picture in it on the rows
-  the tower made rather than on the ids, which is half of the mechanism.
+  The store is four pictures on the model, keyed on the decoded samples and the
+  tower configuration by two independent mixes, and it takes the case the old
+  entry named: a photograph, a question, another conversation, the same
+  photograph, another question is **53.53 s to 39.72 s**, byte for byte the same
+  two conversations. A miss costs under 2%. `CHANGES.md` 0.9.7 has the identity
+  and what is deliberately outside it.
 
-  This is not fresh-image acceleration and must never be reported as one. It is
-  worth having because asking three questions about one photograph is the
-  ordinary case, and because the identity discipline it forces — orientation,
-  resize budget, backend, encoder version — is the same discipline any of the
-  approximate vision work above will need.
+  **What is left is the word "process".** The store is never written to a file,
+  which is what lets the identity leave out the backend and any notion of an
+  encoder version — a backend cannot change under an entry that cannot outlive
+  the process that made it. A store on disk is the useful next form, because the
+  ordinary case for a photograph is a run at a time rather than a loop, and it
+  needs all three of these first:
+
+  - **the backend in the identity**, since a scalar build and a VNNI build do
+    not produce the same rows;
+  - **an encoder version in it**, bumped by hand whenever anything from the
+    resize to the projector changes — the shipped `KEEP_MARK_TEXT` is the
+    pattern, and the reason it carries a version;
+  - **a decision about where the file lives and who evicts it**, which is a
+    caller's question and not the engine's. `--keep` is the precedent: the
+    engine reads and writes a path the caller names and refuses a file that
+    disagrees with its mark.
+
+  Do not persist it without all three. A stale row read back from disk is a
+  wrong answer that nothing downstream can detect.
+
+  *llama.cpp has a narrower form of the in-memory half.* Its server pushes a
+  placeholder for an encoded media chunk into the slot's prompt tokens — "the
+  chunk is already in the KV cache at this point, so we don't need to keep its
+  data around" (`tools/server/server-context.cpp`) — so a picture is reused by
+  an ordinary **prompt-prefix match within one slot**, keyed by the caller's
+  bitmap id. That covers the follow-up turn and nothing else: not the same
+  picture in another conversation, not with different text in front of it, not
+  after a restart. There is still no content-addressed store of post-projector
+  rows anywhere in that tree, and no persisted one either.
+
+  None of this is fresh-image acceleration and none of it must ever be reported
+  as one.
 
 - **The other widths of the integer dot product.** 0.8.9's path is written for
   AVX-512 VNNI and nothing else. A host with `avx_vnni` and no AVX-512 —
@@ -756,3 +776,5 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | A block of queries through the tower's attention, sharing the gathered run both loops read — at the one lane path's arithmetic in its order, held to it bit for bit by two tests | 0.9.6 |
 | Whether flash attention's tiling is worth porting into this tower (refused: a band holds one score row and never held the grid, so the schedule arrives with nothing to save) | 0.9.6 |
 | The fused multiply-add in the tower's blend (refused, and deliberately: 0.6x more, at the cost of a picture's rows no longer being the rows that ship) | 0.9.6 |
+| A picture's rows kept against the picture, on a hundred and twenty-eight bit identity of the decoded samples and the tower's configuration | 0.9.7 |
+| Where that identity has to be taken, so the decoder and the container stay out of it (answered: on the decoded raster, which makes a lossless re-encode one entry and a lossy one two) | 0.9.7 |

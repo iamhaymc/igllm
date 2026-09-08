@@ -5067,6 +5067,127 @@ static void test_tower(void) {
   }
   mem_free(want_list);
 
+  { /* -- the same picture again --------------------------------------- */
+    /* The store hands back the rows the tower made rather than rows like them,
+     * so this is an equality check.  What it is really holding is the identity:
+     * a hit that is not the same picture is the one failure this must not have,
+     * and the cases below are a picture against itself, a picture against one
+     * that differs in a single sample, and a picture against one of another
+     * shape. */
+    app_media again;
+    char other_text[512];
+    int bad_count = 0;
+    test_true(media_image(model, path_text, &again) == APP_OKAY, "the same picture runs again");
+    test_true(again.row_count == media.row_count && again.state_size == media.state_size,
+              "the kept rows have the shape the tower's did");
+    if (again.row_count == media.row_count) {
+      for (row_index = 0; row_index < again.row_count; ++row_index)
+        for (value_index = 0; value_index < again.state_size; ++value_index)
+          if (again.state_data[(size_t)row_index * (size_t)again.state_size + value_index] !=
+              media.state_data[(size_t)row_index * (size_t)media.state_size + value_index])
+            bad_count += 1;
+    }
+    test_true(bad_count == 0, "a kept picture's rows are the tower's bit for bit");
+    test_true(again.state_data != media.state_data,
+              "a kept picture's rows are copied out, so the caller owns them either way");
+    media_free(&again);
+
+    /* One sample moved is a different picture.  The raster is written out as a
+     * pnm rather than a png so that the test does not need an encoder: what is
+     * being checked is the identity, not the container. */
+    {
+      flat_grid twin;
+      memset(&twin, 0, sizeof(twin));
+      if (image_read(path_text, &twin) == APP_OKAY) {
+        uint64_t low_one = 0, high_one = 0, low_two = 0, high_two = 0;
+        media_mark(model, &twin, &low_one, &high_one);
+        twin.value_data[0] = twin.value_data[0] + 1.0f / 512.0f;
+        media_mark(model, &twin, &low_two, &high_two);
+        test_true(low_one != low_two && high_one != high_two,
+                  "one sample moved is a different identity, in both mixes");
+        twin.value_data[0] = twin.value_data[0] - 1.0f / 512.0f;
+        media_mark(model, &twin, &low_two, &high_two);
+        test_true(low_one == low_two && high_one == high_two,
+                  "the identity is the samples and nothing about the call");
+        grid_free(&twin);
+      } else {
+        test_true(0, "the picture is read for the identity check");
+      }
+    }
+
+    /* A different picture is a miss, and the rows say so.  `image.png` is the
+     * only picture the fixture writes, so the second one is made here. */
+    path_join(other_text, sizeof(other_text), test_yard_path, "other.pnm");
+    if (test_file_write("other.pnm", "P6\n12 8\n255\n", 13)) {
+      FILE *handle = fopen(other_text, "ab");
+      if (handle) {
+        unsigned char cell_list[12 * 8 * 3];
+        int cell_index;
+        for (cell_index = 0; cell_index < 12 * 8 * 3; ++cell_index)
+          cell_list[cell_index] = (unsigned char)((cell_index * 37 + 11) & 0xFF);
+        fwrite(cell_list, 1, sizeof(cell_list), handle);
+        fclose(handle);
+        if (media_image(model, other_text, &again) == APP_OKAY) {
+          int same_count = 0;
+          for (value_index = 0; value_index < again.state_size; ++value_index)
+            if (again.state_data[value_index] == media.state_data[value_index]) same_count += 1;
+          test_true(same_count < again.state_size,
+                    "another picture is a miss and gets rows of its own");
+          media_free(&again);
+        } else {
+          test_true(0, "the second picture runs the tower");
+        }
+      } else {
+        test_true(0, "the second picture is written");
+      }
+    } else {
+      test_true(0, "the second picture's header is written");
+    }
+
+    /* And the first picture is still there behind the second: the store holds a
+     * working set, not one entry.
+     *
+     * This one asks the store directly rather than going through `media_image`,
+     * because the two cannot be told apart from the outside — the tower is
+     * deterministic, so a miss that re-runs it hands back exactly the rows a hit
+     * would have, and a test written on the rows would pass with the store
+     * emptied between every call.  `media_recall` says which happened. */
+    {
+      flat_grid first_grid;
+      memset(&first_grid, 0, sizeof(first_grid));
+      if (image_read(path_text, &first_grid) == APP_OKAY) {
+        uint64_t low_mark = 0, high_mark = 0;
+        app_media hit;
+        memset(&hit, 0, sizeof(hit));
+        media_mark(model, &first_grid, &low_mark, &high_mark);
+        test_true(media_recall(model, low_mark, high_mark, &first_grid, &hit) == 1,
+                  "a second picture does not evict the first");
+        bad_count = 0;
+        if (hit.state_data && hit.row_count == media.row_count) {
+          for (row_index = 0; row_index < hit.row_count; ++row_index)
+            for (value_index = 0; value_index < hit.state_size; ++value_index)
+              if (hit.state_data[(size_t)row_index * (size_t)hit.state_size + value_index] !=
+                  media.state_data[(size_t)row_index * (size_t)media.state_size + value_index])
+                bad_count += 1;
+        } else {
+          bad_count = 1;
+        }
+        test_true(bad_count == 0, "the entry behind the newest one is still the right entry");
+        media_free(&hit);
+
+        /* A picture the store has never seen is a miss, said by the store
+         * rather than inferred from the rows. */
+        memset(&hit, 0, sizeof(hit));
+        test_true(media_recall(model, low_mark ^ 1u, high_mark, &first_grid, &hit) == 0 &&
+                      hit.state_data == NULL,
+                  "an identity the store does not hold is a miss");
+        grid_free(&first_grid);
+      } else {
+        test_true(0, "the picture is read for the eviction check");
+      }
+    }
+  }
+
   /* -- audio --------------------------------------------------------- */
   {
     app_media sound;
