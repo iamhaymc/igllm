@@ -277,6 +277,24 @@ python3 run.py run -- chat --model model --image-keep pics.keep \
     --image photo.png --prompt "What is in this picture?"
 ```
 
+**With `--keep` beside it, a repeated turn costs almost nothing.** The two files
+hold the two halves of a picture — `--image-keep` the encoder's rows and
+`--keep` the prompt's cache, which is where the soft tokens have already been
+prefilled — so the same turn a second time is **19.89 s to 0.53 s**, byte for
+byte the same answer:
+
+```sh
+python3 run.py run -- chat --model model \
+    --image-keep pics.keep --keep turn.cache \
+    --image photo.png --prompt "What is in this picture?"
+```
+
+Change the question, though, and only the first file helps: the second is used
+only where the whole of it is a prefix of the new prompt, so a different
+question about the same picture is 10.5 s and prefills the soft tokens again.
+`chat --loop` does not have that limitation, because a conversation carries its
+cache; across runs it is the open entry at the top of `TODO.md`'s speed list.
+
 ## Workflows
 
 | command                       | effect                                        |

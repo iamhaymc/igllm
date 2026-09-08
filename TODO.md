@@ -129,6 +129,19 @@ engine and found the ceiling held down by the output head, so the head entries
 now come before the speculative one rather than beside it. Where an entry is
 only a size, its size is given against a 34.95 ms step floor on the third host.
 
+**Two entries below are out of order on purpose and are worth naming here.**
+The first several are the text stack's, and every one of them is either finished
+or waiting on a host this project does not currently have — a PMU, or AVX-512
+with more bandwidth. Meanwhile 0.9.10 and 0.9.11 measured a multi-modal turn
+properly for the first time and found the largest unclaimed number in the file
+sitting in the caching, not in a kernel: **a second question about an encoded
+picture costs 10.5 s where the same question again costs 0.53**, because a kept
+cache is used only when the whole of it is a prefix. That is *reuse a kept cache
+up to the longest shared prefix*, and on a host that runs pictures it is the
+first thing to take. *Row-blocking the batched float dot product* beside it is a
+refusal, and is placed there because it explains why the AVX2 float kernels are
+where they are.
+
 - **The feed-forward planes, which are half of every token and are closer to
   the memory than this entry used to say.** 18.96 ms of a 36.9 ms step —
   **52%** — reading 475.3 MiB at 24.44 GiB/s.
@@ -752,6 +765,133 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 
   None of this is fresh-image acceleration and none of it must ever be reported
   as one.
+
+- **Row-blocking the batched float dot product — measured, and refused on the
+  register file rather than on the loop.**
+
+  Every single-lane path in this engine blocks rows: `KERN_ROW_WIDE`,
+  `KERN_ROW_BLOCK`, `KERN_CODE_BLOCK`. The batched one does not —
+  `kern_mat_vec_band`'s last branch calls `kern_row_code_many` a row at a time —
+  and that asymmetry looks like something left on the floor. It is not, on a
+  host with sixteen vector registers.
+
+  Why it looked worth taking. `kern_dot_real_many` holds one row against four
+  lanes with two accumulators a lane, stepping sixteen: per sixteen elements
+  that is two row loads, eight lane loads and eight multiply-adds. Ten loads
+  against eight FMAs, on a host with two of each port, so the loads are the
+  ceiling and the arithmetic waits. Blocking a second row shares the lane loads
+  between the rows and should put the loop on its arithmetic instead.
+
+  Measured on the fourth host, one thread, a 256 column group over 4096 rows,
+  minimum of fifty runs, with every lane's total read afterwards so that nothing
+  can be eliminated — **the first version of this measurement was 1.8x and was
+  wrong for exactly that reason**, two of the four lanes being dead code:
+
+  | shape | G multiply-adds a second | against the shipped | order |
+  | --- | --- | --- | --- |
+  | one row, four lanes, two accumulators, step 16 | 27.0–27.4 | — | shipped |
+  | two rows, four lanes, one accumulator, step 8 | 36.5–36.7 | **1.33x** | **different** |
+  | two rows, two lanes, two accumulators, step 16 | 28.0–28.5 | 1.04x | shipped |
+
+  **The only row block that pays changes the summation order, and the one that
+  preserves it does not pay.** Preserving the chain costs two accumulators a
+  row-lane pair, so two rows by four lanes wants sixteen accumulators and the
+  register file has sixteen registers in all — before the row and lane vectors.
+  Two rows by two lanes fits, and halves the lanes, which puts the row loads
+  straight back: four row loads and four lane loads for half the work.
+
+  So this is the same wall the tower's blend entry hit — *"sixteen accumulators
+  and four value registers do not fit in sixteen registers"* — and it is worth
+  stating once in general: **on AVX2 the register file, not the loop, is what
+  limits every batched float kernel in this engine.** Anything wider needs the
+  registers asked for rather than assumed.
+
+  Two things left, and neither is a loop.
+
+  - **1.33x is not nothing, and it is a decision about output rather than a
+    kernel question** — the same shape as the fused multiply-add refused in the
+    tower's blend (0.9.6). Taking it means prefill logits stop being byte for
+    byte what they were. It is not taken here, and it should not be taken
+    quietly if it ever is.
+  - **On AVX-512 the order-preserving form fits.** Thirty-two registers hold
+    sixteen accumulators, four row vectors and two lane vectors with room over,
+    so two rows by four lanes at the shipped chain is available there and is not
+    here. **This is a hypothesis and not a measurement** — the host it was
+    reasoned on has no AVX-512 — and it is worth an hour on a host that does,
+    with one caveat: where VNNI carries most planes onto the integer path, the
+    float many path is a smaller share of a step than it is on a host without.
+
+  This microbenchmark is contiguous rows in cache, not the engine, and it says
+  nothing about how much of a phase the inner loop is. What it does establish is
+  the ranking, and the ranking is a refusal.
+
+- **Reuse a kept cache up to the longest shared prefix, not only where it is
+  the whole prompt.** The largest measured win left in this list on a
+  multi-modal host, and it is worth more than anything above it that is not
+  already built.
+
+  0.9.11 made the split visible and this is what it exposed. A picture's soft
+  tokens sit at the **front** of the prompt and the question sits behind them,
+  so a second question about the same photograph shares every expensive id and
+  differs only in the cheap ones. On the fourth host, a 768×512 notice at 260
+  soft tokens:
+
+  | run | seconds |
+  | --- | --- |
+  | the same question again, `--image-keep --keep` | **0.53** |
+  | a different question, `--image-keep --keep` | 10.53 |
+  | a different question, `--image-keep` alone | 10.52 |
+
+  The second row is the entry. **The session file buys nothing at all when the
+  question changes**, and what it fails to save is the 9.46 s of prefilling 260
+  soft tokens that the new question shares with the old one — 36.5 ms an id, and
+  not one of them has moved.
+
+  `main_keep_prime` already computes the shared prefix, and its own comment
+  describes the behaviour this entry wants: *"What is reused is a prefix and not
+  a match."* Then the next line throws it away — `if (same_count != held_count
+  || held_stamp != stamp_value) same_count = 0;` — so a held cache is reused
+  only when the whole of it is a prefix of the new prompt, which is the case
+  where the question did not change. The prefix is computed and then refused.
+
+  **Four things stand between here and it, and the last two are the reason it
+  was not simply done.**
+
+  - **The stamp cannot be checked at a prefix.** `main_keep_stamp(reel, k)`
+    folds the media rows over the first `k` ids, and the file stores it only at
+    the length that was saved, so there is nothing to compare a shorter fold
+    against. Ids alone cannot stand in for it: two pictures lay down the same
+    placeholder ids, which is why the stamp exists. The fix is to store the fold
+    over the media rows beside the id index just past the last of them, and to
+    accept a prefix only at or past that index — where the media contribution is
+    complete and fixed, one stamp answers for every prefix length.
+  - **The echo history has to be cut with it.** `echo_count` and `echo_room`
+    are the repetition penalty's memory and are as long as the cache.
+  - **The ring may have turned over.** A layer whose `cache_span` is shorter
+    than the held prompt holds its rows at slots whose meaning depends on
+    `fill_count`, so moving `fill_count` back does not move the rows back with
+    it. Either refuse a prefix wherever anything has turned over — which the
+    common case is nowhere near — or teach the file to record the ring's base.
+  - **The cache peaks cannot be un-maxed.** `key_peak` and `value_peak` are
+    running maxima over everything ever written, and truncating the cache leaves
+    them describing rows that are no longer in it. Under `--cache 8` they scale
+    the quantization, so a truncated session would quantize differently from a
+    fresh one and the run would stop being byte for byte — which is the property
+    this engine holds every cache path to. Recompute them over the kept rows, or
+    refuse a prefix under a quantized cache and say so.
+
+  None of these is hard; together they are a careful change to the one part of
+  the engine where a mistake is silent, and it should be taken with the
+  reference comparison available rather than without it. `session_guess_keep`
+  is the nearest precedent for putting a cache back, and the test that holds it
+  — a window narrow enough that every block laps the ring — is the shape the
+  test for this wants.
+
+  *llama.cpp does exactly this and calls it the same thing*: its server matches
+  a new prompt against a slot's cached tokens and keeps the common prefix, which
+  is how a follow-up question about an encoded picture is cheap there. This
+  engine has the harder half of it already — the stamp that knows a picture is
+  the same picture, which a token comparison cannot.
 
 - **The other widths of the integer dot product.** 0.8.9's path is written for
   AVX-512 VNNI and nothing else. A host with `avx_vnni` and no AVX-512 —
