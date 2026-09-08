@@ -825,6 +825,26 @@ the AVX2 float kernels are where they are.
   nothing about how much of a phase the inner loop is. What it does establish is
   the ranking, and the ranking is a refusal.
 
+  **And the sibling question, which looks obvious from the source and is also a
+  refusal.** `kern_row_code_rows` — four rows of the *single lane* float path,
+  each keeping its own two accumulators and its own order, so the sum does not
+  move — is written under `APP_SIMD_AVX512` and at two bits only. Its comment
+  gives the reason: on an AVX-512 host with VNNI the output head is the only
+  plane left on the float path, so that is the one width worth writing. **On a
+  host with no VNNI that reasoning does not hold** — there is no integer path at
+  all, so every plane takes the float route, the feed-forward included at 57% of
+  a decode step — and porting the block to AVX2 and to four bits looks like free
+  money.
+
+  It is not. The same measurement, the four bit AVX2 loop over 6144 rows of a
+  128 column group, one row at a time against four blocked, bit-identical and
+  checked to be: **1.02x.** The AVX-512 head block pays because a two bit row is
+  96 vectors on two accumulators and waits on its own chain; the four bit AVX2
+  loop spends about a dozen uops per sixteen codes on the **unpack**, which is
+  per row and cannot be shared, so blocking four rows shares two activation
+  loads out of roughly fifty uops. The block is right to be AVX-512 only, for a
+  reason its comment does not give.
+
 - **Reuse a kept cache as far as it agrees — built, 0.9.12, and what is left is
   the audio half and the store above it.**
 
