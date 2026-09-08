@@ -1681,6 +1681,85 @@ static void test_kernel(void) {
     test_true(okay_flag, "kern_blend_rows matches the row-at-a-time blend it replaces");
   }
 
+  { /* The two block kernels a tower's attention runs, against the one lane
+     * kernels they are a block of.  Both claim to be the same arithmetic in the
+     * same order rather than the same arithmetic to a tolerance, so both are
+     * checked for equality and not for nearness — a reassociation anywhere in
+     * either would move a last bit and fail here.
+     *
+     * The shapes are deliberately awkward: a span count that is not a multiple
+     * of sixteen exercises the eight wide loop and the scalar tail behind the
+     * wide one, a row count that is not a multiple of anything exercises the
+     * row loop's end, and a lane count of six runs one full block and a
+     * two lane tail through the one lane path. */
+    int span_count = 37, row_count = 23, lane_count = 6;
+    int act_stride = span_count + 5, into_stride = row_count + 3;
+    int value_count = 41, from_stride = value_count + 7, weight_stride = row_count + 2;
+    float *row_data = (float *)mem_clear(sizeof(float) * (size_t)row_count * (size_t)span_count);
+    float *act_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)act_stride);
+    float *want_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)into_stride);
+    float *have_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)into_stride);
+    float *from_data = (float *)mem_clear(sizeof(float) * (size_t)row_count * (size_t)from_stride);
+    float *weight_data =
+        (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)weight_stride);
+    float *want_blend =
+        (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)from_stride);
+    float *have_blend =
+        (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)from_stride);
+    int lane_index, row_index, slot, bad_count = 0;
+    for (slot = 0; slot < row_count * span_count; ++slot)
+      row_data[slot] = (float)sin((double)slot * 0.29) * 1.7f;
+    for (slot = 0; slot < lane_count * act_stride; ++slot)
+      act_data[slot] = (float)cos((double)slot * 0.13) * 0.9f;
+    for (slot = 0; slot < row_count * from_stride; ++slot)
+      from_data[slot] = (float)sin((double)slot * 0.07 + 1.1) * 1.3f;
+    for (slot = 0; slot < lane_count * weight_stride; ++slot)
+      weight_data[slot] = (float)cos((double)slot * 0.23 + 0.4) * 0.6f;
+
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      for (row_index = 0; row_index < row_count; ++row_index)
+        want_data[(size_t)lane_index * (size_t)into_stride + row_index] =
+            kern_dot_real(row_data + (size_t)row_index * (size_t)span_count, STORE_F32,
+                          act_data + (size_t)lane_index * (size_t)act_stride, span_count);
+    for (lane_index = 0; lane_index < lane_count; lane_index += KERN_GRID_LANE) {
+      int block_wide = lane_count - lane_index;
+      if (block_wide > KERN_GRID_LANE) block_wide = KERN_GRID_LANE;
+      kern_score_block(row_data, span_count, row_count,
+                       act_data + (size_t)lane_index * (size_t)act_stride, act_stride, block_wide,
+                       span_count, have_data + (size_t)lane_index * (size_t)into_stride,
+                       into_stride);
+    }
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      for (row_index = 0; row_index < row_count; ++row_index)
+        if (want_data[(size_t)lane_index * (size_t)into_stride + row_index] !=
+            have_data[(size_t)lane_index * (size_t)into_stride + row_index])
+          bad_count += 1;
+    test_true(bad_count == 0, "kern_score_block is kern_dot_real bit for bit, a block at a time");
+
+    bad_count = 0;
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      kern_blend_rows(from_data, from_stride,
+                      weight_data + (size_t)lane_index * (size_t)weight_stride, row_count,
+                      value_count, want_blend + (size_t)lane_index * (size_t)from_stride);
+    for (lane_index = 0; lane_index < lane_count; lane_index += KERN_GRID_LANE) {
+      int block_wide = lane_count - lane_index;
+      if (block_wide > KERN_GRID_LANE) block_wide = KERN_GRID_LANE;
+      kern_blend_rows_many(from_data, from_stride,
+                           weight_data + (size_t)lane_index * (size_t)weight_stride, weight_stride,
+                           block_wide, row_count, value_count,
+                           have_blend + (size_t)lane_index * (size_t)from_stride, from_stride);
+    }
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      for (slot = 0; slot < value_count; ++slot)
+        if (want_blend[(size_t)lane_index * (size_t)from_stride + slot] !=
+            have_blend[(size_t)lane_index * (size_t)from_stride + slot])
+          bad_count += 1;
+    test_true(bad_count == 0, "kern_blend_rows_many is kern_blend_rows bit for bit, four at a time");
+
+    mem_free(row_data); mem_free(act_data); mem_free(want_data); mem_free(have_data);
+    mem_free(from_data); mem_free(weight_data); mem_free(want_blend); mem_free(have_blend);
+  }
+
 }
 
 /* ======================================================================== */
@@ -4192,6 +4271,196 @@ static void test_guess(void) {
     session_guess_keep(session, 0);
   }
 
+  { /* Speculative sampling's rejection rule, held to the theorem it claims.
+     *
+     * `session_guess_taste` says a block verified under a temperature draws the
+     * token at each position from exactly the distribution the plain sampler
+     * draws from.  That is a statement about a distribution and nothing weaker,
+     * so it is checked as one: the shaped distribution at lane 0 is computed
+     * directly, and then a hundred thousand rounds are run through the
+     * rejection rule with a different seed each and the tokens they commit at
+     * position 0 are counted.
+     *
+     * The token committed at position 0 is the guess where the guess was
+     * accepted and the resampled token where it was not, so the histogram is
+     * the mixture `p(t)*[t] + (1 - p(t))*residual` — and the theorem is that
+     * this equals `p`.  A rule that simply took the guess whenever the model
+     * gave it any mass at all, or one that resampled without removing the
+     * guess, would sit far outside the bar below.
+     *
+     * A hundred thousand rounds over twenty-seven tokens puts the standard
+     * error of a bucket under 0.0016, so a bar of 0.01 is six sigma: wide
+     * enough never to flake, narrow enough that no wrong rule fits under it. */
+    const int round_count = 100000;
+    int32_t block_list[3];
+    const float *rows;
+    int case_index;
+
+    block_list[0] = want_list[0];
+    block_list[1] = want_list[1];
+    block_list[2] = want_list[2];
+    /* The guess is chosen rather than taken from the fixture, because what this
+     * has to exercise is the *mixture* — some rounds keeping the guess and some
+     * resampling — and an arbitrary token is usually one top-k has already cut,
+     * which only ever rejects.  A lane 0 logit row is the same whatever follows
+     * it in the block, so a block of one gives the row the guess is picked out
+     * of before the real block is opened on it. */
+    rows = session_guess(session, block_list, 1);
+    if (rows) {
+      app_taste look = app_taste_plain();
+      pick_slot *slot_list = (pick_slot *)session->pick_room;
+      int keep_count;
+      look.heat_value = 1.0f;
+      look.top_count = 12;
+      look.top_portion = 0.9f;
+      look.echo_penalty = 1.0f;
+      keep_count = pick_shape(session, rows, &look, session->guess_echo + 1, slot_list);
+      /* Not the strongest, so the accept rate is well away from both ends. */
+      if (keep_count > 1) block_list[1] = slot_list[keep_count / 2].id_value;
+      session_guess_keep(session, 0);
+    }
+    rows = session_guess(session, block_list, 3);
+    test_true(rows != NULL, "a block runs for the rejection rule");
+    /* Twice over: once on a bare softmax, and once with the whole taste on.
+     * The second is what holds the *history* the rule shapes each lane against
+     * — lane 0 is judged against the stream as it would be with none of the
+     * guesses kept, not as the session holds it with all of them in flight —
+     * and with the echo penalty off there is nothing for that to move. */
+    for (case_index = 0; rows && case_index < 2; ++case_index) {
+      app_taste rule = app_taste_plain();
+      pick_slot *slot_list = (pick_slot *)session->pick_room;
+      float want_share[27];
+      int tally_list[27];
+      int slot, round_index, keep_count, bad_count = 0, take_total = 0;
+      double worst_gap = 0.0;
+      rule.heat_value = 1.0f;
+      if (case_index == 0) {
+        rule.top_count = 0;
+        rule.top_portion = 1.0f;
+        rule.echo_penalty = 1.0f;
+      } else {
+        rule.top_count = 12;
+        rule.top_portion = 0.9f;
+        rule.echo_penalty = 1.4f;
+        rule.echo_window = 64;
+      }
+      for (slot = 0; slot < 27; ++slot) { want_share[slot] = 0.0f; tally_list[slot] = 0; }
+      keep_count = pick_shape(session, rows, &rule, session->guess_echo + 1, slot_list);
+      for (slot = 0; slot < keep_count; ++slot)
+        if (slot_list[slot].id_value >= 0 && slot_list[slot].id_value < 27)
+          want_share[slot_list[slot].id_value] = slot_list[slot].weight_value;
+
+      for (round_index = 0; round_index < round_count; ++round_index) {
+        int32_t made_id = -1;
+        int take_count;
+        rule.seed_value = (uint64_t)round_index * 2654435761ull + 12345ull;
+        take_count = session_guess_taste(session, rows, block_list, 3, &rule, &made_id);
+        if (take_count < 0 || take_count > 2) { bad_count += 1; continue; }
+        take_total += take_count;
+        {
+          int32_t at_zero = take_count >= 1 ? block_list[1] : made_id;
+          if (at_zero < 0 || at_zero >= 27) bad_count += 1;
+          else tally_list[at_zero] += 1;
+        }
+      }
+      test_true(bad_count == 0, case_index == 0
+                                    ? "every round of the rejection rule returns a usable prefix"
+                                    : "the same with the whole taste applied");
+      test_true(take_total > 0 && take_total < 2 * round_count,
+                case_index == 0 ? "the guesses are neither always kept nor never kept"
+                                : "the same under top-k, top-p and the echo penalty");
+      for (slot = 0; slot < 27; ++slot) {
+        double have_share = (double)tally_list[slot] / (double)round_count;
+        double gap_value = fabs(have_share - (double)want_share[slot]);
+        if (gap_value > worst_gap) worst_gap = gap_value;
+      }
+      test_true(worst_gap < 0.01,
+                case_index == 0
+                    ? "a block under a temperature draws position 0 from the plain sampler's "
+                      "own distribution"
+                    : "and does so against each lane's own history, not the block's");
+    }
+    if (rows) session_guess_keep(session, 0);
+  }
+
+  { /* The two edges of the rule, which are where a wrong one hides.
+     *
+     * A guess the taste has already cut has `p(t) = 0` and can never be
+     * accepted; a guess that holds every slot the taste kept has a residual
+     * with nothing in it, and the rule has to hand back the guess rather than
+     * divide by zero. */
+    int32_t block_list[2];
+    const float *rows;
+    app_taste rule = app_taste_plain();
+    int round_index, take_total = 0;
+    rule.heat_value = 1.0f;
+    rule.top_count = 1; /* one slot kept, so all but the strongest token has no mass */
+    rule.top_portion = 1.0f;
+    rule.echo_penalty = 1.0f;
+    block_list[0] = want_list[0];
+    rows = session_guess(session, block_list, 1);
+    if (rows) {
+      pick_slot *slot_list = (pick_slot *)session->pick_room;
+      int32_t best_id, other_id;
+      session_guess_keep(session, 0);
+      pick_shape(session, rows, &rule, session->guess_echo + 1, slot_list);
+      best_id = slot_list[0].id_value;
+      other_id = best_id == 0 ? 1 : 0;
+
+      block_list[0] = want_list[0];
+      block_list[1] = other_id;
+      rows = session_guess(session, block_list, 2);
+      test_true(rows != NULL, "a block runs for the cut guess");
+      if (rows) {
+        for (round_index = 0; round_index < 256; ++round_index) {
+          int32_t made_id = -1;
+          rule.seed_value = (uint64_t)round_index * 6364136223846793005ull + 1ull;
+          take_total += session_guess_taste(session, rows, block_list, 2, &rule, &made_id);
+        }
+        test_true(take_total == 0, "a guess the taste has cut is never accepted");
+        session_guess_keep(session, 0);
+      }
+
+      block_list[1] = best_id;
+      rows = session_guess(session, block_list, 2);
+      test_true(rows != NULL, "a block runs for the whole-mass guess");
+      if (rows) {
+        int32_t made_id = -1;
+        int take_count;
+        take_total = 0;
+        for (round_index = 0; round_index < 256; ++round_index) {
+          rule.seed_value = (uint64_t)round_index * 6364136223846793005ull + 1ull;
+          take_count = session_guess_taste(session, rows, block_list, 2, &rule, &made_id);
+          take_total += take_count;
+          if (take_count == 0 && made_id != best_id) take_total = -1000000;
+        }
+        test_true(take_total == 256,
+                  "a guess holding every slot the taste kept is always accepted");
+        session_guess_keep(session, 0);
+      }
+    } else {
+      test_true(0, "a block runs for the taste edges");
+    }
+  }
+
+  { /* Greedy does not come here at all, which is what keeps `--heat 0 --guess`
+     * byte for byte the run it has always been. */
+    int32_t block_list[2];
+    int32_t made_id = -1;
+    app_taste rule = app_taste_plain();
+    const float *rows;
+    rule.heat_value = 0.0f;
+    block_list[0] = want_list[0];
+    block_list[1] = want_list[1];
+    rows = session_guess(session, block_list, 2);
+    test_true(rows != NULL, "a block runs for the greedy refusal");
+    if (rows) {
+      test_true(session_guess_taste(session, rows, block_list, 2, &rule, &made_id) < 0,
+                "the rejection rule refuses a greedy taste rather than inventing one");
+      session_guess_keep(session, 0);
+    }
+  }
+
   {
     /* A partial keep against the ordinary path: keeping two lanes of a block has
      * to leave the session where feeding those two ids one at a time would.
@@ -4987,6 +5256,127 @@ static void test_tower(void) {
     test_true(0, "the reference reads the picture");
   }
   mem_free(want_list);
+
+  { /* -- the same picture again --------------------------------------- */
+    /* The store hands back the rows the tower made rather than rows like them,
+     * so this is an equality check.  What it is really holding is the identity:
+     * a hit that is not the same picture is the one failure this must not have,
+     * and the cases below are a picture against itself, a picture against one
+     * that differs in a single sample, and a picture against one of another
+     * shape. */
+    app_media again;
+    char other_text[512];
+    int bad_count = 0;
+    test_true(media_image(model, path_text, &again) == APP_OKAY, "the same picture runs again");
+    test_true(again.row_count == media.row_count && again.state_size == media.state_size,
+              "the kept rows have the shape the tower's did");
+    if (again.row_count == media.row_count) {
+      for (row_index = 0; row_index < again.row_count; ++row_index)
+        for (value_index = 0; value_index < again.state_size; ++value_index)
+          if (again.state_data[(size_t)row_index * (size_t)again.state_size + value_index] !=
+              media.state_data[(size_t)row_index * (size_t)media.state_size + value_index])
+            bad_count += 1;
+    }
+    test_true(bad_count == 0, "a kept picture's rows are the tower's bit for bit");
+    test_true(again.state_data != media.state_data,
+              "a kept picture's rows are copied out, so the caller owns them either way");
+    media_free(&again);
+
+    /* One sample moved is a different picture.  The raster is written out as a
+     * pnm rather than a png so that the test does not need an encoder: what is
+     * being checked is the identity, not the container. */
+    {
+      flat_grid twin;
+      memset(&twin, 0, sizeof(twin));
+      if (image_read(path_text, &twin) == APP_OKAY) {
+        uint64_t low_one = 0, high_one = 0, low_two = 0, high_two = 0;
+        media_mark(model, &twin, &low_one, &high_one);
+        twin.value_data[0] = twin.value_data[0] + 1.0f / 512.0f;
+        media_mark(model, &twin, &low_two, &high_two);
+        test_true(low_one != low_two && high_one != high_two,
+                  "one sample moved is a different identity, in both mixes");
+        twin.value_data[0] = twin.value_data[0] - 1.0f / 512.0f;
+        media_mark(model, &twin, &low_two, &high_two);
+        test_true(low_one == low_two && high_one == high_two,
+                  "the identity is the samples and nothing about the call");
+        grid_free(&twin);
+      } else {
+        test_true(0, "the picture is read for the identity check");
+      }
+    }
+
+    /* A different picture is a miss, and the rows say so.  `image.png` is the
+     * only picture the fixture writes, so the second one is made here. */
+    path_join(other_text, sizeof(other_text), test_yard_path, "other.pnm");
+    if (test_file_write("other.pnm", "P6\n12 8\n255\n", 13)) {
+      FILE *handle = fopen(other_text, "ab");
+      if (handle) {
+        unsigned char cell_list[12 * 8 * 3];
+        int cell_index;
+        for (cell_index = 0; cell_index < 12 * 8 * 3; ++cell_index)
+          cell_list[cell_index] = (unsigned char)((cell_index * 37 + 11) & 0xFF);
+        fwrite(cell_list, 1, sizeof(cell_list), handle);
+        fclose(handle);
+        if (media_image(model, other_text, &again) == APP_OKAY) {
+          int same_count = 0;
+          for (value_index = 0; value_index < again.state_size; ++value_index)
+            if (again.state_data[value_index] == media.state_data[value_index]) same_count += 1;
+          test_true(same_count < again.state_size,
+                    "another picture is a miss and gets rows of its own");
+          media_free(&again);
+        } else {
+          test_true(0, "the second picture runs the tower");
+        }
+      } else {
+        test_true(0, "the second picture is written");
+      }
+    } else {
+      test_true(0, "the second picture's header is written");
+    }
+
+    /* And the first picture is still there behind the second: the store holds a
+     * working set, not one entry.
+     *
+     * This one asks the store directly rather than going through `media_image`,
+     * because the two cannot be told apart from the outside — the tower is
+     * deterministic, so a miss that re-runs it hands back exactly the rows a hit
+     * would have, and a test written on the rows would pass with the store
+     * emptied between every call.  `media_recall` says which happened. */
+    {
+      flat_grid first_grid;
+      memset(&first_grid, 0, sizeof(first_grid));
+      if (image_read(path_text, &first_grid) == APP_OKAY) {
+        uint64_t low_mark = 0, high_mark = 0;
+        app_media hit;
+        memset(&hit, 0, sizeof(hit));
+        media_mark(model, &first_grid, &low_mark, &high_mark);
+        test_true(media_recall(model, low_mark, high_mark, &first_grid, &hit) == 1,
+                  "a second picture does not evict the first");
+        bad_count = 0;
+        if (hit.state_data && hit.row_count == media.row_count) {
+          for (row_index = 0; row_index < hit.row_count; ++row_index)
+            for (value_index = 0; value_index < hit.state_size; ++value_index)
+              if (hit.state_data[(size_t)row_index * (size_t)hit.state_size + value_index] !=
+                  media.state_data[(size_t)row_index * (size_t)media.state_size + value_index])
+                bad_count += 1;
+        } else {
+          bad_count = 1;
+        }
+        test_true(bad_count == 0, "the entry behind the newest one is still the right entry");
+        media_free(&hit);
+
+        /* A picture the store has never seen is a miss, said by the store
+         * rather than inferred from the rows. */
+        memset(&hit, 0, sizeof(hit));
+        test_true(media_recall(model, low_mark ^ 1u, high_mark, &first_grid, &hit) == 0 &&
+                      hit.state_data == NULL,
+                  "an identity the store does not hold is a miss");
+        grid_free(&first_grid);
+      } else {
+        test_true(0, "the picture is read for the eviction check");
+      }
+    }
+  }
 
   /* -- audio --------------------------------------------------------- */
   {

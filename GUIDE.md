@@ -354,6 +354,23 @@ in isolation and slower in the engine, and taken out again — see
   on that build, so the towers reach the numbers they reached before. Both
   towers use it; the stride argument is the head width where the rows are heads
   of a wider array and the head size where they have been gathered into a run.
+- `media_mark`, `media_recall` and `media_keep` — a picture's post-projector
+  rows, kept on the model against a hundred and twenty-eight bit identity of the
+  decoded samples and of every part of the tower configuration that decides what
+  they become. Four pictures, least-wanted evicted. The identity is taken after
+  the decoder, so the container is out of it; the backend is out of it too, and
+  may be only because the store never reaches a file — `TODO.md` says what has
+  to go in before it does.
+- `kern_score_block` and `kern_blend_rows_many` — the same two things for a
+  block of `KERN_GRID_LANE` queries at once, which is what a tower's
+  bidirectional attention wants: every query in a band scores against the same
+  gathered keys and blends over the same gathered values, so a block reads each
+  run once for four queries where a query on its own read it once each. Both are
+  the one lane kernel's arithmetic in its order rather than to a tolerance — the
+  four-lane close pairs exactly the floats `kern_dot_total` pairs, and the blend
+  keeps a multiply and an add where a fused multiply-add would drop the
+  intermediate rounding — and the `kernel` group holds both to it bit for bit.
+  The audio tower does not use them: its window is thirteen keys wide.
 - `kern_fma_row` — `into[v] += left[v] * right[v]`, which is what the
   conformer's depthwise convolution becomes once its kernel is held tap-major.
 - `kern_dot_real_many` — one row of floats against four activation vectors at
@@ -1166,7 +1183,10 @@ question only a real prompt answers, and `session_cache_peak` beside
 
 `session_pick` draws a token: repetition penalty over a recent window,
 temperature, top-k, top-p, then a draw from an xorshift stream. A
-temperature of zero short-circuits to the maximum.
+temperature of zero short-circuits to the maximum. The shaping and the draw are
+two functions rather than one — `pick_shape` builds the distribution the taste
+describes and `pick_draw` takes a token out of it — because the block path needs
+the distribution itself rather than a token from it.
 
 **The block path.** `session_guess` runs several ids as one batch and hands back
 one row of the vocabulary a lane, so a caller can ask what the model would have
@@ -1182,6 +1202,20 @@ least `slide_span`, so a block never laps itself: the rows it will overwrite are
 known before it runs, saving them is a fixed scratch, and undoing is the same
 copy back. `session_guess_limit` reports the bound and a longer block is
 refused.
+
+Verifying the block is two rules, one per kind of decoding. Greedy is an argmax
+comparison, and the text it produces is byte for byte a greedy run's. Under a
+temperature `session_guess_taste` applies speculative sampling's modified
+rejection rule, and the shape the scout has makes it unusually simple: a
+proposer that names one token is a **point mass**, so accepting with
+`min(1, p/q)` is accepting with `p(t)`, and the residual `(p - q)+` is `p` with
+the guess removed and the rest renormalized. Each lane is shaped against the
+history it would have if the guesses before it were kept — one echo entry and
+one cache row per lane before it — and each takes its draws from a state derived
+from the seed and the position, because a block's lanes share one `fill_count`
+and a rejecting lane needs two draws. The token drawn is from the plain
+sampler's distribution exactly; it is not the plain sampler's *sample*, and
+`README.md` says so where a caller will see it.
 
 `app_scout` is the other half: an n-gram proposer over the ids it has been told
 about, which are the prompt and then only the tokens the model has agreed to.

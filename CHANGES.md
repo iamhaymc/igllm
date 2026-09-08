@@ -5891,3 +5891,497 @@ that is not finite.
 
 797 pass on the wide build, 788 on a build without the integer dot product,
 where every plane takes the float path exactly as it did before.
+
+---
+
+## 0.9.6 — a block of queries through the tower's attention, at the same arithmetic
+
+### Scope
+
+`TODO.md`'s vision entry — *the tower's own attention, tiled, with the
+normalizer carried* — opened by asking for a fresh profile before any schedule
+was written, because 0.8.9 had changed the shares 0.8.8 recorded. This takes
+that profile, finds the prize where the entry said it would be, and spends it
+on something cheaper than the tiling the entry proposed: a block of queries
+rather than a block of keys, which needs no running maximum, no normalizer
+carried across tiles, and no change to the order of any sum.
+
+Every number below is from the reference host: four cores of a Xeon at 2.8 GHz,
+AVX-512 with VNNI and no GFNI, the `--wide` build, four threads, the checkpoint
+in the page cache. The picture is 768 by 768 at the full patch budget, which is
+2304 patches through 16 layers of width 768 and 12 heads.
+
+### The profile, which is the entry's own first step
+
+A picture divided into its named parts, one tower forward, four threads:
+
+| part | s | share |
+| --- | --- | --- |
+| **score, softmax, blend** | **5.44** | **52.7%** |
+| feed-forward | 2.63 | 25.5% |
+| q k v | 1.34 | 13.0% |
+| attn out | 0.46 | 4.4% |
+| head norms, rotary | 0.26 | 2.5% |
+| gather k v | 0.08 | 0.8% |
+| named, in all | 10.33 | 100% |
+
+So the entry's premise holds and is if anything understated: the projections
+took the integer path in 0.8.9 and the attention did not, and it is now over
+half of a picture. Split further, scoring is 51% of that phase, the blend 43%
+and the softmax 6.6%.
+
+**Both are far off this host's arithmetic, which says it is not a memory
+schedule that is missing.** Scoring runs 65.2 G multiply-adds in 9.75 thread
+seconds and the blend the same 65.2 in 8.18 — 6.7 and 8.0 G a second against a
+256-bit FMA peak of 44.8 a core. A gathered head is 590 KiB of keys and 590 KiB
+of values, and the two are walked in separate loops, so each sits inside this
+host's 1 MiB of private second level cache for the whole of the band. Neither
+loop is waiting on memory; both are waiting on their own shape.
+
+### What the shape was
+
+`tower_attend_band` took one query at a time. For that query it scored against
+every one of the 2304 gathered keys — 2304 calls to `kern_dot_real`, each of
+them eight multiply-adds over sixty-four columns followed by a horizontal
+reduction into a float and a scalar store — softmaxed the row, and blended.
+Then it read the same 590 KiB of keys again for the next query, and again for
+the one after that.
+
+Two costs, and the second is the larger. **The run is read once per query where
+it could be read once per block of queries**, and **a sixty-four column dot
+pays a close that costs about as much as the eight multiply-adds it closes**.
+
+### The block, and why it is not the tiling the entry asked for
+
+`RESEARCH.md` idea 11 is flash attention's schedule: tile the keys, carry a
+running maximum and normalizer across tiles, accumulate the blend, and never
+materialize the score matrix. Its prize is the score matrix, which at 2304
+patches is 2304 by 2304.
+
+**This engine never materialized that matrix in the first place.** A band holds
+one score row, not the grid, so the memory the tiling would save was already
+saved and what is left of the idea is the summation-order change it costs. The
+axis that is actually loose is the other one: the queries, which share every
+byte both loops read and shared nothing.
+
+So the block is four queries wide. `kern_score_block` loads a key row once and
+multiplies it into four queries' accumulators; `kern_blend_rows_many` loads a
+value row once and folds it into four queries' blocks of running sums. The
+softmax between them stays per query, because that is what it is.
+
+**Four, and not more, for the reason `KERN_CODE_LANE` is four.** Four queries
+against a thirty-two column block of values is sixteen live accumulators, which
+is every vector register an AVX2 host has; a host with AVX-512's thirty-two was
+measured at the same width and does not need more to cover the multiply-add's
+latency.
+
+### The arithmetic is the one lane path's, and that is checked rather than argued
+
+Neither kernel reassociates anything.
+
+**Scoring.** Each lane keeps the same two accumulators over the same slots in
+the same order `kern_dot_real` keeps them in. The close is the only thing that
+changes shape: `kern_dot_total` adds a vector's two halves and then pairs what
+is left twice, and a pair of `_mm_hadd_ps` over four lanes at once pairs
+exactly the same four floats in exactly the same order — `(a0+a1)+(a2+a3)` —
+for four lanes in one lane's worth of instructions.
+
+**The blend.** Value `v` still takes span 0 first and span `span_count - 1`
+last, into an accumulator of its own. The multiply and the add stay a multiply
+and an add: **the fused multiply-add is deliberately not taken here.** It is
+the obvious next instruction, it measured 2.2x against the shipped loop where
+the multiply and add measured 1.4x, and it is refused anyway, because it drops
+the intermediate rounding and a picture's rows would stop being the rows that
+ship. It is also the *worse* kernel on a plain AVX2 host — 1.28x against 1.32x
+— where sixteen accumulators and four value registers do not fit in sixteen
+registers and the fused form spills. The 0.6x left on the table is written into
+`TODO.md` as a decision someone can take later with their eyes open.
+
+Two cases in the `kernel` group hold both kernels to the one lane kernels for
+**equality and not for nearness**, on shapes chosen to be awkward: a span count
+that is not a multiple of sixteen, a row count that is not a multiple of
+anything, and a lane count of six, which runs one full block and a two lane
+tail through the one lane path. Swapping the blend's multiply-and-add for the
+fused form fails the second case, which is what it is there for.
+
+### What it is worth
+
+The phase, over runs alternating between the two builds in both orders:
+
+| part | before | after |
+| --- | --- | --- |
+| **score, softmax, blend** | **5.26 – 5.61 s** | **2.72 – 3.01 s** |
+| tower, named parts in all | 10.05 – 11.08 s | 6.67 – 8.53 s |
+
+**The phase is about 1.9x** and the ranges do not overlap. End to end, a
+picture through the tower on the uninstrumented builds is **10.64 s to 8.10 s**
+— minimum of three alternating runs each, less the 0.44 s the model takes to
+map — and the same measurement on a 512 by 384 picture and a 896 by 896 one
+gives 1.40x and 1.37x on the whole run including the load.
+
+Note what the first table's other rows do *not* say. `q k v` and the
+feed-forward appeared to move by five to ten percent between the two builds in
+one direction, and the control — the same series run with the order of the two
+builds reversed — put the first run of *either* build ahead of the runs after
+it. That is the host drifting over a series, not the change, and neither part
+is touched by it.
+
+The text stack is not affected at all: the towers are not in the token loop,
+and decode measures the same on both builds.
+
+**The output is byte for byte what it was.** `logits` after a picture, after a
+clip, after both, and after neither is byte-identical between the two builds on
+every size tried, and 799 tests pass on the wide build, 788 on a build with no
+integer dot product, and 788 on an SSE2 build.
+
+### Where it leaves the entry
+
+Scoring and the blend are now 34 to 41% of a picture against 52.7%, and the
+feed-forward has become the largest part of a tower. What is left in the
+attention is a phase running at roughly twice the multiply-adds a second it
+was, which is still well short of this host's FMA peak — and the query axis,
+which was the loose one, is now spent. The remaining routes are in `TODO.md`.
+
+### Code
+
+- `KERN_GRID_LANE`, `kern_score_block`, `kern_blend_rows_many`: the two block
+  kernels, beside `kern_blend_rows` which they are a block of.
+- `tower_attend_band`: a block of queries a turn, with the softmax still per
+  query between the two halves.
+- `tower_room_open`: a band's score scratch is a block of rows rather than one.
+
+### Tests
+
+The `kernel` group grew the two equality cases described above. 799 pass on the
+wide build, 788 on a build without the integer dot product and 788 on SSE2.
+
+---
+
+## 0.9.7 — a picture's rows kept against the picture
+
+### Scope
+
+`TODO.md`'s *reuse a picture's rows when it is the same picture* — `RESEARCH.md`
+idea 12. Exact, cheap and narrow, and worth more after 0.9.6 than before it only
+in the sense that a picture is now 8 s rather than 10.6: asking three questions
+about one photograph is the ordinary case, and until now every one of them paid
+the whole tower.
+
+**This is not fresh-image acceleration and must not be reported as one.** A
+picture the engine has not seen costs exactly what it cost before. What changes
+is the second time.
+
+### What is kept, and where
+
+The **post-projector rows** — `soft_limit` by the text stack's width, 256 by
+1536 on the shipped export, 1.5 MiB a picture. Those are the last thing the
+vision path produces and the first thing the text stack consumes, so keeping
+them skips the resize, the patch cut, all sixteen encoder layers, the pooling
+and the projector at once, and leaves the caller holding exactly the
+`app_media` it would have held.
+
+It lives on the **model** and not on a session. The rows are the weights' answer
+to a picture rather than a conversation's, so a second conversation about the
+same photograph has them too — which is the case `--keep` and `chat --loop`
+cannot reach, because both of those match on rows the tower has already been run
+to produce. Like everything else hanging off a model it assumes one caller at a
+time, which is the assumption `pool_group` already makes.
+
+Four pictures, fixed, least-wanted evicted. That is the working set the ordinary
+case has — a photograph and some questions, or a handful of pictures compared
+against each other — and depth beyond a working set does nothing for it. The
+1.5 MiB an entry costs is reported without being asked for, because it comes out
+of the engine's own allocator: `bench` with a picture goes from 2205.5 MiB
+allocated to 2207.0.
+
+### The identity, which is the whole of the risk
+
+A cache like this has exactly one failure mode that matters: handing back rows
+for a picture the caller never showed, silently. So the identity is the part
+that got the attention.
+
+**It is taken on the decoded raster**, after `image_read` and before anything
+else, so the container and the decoder are out of it: the same photograph as a
+png and as a lossless bmp is one entry, a lossy re-encode of it is not, and both
+of those are the right answer. Reading and decoding the file is still paid on a
+hit; what is saved is the tower, which is all but the whole of what a picture
+costs.
+
+**Into it go** every decoded sample, the raster's own shape, and the tower
+configuration that decides what the samples become — the patch and pool sizes
+and the soft token budget, which together fix the resized grid and the pooling
+geometry; the tower's depth and width; the text stack's width, which is what the
+projector lifts into; and the checkpoint's mapped size, the way `keep_mark` uses
+it, so two exports of the same shape are not one identity.
+
+**Two independent mixes, not one.** Sixty-four bits puts a birthday collision
+somewhere around four billion pictures, which is not a number to rest a silent
+wrong answer on. The samples go through an FNV-1a and through `keep_mix` with a
+different seed at the same time, which is a hundred and twenty-eight bits, and
+the raster's shape is compared exactly beside them, so a collision has to agree
+on that as well. Over a 6.8 MiB raster both mixes together measure **2.5 to 5.1
+ms**.
+
+**The backend is deliberately not in it, and that is written down rather than
+left to be noticed.** This store is never put in a file, so a backend cannot
+change under an entry — it is fixed for the life of the process that made it.
+Anything that gives these rows a life beyond one process has to put the backend
+and an encoder version in first.
+
+### What it is worth
+
+The case the entry names, end to end: a photograph, a question about it, `/new`,
+the same photograph, another question — **53.53 s to 39.72 s**, and the two
+conversations are byte for byte identical. The same picture twice in one prompt
+is 9.12 s against 9.18 s for one; two different pictures is 17.19 s, which is
+both towers, as it should be.
+
+A miss costs the identity and the copy. Over three alternating runs a single
+picture measured 8.79 s without the store and 8.94 with — under 2%, and the
+identity is 5 ms of it.
+
+`logits` after a picture, a clip, both and neither is byte for byte what it was
+on every case tried, and a hit hands back the tower's rows bit for bit.
+
+### Code
+
+- `MEDIA_KEEP_COUNT`, `media_note`, and `vision_note` / `media_turn` on
+  `app_model`: the store.
+- `media_mark`, `media_recall`, `media_keep`, `media_keep_free`.
+- `media_image`: the identity taken on the decoded raster, the store consulted
+  before the tower and written after it.
+- `keep_mix` moved up the file, so the store and `keep_mark` share one mixer.
+
+### Tests
+
+Six cases in the `tower` group. The store's arithmetic is held for **equality**
+— a hit hands back the tower's rows bit for bit, and copied out rather than
+lent, so the caller owns them either way. The identity is held three ways: one
+sample moved is a different identity in *both* mixes, the same samples are the
+same identity whatever the call around them, and another picture gets rows of
+its own.
+
+The eviction cases ask `media_recall` directly rather than going through
+`media_image`, and that is the point rather than a convenience: **the tower is
+deterministic, so a miss that re-runs it hands back exactly the rows a hit would
+have.** A test written on the rows passes with the store emptied between every
+call — the first draft of this one did, and it was rewritten when setting
+`MEDIA_KEEP_COUNT` to 1 failed to fail it.
+
+809 pass on the wide build, 800 on a build without the integer dot product and
+800 on SSE2.
+
+---
+
+## 0.9.8 — the block verified under a temperature, by the rule that makes it exact
+
+### Scope
+
+The speculative entry's step 4, which had been open since 0.9.0 and read: *so
+either the feature is greedy-only and says so, or it needs a proposer that
+carries a distribution. Decide which before plumbing it into `chat`.*
+
+It turns out to be a false choice, and that is the whole of this version. A
+proposer needs a distribution only because the rejection rule divides by it —
+and the scout's distribution is a **point mass**, which is a distribution like
+any other and the easiest one to divide by.
+
+`--guess` was refused outright above `--heat 0`, and the default taste is
+`--heat 1`, so the flag was unusable without being asked for explicitly. It now
+works under any taste.
+
+### The rule, and why it needs nothing the scout does not have
+
+Speculative sampling accepts a proposal `t` with probability `min(1, p(t)/q(t))`
+and, on a rejection, draws from the residual `norm((p - q)+)`. The scout names
+one token and nothing else, so `q(t) = 1` and `q` is zero everywhere else. Put
+that in:
+
+- accept with probability `min(1, p(t)/1)`, which is **`p(t)`**;
+- on a rejection the residual is `p(x)` for every `x` other than `t`, and
+  `max(0, p(t) - 1) = 0` at `t` itself — so it is **`p` with the guess taken out
+  and what is left renormalized**.
+
+Both halves are exactly computable from `p` alone. There is nothing to
+approximate and no second model to carry, and the token that comes out is drawn
+from `p` exactly.
+
+**`p` is the caller's whole taste**, not a bare softmax: heat, the echo penalty,
+top-k and top-p, all of it. So `session_pick_at`'s body is lifted out into
+`pick_shape`, which builds the shaped distribution, and `pick_draw`, which takes
+a token out of one. Both paths now sit on one definition of what a taste means,
+and the sampled text of a plain run is byte for byte what it was — checked on
+three seeds.
+
+**Each lane is shaped against its own history.** Lane `j` is judged as a plain
+run would judge it having committed the first `j` guesses: `guess_echo + j + 1`
+echo entries and cache position `guess_from + j + 1`, neither of which is what
+the session holds while the whole block is in flight. Reading the echo history
+off the session instead is the kind of mistake that changes a distribution
+slightly and silently; there is a test below that fails on it.
+
+**The draws are derived rather than sequential.** `session_pick_at` reseeds from
+`seed ^ fill_count` and draws once, which fits a path that takes one draw per
+position. A block fits it twice over — its lanes share one `fill_count`, and a
+lane that rejects takes two draws rather than one — so a block derives each draw
+from the seed, the position, and which of the two it is, through splitmix64's
+finalizer. The finalizer is not decoration: `draw_next` is an xorshift64, and
+xorshift's first word out of two nearly equal seeds is nearly equal too, so the
+accept draw and the resample draw would otherwise be a constant apart.
+
+### What it promises, and what it does not
+
+A greedy block is byte for byte a greedy run, and 0.9.8 does not touch that —
+`--heat 0 --guess 4` and `--guess 8` are identical to 0.9.7's.
+
+**A sampled block is not, and cannot be.** A round takes one draw where its
+guess is accepted and two where it is not, so the block path and the plain path
+consume randomness at different rates and diverge from the first rejection: the
+same seed gives a different stream at a different `--guess`, and the same stream
+only at the same one. What is equal is the **distribution** the stream is drawn
+from, which is the guarantee speculative sampling makes and the only one it
+makes. This is stated in the README rather than left for someone to discover.
+
+### What it is worth
+
+Acceptance under a temperature is `p(t)` — the model's own probability of the
+guessed token — so it tracks how certain the continuation is, where greedy
+acceptance only asks whether the guess was the argmax. That cuts both ways, and
+both ways were measured on the reference host at four threads, `--heat 1` with
+the default top-k 64 and top-p 0.95:
+
+| workload | plain | `--guess 4` | `--guess 8` |
+| --- | --- | --- | --- |
+| repeat a passage back verbatim | 33.55 tok/s | **68.32** (2.04x) | **79.15** (2.36x) |
+| free generation | 33.99 | 31.92 (0.94x) | — |
+
+On the quoting workload it keeps **100% of 63 guesses** at a block of four and
+96% of 77 at eight, and 2.04x and 2.36x are *better* than the greedy path's
+1.69x and 1.80x on its own quoting prompt — because verbatim repetition is
+where the model is nearly certain, and near-certainty is exactly what this
+acceptance rule rewards. Where the model is not certain it rejects, so a
+paraphrasing prompt sits between the two rows above.
+
+Free generation costs about 6% over three alternating runs, which is the same
+place greedy sits (0.92 to 0.95), and for the same reason: the scout draws
+nothing at all most rounds, and a round it draws nothing in is an ordinary step.
+So `--guess` stays a flag rather than a default under a temperature, exactly as
+it is without one.
+
+### Code
+
+- `pick_shape` and `pick_draw`: `session_pick_at`'s body, lifted out whole so a
+  second caller can have the distribution rather than a token from it.
+- `session_guess_taste`: the rejection rule, public beside `session_guess`.
+- `guess_draw_state`, `GUESS_DRAW_TAKE`, `GUESS_DRAW_MAKE`: a block's draws.
+- `pick_share`: what a shaped distribution gives one token, zero where the taste
+  has already cut it.
+- `main_answer_guess`: the rule where the taste has a temperature, the argmax
+  comparison where it does not, and a plain step drawn with the caller's taste
+  where the scout proposes nothing.
+- `main_serve`: the refusal above `--heat 0` is gone.
+
+### Tests
+
+The `guess` group grew six cases, and the first is the one that matters.
+
+**The theorem is held as a theorem.** The shaped distribution at lane 0 is
+computed directly, then a hundred thousand rounds are run through the rejection
+rule with a different seed each and the tokens they commit at position 0 are
+counted. What is being checked is that the mixture `p(t)*[t] + (1 - p(t))*residual`
+**is** `p`. A hundred thousand rounds over twenty-seven tokens puts a bucket's
+standard error under 0.0016, so the bar of 0.01 is six sigma — wide enough never
+to flake and narrow enough that no wrong rule fits under it. Two of them were
+built and neither does: resampling without removing the guess fails it, and
+accepting whenever the model gives the guess any mass at all fails it twice.
+
+It runs **twice**, once on a bare softmax and once with top-k, top-p and the
+echo penalty on. The second is what holds the per-lane history, and it was added
+because the first draft passed with the history read off the session — the
+penalty was switched off, so there was nothing for the mistake to move. The
+guess is now chosen out of the shaped row rather than taken from the fixture,
+because an arbitrary token is usually one top-k has already cut, and a guess
+that can only ever be rejected exercises half the rule.
+
+Three more hold the edges and the boundary: a guess the taste has cut is never
+accepted, a guess holding every slot the taste kept is always accepted and never
+divides by an empty residual, and a greedy taste is refused rather than given an
+invented rule.
+
+822 pass on the wide build, 813 on a build without the integer dot product and
+813 on SSE2.
+
+---
+
+## 0.9.9 — the batched row's total off the destination
+
+### Scope
+
+The one thing 0.9.5 measured in the batched path and left on the floor. Its
+note read: *replacing the whole close with a raw store is worth 3.7 to 8.7% of
+the batched plane, 0.3 to 0.8 ms of a lane. Worth having eventually; nowhere
+near four times.* It is still nowhere near four times, and it is now had.
+
+### What it was
+
+`kern_row_code_level_many` accumulated straight into the caller's destination, a
+group at a time:
+
+    out_data[lane * out_stride + row] += gain * step[lane] * (float)whole;
+
+Sixteen of those per group of every row, and they are strided a **whole lane
+apart** — so a loop whose content is one subtract and two multiplies was paying
+sixteen scattered read-modify-writes for every group it closed, on a plane whose
+rows have twelve groups.
+
+### What it is
+
+The row's running totals live in a local and reach the destination once, which
+is exactly the move `kern_blend_rows` makes and makes for the same reason. A
+lane still takes group 0 first and the last group last, into an accumulator of
+its own, and each term is still formed as `(gain * step) * whole` in that
+association — only where the accumulator lives has changed, so every number the
+engine produces is the number it produced. Prefill logits, decode logits, a
+picture's logits and a clip's are byte for byte 0.9.8's, and greedy `--guess 8`
+gives the same text.
+
+The one lane path does not come here at all, so decode is untouched by
+construction.
+
+### What it is worth
+
+On the reference host at four threads, over runs alternating between the two
+builds:
+
+- **prefill 101.10 to 105.53 tokens a second on a 561 id prompt**, and the new
+  build ahead in all three paired runs — inside the 3.7 to 8.7% the note
+  predicted.
+- **the marginal lane of a speculative block 10.31 ms to 9.19**, taking the
+  minimum of three runs each, measured the way `guess --verbose` measures it:
+  the oracle's block of 2 subtracted from its block of 16, over fourteen lanes.
+- and the ceiling that rides on it, on the same prompt: the **oracle at a block
+  of sixteen 2.54–2.63x to 2.67–2.82x**, at eight 2.48–2.65x to 2.52–2.63x, and
+  the n-gram scout that ships 1.83x to 2.02x. Every row still prints `matches
+  plain`.
+
+`TODO.md`'s note that four fifths of the batched lane is unexplained still
+stands, and this does not dent it: 1.1 ms of 10.3 is the epilogue, which is what
+0.9.5 said it would be. **The rest of that entry is now blocked on a hardware
+counter and not on an idea** — and worth recording, since it cost a check: the
+host this was measured on exposes no PMU at all (`/sys/bus/event_source/devices`
+has `breakpoint`, `msr`, `power`, `software`, `tracepoint` and `uprobe`, and no
+`cpu`), so the entry's own instruction to take a counter to it cannot be
+followed here by anyone.
+
+### Code
+
+- `kern_row_code_level_many`: `total_list` beside `part_list`, and the
+  destination written once a row.
+
+### Tests
+
+None added; there is nothing new to hold. What the change claims is that it
+moves no number, and that is checked the way the rest of this file checks it —
+`logits` byte for byte against the previous build on a text prompt, a picture, a
+clip and a long prefill, and greedy `--guess 8` byte for byte. 822 pass on the
+wide build, 813 without the integer dot product and 813 on SSE2.

@@ -62,13 +62,24 @@ Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
 `--echo-penalty`, `--seed`, `--guess`, `--loop`, `--keep`, `--raw`,
 `--verbose`. Run `igllm --help` for the full list.
 
-`--guess <lanes>` is speculative decoding, and it is greedy only. A proposer
-guesses the next few tokens out of the stream's own history, the model checks
-the whole block in one pass, and the guesses it agrees with are kept — so the
-text is byte for byte the text a plain greedy run produces, and the only thing
-that changes is how many sweeps of the weights it took. The proposer carries no
-second model and no training: it asks what followed the last time this stream
-said what it has just said.
+`--guess <lanes>` is speculative decoding. A proposer guesses the next few
+tokens out of the stream's own history, the model checks the whole block in one
+pass, and the guesses it agrees with are kept — the only thing that changes is
+how many sweeps of the weights it took. The proposer carries no second model and
+no training: it asks what followed the last time this stream said what it has
+just said.
+
+**Greedy and sampled decoding give different guarantees here, and the difference
+matters.** Under `--heat 0` a guess is kept when it is the argmax, so the text is
+**byte for byte** the text a plain greedy run produces. Under a temperature a
+guess is kept with probability `p(t)` — the model's own probability of it — and
+a rejected guess is replaced by a draw from the same distribution with that
+guess taken out, which is speculative sampling's rejection rule for a proposer
+that names one token. That draws each token from **exactly the distribution the
+plain sampler draws from**, but it is not the same *sample*: a round takes one
+draw when its guess is accepted and two when it is not, so the same seed gives a
+different stream at a different `--guess`, and the same stream only at the same
+one. Same distribution, different sample.
 
 That makes it worth a great deal on an answer that quotes its prompt —
 summarising, editing, answering about a document, repairing code that is in the
@@ -86,16 +97,30 @@ free generation                    27.63 tok/s plain, 26.32 with --guess 4
 guess   3.08 tokens a round over 12 rounds, 100% of 27 guesses kept
 ```
 
-`guess` is where that is measured rather than asserted. It runs the same greedy
+Under a temperature the same shape holds, with the ends further apart, because
+acceptance is the model's own certainty rather than a comparison against one
+token. At `--heat 1` with the default top-k 64 and top-p 0.95, repeating a
+passage back verbatim — where the model is nearly certain — runs 33.55 tok/s
+plain, **68.32 with `--guess 4` and 79.15 with `--guess 8`**, keeping 100% of 63
+guesses and 96% of 77. That is above what the greedy path reaches on its own
+quoting prompt. Free generation costs about 6%, which is where greedy sits too,
+so `--guess` is a flag under a temperature for the same reason it is one without.
+
+`guess` is where that is measured rather than asserted, and it is greedy: the
+bracket it prints is about the proposer, and holding all three proposers to one
+token stream is what makes the rows comparable. It runs the same greedy
 continuation with three proposers — one that is always right, the n-gram
 proposer that ships, and one that is always wrong — and holds all three to the
 plain run's token stream, so it checks the block path as much as it measures it.
 The first is the ceiling of any proposer and the last is its floor. On the
-shipped export the ceiling is about 2.2x at a block of eight — 2.35x since 0.9.5
-put the output head on the integer path and made a block's marginal lane 21%
-cheaper — and `CHANGES.md` 0.9.0 says why it is not higher still. The proposer
-reaches 85% of it where it applies. The table below was taken before 0.9.5, on a
-host whose numbers `CHANGES.md` names; run `igllm guess` for this host's own.
+shipped export the ceiling was about 2.2x at a block of eight when 0.9.0
+measured it; 0.9.5 put the output head on the integer path and 0.9.9 took the
+batched row's close off the destination, and between them the marginal lane is
+about a third cheaper, so a block of sixteen now brackets **2.67 to 2.82x** and
+a block of eight 2.5 to 2.65 — with `CHANGES.md` 0.9.0 still saying why it is
+not higher than that. The proposer reaches 77 to 85% of it where it applies. The
+table below was taken before 0.9.5, on a host whose numbers `CHANGES.md` names;
+run `igllm guess` for this host's own.
 
 ```
 block  proposer    tok/s  ms a round  committed of drawn  vs plain  stream
@@ -537,3 +562,99 @@ it. The same 96 MiB of the mapped checkpoint costs **32.4 GiB/s back to back and
 43.4 with a gigabyte of the rest of the file swept in between**: no penalty, and
 anonymous memory of the same size is no faster than the file. The hypothesis is
 gone and the puzzle is not.
+
+## Where a picture goes, and the tiling that was not the answer
+
+`TODO.md` had carried an entry for the tower's own attention since 0.8.9 put the
+projections on the integer path and left the scoring and the blend on the float
+one, and it opened by refusing to be acted on: retake the profile first, because
+0.8.9 changed the shares the last one recorded.
+
+0.9.6 retook it. A 768 by 768 picture at the full patch budget is 2304 patches
+through 16 layers of width 768 and 12 heads, and on four threads it divides:
+**scoring, softmax and blend 52.7%**, the feed-forward 25.5%, `q k v` 13.0%,
+everything else under 5% each. So the entry's premise held, and understated
+itself — a picture had become mostly one phase.
+
+The phase is not waiting on memory, which is the thing that decided what to do
+about it. A gathered head is 590 KiB of keys and 590 KiB of values, and scoring
+and blending walk them in separate loops, so each sits inside this host's
+megabyte of private second level cache for a whole band. What the two loops were
+actually doing was reading that run **once per query** — 2304 times over, for a
+run every query in the band shares — and paying a horizontal reduction on every
+sixty-four column dot product, a close that costs about what the eight
+multiply-adds it closes cost.
+
+`RESEARCH.md`'s idea for this was flash attention's schedule: tile the keys,
+carry a running maximum and normalizer between tiles, and never materialize the
+2304 by 2304 score matrix. **That is refused, and the reason is worth keeping.**
+A band here holds one score row and never held the grid, so the memory the
+tiling exists to save was never spent — the schedule arrives with nothing to
+save and a change to the order of every sum to pay for it. llama.cpp's tiled
+kernel is written against a runtime that does materialize the matrix.
+
+The axis that was actually loose was the other one. Four queries share every
+byte both loops read, and shared nothing. So a band now takes **four queries at
+a time**: one key row loaded into four queries' accumulators, four closes folded
+into the three instructions one close took, one value row folded into four
+queries' running sums, and the softmax still per query in between.
+
+**Nothing is reassociated, and that is the point rather than a caveat.** Each
+lane keeps the same accumulators over the same slots in the same order; the
+four-lane close pairs exactly the floats `kern_dot_total` pairs, in its order;
+and the blend's multiply and add stay a multiply and an add. The fused
+multiply-add is the obvious next instruction and it is **deliberately not
+taken** — it measured 2.2x against the 1.4x the unfused form gives, and it drops
+the intermediate rounding, so a picture's rows would stop being the rows that
+ship. It is also the slower kernel on a plain AVX2 host, where sixteen
+accumulators and four value registers do not fit in sixteen registers.
+
+The phase goes **5.26–5.61 s to 2.72–3.01 s**, about 1.9x, with no overlap
+between the two builds' ranges over six alternating runs. A picture through the
+tower is **10.64 s to 8.10 s**. `logits` after a picture, after a clip, after
+both and after neither is byte for byte what it was, and two tests in the
+`kernel` group hold each new kernel to the one it is a block of for equality
+rather than for nearness — swapping the blend's multiply-and-add for the fused
+form fails one of them, which is what it is there for.
+
+One thing the table above does not say, and the control is why. `q k v` and the
+feed-forward appeared to move five to ten percent between the two builds, in
+code neither of them touches; running the same series with the order of the
+builds reversed put the first run of *whichever* build went first ahead of the
+runs after it. That is the host drifting over a series, not the change.
+
+## Asking twice about one photograph
+
+A picture costs the tower once. Since 0.9.7 it costs it once *in total*: the
+rows the projector hands the text stack are kept on the model against an
+identity of the picture, so the second question about the same photograph skips
+the resize, the patch cut, all sixteen encoder layers, the pooling and the
+projector, and gets the rows the tower made bit for bit.
+
+**This is not fresh-image acceleration.** A picture the engine has not seen
+costs exactly what it cost before, and a miss costs under 2% more for taking the
+identity and copying the rows in. What changes is the second time. A photograph,
+a question, `/new`, the same photograph and another question goes **53.53 s to
+39.72 s**, with the two conversations byte for byte identical.
+
+It lives on the model rather than on a session, because the rows are the
+weights' answer to a picture and not a conversation's — so a second conversation
+has them, which is the case `--keep` and `chat --loop` cannot reach: both of
+those match on rows the tower has already been run to make. Four pictures are
+kept, least-wanted first out, and each costs 1.5 MiB of the engine's own
+allocator, which `bench` reports without being asked.
+
+The identity is the whole of the risk, because the one thing a cache like this
+must never do is hand back rows for a picture that was never shown. It is taken
+on the **decoded raster** — so the container and the decoder are out of it, and
+the same photograph as a png and as a lossless bmp is one entry — over every
+sample, the raster's shape, and every part of the tower configuration that
+decides what the samples become. Two independent mixes run over the same bytes
+rather than one, which is a hundred and twenty-eight bits instead of sixty-four,
+and the raster's shape is compared exactly beside them. Both mixes together cost
+2.5 to 5.1 ms on a 6.8 MiB raster.
+
+The backend is deliberately not in the identity, and the reason is worth knowing
+before anyone extends this: the store is never written to a file, so a backend
+cannot change under an entry. `TODO.md` says what has to go in first if it ever
+is.

@@ -267,6 +267,13 @@ const float *session_step_state(app_session *session, int32_t id_value, const fl
  * to anything that wants to score a branch and abandon it. */
 const float *session_guess(app_session *session, const int32_t *id_list, int id_count);
 app_code     session_guess_keep(app_session *session, int keep_count);
+/* A block verified under a temperature, by speculative sampling's modified
+ * rejection rule: the guesses kept, and the token that follows them, drawn from
+ * exactly the distribution the plain sampler draws from.  Greedy verification
+ * is an argmax comparison and does not come here. */
+int          session_guess_taste(app_session *session, const float *row_list,
+                                 const int32_t *id_list, int id_count, const app_taste *taste,
+                                 int32_t *made_out);
 int          session_guess_span(const app_session *session);
 int          session_guess_limit(const app_session *session);
 
@@ -4117,13 +4124,27 @@ static void kern_dot_level_many(const uint8_t *code_row, int from_index, int spa
                        code_flip);
 }
 
+/* One row of codes against every lane of the batch.
+ *
+ * A row's running total lives in a local rather than in the destination, which
+ * is the same move `kern_blend_rows` makes and for the same reason.  Written
+ * into `out_data` a group at a time it was a read and a write per lane per
+ * group, and those are strided a whole lane apart — sixteen scattered
+ * read-modify-writes for every group of every row, on a loop whose content is
+ * one subtract and two multiplies.  Held in `total_list` the groups accumulate
+ * in registers and the destination is touched once a row.
+ *
+ * Nothing about the arithmetic moves: a lane still takes group 0 first and the
+ * last group last, into an accumulator of its own, and each term is formed
+ * exactly as it was — `(gain * step) * whole`, in that association.  Only where
+ * the accumulator lives has changed. */
 static void kern_row_code_level_many(const plane *sheet, int row_index, const kern_job *job) {
   const uint8_t *code_row = sheet->code_data + (size_t)row_index * sheet->row_stride;
   size_t gain_base = (size_t)row_index * (size_t)sheet->group_count;
   int32_t part_list[KERN_LANE_LIMIT];
+  float total_list[KERN_LANE_LIMIT];
   int lane_index, group_index;
-  for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
-    job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] = 0.0f;
+  for (lane_index = 0; lane_index < job->lane_count; ++lane_index) total_list[lane_index] = 0.0f;
   for (group_index = 0; group_index < sheet->group_count; ++group_index) {
     int from_index = group_index * sheet->group_size;
     int span_count = sheet->col_count - from_index;
@@ -4139,10 +4160,12 @@ static void kern_row_code_level_many(const plane *sheet, int row_index, const ke
           (int64_t)part_list[lane_index] -
           (int64_t)bias_value * (int64_t)job->isum_data[(size_t)lane_index * (size_t)job->sum_stride +
                                                         (size_t)group_index];
-      job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] +=
-          gain_value * job->step_list[lane_index] * (float)whole_value;
+      total_list[lane_index] += gain_value * job->step_list[lane_index] * (float)whole_value;
     }
   }
+  for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
+    job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] =
+        total_list[lane_index];
 }
 
 static void kern_mat_vec_band(void *state, int slice_index, int slice_count) {
@@ -4305,6 +4328,250 @@ static void kern_blend_rows(const float *from_data, int from_stride, const float
       }
       for (value_index = 0; value_index < chunk_count; ++value_index)
         into_data[base_index + value_index] = part_list[value_index];
+    }
+  }
+}
+
+/* How many queries of a bidirectional block are scored and blended together.
+ *
+ * A tower's attention is every patch against every patch, so the keys one query
+ * reads are exactly the keys the next one reads.  Taken a query at a time that
+ * run is walked once per query; taken four at a time it is walked once per four,
+ * and the multiply-adds that were waiting on the load have something to do.
+ *
+ * Four for the reason `KERN_CODE_LANE` is four: it is what the sixteen vector
+ * registers of an AVX2 host hold beside a block of accumulators without
+ * spilling, and a host with thirty-two does not need more to cover the
+ * multiply-add's latency. */
+#define KERN_GRID_LANE 4
+
+/* Several queries against one gathered run of key rows: for each lane and each
+ * row, the dot product of the two.
+ *
+ * This is `kern_dot_real` with the loop turned inside out.  The one lane form
+ * loads the row, multiplies it by the single activation it was given, and closes
+ * the accumulators into a float — so scoring a block of queries against a run of
+ * keys reads the whole run once per query and pays a horizontal reduction for
+ * every sixty-four columns.  Here the row is loaded once for the whole block and
+ * the four lanes' closes are folded into one three-instruction sequence.
+ *
+ * The arithmetic is the one lane path's exactly.  Each lane keeps the same two
+ * accumulators over the same slots in the same order, and the fold below reaches
+ * the same float `kern_dot_total` reaches: `(a0+a1)+(a2+a3)` over the same four
+ * partial sums, because that is what a pair of `hadd`s does. */
+static void kern_score_block(const float *row_data, int row_stride, int row_count,
+                             const float *act_data, int act_stride, int lane_count,
+                             int span_count, float *into_data, int into_stride) {
+  int row_index;
+  if (lane_count != KERN_GRID_LANE) {
+    /* The block's tail, and every build without a vector path.  A lane on its
+     * own is the kernel this one is a block of. */
+    int lane_index;
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      for (row_index = 0; row_index < row_count; ++row_index)
+        into_data[(size_t)lane_index * (size_t)into_stride + row_index] =
+            kern_dot_real(row_data + (size_t)row_index * (size_t)row_stride, STORE_F32,
+                          act_data + (size_t)lane_index * (size_t)act_stride, span_count);
+    return;
+  }
+  {
+    const float *lane_a = act_data;
+    const float *lane_b = lane_a + act_stride;
+    const float *lane_c = lane_b + act_stride;
+    const float *lane_d = lane_c + act_stride;
+    float *into_a = into_data;
+    float *into_b = into_a + into_stride;
+    float *into_c = into_b + into_stride;
+    float *into_d = into_c + into_stride;
+    for (row_index = 0; row_index < row_count; ++row_index) {
+      const float *row_head = row_data + (size_t)row_index * (size_t)row_stride;
+      int slot = 0;
+#if defined(APP_SIMD_AVX2)
+      __m256 part_a0 = _mm256_setzero_ps(), part_a1 = _mm256_setzero_ps();
+      __m256 part_b0 = _mm256_setzero_ps(), part_b1 = _mm256_setzero_ps();
+      __m256 part_c0 = _mm256_setzero_ps(), part_c1 = _mm256_setzero_ps();
+      __m256 part_d0 = _mm256_setzero_ps(), part_d1 = _mm256_setzero_ps();
+      for (; slot + 16 <= span_count; slot += 16) {
+        __m256 row_low = _mm256_loadu_ps(row_head + slot);
+        __m256 row_high = _mm256_loadu_ps(row_head + slot + 8);
+        part_a0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_a + slot), part_a0);
+        part_a1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_a + slot + 8), part_a1);
+        part_b0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_b + slot), part_b0);
+        part_b1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_b + slot + 8), part_b1);
+        part_c0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_c + slot), part_c0);
+        part_c1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_c + slot + 8), part_c1);
+        part_d0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_d + slot), part_d0);
+        part_d1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_d + slot + 8), part_d1);
+      }
+      for (; slot + 8 <= span_count; slot += 8) {
+        __m256 row_low = _mm256_loadu_ps(row_head + slot);
+        part_a0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_a + slot), part_a0);
+        part_b0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_b + slot), part_b0);
+        part_c0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_c + slot), part_c0);
+        part_d0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_d + slot), part_d0);
+      }
+      {
+        /* Four closes folded into one.  `kern_dot_total` adds the two halves of
+         * a lane's vector and then pairs what is left twice; a pair of `hadd`s
+         * over four lanes at once pairs exactly the same floats in exactly the
+         * same order, four lanes to a lane's worth of instructions. */
+        __m256 whole_a = _mm256_add_ps(part_a0, part_a1);
+        __m256 whole_b = _mm256_add_ps(part_b0, part_b1);
+        __m256 whole_c = _mm256_add_ps(part_c0, part_c1);
+        __m256 whole_d = _mm256_add_ps(part_d0, part_d1);
+        __m128 half_a = _mm_add_ps(_mm256_castps256_ps128(whole_a),
+                                   _mm256_extractf128_ps(whole_a, 1));
+        __m128 half_b = _mm_add_ps(_mm256_castps256_ps128(whole_b),
+                                   _mm256_extractf128_ps(whole_b, 1));
+        __m128 half_c = _mm_add_ps(_mm256_castps256_ps128(whole_c),
+                                   _mm256_extractf128_ps(whole_c, 1));
+        __m128 half_d = _mm_add_ps(_mm256_castps256_ps128(whole_d),
+                                   _mm256_extractf128_ps(whole_d, 1));
+        __m128 fold_low = _mm_hadd_ps(half_a, half_b);
+        __m128 fold_high = _mm_hadd_ps(half_c, half_d);
+        __m128 total_wide = _mm_hadd_ps(fold_low, fold_high);
+        float total_a = _mm_cvtss_f32(total_wide);
+        float total_b = _mm_cvtss_f32(_mm_shuffle_ps(total_wide, total_wide, 0x55));
+        float total_c = _mm_cvtss_f32(_mm_movehl_ps(total_wide, total_wide));
+        float total_d = _mm_cvtss_f32(_mm_shuffle_ps(total_wide, total_wide, 0xff));
+        for (; slot < span_count; ++slot) {
+          float row_value = row_head[slot];
+          total_a += row_value * lane_a[slot];
+          total_b += row_value * lane_b[slot];
+          total_c += row_value * lane_c[slot];
+          total_d += row_value * lane_d[slot];
+        }
+        into_a[row_index] = total_a;
+        into_b[row_index] = total_b;
+        into_c[row_index] = total_c;
+        into_d[row_index] = total_d;
+      }
+#else
+      /* Every other build: the one lane kernel, four times over.  The block is
+       * still worth taking here — the row it reads is read once for the four
+       * rather than once each — and nothing about the arithmetic changes. */
+      (void)slot;
+      into_a[row_index] = kern_dot_real(row_head, STORE_F32, lane_a, span_count);
+      into_b[row_index] = kern_dot_real(row_head, STORE_F32, lane_b, span_count);
+      into_c[row_index] = kern_dot_real(row_head, STORE_F32, lane_c, span_count);
+      into_d[row_index] = kern_dot_real(row_head, STORE_F32, lane_d, span_count);
+#endif
+    }
+  }
+}
+
+/* Several blends over one gathered run of value rows: `kern_blend_rows` for a
+ * block of weight rows at once.
+ *
+ * The run is the same for every lane of the block, so reading it once for four
+ * lanes is three quarters of the loads gone.  Each lane keeps its own
+ * accumulators over the same value block and takes the spans in the same order,
+ * and each path multiplies and adds the way `kern_blend_rows` does on that
+ * build, so a lane reaches the float it would have reached alone. */
+static void kern_blend_rows_many(const float *from_data, int from_stride,
+                                 const float *weight_data, int weight_stride, int lane_count,
+                                 int span_count, int value_count, float *into_data,
+                                 int into_stride) {
+  int base_index;
+  if (lane_count != KERN_GRID_LANE) {
+    int lane_index;
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      kern_blend_rows(from_data, from_stride,
+                      weight_data + (size_t)lane_index * (size_t)weight_stride, span_count,
+                      value_count, into_data + (size_t)lane_index * (size_t)into_stride);
+    return;
+  }
+  for (base_index = 0; base_index < value_count; base_index += KERN_BLEND_BLOCK) {
+    const float *from_head = from_data + base_index;
+    const float *weight_a = weight_data;
+    const float *weight_b = weight_a + weight_stride;
+    const float *weight_c = weight_b + weight_stride;
+    const float *weight_d = weight_c + weight_stride;
+    int chunk_count = value_count - base_index;
+    int span_index;
+    if (chunk_count > KERN_BLEND_BLOCK) chunk_count = KERN_BLEND_BLOCK;
+#if defined(APP_SIMD_AVX2)
+    if (chunk_count == KERN_BLEND_BLOCK) {
+      __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+      __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+      __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+      __m256 b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+      __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps();
+      __m256 c2 = _mm256_setzero_ps(), c3 = _mm256_setzero_ps();
+      __m256 d0 = _mm256_setzero_ps(), d1 = _mm256_setzero_ps();
+      __m256 d2 = _mm256_setzero_ps(), d3 = _mm256_setzero_ps();
+      for (span_index = 0; span_index < span_count; ++span_index, from_head += from_stride) {
+        __m256 from_0 = _mm256_loadu_ps(from_head);
+        __m256 from_1 = _mm256_loadu_ps(from_head + 8);
+        __m256 from_2 = _mm256_loadu_ps(from_head + 16);
+        __m256 from_3 = _mm256_loadu_ps(from_head + 24);
+        __m256 weight_wide;
+        weight_wide = _mm256_broadcast_ss(weight_a + span_index);
+        a0 = _mm256_add_ps(a0, _mm256_mul_ps(weight_wide, from_0));
+        a1 = _mm256_add_ps(a1, _mm256_mul_ps(weight_wide, from_1));
+        a2 = _mm256_add_ps(a2, _mm256_mul_ps(weight_wide, from_2));
+        a3 = _mm256_add_ps(a3, _mm256_mul_ps(weight_wide, from_3));
+        weight_wide = _mm256_broadcast_ss(weight_b + span_index);
+        b0 = _mm256_add_ps(b0, _mm256_mul_ps(weight_wide, from_0));
+        b1 = _mm256_add_ps(b1, _mm256_mul_ps(weight_wide, from_1));
+        b2 = _mm256_add_ps(b2, _mm256_mul_ps(weight_wide, from_2));
+        b3 = _mm256_add_ps(b3, _mm256_mul_ps(weight_wide, from_3));
+        weight_wide = _mm256_broadcast_ss(weight_c + span_index);
+        c0 = _mm256_add_ps(c0, _mm256_mul_ps(weight_wide, from_0));
+        c1 = _mm256_add_ps(c1, _mm256_mul_ps(weight_wide, from_1));
+        c2 = _mm256_add_ps(c2, _mm256_mul_ps(weight_wide, from_2));
+        c3 = _mm256_add_ps(c3, _mm256_mul_ps(weight_wide, from_3));
+        weight_wide = _mm256_broadcast_ss(weight_d + span_index);
+        d0 = _mm256_add_ps(d0, _mm256_mul_ps(weight_wide, from_0));
+        d1 = _mm256_add_ps(d1, _mm256_mul_ps(weight_wide, from_1));
+        d2 = _mm256_add_ps(d2, _mm256_mul_ps(weight_wide, from_2));
+        d3 = _mm256_add_ps(d3, _mm256_mul_ps(weight_wide, from_3));
+      }
+      {
+        float *into_a = into_data + base_index;
+        float *into_b = into_a + into_stride;
+        float *into_c = into_b + into_stride;
+        float *into_d = into_c + into_stride;
+        _mm256_storeu_ps(into_a, a0); _mm256_storeu_ps(into_a + 8, a1);
+        _mm256_storeu_ps(into_a + 16, a2); _mm256_storeu_ps(into_a + 24, a3);
+        _mm256_storeu_ps(into_b, b0); _mm256_storeu_ps(into_b + 8, b1);
+        _mm256_storeu_ps(into_b + 16, b2); _mm256_storeu_ps(into_b + 24, b3);
+        _mm256_storeu_ps(into_c, c0); _mm256_storeu_ps(into_c + 8, c1);
+        _mm256_storeu_ps(into_c + 16, c2); _mm256_storeu_ps(into_c + 24, c3);
+        _mm256_storeu_ps(into_d, d0); _mm256_storeu_ps(into_d + 8, d1);
+        _mm256_storeu_ps(into_d + 16, d2); _mm256_storeu_ps(into_d + 24, d3);
+      }
+      continue;
+    }
+#endif
+    /* The tail block, and the whole of it on a build with no AVX2 path.  Four
+     * lanes still share the row's load, and each lane's block of scratch keeps
+     * this the same arithmetic in the same order as `kern_blend_rows`. */
+    {
+      float part_a[KERN_BLEND_BLOCK], part_b[KERN_BLEND_BLOCK];
+      float part_c[KERN_BLEND_BLOCK], part_d[KERN_BLEND_BLOCK];
+      int value_index;
+      for (value_index = 0; value_index < chunk_count; ++value_index) {
+        part_a[value_index] = 0.0f; part_b[value_index] = 0.0f;
+        part_c[value_index] = 0.0f; part_d[value_index] = 0.0f;
+      }
+      for (span_index = 0; span_index < span_count; ++span_index, from_head += from_stride) {
+        float weight_av = weight_a[span_index], weight_bv = weight_b[span_index];
+        float weight_cv = weight_c[span_index], weight_dv = weight_d[span_index];
+        for (value_index = 0; value_index < chunk_count; ++value_index) {
+          float from_value = from_head[value_index];
+          part_a[value_index] += weight_av * from_value;
+          part_b[value_index] += weight_bv * from_value;
+          part_c[value_index] += weight_cv * from_value;
+          part_d[value_index] += weight_dv * from_value;
+        }
+      }
+      for (value_index = 0; value_index < chunk_count; ++value_index) {
+        into_data[base_index + value_index] = part_a[value_index];
+        into_data[into_stride + base_index + value_index] = part_b[value_index];
+        into_data[2 * (size_t)into_stride + base_index + value_index] = part_c[value_index];
+        into_data[3 * (size_t)into_stride + base_index + value_index] = part_d[value_index];
+      }
     }
   }
 }
@@ -7378,6 +7645,33 @@ static void rope_grid_turn(float *value_list, int head_size, const float *cos_li
 
 typedef struct token_book token_book; /* defined in the token layer */
 
+/* -- a picture's rows, kept against the picture ---------------------------- */
+
+/* How many pictures' rows the model keeps.
+ *
+ * A picture's rows are `soft_limit` by the text stack's width — 256 by 1536 on
+ * the shipped export, so 1.5 MiB each — against the 8 s the tower spends making
+ * them.  Four is the ordinary case this exists for: a photograph and a couple
+ * of questions about it, or a handful of pictures compared against each other
+ * in one loop.  It is deliberately small and fixed rather than a caller's
+ * tunable: what makes this worth having is that asking twice costs once, and no
+ * depth beyond a working set does anything for that. */
+#define MEDIA_KEEP_COUNT 4
+
+/* One kept picture: the identity of the pixels that made the rows, and the
+ * rows. */
+typedef struct media_note {
+  uint64_t low_mark;   /* the identity, as two independent mixes */
+  uint64_t high_mark;
+  int      wide_count; /* the source raster, compared exactly beside the mix */
+  int      high_count;
+  int      band_count;
+  int      row_count;
+  int      state_size;
+  uint64_t turn_value; /* when it was last wanted, for the eviction pick */
+  float   *state_data;
+} media_note;
+
 struct app_model {
   app_setup  setup;
   model_form form;
@@ -7402,6 +7696,14 @@ struct app_model {
   back_desk  desk;
   size_t     weight_bytes;
   int        code_col_peak; /* widest code plane bound, for the backend's staging */
+
+  /* A picture's rows, kept against the picture that made them.  It lives on the
+   * model rather than on a session because the rows are the weights' answer and
+   * not a conversation's, so a second conversation about the same photograph
+   * has it too.  Like everything else hanging off a model, it assumes one
+   * caller at a time — the same assumption `pool_group` already makes. */
+  media_note vision_note[MEDIA_KEEP_COUNT];
+  uint64_t   media_turn;
 };
 
 /* Rounds the activation onto whatever grid the checkpoint declares, multiplies,
@@ -8905,6 +9207,7 @@ static app_code tower_bind(app_model *model, tower_gear *gear, int kind_mark) {
 
 /* -- tower forward ------------------------------------------------------- */
 
+
 /* One tower's scratch.  Nothing here outlives a single image or clip, so it is
  * allocated per call rather than per session: a tower runs once for a prompt
  * and never inside the token loop. */
@@ -8994,10 +9297,12 @@ static app_code tower_room_open(tower_room *room, const tower_gear *gear, int la
       (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)form->head_size);
   room->value_pack =
       (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)form->head_size);
-  /* One slice of scores per band, because the bands run at the same time. */
+  /* One slice of scores per band, because the bands run at the same time — and
+   * a block of rows inside each, because a band scores `KERN_GRID_LANE` queries
+   * against the whole grid before it softmaxes any of them. */
   if (band_count < 1) band_count = 1;
-  room->score_data =
-      (float *)mem_clear(sizeof(float) * (size_t)band_count * (size_t)lane_count);
+  room->score_data = (float *)mem_clear(sizeof(float) * (size_t)band_count *
+                                        (size_t)KERN_GRID_LANE * (size_t)lane_count);
   room->cos_data = (float *)mem_clear(sizeof(float) * (size_t)(form->head_size / 2 + 1));
   room->sin_data = (float *)mem_clear(sizeof(float) * (size_t)(form->head_size / 2 + 1));
   room->quant_data = (float *)mem_clear(sizeof(float) * (size_t)KERN_LANE_LIMIT * (size_t)wide_peak);
@@ -9069,21 +9374,32 @@ static void tower_attend_band(void *state, int slice_index, int slice_count) {
   tower_room *room = job->room;
   int head_size = job->head_size;
   int head_wide = room->head_wide;
-  float *score_data = room->score_data + (size_t)slice_index * (size_t)job->lane_count;
-  int from_lane, upto_lane, lane_index, span_index;
+  float *score_data =
+      room->score_data + (size_t)slice_index * (size_t)KERN_GRID_LANE * (size_t)job->lane_count;
+  int from_lane, upto_lane, lane_index, span_index, block_index;
   slice_span(job->lane_count, slice_index, slice_count, &from_lane, &upto_lane);
-  for (lane_index = from_lane; lane_index < upto_lane; ++lane_index) {
-    const float *query_head = room->query_data + (size_t)lane_index * (size_t)head_wide +
-                              (size_t)job->head_index * head_size;
-    float *blend_head = room->blend_data + (size_t)lane_index * (size_t)head_wide +
-                        (size_t)job->head_index * head_size;
-    for (span_index = 0; span_index < job->lane_count; ++span_index)
-      score_data[span_index] =
-          kern_dot_real(job->key_pack + (size_t)span_index * (size_t)head_size, STORE_F32,
-                        query_head, head_size) *
-          job->head_gain;
-    job->model->desk.soft_max(&job->model->desk, score_data, job->lane_count);
-    kern_blend_rows(job->value_pack, head_size, score_data, job->lane_count, head_size, blend_head);
+  /* A block of queries at a time rather than one.  Every query in the band
+   * scores against the same gathered keys and blends over the same gathered
+   * values, so a block reads each of those runs once for four queries where a
+   * query on its own read them once each.  The softmax between the two stays
+   * per query, because that is what it is. */
+  for (lane_index = from_lane; lane_index < upto_lane; lane_index += KERN_GRID_LANE) {
+    int block_wide = upto_lane - lane_index;
+    const float *query_block = room->query_data + (size_t)lane_index * (size_t)head_wide +
+                               (size_t)job->head_index * head_size;
+    float *blend_block = room->blend_data + (size_t)lane_index * (size_t)head_wide +
+                         (size_t)job->head_index * head_size;
+    if (block_wide > KERN_GRID_LANE) block_wide = KERN_GRID_LANE;
+    kern_score_block(job->key_pack, head_size, job->lane_count, query_block, head_wide, block_wide,
+                     head_size, score_data, job->lane_count);
+    for (block_index = 0; block_index < block_wide; ++block_index) {
+      float *score_row = score_data + (size_t)block_index * (size_t)job->lane_count;
+      for (span_index = 0; span_index < job->lane_count; ++span_index)
+        score_row[span_index] *= job->head_gain;
+      job->model->desk.soft_max(&job->model->desk, score_row, job->lane_count);
+    }
+    kern_blend_rows_many(job->value_pack, head_size, score_data, job->lane_count, block_wide,
+                         job->lane_count, head_size, blend_block, head_wide);
   }
 }
 
@@ -12164,11 +12480,20 @@ app_code model_load(const char *folder_path, const app_setup *setup, app_model *
   return APP_OKAY;
 }
 
+static void media_keep_free(app_model *model) {
+  int note_index;
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    mem_free(model->vision_note[note_index].state_data);
+    model->vision_note[note_index].state_data = NULL;
+  }
+}
+
 void model_free(app_model *model) {
   int layer_index;
   if (!model) return;
   back_close(&model->desk);
   pool_close(&model->pool);
+  media_keep_free(model);
   token_free(model->book_ref);
   if (model->wing_list) {
     for (layer_index = 0; layer_index < model->form.layer_count; ++layer_index) {
@@ -12415,19 +12740,187 @@ int model_audio_span_ms(const app_model *model) {
   return model->tower_list[TOWER_AUDIO].form.token_ms;
 }
 
+/* One value folded into a running mix.  Both the picture store above and
+ * `keep_mark` below build an identity out of this. */
+static uint64_t keep_mix(uint64_t mark_value, uint64_t value_now) {
+  mark_value ^= value_now + 0x9E3779B97F4A7C15ull + (mark_value << 6) + (mark_value >> 2);
+  return mark_value;
+}
+
+/* The identity of a picture, and of everything about this engine that decides
+ * what rows it turns into.
+ *
+ * **What is in it.** Every decoded sample, the raster's own shape, and the
+ * tower configuration the rows depend on: the patch and pool sizes and the soft
+ * token budget, which together fix the resized grid and the pooling geometry;
+ * the tower's depth and width; and the text stack's width, which is what the
+ * projector lifts into.  The checkpoint's mapped size goes in as well, the way
+ * `keep_mark` uses it, so two exports of the same shape are not the same
+ * identity.
+ *
+ * **What is deliberately not in it.** The file path, the container and the
+ * decoder: the pixels are hashed after decoding, so the same photograph as a
+ * png and as a lossless bmp is one entry and a lossy re-encode of it is not,
+ * which is the right answer both times.  The backend is not in it either, and
+ * that is worth saying rather than leaving to be noticed: this store lives on a
+ * model and is never written to a file, so a backend cannot change under an
+ * entry — it is fixed for the life of the process that made it.  Anything that
+ * gives these rows a life beyond one process has to put the backend and an
+ * encoder version in here first.
+ *
+ * **Why two mixes and not one.** A hit hands back rows for a picture the caller
+ * never showed if two pictures collide, and it does it silently, which is the
+ * one failure mode a cache like this must not have.  Sixty-four bits is a
+ * birthday collision somewhere around four billion pictures; two independent
+ * mixes over the same bytes, with different seeds and different multipliers,
+ * make it a hundred and twenty-eight and put it out of reach.  The raster's
+ * shape is compared exactly beside them, so a collision has to agree on that
+ * too. */
+static void media_mark(const app_model *model, const flat_grid *grid, uint64_t *low_out,
+                       uint64_t *high_out) {
+  const tower_form *form = &model->tower_list[TOWER_VISION].form;
+  uint64_t low_value = 0xCBF29CE484222325ull;
+  uint64_t high_value = 0x9E3779B97F4A7C15ull;
+  size_t value_count = (size_t)grid->wide_count * (size_t)grid->high_count *
+                       (size_t)grid->band_count;
+  const unsigned char *byte_data = (const unsigned char *)grid->value_data;
+  size_t byte_count = value_count * sizeof(float);
+  size_t byte_index;
+
+  /* Eight bytes at a time over the samples, because a picture is megabytes of
+   * them and a byte at a time is a measurable share of what this saves.  The
+   * word is assembled rather than loaded through a cast so that the mix does
+   * not depend on the host's alignment rules or its byte order. */
+  for (byte_index = 0; byte_index + 8 <= byte_count; byte_index += 8) {
+    uint64_t word_value = (uint64_t)byte_data[byte_index] |
+                          ((uint64_t)byte_data[byte_index + 1] << 8) |
+                          ((uint64_t)byte_data[byte_index + 2] << 16) |
+                          ((uint64_t)byte_data[byte_index + 3] << 24) |
+                          ((uint64_t)byte_data[byte_index + 4] << 32) |
+                          ((uint64_t)byte_data[byte_index + 5] << 40) |
+                          ((uint64_t)byte_data[byte_index + 6] << 48) |
+                          ((uint64_t)byte_data[byte_index + 7] << 56);
+    low_value = (low_value ^ word_value) * 1099511628211ull;
+    high_value = keep_mix(high_value, word_value);
+  }
+  for (; byte_index < byte_count; ++byte_index) {
+    low_value = (low_value ^ (uint64_t)byte_data[byte_index]) * 1099511628211ull;
+    high_value = keep_mix(high_value, (uint64_t)byte_data[byte_index]);
+  }
+
+  {
+    /* The shape of the picture and everything about the engine that decides
+     * what it becomes, into both mixes. */
+    uint64_t part_list[11];
+    int part_index;
+    part_list[0] = (uint64_t)grid->wide_count;
+    part_list[1] = (uint64_t)grid->high_count;
+    part_list[2] = (uint64_t)grid->band_count;
+    part_list[3] = (uint64_t)form->patch_size;
+    part_list[4] = (uint64_t)form->pool_size;
+    part_list[5] = (uint64_t)form->soft_limit;
+    part_list[6] = (uint64_t)form->layer_count;
+    part_list[7] = (uint64_t)form->state_size;
+    part_list[8] = (uint64_t)form->head_count;
+    part_list[9] = (uint64_t)model->form.state_size;
+    part_list[10] = (uint64_t)model_memory_bytes(model);
+    for (part_index = 0; part_index < 11; ++part_index) {
+      low_value = (low_value ^ part_list[part_index]) * 1099511628211ull;
+      high_value = keep_mix(high_value, part_list[part_index]);
+    }
+  }
+  *low_out = low_value;
+  *high_out = high_value;
+}
+
+/* Hands back a kept picture's rows, or says there are none.
+ *
+ * The rows are copied out rather than lent, so the caller owns and frees an
+ * `app_media` exactly as it does for a picture the tower ran: nothing about the
+ * calling side changes according to whether this hit. */
+static int media_recall(app_model *model, uint64_t low_mark, uint64_t high_mark,
+                        const flat_grid *grid, app_media *media_out) {
+  int note_index;
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    media_note *note = &model->vision_note[note_index];
+    float *state_data;
+    if (!note->state_data) continue;
+    if (note->low_mark != low_mark || note->high_mark != high_mark) continue;
+    if (note->wide_count != grid->wide_count || note->high_count != grid->high_count ||
+        note->band_count != grid->band_count)
+      continue;
+    state_data = (float *)mem_clear(sizeof(float) * (size_t)note->row_count *
+                                    (size_t)note->state_size);
+    if (!state_data) return 0; /* out of memory is a miss, not a failure */
+    memcpy(state_data, note->state_data,
+           sizeof(float) * (size_t)note->row_count * (size_t)note->state_size);
+    media_out->state_data = state_data;
+    media_out->row_count = note->row_count;
+    media_out->state_size = note->state_size;
+    note->turn_value = ++model->media_turn;
+    return 1;
+  }
+  return 0;
+}
+
+/* Keeps a picture's rows, over the entry that was wanted longest ago.
+ *
+ * Failing to keep them is not an error and is not reported: the rows the caller
+ * asked for are already made and already handed over, and all that is lost is
+ * the next question about the same picture. */
+static void media_keep(app_model *model, uint64_t low_mark, uint64_t high_mark,
+                       const flat_grid *grid, const app_media *media_in) {
+  media_note *pick = &model->vision_note[0];
+  int note_index;
+  size_t row_bytes;
+  float *state_data;
+  if (media_in->row_count < 1 || media_in->state_size < 1) return;
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    media_note *note = &model->vision_note[note_index];
+    if (!note->state_data) { pick = note; break; }
+    if (note->turn_value < pick->turn_value) pick = note;
+  }
+  row_bytes = sizeof(float) * (size_t)media_in->row_count * (size_t)media_in->state_size;
+  state_data = (float *)mem_clear(row_bytes);
+  if (!state_data) return;
+  memcpy(state_data, media_in->state_data, row_bytes);
+  mem_free(pick->state_data);
+  pick->low_mark = low_mark;
+  pick->high_mark = high_mark;
+  pick->wide_count = grid->wide_count;
+  pick->high_count = grid->high_count;
+  pick->band_count = grid->band_count;
+  pick->row_count = media_in->row_count;
+  pick->state_size = media_in->state_size;
+  pick->state_data = state_data;
+  pick->turn_value = ++model->media_turn;
+}
+
 app_code media_image(app_model *model, const char *path_text, app_media *media_out) {
   flat_grid grid;
+  uint64_t low_mark = 0, high_mark = 0;
   app_code code;
   if (!model || !path_text || !media_out) return APP_FAIL_ARGUMENT;
   memset(media_out, 0, sizeof(*media_out));
   if (!model->tower_list[TOWER_VISION].form.live_flag) return APP_FAIL_SUPPORT;
   code = image_read(path_text, &grid);
   if (code != APP_OKAY) return code;
+  /* The identity is taken on the decoded raster, so the decoder and the
+   * container are out of it and the same photograph twice is one entry however
+   * it arrived.  Reading and decoding the file is still paid on a hit; what is
+   * saved is the tower, which is all but the whole of what a picture costs. */
+  media_mark(model, &grid, &low_mark, &high_mark);
+  if (media_recall(model, low_mark, high_mark, &grid, media_out)) {
+    grid_free(&grid);
+    return APP_OKAY;
+  }
   code = vision_run(model, &grid, &media_out->state_data, &media_out->row_count);
+  if (code == APP_OKAY) {
+    media_out->state_size = model->form.state_size;
+    media_keep(model, low_mark, high_mark, &grid, media_out);
+  }
   grid_free(&grid);
-  if (code != APP_OKAY) return code;
-  media_out->state_size = model->form.state_size;
-  return APP_OKAY;
+  return code;
 }
 
 app_code media_audio(app_model *model, const char *path_text, app_media *media_out) {
@@ -12649,11 +13142,6 @@ static int token_frame_inner(const app_model *model, const app_part *part_list, 
  * might not be. */
 #define KEEP_MARK_TEXT "igllm cache 2\n\0\0"
 #define KEEP_MARK_SIZE 16
-
-static uint64_t keep_mix(uint64_t mark_value, uint64_t value_now) {
-  mark_value ^= value_now + 0x9E3779B97F4A7C15ull + (mark_value << 6) + (mark_value >> 2);
-  return mark_value;
-}
 
 /* Everything about a model and a session that decides how the cache is laid
  * out, and enough about the checkpoint to tell two of the same shape apart. */
@@ -13195,36 +13683,37 @@ app_tally session_tally(const app_session *session) {
 /* The sampler proper.  It leaves by whichever of half a dozen returns the
  * taste reaches first, so the clock that times it is put around the call
  * rather than threaded through the body. */
-static int32_t session_pick_at(app_session *session, const float *logit_list,
-                               const app_taste *taste) {
-  app_taste rule;
-  int vocab_count;
-  pick_slot *slot_list;
+/* The distribution a draw is actually taken from: the logits with the caller's
+ * whole taste applied, sorted, softmaxed and normalized, written into
+ * `slot_list` and cut to the returned length.
+ *
+ * This is the body `session_pick_at` used to be, lifted out whole and not
+ * otherwise touched, because a second caller needs the distribution itself
+ * rather than a token drawn from it — speculative decoding under a temperature
+ * has to ask what the model's probability of a *proposed* token is, and then to
+ * draw from the same distribution with that token taken out of it.  Splitting
+ * it is what keeps the two paths on one definition of what the taste means.
+ *
+ * `echo_count` is passed rather than read off the session because a block's
+ * lanes each have a history of their own: lane `j` is judged against the tokens
+ * the stream would hold if the first `j` guesses were kept, which is not what
+ * the session holds while the block is in flight. */
+static int pick_shape(app_session *session, const float *logit_list, const app_taste *rule_ref,
+                      int echo_count, pick_slot *slot_list) {
+  const app_taste rule = *rule_ref;
+  int vocab_count = session->model->head_sheet.row_count;
   int slot_index, keep_count;
-  float total_value = 0.0f, draw_value;
-
-  if (!session || !logit_list) return -1;
-  rule = taste ? *taste : app_taste_plain();
-  vocab_count = session->model->head_sheet.row_count;
-  slot_list = (pick_slot *)session->pick_room;
-  if (rule.seed_value) session->draw_state = rule.seed_value ^ (uint64_t)session->fill_count;
-
-  if (rule.heat_value <= 0.0f) {
-    int best_slot = 0;
-    for (slot_index = 1; slot_index < vocab_count; ++slot_index)
-      if (logit_list[slot_index] > logit_list[best_slot]) best_slot = slot_index;
-    return best_slot;
-  }
+  float total_value = 0.0f;
 
   for (slot_index = 0; slot_index < vocab_count; ++slot_index) {
     slot_list[slot_index].weight_value = logit_list[slot_index];
     slot_list[slot_index].id_value = slot_index;
   }
   if (rule.echo_penalty != 1.0f && rule.echo_window > 0) {
-    int echo_from = session->echo_count - rule.echo_window;
+    int echo_from = echo_count - rule.echo_window;
     int echo_index;
     if (echo_from < 0) echo_from = 0;
-    for (echo_index = echo_from; echo_index < session->echo_count; ++echo_index) {
+    for (echo_index = echo_from; echo_index < echo_count; ++echo_index) {
       int32_t id_value = session->echo_room[echo_index];
       if (id_value < 0 || id_value >= vocab_count) continue;
       if (slot_list[id_value].weight_value > 0.0f)
@@ -13263,7 +13752,13 @@ static int32_t session_pick_at(app_session *session, const float *logit_list,
       total_value += slot_list[slot_index].weight_value;
     }
   }
-  if (total_value <= 0.0f) return slot_list[0].id_value;
+  /* Every weight underflowed, which leaves nothing to divide by.  One slot of
+   * all the mass is the strongest logit, which is what the draw below would
+   * have landed on anyway. */
+  if (total_value <= 0.0f) {
+    slot_list[0].weight_value = 1.0f;
+    return 1;
+  }
   for (slot_index = 0; slot_index < keep_count; ++slot_index)
     slot_list[slot_index].weight_value /= total_value;
 
@@ -13280,12 +13775,195 @@ static int32_t session_pick_at(app_session *session, const float *logit_list,
       slot_list[slot_index].weight_value /= total_value;
   }
 
-  draw_value = draw_unit(&session->draw_state);
+  return keep_count;
+}
+
+/* One token out of a shaped distribution, for a draw already taken. */
+static int32_t pick_draw(const pick_slot *slot_list, int keep_count, float draw_value) {
+  int slot_index;
   for (slot_index = 0; slot_index < keep_count; ++slot_index) {
     draw_value -= slot_list[slot_index].weight_value;
     if (draw_value <= 0.0f) return slot_list[slot_index].id_value;
   }
   return slot_list[keep_count - 1].id_value;
+}
+
+static int32_t session_pick_at(app_session *session, const float *logit_list,
+                               const app_taste *taste) {
+  app_taste rule;
+  int vocab_count;
+  pick_slot *slot_list;
+  int slot_index, keep_count;
+
+  if (!session || !logit_list) return -1;
+  rule = taste ? *taste : app_taste_plain();
+  vocab_count = session->model->head_sheet.row_count;
+  slot_list = (pick_slot *)session->pick_room;
+  if (rule.seed_value) session->draw_state = rule.seed_value ^ (uint64_t)session->fill_count;
+
+  if (rule.heat_value <= 0.0f) {
+    int best_slot = 0;
+    for (slot_index = 1; slot_index < vocab_count; ++slot_index)
+      if (logit_list[slot_index] > logit_list[best_slot]) best_slot = slot_index;
+    return best_slot;
+  }
+  keep_count = pick_shape(session, logit_list, &rule, session->echo_count, slot_list);
+  return pick_draw(slot_list, keep_count, draw_unit(&session->draw_state));
+}
+
+/* -- speculative decoding under a temperature ----------------------------- */
+
+/* A draw's starting state, for a block that needs more than one of them.
+ *
+ * `session_pick_at` reseeds from `seed ^ fill_count` and draws once, which is a
+ * clean contract for a path that takes exactly one draw at each position.  A
+ * block does not fit it twice over: its lanes share one `fill_count` while the
+ * block is in flight, and a lane that rejects its guess takes two draws rather
+ * than one.  So a block derives its own state from the seed, the position the
+ * lane stands at, and which of the two draws it is.
+ *
+ * The mix matters here in a way it does not there.  `draw_next` is an
+ * xorshift64, and xorshift's first word out of two nearly equal seeds is nearly
+ * equal too — which the one draw path gets away with because consecutive
+ * positions are consecutive tokens and nobody compares them, and which a block
+ * would not, because its accept draw and its resample draw would be a constant
+ * apart.  splitmix64's finalizer over the three parts fixes that before the
+ * chain starts. */
+#define GUESS_DRAW_TAKE 0x9E3779B97F4A7C15ull /* the accept-or-reject draw */
+#define GUESS_DRAW_MAKE 0xC2B2AE3D27D4EB4Full /* the draw that replaces a rejected guess */
+
+static uint64_t guess_draw_state(uint64_t seed_value, uint64_t place_value, uint64_t part_value) {
+  uint64_t state = seed_value ^ (place_value * 0xD1342543DE82EF95ull) ^ part_value;
+  state ^= state >> 30;
+  state *= 0xBF58476D1CE4E5B9ull;
+  state ^= state >> 27;
+  state *= 0x94D049BB133111EBull;
+  state ^= state >> 31;
+  return state ? state : 0x2545F4914F6CDD1Dull; /* an xorshift chain must not start at zero */
+}
+
+/* What a shaped distribution gives a particular token.  Zero where the taste
+ * has already cut it, which is the right answer: a guess top-k or top-p has
+ * thrown away is a guess the plain sampler could not have made. */
+static float pick_share(const pick_slot *slot_list, int keep_count, int32_t id_value) {
+  int slot_index;
+  for (slot_index = 0; slot_index < keep_count; ++slot_index)
+    if (slot_list[slot_index].id_value == id_value) return slot_list[slot_index].weight_value;
+  return 0.0f;
+}
+
+/* A block verified under a temperature, by the modified rejection rule.
+ *
+ * **What makes this exact.** Speculative sampling accepts a proposal `t` with
+ * probability `min(1, p(t)/q(t))` and, on a rejection, draws from the residual
+ * `norm((p - q)+)`.  The proposer here carries no distribution at all — the
+ * scout names one token and nothing else — so `q` is a point mass on that
+ * token: `q(t) = 1`, and zero everywhere else.  Put that in and both halves
+ * collapse to something with nothing left to approximate:
+ *
+ * - accept with probability `min(1, p(t)/1)`, which is **`p(t)`**;
+ * - on a rejection the residual is `p(x)` for every `x` other than `t` and
+ *   `max(0, p(t) - 1) = 0` at `t` itself, so it is **`p` with the guess taken
+ *   out and what is left renormalized**.
+ *
+ * So a deterministic proposer needs no distribution of its own to be sampled
+ * under correctly, and the token this hands back is drawn from `p` exactly.
+ * That is the theorem rather than an approximation of it, and `test_guess`
+ * holds it as one: a hundred thousand rounds through this path against a
+ * hundred thousand through the plain sampler, on the same shaped row.
+ *
+ * **What it does not promise.** A greedy block is byte for byte a greedy run;
+ * this is not, and cannot be.  A round takes one draw where its guess is
+ * accepted and two where it is not, so the block path and the plain path
+ * consume randomness at different rates and diverge from the first rejection —
+ * the same seed gives a different stream at a different `--guess`, and the same
+ * stream only at the same one.  What is equal is the distribution the stream is
+ * drawn from, which is the guarantee speculative sampling actually makes.
+ *
+ * `p` is the caller's whole taste, not the bare softmax: heat, the echo
+ * penalty, top-k and top-p, all of it, and each lane against the history it
+ * would have if the guesses before it were kept.  Anything less and the block
+ * would be sampling from a distribution the plain path never uses.
+ *
+ * Returns how many of the `id_count - 1` guesses were kept and writes the token
+ * that follows them into `made_out` — the resampled one where a guess was
+ * rejected, and an ordinary draw from the last lane where none was. */
+int session_guess_taste(app_session *session, const float *row_list, const int32_t *id_list,
+                        int id_count, const app_taste *taste, int32_t *made_out) {
+  app_taste rule;
+  pick_slot *slot_list;
+  int vocab_count, take_count = 0, lane_index;
+  if (!session || !row_list || !id_list || !made_out) return -1;
+  if (id_count < 1 || session->guess_count != id_count) return -1;
+  rule = taste ? *taste : app_taste_plain();
+  if (rule.heat_value <= 0.0f) return -1; /* greedy has its own comparison and does not come here */
+  vocab_count = session->model->head_sheet.row_count;
+  slot_list = (pick_slot *)session->pick_room;
+
+  for (lane_index = 0; lane_index < id_count; ++lane_index) {
+    const float *logit_list = row_list + (size_t)lane_index * (size_t)vocab_count;
+    /* Lane `j` stands where a plain run would stand having committed the first
+     * `j` guesses: one cache row and one echo entry per lane before it, plus
+     * the id the block was opened on. */
+    int echo_count = session->guess_echo + lane_index + 1;
+    uint64_t place_value = (uint64_t)(session->guess_from + lane_index + 1);
+    int keep_count;
+    if (echo_count > session->echo_limit) echo_count = session->echo_limit;
+    keep_count = pick_shape(session, logit_list, &rule, echo_count, slot_list);
+
+    if (lane_index + 1 < id_count) {
+      int32_t want_id = id_list[lane_index + 1];
+      float want_share = pick_share(slot_list, keep_count, want_id);
+      uint64_t take_state;
+      float take_value;
+      if (rule.seed_value) {
+        take_state = guess_draw_state(rule.seed_value, place_value, GUESS_DRAW_TAKE);
+      } else {
+        take_state = session->draw_state;
+      }
+      take_value = draw_unit(&take_state);
+      if (!rule.seed_value) session->draw_state = take_state;
+      if (take_value < want_share) {
+        take_count += 1;
+        continue;
+      }
+      /* Rejected, so the guess is taken out of the distribution and what is
+       * left is renormalized — which is `(p - q)+` for a point mass `q`, and
+       * the only place this differs from an ordinary draw. */
+      {
+        int slot_index, fill_count = 0;
+        float total_value = 0.0f;
+        for (slot_index = 0; slot_index < keep_count; ++slot_index) {
+          if (slot_list[slot_index].id_value == want_id) continue;
+          slot_list[fill_count++] = slot_list[slot_index];
+          total_value += slot_list[slot_index].weight_value;
+        }
+        if (fill_count < 1 || !(total_value > 0.0f)) {
+          /* The guess held every one of the kept slots' mass, so the residual
+           * is empty.  Nothing else was reachable, so the guess is the draw. */
+          *made_out = want_id;
+          return take_count;
+        }
+        for (slot_index = 0; slot_index < fill_count; ++slot_index)
+          slot_list[slot_index].weight_value /= total_value;
+        keep_count = fill_count;
+      }
+    }
+    {
+      uint64_t make_state;
+      float make_value;
+      if (rule.seed_value) {
+        make_state = guess_draw_state(rule.seed_value, place_value, GUESS_DRAW_MAKE);
+      } else {
+        make_state = session->draw_state;
+      }
+      make_value = draw_unit(&make_state);
+      if (!rule.seed_value) session->draw_state = make_state;
+      *made_out = pick_draw(slot_list, keep_count, make_value);
+    }
+    return take_count;
+  }
+  return take_count;
 }
 
 /* The sampler is not in `session_step`, so it is not in the span the phase

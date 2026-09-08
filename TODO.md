@@ -414,13 +414,15 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 
      0.9.5 measured the two obvious explanations and neither is it:
 
-     - **The epilogue is not it.** `kern_row_code_level_many` closes every row
-       for every lane on its own — a sixty-four bit subtract, a widening and two
-       float multiplies, 7.7 M times over the mlp at sixteen lanes — where the
-       one lane path has folded sixteen rows into a vector since 0.8.12.
-       Replacing the whole close with a raw store is worth **3.7 to 8.7%** of
-       the batched plane, 0.3 to 0.8 ms of a lane. Worth having eventually;
-       nowhere near four times.
+     - **The epilogue is not it, and 0.9.9 has now taken it anyway.** The close
+       accumulated straight into the destination, a group at a time and strided
+       a whole lane apart — sixteen scattered read-modify-writes per group of
+       every row. The totals now live in a local and reach the destination once
+       a row, which is `kern_blend_rows`' move and moves no number: prefill
+       **101.10 to 105.53 tokens a second**, the marginal lane **10.31 ms to
+       9.19**, the oracle at a block of sixteen 2.54–2.63x to **2.67–2.82x** and
+       the scout 1.83x to **2.02x**. That is 1.1 ms of 10.3, which is what this
+       note predicted, and it leaves the gap below where it was.
      - **The staging stride was not it either.** Every lane's levels used to be
        laid down `desk->level_limit` apart, which is the widest code plane the
        model binds — `ple embed`'s 8960 columns — so sixteen lanes of a 1536
@@ -434,9 +436,18 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      So four fifths of the batched lane is still unexplained, and it is now the
      largest single number in this list — 8.9 ms a lane against a 45.7 ms step,
      with the ceiling in the table above riding on it. **Take a hardware counter
-     to it before writing another loop**: the three hypotheses that can be
-     reasoned about from the source have now all been measured and all three
-     came back small.
+     to it before writing another loop**: the four hypotheses that can be
+     reasoned about from the source have now all been measured, and all four
+     came back small — the epilogue was the last of them, and 0.9.9 took it for
+     a tenth of the lane rather than the four times the gap needs.
+
+     **And that instruction is now the blocker rather than the advice.** The
+     host these figures were taken on exposes no performance counters at all:
+     `/sys/bus/event_source/devices` holds `breakpoint`, `msr`, `power`,
+     `software`, `tracepoint` and `uprobe`, and no `cpu`, so `perf stat` has
+     nothing to count and neither would anything else. This entry needs a host
+     with a PMU before it can move, and that is the whole of what it is waiting
+     for.
 
   3. **Done, 0.9.3: the n-gram proposer.** `app_scout` asks what followed the
      last time this stream said what it has just said — a growing array of ids
@@ -458,13 +469,42 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      an ordinary `session_step` rather than a block of one lane, which is the
      other half of why the flag is nearly free when it does not help.
 
-  4. **Then sampling.** Everything above is greedy: `session_guess`'s
-     verification is an argmax comparison. Speculative decoding under a
-     temperature needs the modified rejection rule — accept a guess with
-     probability `min(1, p/q)` and resample from the difference — and an n-gram
-     proposer has no `q` to divide by. So either the feature is greedy-only and
-     says so, or it needs a proposer that carries a distribution. Decide which
-     before plumbing it into `chat`.
+  4. **Done, 0.9.8: sampling, and the choice this step posed was a false one.**
+     The step read that an n-gram proposer has no `q` to divide by, so the
+     feature was either greedy-only or wanted a proposer that carries a
+     distribution. It has one: the scout names a token, so `q` is a **point
+     mass** on it. Put `q(t) = 1` into the modified rejection rule and both
+     halves collapse — accept with probability `p(t)`, and on a rejection draw
+     from `p` with the guess taken out and the rest renormalized. Nothing is
+     approximated and no second model is carried.
+
+     `p` is the caller's whole taste rather than a bare softmax, and each lane
+     is shaped against the history it would have if the guesses before it were
+     kept. `--guess` above `--heat 0` used to be refused outright, and the
+     default taste is `--heat 1`, so the flag was unusable unless asked for.
+
+     **Acceptance under a temperature is the model's own certainty**, where
+     greedy acceptance only asks whether the guess was the argmax — so it pays
+     better where the model is sure and worse where it is not. Repeating a
+     passage back verbatim at `--heat 1` is 33.55 tok/s to **68.32 at a block of
+     four and 79.15 at eight**, 100% of 63 guesses kept and 96% of 77, which is
+     *above* the greedy path's 1.69x and 1.80x. Free generation costs about 6%,
+     the same place greedy sits. So it stays a flag.
+
+     A greedy block is still byte for byte a greedy run. A sampled one is not
+     and cannot be: a round takes one draw where its guess is accepted and two
+     where it is not, so the streams diverge from the first rejection. The
+     distribution is equal, which is what speculative sampling guarantees, and
+     `CHANGES.md` 0.9.8 says how that is tested rather than asserted.
+
+     **What is left of it is a proposer that carries a real `q`.** The point
+     mass is the strongest possible proposal and therefore the harshest: it
+     stakes everything on one token, so acceptance can never exceed `p(t)`. A
+     proposer offering a distribution — a small draft model, or the scout's own
+     counts turned into one — is accepted with `min(1, p/q)`, which can be 1
+     over a whole region rather than only at a near-certain token. That is the
+     route to raising acceptance under a temperature, and the rule it needs is
+     already built and already tested; only the proposer is missing.
 
   5. **Done, 0.9.3: the plumbing.** `--guess <lanes>` on `chat` and `complete`,
      the block path inside `main_serve`, and a tally line counting committed
@@ -557,28 +597,44 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   Together the two are 2.6 ms of a 34.8 ms step, so the ceiling on this entry
   was about 5% of a token and 0.8.12 took 2.4% of it.
 
-- **The tower's own attention, tiled, with the normalizer carried.** A picture
-  is now mostly this. On the reference host at one thread, the same 768 by 768
-  picture at the full patch budget costs 48.3 s where it cost 105.0 before
-  0.8.9; of that, prefilling the 256 soft tokens through the text stack is 16.3
-  s where it was 50.7, so about **32 s is the tower** where it was about 54. The
-  projections took the integer path with everything else. The scoring and the
-  blend did not — they are float, untouched since they were written, and a
-  larger share of a tower than they have ever been.
+- **What is left of the tower's own attention.** 0.9.6 retook the profile this
+  entry asked for and took the largest thing in it. Scoring and the blend were
+  **52.7% of a picture**; a block of four queries sharing every byte both loops
+  read made the phase **1.9x** and a picture 10.64 s to 8.10 s, at the same
+  arithmetic in the same order — `logits` after a picture is byte for byte what
+  it was. `CHANGES.md` 0.9.6 has the division and every number.
 
-  `RESEARCH.md` idea 11: score a tile, carry the running maximum and normalizer,
-  accumulate the blend into the output, and never hold the whole score matrix.
-  It is a memory schedule rather than a kernel, and at 2304 patches the score
-  matrix it stops materializing is 2304 by 2304.
+  **The tiling itself is refused, and it is worth knowing why before anyone
+  reopens it.** `RESEARCH.md` idea 11's prize is the score matrix it stops
+  materializing, which at 2304 patches is 2304 by 2304 — but a band here holds
+  **one score row, not the grid**, so that memory was never spent and the idea
+  arrives with nothing to save and a summation-order change to pay. llama.cpp's
+  `ggml_compute_forward_flash_attn_ext_tiled` is written against a runtime that
+  does materialize it. Do not port it on the strength of that.
 
-  *llama.cpp has this on CPU* —
-  `ggml_compute_forward_flash_attn_ext_tiled` with a partial-reduction pass, in
-  `ggml/src/ggml-cpu/ops.cpp`. Which is the strongest argument that it is worth
-  the summation-order change it costs.
+  **What is actually left is the arithmetic, and the loose axis is spent.**
+  After 0.9.6 the phase is 34 to 41% of a picture and the feed-forward is the
+  larger part of a tower. Scoring ran 6.7 G multiply-adds a second and the blend
+  8.0, against a 256-bit FMA peak of 44.8 a core; both are now roughly twice
+  that and still a long way short. Three things are known about what is left:
 
-  Retake 0.8.8's profile first — projections, scoring, blend, softmax, one
-  thread — because 0.8.9 changed the shares it recorded and the schedule should
-  be written against the new ones.
+  - **The fused multiply-add in the blend is worth another 0.6x and was
+    refused, not missed.** `kern_blend_rows_many` keeps a multiply and an add
+    because dropping the intermediate rounding would stop a picture's rows being
+    the rows that ship. Measured: 2.2x fused against 1.4x not, on the AVX-512
+    host. It is a decision about output rather than a kernel question, and the
+    test that holds the kernel bit for bit fails on it deliberately. Taking it
+    means saying so in `CHANGES.md` and re-taking the media parity run.
+  - **It is also the worse kernel on a plain AVX2 host** — 1.28x against 1.32x —
+    because sixteen accumulators and four value registers do not fit in sixteen
+    registers. Anything wider than `KERN_GRID_LANE` has the same problem, so a
+    wider block needs the register file asked for rather than assumed.
+  - **The key axis is untouched and is the one left.** Four queries share the
+    key row; nothing shares the *query*. A block of keys against a block of
+    queries is the register-blocked matrix product this loop really is, and it
+    is the only route here that does not need the summation order.
+
+  The softmax is 6.6% of the phase and not worth opening.
 
 - **Fewer patches, before the pooling — and a budget the caller can ask for.**
   The largest vision win available, and the one that costs behaviour.
@@ -608,28 +664,48 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   versus coarse understanding, not a single latency number; a fast path that
   falls back to full resolution half the time is not a fast path.
 
-- **Reuse a picture's rows when it is the same picture.** Exact, cheap, and
-  narrow: cache the post-projector rows against a collision-resistant identity
-  of the pixels plus the preprocessing and model configuration, so a second
-  question about the same image costs nothing. `RESEARCH.md` idea 12.
+- **Give a picture's rows a life beyond one process.** 0.9.6's entry above is
+  built and ships — 0.9.7 — and this is what it left.
 
-  *llama.cpp has a narrower form of this.* Its server pushes a placeholder for
-  an encoded media chunk into the slot's prompt tokens — "the chunk is already
-  in the KV cache at this point, so we don't need to keep its data around"
-  (`tools/server/server-context.cpp`) — so a picture is reused by an ordinary
-  **prompt-prefix match within one slot**, keyed by the caller's bitmap id. That
-  covers the follow-up turn and nothing else: not the same picture in another
-  conversation, not with different text in front of it, not after a restart.
-  There is no content-addressed store of post-projector rows anywhere in the
-  tree. The gap is worth having, and the prefix form is worth having too — this
-  engine's `--keep` already matches a prompt with a picture in it on the rows
-  the tower made rather than on the ids, which is half of the mechanism.
+  The store is four pictures on the model, keyed on the decoded samples and the
+  tower configuration by two independent mixes, and it takes the case the old
+  entry named: a photograph, a question, another conversation, the same
+  photograph, another question is **53.53 s to 39.72 s**, byte for byte the same
+  two conversations. A miss costs under 2%. `CHANGES.md` 0.9.7 has the identity
+  and what is deliberately outside it.
 
-  This is not fresh-image acceleration and must never be reported as one. It is
-  worth having because asking three questions about one photograph is the
-  ordinary case, and because the identity discipline it forces — orientation,
-  resize budget, backend, encoder version — is the same discipline any of the
-  approximate vision work above will need.
+  **What is left is the word "process".** The store is never written to a file,
+  which is what lets the identity leave out the backend and any notion of an
+  encoder version — a backend cannot change under an entry that cannot outlive
+  the process that made it. A store on disk is the useful next form, because the
+  ordinary case for a photograph is a run at a time rather than a loop, and it
+  needs all three of these first:
+
+  - **the backend in the identity**, since a scalar build and a VNNI build do
+    not produce the same rows;
+  - **an encoder version in it**, bumped by hand whenever anything from the
+    resize to the projector changes — the shipped `KEEP_MARK_TEXT` is the
+    pattern, and the reason it carries a version;
+  - **a decision about where the file lives and who evicts it**, which is a
+    caller's question and not the engine's. `--keep` is the precedent: the
+    engine reads and writes a path the caller names and refuses a file that
+    disagrees with its mark.
+
+  Do not persist it without all three. A stale row read back from disk is a
+  wrong answer that nothing downstream can detect.
+
+  *llama.cpp has a narrower form of the in-memory half.* Its server pushes a
+  placeholder for an encoded media chunk into the slot's prompt tokens — "the
+  chunk is already in the KV cache at this point, so we don't need to keep its
+  data around" (`tools/server/server-context.cpp`) — so a picture is reused by
+  an ordinary **prompt-prefix match within one slot**, keyed by the caller's
+  bitmap id. That covers the follow-up turn and nothing else: not the same
+  picture in another conversation, not with different text in front of it, not
+  after a restart. There is still no content-addressed store of post-projector
+  rows anywhere in that tree, and no persisted one either.
+
+  None of this is fresh-image acceleration and none of it must ever be reported
+  as one.
 
 - **The other widths of the integer dot product.** 0.8.9's path is written for
   AVX-512 VNNI and nothing else. A host with `avx_vnni` and no AVX-512 —
@@ -736,3 +812,12 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | A speculative round divided into named parts, and the marginal lane priced part by part by subtracting the narrowest block from the widest | 0.9.5 |
 | Where the mlp's gap to a bare sweep goes (answered: 12% is the row block's access pattern and 19% is three inner-loop uops, one of which GFNI already removes) | 0.9.5 |
 | Whether the batched path's per-lane epilogue or its staging stride explains the marginal lane (answered: neither — 4 to 9% and 7%, against a gap of four times) | 0.9.5 |
+| A fresh profile of a picture, part by part, which the vision entry opened by asking for (answered: scoring and the blend are 52.7% of a tower, and neither is waiting on memory) | 0.9.6 |
+| A block of queries through the tower's attention, sharing the gathered run both loops read — at the one lane path's arithmetic in its order, held to it bit for bit by two tests | 0.9.6 |
+| Whether flash attention's tiling is worth porting into this tower (refused: a band holds one score row and never held the grid, so the schedule arrives with nothing to save) | 0.9.6 |
+| The fused multiply-add in the tower's blend (refused, and deliberately: 0.6x more, at the cost of a picture's rows no longer being the rows that ship) | 0.9.6 |
+| A picture's rows kept against the picture, on a hundred and twenty-eight bit identity of the decoded samples and the tower's configuration | 0.9.7 |
+| Where that identity has to be taken, so the decoder and the container stay out of it (answered: on the decoded raster, which makes a lossless re-encode one entry and a lossy one two) | 0.9.7 |
+| Speculative decoding under a temperature (answered: the scout's proposal is a point mass, which is a `q` like any other — accept with `p(t)`, resample from `p` with the guess removed) | 0.9.8 |
+| The sampler's shaped distribution, lifted out of the draw so two paths sit on one definition of what a taste means | 0.9.8 |
+| The batched path's per-lane epilogue, which 0.9.5 measured and left (taken: the row's totals off the destination, prefill 4.4% and the marginal lane a tenth) | 0.9.9 |
