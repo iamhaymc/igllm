@@ -248,6 +248,14 @@ int      model_audio_span_ms(const app_model *model); /* milliseconds one row st
 app_code media_image(app_model *model, const char *path_text, app_media *media_out);
 app_code media_audio(app_model *model, const char *path_text, app_media *media_out);
 void     media_free(app_media *media);
+/* The store of pictures' rows, written to a path the caller names and read back
+ * from it.  A file this engine, this backend or this checkpoint did not write
+ * is `APP_FAIL_FORMAT` and leaves the store alone; a caller may carry on from
+ * that, and the only cost of doing so is running the tower.  What is written is
+ * the working set rather than an archive, so the file is bounded and a caller
+ * that wants two of them names two paths. */
+app_code media_store_save(const app_model *model, const char *path_text);
+app_code media_store_load(app_model *model, const char *path_text);
 
 /* session layer -----------------------------------------------------------*/
 app_code     session_open(app_model *model, app_session **session_out);
@@ -12952,6 +12960,211 @@ static void media_keep(app_model *model, uint64_t low_mark, uint64_t high_mark,
   pick->state_size = media_in->state_size;
   pick->state_data = state_data;
   pick->turn_value = ++model->media_turn;
+}
+
+/* -- the same store, on disk ----------------------------------------------
+ *
+ * The store above cannot outlive the process that made it, and the ordinary
+ * case for a photograph is a run at a time rather than a loop: ask about a
+ * picture, read the answer, ask again tomorrow.  A file closes that gap, and
+ * `TODO.md` named the three things it needs before it is safe to have.  All
+ * three are here, and the reason each is here rather than assumed is the whole
+ * of what makes a file different from memory.
+ *
+ * **The backend, and an encoder version.**  A picture's own identity mixes the
+ * samples and everything about the tower's shape, which is enough inside one
+ * process: a backend cannot change under an entry that cannot outlive the
+ * process that made it, and neither can the code.  A file outlives both.  A
+ * scalar build and a VNNI build do not produce the same rows from the same
+ * pixels, and neither do two versions of this engine whose resize or projector
+ * differ — so both go into the mark, and `MEDIA_KEEP_VERSION` is bumped **by
+ * hand** whenever anything from `vision_grid_pick` to the projector changes.
+ * Forgetting to bump it is the one mistake this design cannot detect for you.
+ *
+ * They go into the file's mark rather than into each picture's identity, and
+ * that placement is deliberate.  In the identity a stale file would simply miss
+ * on every entry, which is indistinguishable from an empty one; in the mark the
+ * whole file is refused at once and the caller is told.
+ *
+ * **Where it lives and who evicts it** is the caller's, exactly as `--keep` is:
+ * the engine reads and writes a path it is given and refuses a file that
+ * disagrees with its mark.  What it writes is the working set and not an
+ * archive — the same `MEDIA_KEEP_COUNT` entries under the same eviction as
+ * memory — so the file cannot grow without bound and a caller that wants two
+ * working sets names two paths.
+ *
+ * Like the session's own keep file, this is written in the host's byte order
+ * and float format.  The mark does not try to describe those; a file carried
+ * between hosts that disagree on them is refused by the mark it fails to
+ * match, which is the same protection by a different route. */
+
+/* Bump this by hand whenever anything between the resize and the projector
+ * changes what a picture becomes.  A file written by an older engine is then
+ * refused rather than read back as rows this one would not have made. */
+#define MEDIA_KEEP_VERSION 1
+#define MEDIA_KEEP_TEXT    "igllm picture 1\n"
+#define MEDIA_KEEP_SIZE    16
+
+/* Everything outside a picture's own identity that decides what its rows are:
+ * the encoder's version, the backend that ran it, and the checkpoint.
+ *
+ * `desk->level_live` is in it beside the backend's name because the name does
+ * not carry it — a build with AVX-512 and one with AVX-512 and VNNI both call
+ * themselves `cpu/avx512`, and only the second takes the integer path through
+ * the tower's projections. */
+static uint64_t media_keep_mark(const app_model *model) {
+  const tower_form *form = &model->tower_list[TOWER_VISION].form;
+  const char *name_text = model->desk.name_text ? model->desk.name_text : "";
+  uint64_t mark_value = 0xB5026F5AA96619E9ull;
+  int text_index;
+  mark_value = keep_mix(mark_value, (uint64_t)MEDIA_KEEP_VERSION);
+  for (text_index = 0; name_text[text_index]; ++text_index)
+    mark_value = keep_mix(mark_value, (uint64_t)(unsigned char)name_text[text_index]);
+  mark_value = keep_mix(mark_value, (uint64_t)model->desk.level_live);
+  mark_value = keep_mix(mark_value, (uint64_t)form->layer_count);
+  mark_value = keep_mix(mark_value, (uint64_t)form->state_size);
+  mark_value = keep_mix(mark_value, (uint64_t)form->head_count);
+  mark_value = keep_mix(mark_value, (uint64_t)form->head_size);
+  mark_value = keep_mix(mark_value, (uint64_t)form->patch_size);
+  mark_value = keep_mix(mark_value, (uint64_t)form->pool_size);
+  mark_value = keep_mix(mark_value, (uint64_t)form->soft_limit);
+  mark_value = keep_mix(mark_value, (uint64_t)model->form.state_size);
+  mark_value = keep_mix(mark_value, (uint64_t)model_memory_bytes(model));
+  return mark_value;
+}
+
+/* Writes the pictures the store is holding.
+ *
+ * The budget in force is not in the file's mark and must not be: a store may
+ * legitimately hold the same photograph at two budgets, and each entry already
+ * carries the budget it was made under inside its own identity. */
+app_code media_store_save(const app_model *model, const char *path_text) {
+  FILE *handle;
+  uint64_t head_list[3];
+  int note_index, live_count = 0;
+  app_code code = APP_OKAY;
+  if (!model || !path_text) return APP_FAIL_ARGUMENT;
+  if (!model_vision_ready(model)) return APP_FAIL_SUPPORT;
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index)
+    if (model->vision_note[note_index].state_data) live_count += 1;
+  handle = fopen(path_text, "wb");
+  if (!handle) return APP_FAIL_FILE;
+  head_list[0] = media_keep_mark(model);
+  head_list[1] = (uint64_t)live_count;
+  head_list[2] = (uint64_t)model->media_turn;
+  if (fwrite(MEDIA_KEEP_TEXT, 1, MEDIA_KEEP_SIZE, handle) != MEDIA_KEEP_SIZE ||
+      fwrite(head_list, sizeof(uint64_t), 3, handle) != 3)
+    code = APP_FAIL_FORMAT;
+  for (note_index = 0; code == APP_OKAY && note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    const media_note *note = &model->vision_note[note_index];
+    uint64_t note_list[8];
+    size_t value_count;
+    if (!note->state_data) continue;
+    value_count = (size_t)note->row_count * (size_t)note->state_size;
+    note_list[0] = note->low_mark;
+    note_list[1] = note->high_mark;
+    note_list[2] = (uint64_t)note->wide_count;
+    note_list[3] = (uint64_t)note->high_count;
+    note_list[4] = (uint64_t)note->band_count;
+    note_list[5] = (uint64_t)note->row_count;
+    note_list[6] = (uint64_t)note->state_size;
+    note_list[7] = note->turn_value;
+    if (fwrite(note_list, sizeof(uint64_t), 8, handle) != 8 ||
+        fwrite(note->state_data, sizeof(float), value_count, handle) != value_count)
+      code = APP_FAIL_FORMAT;
+  }
+  if (fclose(handle) != 0) code = APP_FAIL_FORMAT;
+  return code;
+}
+
+/* Reads a file back into the store, over whatever it is holding.
+ *
+ * A file that is not this engine's, not this backend's, or not this
+ * checkpoint's is `APP_FAIL_FORMAT` and leaves the store exactly as it was — a
+ * refusal a caller can ignore and carry on from, which is what it should do,
+ * since the only cost of ignoring it is running the tower.  A file that is this
+ * engine's but truncated or damaged is the same refusal, and the store is put
+ * back to empty rather than left half filled. */
+app_code media_store_load(app_model *model, const char *path_text) {
+  FILE *handle;
+  char mark_room[MEDIA_KEEP_SIZE];
+  uint64_t head_list[3];
+  media_note load_list[MEDIA_KEEP_COUNT];
+  int note_index, live_count, take_count = 0;
+  app_code code = APP_OKAY;
+  if (!model || !path_text) return APP_FAIL_ARGUMENT;
+  if (!model_vision_ready(model)) return APP_FAIL_SUPPORT;
+  handle = fopen(path_text, "rb");
+  if (!handle) return APP_FAIL_MISSING;
+  memset(load_list, 0, sizeof(load_list));
+  if (fread(mark_room, 1, MEDIA_KEEP_SIZE, handle) != MEDIA_KEEP_SIZE ||
+      memcmp(mark_room, MEDIA_KEEP_TEXT, MEDIA_KEEP_SIZE) != 0 ||
+      fread(head_list, sizeof(uint64_t), 3, handle) != 3 ||
+      head_list[0] != media_keep_mark(model)) {
+    fclose(handle);
+    return APP_FAIL_FORMAT;
+  }
+  live_count = (int)head_list[1];
+  if (live_count < 0 || live_count > MEDIA_KEEP_COUNT) {
+    fclose(handle);
+    return APP_FAIL_FORMAT;
+  }
+  for (note_index = 0; code == APP_OKAY && note_index < live_count; ++note_index) {
+    media_note *note = &load_list[take_count];
+    uint64_t note_list[8];
+    size_t value_count;
+    if (fread(note_list, sizeof(uint64_t), 8, handle) != 8) {
+      code = APP_FAIL_FORMAT;
+      break;
+    }
+    /* Every count is bounded against what this checkpoint could have produced
+     * before a byte of it is used to size an allocation.  A row count the tower
+     * cannot reach, or a width that is not the text stack's, is a damaged file
+     * and not a picture. */
+    if (note_list[5] < 1 || note_list[5] > (uint64_t)model_image_rows_most(model) ||
+        note_list[6] != (uint64_t)model->form.state_size ||
+        note_list[2] < 1 || note_list[2] > (uint64_t)MEDIA_SIDE_LIMIT ||
+        note_list[3] < 1 || note_list[3] > (uint64_t)MEDIA_SIDE_LIMIT ||
+        note_list[4] < 1 || note_list[4] > (uint64_t)MEDIA_BAND_LIMIT) {
+      code = APP_FAIL_FORMAT;
+      break;
+    }
+    note->low_mark = note_list[0];
+    note->high_mark = note_list[1];
+    note->wide_count = (int)note_list[2];
+    note->high_count = (int)note_list[3];
+    note->band_count = (int)note_list[4];
+    note->row_count = (int)note_list[5];
+    note->state_size = (int)note_list[6];
+    note->turn_value = note_list[7];
+    value_count = (size_t)note->row_count * (size_t)note->state_size;
+    note->state_data = (float *)mem_clear(sizeof(float) * value_count);
+    if (!note->state_data) {
+      code = APP_FAIL_MEMORY;
+      break;
+    }
+    take_count += 1;
+    if (fread(note->state_data, sizeof(float), value_count, handle) != value_count)
+      code = APP_FAIL_FORMAT;
+  }
+  fclose(handle);
+  if (code != APP_OKAY) {
+    /* Nothing read is kept.  Half a store is worse than none: the entries that
+     * did arrive would answer while the ones that did not would silently run
+     * the tower, and the caller would have no way to tell the file was bad. */
+    for (note_index = 0; note_index < take_count; ++note_index)
+      mem_free(load_list[note_index].state_data);
+    return code;
+  }
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    mem_free(model->vision_note[note_index].state_data);
+    model->vision_note[note_index] = load_list[note_index];
+  }
+  /* The turn counter goes back with the entries, so that a picture read from
+   * the file and one made after it are ordered against each other rather than
+   * every loaded entry looking older than everything. */
+  model->media_turn = head_list[2];
+  return APP_OKAY;
 }
 
 app_code media_image(app_model *model, const char *path_text, app_media *media_out) {

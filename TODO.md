@@ -614,13 +614,15 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 
   **What is actually left is the arithmetic, and the loose axis is spent.**
   After 0.9.6 the phase is 34 to 41% of a picture and the feed-forward is the
-  larger part of a tower — *on the host 0.9.6 measured.* **0.9.10 found a host
-  where it is about 8%**, by timing whole pictures across seven grid sizes and
-  fitting the quadratic term: 7.4 to 8.0 ms a patch, flat from 108 patches to
-  2340, on four AVX2 cores with no AVX-512. Both numbers cannot describe the
-  same phase, and which of them a given host sees decides whether anything below
-  is worth building at all. **Take the split on the host before taking the
-  work**, and prefer the patch budget where the phase is small. Scoring ran 6.7 G multiply-adds a second and the blend
+  larger part of a tower — *on the host 0.9.6 measured.* **0.9.11 found a host
+  where the dense pair is about a sixth of the encoder**, by answering a turn
+  with the tower skipped and fitting `a·n + b·n²` over seven grid sizes: 3.25 ms
+  a patch plus a term worth 17.8% at 2340 patches, on four AVX2 cores with no
+  AVX-512. Some of the gap to 34–41% is the denominator — that figure is against
+  a picture and this one against the encoder, and half a picture is not the
+  encoder at all — but not all of it, and the two hosts should not be assumed to
+  agree. **Take the split on the host before taking the work**, with the picture
+  file as the instrument, and prefer the patch budget where the phase is small. Scoring ran 6.7 G multiply-adds a second and the blend
   8.0, against a 256-bit FMA peak of 44.8 a core; both are now roughly twice
   that and still a long way short. Three things are known about what is left:
 
@@ -713,25 +715,30 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   two conversations. A miss costs under 2%. `CHANGES.md` 0.9.7 has the identity
   and what is deliberately outside it.
 
-  **What is left is the word "process".** The store is never written to a file,
-  which is what lets the identity leave out the backend and any notion of an
-  encoder version — a backend cannot change under an entry that cannot outlive
-  the process that made it. A store on disk is the useful next form, because the
-  ordinary case for a photograph is a run at a time rather than a loop, and it
-  needs all three of these first:
+  **The word "process" is closed — 0.9.11.** `--image-keep <path>` reads the
+  store at the start of a run and writes it at the end, and the three things
+  this entry required before a file could be safe are all in it: the backend and
+  `desk->level_live` beside it in the mark, a `MEDIA_KEEP_VERSION` bumped by
+  hand, and the path and the eviction left to the caller exactly as `--keep`
+  leaves them. A refused file leaves the store alone and the run says so; a
+  truncated one is refused whole rather than read half. A repeat run of a
+  picture is **19.60 s to 10.36 s, 1.89x**, and with a budget beside it two
+  turns about one photograph are **39.44 s to 5.58 s, 7.07x**. `CHANGES.md`
+  0.9.11 has the rest.
 
-  - **the backend in the identity**, since a scalar build and a VNNI build do
-    not produce the same rows;
-  - **an encoder version in it**, bumped by hand whenever anything from the
-    resize to the projector changes — the shipped `KEEP_MARK_TEXT` is the
-    pattern, and the reason it carries a version;
-  - **a decision about where the file lives and who evicts it**, which is a
-    caller's question and not the engine's. `--keep` is the precedent: the
-    engine reads and writes a path the caller names and refuses a file that
-    disagrees with its mark.
+  **And it turned out to be the instrument this list needed more than the
+  feature.** Answering a turn with the tower skipped is what separates the
+  encoder from the text stack's prefill of the soft tokens, and nothing before
+  it could. Doing that across seven grid sizes gives the tower's cost law
+  directly, and it corrected a number in the entry above by a factor of two.
+  **Half of what a picture costs is not the tower at all** — 9.25 s of 19.60 on
+  that host is the encoder and 9.46 is the 260 soft tokens going through the
+  text stack, at a flat 36.5 ms each. Nothing in this file had that split.
 
-  Do not persist it without all three. A stale row read back from disk is a
-  wrong answer that nothing downstream can detect.
+  What is left of the entry is small and is not the file. A picture's rows are
+  reusable across processes now; a *clip's* are not, and the audio tower has no
+  store at all, in memory or on disk. Whether that is worth having is a question
+  about how often the same clip is asked about twice, and nobody has asked it.
 
   *llama.cpp has a narrower form of the in-memory half.* Its server pushes a
   placeholder for an encoded media chunk into the slot's prompt tokens — "the
@@ -862,4 +869,6 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | The batched path's per-lane epilogue, which 0.9.5 measured and left (taken: the row's totals off the destination, prefill 4.4% and the marginal lane a tenth) | 0.9.9 |
 | A patch budget the caller states, honestly plumbed — the resize moved and nothing else, and the budget inside the picture store's identity so two budgets cannot collide on one entry | 0.9.10 |
 | What a patch budget costs, split by reading and by recognising as the entry demanded (answered: a six line notice survives to 35 rows, a four object scene to 12, and below six rows the model reports no picture at all) | 0.9.10 |
-| Whether the vision tower is quadratic in patches at the grids it actually runs (answered: no — 7.4 to 8.0 ms a patch flat from 108 to 2340, which puts the dense attention pair at about 8% of a picture on an AVX2 host) | 0.9.10 |
+| Whether the vision tower is quadratic in patches at the grids it actually runs (answered: 3.25 ms a patch plus a term worth 17.8% at 2340, measured by skipping the tower rather than by subtracting a text turn) | 0.9.10, corrected in 0.9.11 |
+| A picture's rows beyond one process — the backend and an encoder version in the mark, the path and the eviction left to the caller, and a refused file leaving the store alone | 0.9.11 |
+| What half of a picture actually is (answered: not the tower — 9.25 s of 19.60 is the encoder and 9.46 is the 260 soft tokens through the text stack at a flat 36.5 ms each) | 0.9.11 |

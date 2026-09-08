@@ -47,6 +47,9 @@ typedef struct main_flag {
    * It buys most of what a picture costs and it costs detail, so it is a flag
    * and never a default. */
   int         image_rows;
+  /* A file the pictures' rows are read from at the start and written to at the
+   * end, so that a photograph asked about in two runs is encoded in one. */
+  const char *image_keep;
   const char *keep_path;
   app_taste   taste;
 } main_flag;
@@ -118,6 +121,7 @@ static void main_usage(void) {
   printf("  --threads <count>   worker threads, default host count\n");
   printf("  --window <count>    context length cap\n");
   printf("  --image-tokens <n>  soft tokens a picture may cost, fewer for a faster read\n");
+  printf("  --image-keep <path> hold pictures' rows here, and reuse them next run\n");
   printf("  --cache <bits>      key and value cache storage, 0 float or 8 quantized\n");
   printf("  --heat <value>      temperature, 0 for greedy\n");
   printf("  --top-k <count>     top-k cutoff, 0 disables\n");
@@ -166,6 +170,7 @@ static int main_flags(int argc, char **argv, main_flag *flag_out) {
     else if (strcmp(name_text, "--threads") == 0 && value_text) flag_out->thread_count = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--window") == 0 && value_text) flag_out->window_limit = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--image-tokens") == 0 && value_text) flag_out->image_rows = atoi(argv[++argument_index]);
+    else if (strcmp(name_text, "--image-keep") == 0 && value_text) flag_out->image_keep = argv[++argument_index];
     else if (strcmp(name_text, "--cache") == 0 && value_text) flag_out->cache_bits = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--heat") == 0 && value_text) flag_out->taste.heat_value = (float)atof(argv[++argument_index]);
     else if (strcmp(name_text, "--top-k") == 0 && value_text) flag_out->taste.top_count = atoi(argv[++argument_index]);
@@ -1545,6 +1550,18 @@ int main(int argc, char **argv) {
     }
   }
 
+  /* Pictures kept from an earlier run.  A file that is not there is the first
+   * run and is not worth a word; one that is there and is refused is worth
+   * saying, because it means the tower is about to run over pictures the caller
+   * thought were already encoded — but it is not a failure, since running the
+   * tower is exactly what the engine would have done without the flag. */
+  if (flag.image_keep) {
+    code = media_store_load(model, flag.image_keep);
+    if (code != APP_OKAY && code != APP_FAIL_MISSING)
+      fprintf(stderr, "image-keep: %s, so the pictures are encoded again (%s)\n",
+              app_code_text(code), flag.image_keep);
+  }
+
   if (strcmp(flag.task_text, "chat") == 0 && flag.loop_flag)
     result_code = main_loop(model, &flag);
   else if (strcmp(flag.task_text, "chat") == 0 || strcmp(flag.task_text, "complete") == 0)
@@ -1564,6 +1581,16 @@ int main(int argc, char **argv) {
   else {
     main_usage();
     result_code = 1;
+  }
+
+  /* And back out again, whatever the task made of them.  Writing is worth a
+   * word when it fails: the caller asked for a file and there will not be one,
+   * so the next run pays the tower again without knowing why. */
+  if (flag.image_keep && model_vision_ready(model)) {
+    code = media_store_save(model, flag.image_keep);
+    if (code != APP_OKAY)
+      fprintf(stderr, "image-keep: %s, so nothing is held for the next run (%s)\n",
+              app_code_text(code), flag.image_keep);
   }
 
   model_free(model);

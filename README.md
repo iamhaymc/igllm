@@ -57,7 +57,8 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 | `cache`    | print the export's calibrated cache ranges    |
 | `guess`    | what a block of guesses is worth, against a proposer's ceiling; `--verbose` divides a round and prices its marginal lane |
 
-Common flags: `--model`, `--prompt`, `--text`, `--image`, `--image-tokens`, `--audio`, `--serve`,
+Common flags: `--model`, `--prompt`, `--text`, `--image`, `--image-tokens`,
+`--image-keep`, `--audio`, `--serve`,
 `--threads`, `--window`, `--cache`, `--heat`, `--top-k`, `--top-p`,
 `--echo-penalty`, `--seed`, `--guess`, `--loop`, `--keep`, `--raw`,
 `--verbose`. Run `igllm --help` for the full list.
@@ -255,6 +256,24 @@ attached at all. `CHANGES.md` 0.9.10 has both curves.
 
 ```sh
 python3 run.py run -- chat --model model --image-tokens 64 \
+    --image photo.png --prompt "What is in this picture?"
+```
+
+`--image-keep <path>` holds the pictures' rows in a file and reuses them next
+run, which is what a photograph asked about a run at a time needs — the
+in-process store only reaches a second question in the same loop. A repeat run
+of the notice above is **19.60 s to 10.36 s**; what is left is the text stack
+prefilling the soft tokens, which no store can avoid, because those ids are the
+prompt. With a budget beside it, two turns about one picture are **39.44 s to
+5.58 s**.
+
+The file carries the backend and an encoder version, so one written by a
+different build is refused rather than believed, and the run says so and encodes
+the pictures again. It holds a working set of four and not an archive, so it
+does not grow; name two paths for two working sets.
+
+```sh
+python3 run.py run -- chat --model model --image-keep pics.keep \
     --image photo.png --prompt "What is in this picture?"
 ```
 

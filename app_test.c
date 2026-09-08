@@ -5441,6 +5441,191 @@ static void test_tower(void) {
               "the budget is put away again");
   }
 
+  { /* -- the store on disk --------------------------------------------- */
+    /* What a file has to do that memory does not: come back as the same rows,
+     * refuse to come back at all when it was not this engine that wrote it, and
+     * leave the store alone when it refuses.  The last of those is the one with
+     * teeth — a half-loaded store answers some pictures and silently re-runs
+     * the tower for the rest, and the caller cannot tell. */
+    char keep_text[1024];
+    app_media before, after;
+    uint64_t low_mark = 0, high_mark = 0;
+    flat_grid mark_grid;
+    int bad_count;
+
+    path_join(keep_text, sizeof(keep_text), test_yard_path, "pictures.keep");
+    memset(&before, 0, sizeof(before));
+    memset(&after, 0, sizeof(after));
+
+    test_true(media_image(model, path_text, &before) == APP_OKAY,
+              "a picture is in the store to be written");
+    test_true(media_store_save(model, keep_text) == APP_OKAY, "the store is written");
+
+    /* Emptied by hand rather than by a second model, so that what is read back
+     * is known to have come from the file. */
+    for (row_index = 0; row_index < MEDIA_KEEP_COUNT; ++row_index) {
+      mem_free(model->vision_note[row_index].state_data);
+      memset(&model->vision_note[row_index], 0, sizeof(model->vision_note[row_index]));
+    }
+    memset(&mark_grid, 0, sizeof(mark_grid));
+    if (image_read(path_text, &mark_grid) == APP_OKAY) {
+      app_media hit;
+      memset(&hit, 0, sizeof(hit));
+      media_mark(model, &mark_grid, &low_mark, &high_mark);
+      test_true(media_recall(model, low_mark, high_mark, &mark_grid, &hit) == 0,
+                "the store really is empty before the file is read");
+      media_free(&hit);
+
+      test_true(media_store_load(model, keep_text) == APP_OKAY, "the store is read back");
+      memset(&hit, 0, sizeof(hit));
+      test_true(media_recall(model, low_mark, high_mark, &mark_grid, &hit) == 1,
+                "a picture written to the file is a hit when it is read back");
+      bad_count = 0;
+      if (hit.state_data && hit.row_count == before.row_count &&
+          hit.state_size == before.state_size) {
+        for (row_index = 0; row_index < hit.row_count; ++row_index)
+          for (value_index = 0; value_index < hit.state_size; ++value_index)
+            if (hit.state_data[(size_t)row_index * (size_t)hit.state_size + value_index] !=
+                before.state_data[(size_t)row_index * (size_t)before.state_size + value_index])
+              bad_count += 1;
+      } else {
+        bad_count = 1;
+      }
+      test_true(bad_count == 0, "the rows off the file are the tower's bit for bit");
+      media_free(&hit);
+      grid_free(&mark_grid);
+    } else {
+      test_true(0, "the picture is read for the file check");
+    }
+
+    /* A path with nothing at it is the first run, and is told apart from a file
+     * that is there and wrong — a caller may want to say something about the
+     * second and never about the first. */
+    {
+      char gone_text[1024];
+      path_join(gone_text, sizeof(gone_text), test_yard_path, "nothing.keep");
+      remove(gone_text);
+      test_true(media_store_load(model, gone_text) == APP_FAIL_MISSING,
+                "a file that is not there is missing rather than malformed");
+    }
+
+    /* A file some other engine wrote.  The mark is the first sixteen bytes, so
+     * moving one of them is the cheapest possible version of every way a file
+     * can fail to be this one's. */
+    {
+      FILE *handle = fopen(keep_text, "r+b");
+      int wrote_flag = 0;
+      if (handle) {
+        wrote_flag = fseek(handle, 8, SEEK_SET) == 0 && fputc('X', handle) != EOF;
+        fclose(handle);
+      }
+      test_true(wrote_flag, "the file's mark is damaged for the test");
+      test_true(media_store_load(model, keep_text) == APP_FAIL_FORMAT,
+                "a file this engine did not write is refused");
+      memset(&mark_grid, 0, sizeof(mark_grid));
+      if (image_read(path_text, &mark_grid) == APP_OKAY) {
+        app_media hit;
+        memset(&hit, 0, sizeof(hit));
+        test_true(media_recall(model, low_mark, high_mark, &mark_grid, &hit) == 1,
+                  "a refused file leaves the store exactly as it was");
+        media_free(&hit);
+        grid_free(&mark_grid);
+      } else {
+        test_true(0, "the picture is read for the refusal check");
+      }
+    }
+
+    /* A file this engine did write and then lost the end of.  It passes the
+     * mark and fails inside an entry, which is the case that could have left
+     * the store half filled. */
+    {
+      long byte_count = 0;
+      FILE *handle;
+      test_true(media_store_save(model, keep_text) == APP_OKAY, "the store is written again");
+      handle = fopen(keep_text, "rb");
+      if (handle) {
+        fseek(handle, 0, SEEK_END);
+        byte_count = ftell(handle);
+        fclose(handle);
+      }
+      test_true(byte_count > 64, "the written store has a body to lose");
+      {
+        /* Read the head back and write it out on its own: the entry's header
+         * survives and its rows do not. */
+        unsigned char *head_data = (unsigned char *)mem_clear((size_t)byte_count);
+        size_t took_count = 0;
+        handle = fopen(keep_text, "rb");
+        if (handle && head_data) {
+          took_count = fread(head_data, 1, (size_t)byte_count, handle);
+          fclose(handle);
+          handle = fopen(keep_text, "wb");
+          if (handle) {
+            fwrite(head_data, 1, took_count > 96 ? 96 : took_count, handle);
+            fclose(handle);
+          }
+        } else if (handle) {
+          fclose(handle);
+        }
+        mem_free(head_data);
+      }
+      test_true(media_store_load(model, keep_text) == APP_FAIL_FORMAT,
+                "a truncated file is refused rather than half read");
+      memset(&mark_grid, 0, sizeof(mark_grid));
+      if (image_read(path_text, &mark_grid) == APP_OKAY) {
+        app_media hit;
+        memset(&hit, 0, sizeof(hit));
+        test_true(media_recall(model, low_mark, high_mark, &mark_grid, &hit) == 1,
+                  "a truncated file leaves the store exactly as it was");
+        media_free(&hit);
+        grid_free(&mark_grid);
+      } else {
+        test_true(0, "the picture is read for the truncation check");
+      }
+    }
+
+    /* And the budget travels through the file, because it travels in each
+     * entry's own identity: a store written at the maximum must not answer a
+     * call made under a budget.
+     *
+     * The store is emptied first and the picture run once at the maximum, so
+     * that the file holds that picture at that budget and nothing else — the
+     * budget block above left an entry at a budget of two behind, and a hit on
+     * *that* would be correct and would pass this test for the wrong reason. */
+    for (row_index = 0; row_index < MEDIA_KEEP_COUNT; ++row_index) {
+      mem_free(model->vision_note[row_index].state_data);
+      memset(&model->vision_note[row_index], 0, sizeof(model->vision_note[row_index]));
+    }
+    {
+      app_media lone;
+      memset(&lone, 0, sizeof(lone));
+      test_true(media_image(model, path_text, &lone) == APP_OKAY,
+                "the picture is run at the maximum, alone in the store");
+      media_free(&lone);
+    }
+    test_true(media_store_save(model, keep_text) == APP_OKAY, "the store is written once more");
+    test_true(model_image_budget(model, 2) == APP_OKAY, "a budget is taken for the file check");
+    memset(&mark_grid, 0, sizeof(mark_grid));
+    if (image_read(path_text, &mark_grid) == APP_OKAY) {
+      app_media hit;
+      uint64_t low_thin = 0, high_thin = 0;
+      memset(&hit, 0, sizeof(hit));
+      test_true(media_store_load(model, keep_text) == APP_OKAY,
+                "the file is read under a budget it was not written under");
+      media_mark(model, &mark_grid, &low_thin, &high_thin);
+      test_true(media_recall(model, low_thin, high_thin, &mark_grid, &hit) == 0,
+                "a picture kept at the maximum is a miss under a budget");
+      media_free(&hit);
+      grid_free(&mark_grid);
+    } else {
+      test_true(0, "the picture is read for the budget file check");
+    }
+    test_true(model_image_budget(model, 0) == APP_OKAY, "the budget is put away again");
+
+    media_free(&before);
+    media_free(&after);
+    remove(keep_text);
+  }
+
   /* -- audio --------------------------------------------------------- */
   {
     app_media sound;

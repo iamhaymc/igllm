@@ -737,6 +737,19 @@ Because both sides round down to a whole pooling window, a picture lands *under*
 its budget rather than on it — 40 rows at a budget of 48. `--verbose` prints
 what a picture actually came to beside the cap in force.
 
+The store of those rows can also be written to a file. `media_store_save` and
+`media_store_load` put the working set on disk and read it back, behind
+`--image-keep <path>`, so a photograph asked about in two runs is encoded in
+one. What a file needs that memory does not is in `media_keep_mark`: the
+backend's name, `desk->level_live` beside it because an AVX-512 build and an
+AVX-512-with-VNNI build share a name and not a code path, and
+`MEDIA_KEEP_VERSION` — **bump that by hand whenever anything between the resize
+and the projector changes**, or an older file will be read back as rows this
+engine would not have made. They sit in the file's mark rather than in each
+picture's identity so that a stale file is refused whole and reported, instead
+of missing silently on every entry. A refusal leaves the store exactly as it
+was, and a truncated file is refused whole rather than read half.
+
 The budget is inside the picture store's identity (§3.8), which it has to be:
 the same photograph under two budgets is two different sets of rows, and an
 identity that left the budget out would hand the second call the first call's

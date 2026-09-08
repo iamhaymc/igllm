@@ -6440,28 +6440,45 @@ On a fourth host — four cores of an i5-7600K at 3.8 GHz, AVX2 with FMA and no
 AVX-512, so the integer kernels compile away and the float path is the whole
 engine, the tuned build — over a 768×512 notice in block capitals, minimum of
 three runs each, a one-token turn so that the picture is nearly the whole of it.
-A turn with no picture at all is **0.878 s** on the same line, which is what the
-tower column has taken off.
+A turn with no picture at all is **0.896 s** on the same line.
 
-| budget | rows | patches | turn | tower | tower vs the maximum |
+The *tower* column is the encoder alone. Separating it needs 0.9.11's picture
+file, which answers the same turn with the tower skipped: **tower = the plain
+turn less the same turn warm**. This entry was first written without that
+instrument and reported the tower as the whole of what a picture adds, which it
+is not — half of what a picture adds is the text stack prefilling the soft
+tokens the tower produced. The table below is the corrected one.
+
+| budget | rows | patches | turn | tower | the rows through the text stack |
 | --- | --- | --- | --- | --- | --- |
-| the checkpoint's 280 | 260 | 2340 | 19.39 s | 18.51 s | 1.00x |
-| 128 | 117 | 1053 | 8.84 s | 7.96 s | 2.33x |
-| 64 | 54 | 486 | 4.48 s | 3.61 s | 5.13x |
-| 48 | 40 | 360 | 3.57 s | 2.69 s | 6.88x |
-| 40 | 35 | 315 | 3.25 s | 2.37 s | 7.81x |
-| 32 | 24 | 216 | 2.52 s | 1.64 s | 11.3x |
-| 16 | 12 | 108 | 1.74 s | 0.86 s | 21.5x |
+| the checkpoint's 280 | 260 | 2340 | 19.604 s | 9.248 s | 9.460 s |
+| 128 | 117 | 1053 | 8.918 s | 3.716 s | 4.306 s |
+| 64 | 54 | 486 | 4.549 s | 1.638 s | 2.015 s |
+| 48 | 40 | 360 | 3.552 s | 1.210 s | 1.446 s |
+| 40 | 35 | 315 | 3.300 s | 1.115 s | 1.289 s |
+| 32 | 24 | 216 | 2.512 s | 0.743 s | 0.873 s |
+| 16 | 12 | 108 | 1.746 s | 0.379 s | 0.471 s |
 
-**And the tower is very nearly linear in patches over that whole range**, which
-is not what this entry expected. Milliseconds a patch run 7.91, 7.56, 7.43,
-7.47, 7.52, 7.59, 7.96 top to bottom — flat inside 7%, with the two ends the
-highest. Fitting `a·n + b·n²` to the top two points puts the quadratic term at
-**8% of the tower at the full 2340 patches**, so on this host the dense
-attention pair is a small part of a picture and the per-patch work is nearly all
-of it. That is worth knowing before anyone spends more on the attention here:
-`TODO.md`'s vision attention entry records scoring and the blend at 34 to 41% of
-a picture on the reference host, and this host does not agree.
+**A picture at the full budget is very nearly half encoder and half prefill** —
+9.25 s against 9.46 s — and the budget is worth having because it cuts *both*.
+Patches fall with the area and the soft tokens fall with them, so one knob moves
+two costs that are each about half of the total.
+
+The two halves separate cleanly and each has a simple law:
+
+- **the text stack is 36.5 ms a soft token**, flat from 12 rows to 260 (36.4,
+  36.8, 37.3, 36.2, 36.8, 36.4, 39.2 top to bottom), which is what a prefilled
+  id costs and has nothing to do with the tower;
+- **the tower is 3.25 ms a patch plus a quadratic term**, and fitting
+  `a·n + b·n²` over all seven points puts that term at **17.8% of the tower at
+  the full 2340 patches** — 8.9% at 1053, 1.0% at 108 — with every point inside
+  6% of the fit.
+
+So the dense attention pair is **about a sixth of the encoder at the full grid
+on this host**, against the 34 to 41% of a picture `TODO.md`'s vision attention
+entry records on the reference host. Some of that difference is the denominator
+— that entry measures against a picture and this one against the encoder — but
+not all of it, and the two hosts should not be assumed to agree.
 
 ### What it costs, which is the half that has to be reported
 
@@ -6500,8 +6517,8 @@ to."* A budget that low is not a cheap look, it is a dropped attachment, and a
 caller has no way to tell which it got from the answer alone.
 
 Taking the last budget that keeps the transcription, a picture-reading turn is
-**19.39 s to 3.25 s, 5.97x**, and the tower inside it 18.51 to 2.37, **7.81x**.
-Taking the last that keeps the scene, **19.39 s to 1.74 s, 11.2x**.
+**19.60 s to 3.30 s, 5.94x**, and the encoder inside it 9.25 s to 1.12,
+**8.30x**. Taking the last that keeps the scene, **19.60 s to 1.75 s, 11.2x**.
 
 None of this is a policy and none of it is a default. The flag ships off, the
 shipped path is untouched, and what a caller should ask for depends on their
@@ -6540,3 +6557,132 @@ it back, the rows a budgeted picture emits, the row width unmoved, every value
 finite, and — the one that matters — one raster under two budgets giving two
 identities in both mixes, and the narrow call not being served the wide entry.
 **827 pass** on the tuned AVX2 build, 813 before.
+
+---
+
+## 0.9.11 — a picture's rows beyond one process
+
+### Scope
+
+What 0.9.7 left. The picture store keys a picture's rows on the decoded samples
+and the tower's configuration, and it is very good at the case it was built for
+— a photograph and several questions inside one loop. It cannot help the
+ordinary case, which is a run at a time: ask about a picture, read the answer,
+ask again tomorrow. `TODO.md` named the three things a file needs before it is
+safe to have, and refused to have one without all three. All three are here.
+
+`media_store_save` and `media_store_load` write and read the store; the flag is
+`--image-keep <path>`, read at the start of a run and written at the end.
+
+### The three, and why each is not optional
+
+**The backend, and an encoder version.** A picture's own identity mixes the
+samples and the tower's shape, which is everything that can vary *inside one
+process* — a backend cannot change under an entry that cannot outlive the
+process that made it, and neither can the code. A file outlives both. A scalar
+build and a VNNI build do not produce the same rows from the same pixels, and
+neither do two versions of this engine whose resize or projector differ. So the
+mark carries `back_flavor()`, `desk->level_live` beside it — an AVX-512 build
+and an AVX-512-with-VNNI build both call themselves `cpu/avx512` and only the
+second takes the integer path — and `MEDIA_KEEP_VERSION`, which is **bumped by
+hand** whenever anything between `vision_grid_pick` and the projector changes.
+Forgetting to bump it is the one mistake this design cannot catch, which is why
+it is written down twice.
+
+That the backend half works is checked with two real builds rather than
+asserted: a file written by the tuned AVX2 build and offered to the default
+scalar build is refused, the run says so, and it encodes the pictures again.
+
+**They go in the file's mark, not in each picture's identity**, and the
+placement is the decision rather than a detail. In the identity a stale file
+would simply miss on every entry, which a caller cannot tell from an empty one.
+In the mark the whole file is refused at once and the caller is told what
+happened.
+
+**Where it lives and who evicts it** is the caller's, exactly as `--keep` is:
+the engine reads and writes a path it is given and refuses a file that disagrees
+with its mark. What is written is the **working set and not an archive** — the
+same four entries under the same eviction as memory — so the file cannot grow
+without bound, and a caller who wants two working sets names two paths. The
+shipped export writes 1.5 MiB an entry.
+
+### What a bad file does
+
+Nothing. A refusal leaves the store exactly as it was and returns
+`APP_FAIL_FORMAT`, which a caller may ignore and carry on from — the only cost
+of ignoring it is running the tower, which is what the engine would have done
+without the flag at all. A path with nothing at it is `APP_FAIL_MISSING` and is
+told apart from a file that is there and wrong, because the first is an ordinary
+first run and the second is worth a word.
+
+**A file that fails part way through is refused whole.** Every count is bounded
+against what this checkpoint could have produced before a byte of it sizes an
+allocation, and nothing already read is kept. Half a store is worse than none:
+the entries that arrived would answer while the ones that did not would silently
+re-run the tower, and the caller would have no way to tell the file was bad.
+
+### What it is worth
+
+On the same host and the same 768×512 notice as 0.9.10, minimum of three runs:
+
+| | turn |
+| --- | --- |
+| no file, or the first run with one | 19.60 s |
+| a later run off the file | 10.36 s |
+
+**1.89x on every run after the first**, and what it removes is the encoder
+exactly: 9.25 s of the 9.46 s that remains is the text stack prefilling the 260
+soft tokens, which no store can avoid because those ids are the prompt.
+
+It composes with the budget, and the two are worth having together — measured
+as the pair rather than inferred from the two tables. Two turns about one
+picture, in two processes, at `--image-tokens 40` (the narrowest budget that
+still transcribes the notice exactly) and `--image-keep`:
+
+| | first turn | second turn | both |
+| --- | --- | --- | --- |
+| the shipped path | 19.897 s | 19.546 s | 39.44 s |
+| both flags | 3.362 s | 2.217 s | **5.58 s** |
+
+**7.07x**, and the transcription off the file is still every line exact.
+
+Both halves are held to being the same answer rather than a similar one:
+`logits` is byte for byte across the file, and the greedy transcription with the
+flag matches the run without it exactly. A file entry that is not bit-identical
+to what the tower made is the failure this feature exists to avoid, so it is
+checked as equality and not as closeness.
+
+### And the instrument it turned out to be
+
+Answering a turn with the tower skipped is the measurement 0.9.10 could not
+make. Subtracting a warm turn from a plain one separates the encoder from the
+text stack's prefill of the soft tokens, and doing that across seven grid sizes
+gives the tower's cost law directly: **3.25 ms a patch plus a quadratic term
+worth 17.8% at 2340 patches**, with the text stack a flat 36.5 ms a soft token
+beside it. 0.9.10's table has been corrected against it — as first written it
+reported the whole of what a picture adds as the tower, which is about twice the
+truth.
+
+### Code
+
+- `media_keep_mark`: the encoder version, the backend and its integer path, and
+  the checkpoint, into one mix.
+- `media_store_save`, `media_store_load`: the working set out and back, with
+  every count bounded before it is used and nothing kept on a refusal.
+- `MEDIA_KEEP_VERSION`, `MEDIA_KEEP_TEXT`: the version to bump by hand, and the
+  sixteen byte mark that carries it.
+- `app_main.c`: `--image-keep`, read after the model opens and written before it
+  closes; a missing file silent, a refused one reported.
+
+### Tests
+
+Twenty added, beside the store's own: a round trip whose rows are equal bit
+for bit, an empty store proved empty before the file is read, a missing path
+told apart from a malformed one, a damaged mark refused, a truncated file
+refused, the store left exactly as it was after each of those two refusals, and
+a picture kept at the maximum missing under a budget after travelling through a
+file. **847 pass** on the tuned AVX2 build, 827 before.
+
+The cross-backend refusal is not in the unit suite, because a second backend is
+a second binary and the suite is one: it is checked by building the default
+scalar target beside the tuned one and offering each the other's file.
