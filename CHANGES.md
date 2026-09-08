@@ -6385,3 +6385,712 @@ moves no number, and that is checked the way the rest of this file checks it —
 `logits` byte for byte against the previous build on a text prompt, a picture, a
 clip and a long prefill, and greedy `--guess 8` byte for byte. 822 pass on the
 wide build, 813 without the integer dot product and 813 on SSE2.
+
+---
+
+## 0.9.10 — a patch budget the caller can ask for
+
+### Scope
+
+The cheap half of `TODO.md`'s *fewer patches, before the pooling* — `RESEARCH.md`
+idea 4, and the entry called it the largest vision win available. The tower is
+16 layers of width 768 over every patch, and the 3×3 pooling that turns those
+patches into soft tokens happens **after** the encoder, so every patch is paid
+in full whatever the pooling later does with it. Until now the resize always
+filled the checkpoint's configured maximum, and a caller who wanted a cheaper
+look at a picture had no way to say so.
+
+It now has one. `model_image_budget(model, rows)` caps what a picture may cost
+in soft tokens, and `--image-tokens <n>` is that flag on the command line.
+
+### What it moves, and what it deliberately does not
+
+Only the resize. `vision_grid_pick` sized the picture from `form->soft_limit`;
+it now sizes it from `vision_soft_cap`, which is `soft_limit` unless the caller
+has asked for less. Everything downstream is untouched — the 3×3 pool geometry,
+the two position tables, the patch cut, the projector, and the count of rows the
+tower emits are all still exactly what they were for a grid of that size. **A
+budgeted picture is a smaller picture honestly encoded, not a full one
+truncated**, which is the property that makes the flag safe to hand to a caller.
+
+The budget is a cap and never a floor. Asking for more than the checkpoint
+carries gives the checkpoint's own maximum rather than raising it, because the
+position table is sized for that maximum and not for more; asking for zero puts
+it back. A negative budget is refused rather than clamped.
+
+**Both sides of the resize round down to a whole pooling window, so the rows
+land under the budget rather than on it** — 40 rows at a budget of 48, 35 at 40.
+`--verbose` now prints what a picture actually came to beside the cap in force,
+because a number the caller asked for and a number they got are different
+numbers, and the flag is not honestly plumbed if only the first is visible.
+
+### The identity, which is the one thing that could have gone wrong
+
+A picture's rows are kept against the picture (0.9.7), keyed on the decoded
+samples and the tower configuration. The budget changes what the tower produces
+from the same samples, so it has to be **inside that identity or the store hands
+back the wrong answer** — the same photograph asked for cheaply once and fully
+once would collide on one entry, and nothing downstream could detect it. The
+mix takes `vision_soft_cap` where it took `soft_limit`. A test holds it: one
+raster, two budgets, and both mixes required to differ.
+
+### What it is worth
+
+On a fourth host — four cores of an i5-7600K at 3.8 GHz, AVX2 with FMA and no
+AVX-512, so the integer kernels compile away and the float path is the whole
+engine, the tuned build — over a 768×512 notice in block capitals, minimum of
+three runs each, a one-token turn so that the picture is nearly the whole of it.
+A turn with no picture at all is **0.896 s** on the same line.
+
+The *tower* column is the encoder alone. Separating it needs 0.9.11's picture
+file, which answers the same turn with the tower skipped: **tower = the plain
+turn less the same turn warm**. This entry was first written without that
+instrument and reported the tower as the whole of what a picture adds, which it
+is not — half of what a picture adds is the text stack prefilling the soft
+tokens the tower produced. The table below is the corrected one.
+
+| budget | rows | patches | turn | tower | the rows through the text stack |
+| --- | --- | --- | --- | --- | --- |
+| the checkpoint's 280 | 260 | 2340 | 19.604 s | 9.248 s | 9.460 s |
+| 128 | 117 | 1053 | 8.918 s | 3.716 s | 4.306 s |
+| 64 | 54 | 486 | 4.549 s | 1.638 s | 2.015 s |
+| 48 | 40 | 360 | 3.552 s | 1.210 s | 1.446 s |
+| 40 | 35 | 315 | 3.300 s | 1.115 s | 1.289 s |
+| 32 | 24 | 216 | 2.512 s | 0.743 s | 0.873 s |
+| 16 | 12 | 108 | 1.746 s | 0.379 s | 0.471 s |
+
+**A picture at the full budget is very nearly half encoder and half prefill** —
+9.25 s against 9.46 s — and the budget is worth having because it cuts *both*.
+Patches fall with the area and the soft tokens fall with them, so one knob moves
+two costs that are each about half of the total.
+
+The two halves separate cleanly and each has a simple law:
+
+- **the text stack is 36.5 ms a soft token**, flat from 12 rows to 260 (36.4,
+  36.8, 37.3, 36.2, 36.8, 36.4, 39.2 top to bottom), which is what a prefilled
+  id costs and has nothing to do with the tower;
+- **the tower is 3.25 ms a patch plus a quadratic term**, and fitting
+  `a·n + b·n²` over all seven points puts that term at **17.8% of the tower at
+  the full 2340 patches** — 8.9% at 1053, 1.0% at 108 — with every point inside
+  6% of the fit.
+
+So the dense attention pair is **about a sixth of the encoder at the full grid
+on this host**, against the 34 to 41% of a picture `TODO.md`'s vision attention
+entry records on the reference host. Some of that difference is the denominator
+— that entry measures against a picture and this one against the encoder — but
+not all of it, and the two hosts should not be assumed to agree.
+
+### What it costs, which is the half that has to be reported
+
+The entry's own instruction was to report a quality curve split by reading
+versus recognising, not a latency number. Two pictures, greedy, the same prompt
+at every budget.
+
+**Reading** — a notice of six lines, transcribed:
+
+| budget | rows | what came back |
+| --- | --- | --- |
+| 280 | 260 | every line exact |
+| 128 | 117 | every line exact |
+| 64 | 54 | every line exact |
+| 48 | 40 | every line exact |
+| 40 | 35 | every line exact |
+| 32 | 24 | the heading lost, the remaining five lines exact |
+| 16 | 12 | the heading and the last line both lost |
+
+**Recognising** — a scene of a house, a tree, a sun and three balls:
+
+| budget | rows | what came back |
+| --- | --- | --- |
+| 280 | 266 | house and its colour, door, window, tree |
+| 64 | 54 | house and its colour, roof, tree |
+| 32 | 24 | house, tree, sun, grass — four for four |
+| 16 | 12 | house, tree, sun, ground — still four for four |
+| 8 | 6 | **no picture seen at all** |
+
+So the two halves part company by about a factor of two in rows, and both cliffs
+are sharp rather than gradual. Reading this notice survives to 35 rows and
+breaks at 24; recognising this scene survives to 12. **Six rows is the failure
+worth naming**: the model does not describe a blurred picture, it answers as
+though no picture was attached — *"Please provide the picture you are referring
+to."* A budget that low is not a cheap look, it is a dropped attachment, and a
+caller has no way to tell which it got from the answer alone.
+
+Taking the last budget that keeps the transcription, a picture-reading turn is
+**19.60 s to 3.30 s, 5.94x**, and the encoder inside it 9.25 s to 1.12,
+**8.30x**. Taking the last that keeps the scene, **19.60 s to 1.75 s, 11.2x**.
+
+None of this is a policy and none of it is a default. The flag ships off, the
+shipped path is untouched, and what a caller should ask for depends on their
+picture and their question — which is why the two curves above are given as
+curves rather than reduced to a recommendation. Two pictures are also not a
+quality study: they are a shape, taken on synthetic rasters written for the
+purpose, and the cliff on a photograph of a page has not been measured.
+
+### That the shipped path is untouched
+
+By construction: with no budget asked for, `vision_soft_cap` returns
+`soft_limit` and every caller of it reads what it read before. Held end to end
+against a binary built from the previous commit — `logits` byte for byte on a
+text prompt and on both pictures, and, on the new build, the default,
+`--image-tokens 280` and `--image-tokens 400` byte for byte with each other.
+Two runs at one budget are byte for byte, and a budget against the default
+differs, so the flag is neither a no-op nor a source of noise.
+
+### Code
+
+- `tower_form`: `soft_budget`, the caller's cap, zero for the checkpoint's own.
+- `vision_soft_cap`: the cap in force, and the one place the two are reconciled.
+- `vision_grid_pick`, `media_mark`, `model_image_rows`: all three read it.
+- `model_image_budget`, `model_image_rows_most`: the setter, and the way to ask
+  what the checkpoint itself allows.
+- `app_main.c`: `--image-tokens`, put in force once between the load and the
+  task; the `--verbose` line reporting a picture's actual rows; and the
+  `--guess` usage line, which still said *greedy only* three versions after
+  0.9.8 gave the block path a temperature.
+
+### Tests
+
+Fourteen added, all in the tower test beside the picture store: the default cap,
+a negative budget refused, a budget over the maximum clamped to it, zero putting
+it back, the rows a budgeted picture emits, the row width unmoved, every value
+finite, and — the one that matters — one raster under two budgets giving two
+identities in both mixes, and the narrow call not being served the wide entry.
+**827 pass** on the tuned AVX2 build, 813 before.
+
+---
+
+## 0.9.11 — a picture's rows beyond one process
+
+### Scope
+
+What 0.9.7 left. The picture store keys a picture's rows on the decoded samples
+and the tower's configuration, and it is very good at the case it was built for
+— a photograph and several questions inside one loop. It cannot help the
+ordinary case, which is a run at a time: ask about a picture, read the answer,
+ask again tomorrow. `TODO.md` named the three things a file needs before it is
+safe to have, and refused to have one without all three. All three are here.
+
+`media_store_save` and `media_store_load` write and read the store; the flag is
+`--image-keep <path>`, read at the start of a run and written at the end.
+
+### The three, and why each is not optional
+
+**The backend, and an encoder version.** A picture's own identity mixes the
+samples and the tower's shape, which is everything that can vary *inside one
+process* — a backend cannot change under an entry that cannot outlive the
+process that made it, and neither can the code. A file outlives both. A scalar
+build and a VNNI build do not produce the same rows from the same pixels, and
+neither do two versions of this engine whose resize or projector differ. So the
+mark carries `back_flavor()`, `desk->level_live` beside it — an AVX-512 build
+and an AVX-512-with-VNNI build both call themselves `cpu/avx512` and only the
+second takes the integer path — and `MEDIA_KEEP_VERSION`, which is **bumped by
+hand** whenever anything between `vision_grid_pick` and the projector changes.
+Forgetting to bump it is the one mistake this design cannot catch, which is why
+it is written down twice.
+
+That the backend half works is checked with two real builds rather than
+asserted: a file written by the tuned AVX2 build and offered to the default
+scalar build is refused, the run says so, and it encodes the pictures again.
+
+**They go in the file's mark, not in each picture's identity**, and the
+placement is the decision rather than a detail. In the identity a stale file
+would simply miss on every entry, which a caller cannot tell from an empty one.
+In the mark the whole file is refused at once and the caller is told what
+happened.
+
+**Where it lives and who evicts it** is the caller's, exactly as `--keep` is:
+the engine reads and writes a path it is given and refuses a file that disagrees
+with its mark. What is written is the **working set and not an archive** — the
+same four entries under the same eviction as memory — so the file cannot grow
+without bound, and a caller who wants two working sets names two paths. The
+shipped export writes 1.5 MiB an entry.
+
+### What a bad file does
+
+Nothing. A refusal leaves the store exactly as it was and returns
+`APP_FAIL_FORMAT`, which a caller may ignore and carry on from — the only cost
+of ignoring it is running the tower, which is what the engine would have done
+without the flag at all. A path with nothing at it is `APP_FAIL_MISSING` and is
+told apart from a file that is there and wrong, because the first is an ordinary
+first run and the second is worth a word.
+
+**A file that fails part way through is refused whole.** Every count is bounded
+against what this checkpoint could have produced before a byte of it sizes an
+allocation, and nothing already read is kept. Half a store is worse than none:
+the entries that arrived would answer while the ones that did not would silently
+re-run the tower, and the caller would have no way to tell the file was bad.
+
+### What it is worth
+
+On the same host and the same 768×512 notice as 0.9.10, minimum of three runs:
+
+| | turn |
+| --- | --- |
+| no file, or the first run with one | 19.60 s |
+| a later run off the file | 10.36 s |
+
+**1.89x on every run after the first**, and what it removes is the encoder
+exactly: 9.25 s of the 9.46 s that remains is the text stack prefilling the 260
+soft tokens, which no store can avoid because those ids are the prompt.
+
+It composes with the budget, and the two are worth having together — measured
+as the pair rather than inferred from the two tables. Two turns about one
+picture, in two processes, at `--image-tokens 40` (the narrowest budget that
+still transcribes the notice exactly) and `--image-keep`:
+
+| | first turn | second turn | both |
+| --- | --- | --- | --- |
+| the shipped path | 19.897 s | 19.546 s | 39.44 s |
+| both flags | 3.362 s | 2.217 s | **5.58 s** |
+
+**7.07x**, and the transcription off the file is still every line exact.
+
+Both halves are held to being the same answer rather than a similar one:
+`logits` is byte for byte across the file, and the greedy transcription with the
+flag matches the run without it exactly. A file entry that is not bit-identical
+to what the tower made is the failure this feature exists to avoid, so it is
+checked as equality and not as closeness.
+
+### And the instrument it turned out to be
+
+Answering a turn with the tower skipped is the measurement 0.9.10 could not
+make. Subtracting a warm turn from a plain one separates the encoder from the
+text stack's prefill of the soft tokens, and doing that across seven grid sizes
+gives the tower's cost law directly: **3.25 ms a patch plus a quadratic term
+worth 17.8% at 2340 patches**, with the text stack a flat 36.5 ms a soft token
+beside it. 0.9.10's table has been corrected against it — as first written it
+reported the whole of what a picture adds as the tower, which is about twice the
+truth.
+
+### Code
+
+- `media_keep_mark`: the encoder version, the backend and its integer path, and
+  the checkpoint, into one mix.
+- `media_store_save`, `media_store_load`: the working set out and back, with
+  every count bounded before it is used and nothing kept on a refusal.
+- `MEDIA_KEEP_VERSION`, `MEDIA_KEEP_TEXT`: the version to bump by hand, and the
+  sixteen byte mark that carries it.
+- `app_main.c`: `--image-keep`, read after the model opens and written before it
+  closes; a missing file silent, a refused one reported.
+
+### Tests
+
+Twenty added, beside the store's own: a round trip whose rows are equal bit
+for bit, an empty store proved empty before the file is read, a missing path
+told apart from a malformed one, a damaged mark refused, a truncated file
+refused, the store left exactly as it was after each of those two refusals, and
+a picture kept at the maximum missing under a budget after travelling through a
+file. **847 pass** on the tuned AVX2 build, 827 before.
+
+The cross-backend refusal is not in the unit suite, because a second backend is
+a second binary and the suite is one: it is checked by building the default
+scalar target beside the tuned one and offering each the other's file.
+
+---
+
+## 0.9.12 — a kept cache reused as far as it agrees
+
+### Scope
+
+The entry 0.9.11 put at the top of the speed list, taken. It was the largest
+unclaimed number in that list and it was not in a kernel.
+
+A picture's soft tokens sit at the **front** of a prompt and the question sits
+behind them, so a second question about the same photograph shares every
+expensive id and differs only in the cheap ones. `main_keep_prime` already
+computed that shared prefix — its own comment said *"What is reused is a prefix
+and not a match"* — and then the next line threw it away unless the whole of the
+held cache was a prefix of the new prompt, which is the case where the question
+did not change. **The prefix was computed and then refused.**
+
+### What it took
+
+**A session that can be wound back.** `session_hold(session, keep_count)` puts a
+session back to its first `keep_count` ids. Attention here is causal, so those
+rows depend on nothing after them: dropping the rest leaves the session in the
+state it was in when it had primed that many, and priming a different tail onto
+it produces what priming the whole of that prompt would have.
+
+**And a stamp that answers for a prefix.** The old one folded the tower's
+embedding rows over the first `k` ids, and the file holds one number, so it
+could only ever be checked at the length it was taken. It now folds **every** row
+the reel carries, whatever the length — which is the same number for two prompts
+that show the same pictures however differently they go on, so one number
+answers for every prefix of them at once. The ids either side are compared
+directly and are what place the rows; the stamp only has to say the rows are the
+same rows, which the ids cannot, because two pictures lay down the same
+placeholder ids. `KEEP_MARK_TEXT` goes to `igllm cache 3` because the number
+behind it means something else now.
+
+### The refusal, which is the reason the call can fail
+
+**A ring that has turned over cannot be wound back.** A layer whose `cache_span`
+is shorter than what has been primed holds its rows at slots whose meaning is
+fixed by `fill_count` — slot `i` is id `i` only while the ring has never wrapped
+— so winding `fill_count` back does not wind the rows back with it, and the
+attention would then read the wrong rows with nothing downstream able to tell.
+It is refused in front instead, and the caller primes from nothing, which costs
+what it cost before there was a file at all. On the shipped export the sliding
+window is 512, so every prompt short of that is covered and the ones past it
+lose nothing they had.
+
+**The cache peaks are deliberately left alone**, and it is worth saying why
+rather than leaving it to be rediscovered. They are running maxima over
+everything a session has written and cannot be un-maxed by a wind back — but
+nothing reads them except `session_cache_peak`, which reports them, and the
+quantized store takes its scale from the export's calibration rather than from
+what a prompt reached. No arithmetic depends on a peak. So a wound-back session
+reports a peak covering rows it no longer holds, which is conservative in the
+only direction that matters, and `--cache 8` stays byte for byte. That was
+checked and not assumed.
+
+### What it is worth
+
+On the fourth host, the 768×512 notice at 260 soft tokens, `--image-keep` and
+`--keep` both given. Each row after the first is a question that had **never
+been asked before**, so the prefix is genuinely partial every time — measuring
+the same question twice measures the old whole-prefix path and says nothing
+about this change:
+
+| run | seconds |
+| --- | --- |
+| the first, cold | 19.990 |
+| a question never asked | 0.931 |
+| another | 0.833 |
+| another | 0.912 |
+| another | 0.979 |
+| another | 0.933 |
+
+**20.0 s to about 0.93, some 21x** — and against 0.9.11, where only the picture
+file helped and the soft tokens were prefilled again, **10.5 s to 0.93, about
+11x**. A typical round keeps 267 of 278 ids.
+
+### That it is the same answer
+
+A prefix-primed run has to be **bit for bit** a fresh one, and this is checked
+rather than reasoned about, because it could have failed: a batched prime is
+sixteen lanes wide, so priming a tail alone lands on different batch boundaries
+than priming the whole prompt, and `TODO.md` already warns that a batch and a
+sequence of steps can take different kernels. They do not here.
+
+Greedy `chat` output compared against a run with no files at all, on the shipped
+export:
+
+- a picture and a question never asked — same text, 267 of 278 ids kept;
+- text with no picture at all and a shared opening — same text, 23 of 33 kept;
+- the same under `--cache 8` — same text, 23 of 33 kept;
+- a new prompt *shorter* than the held one — same text, 9 of 14 kept;
+- **a different picture behind identical ids** — nothing kept, and the same
+  text: the stamp catches what the ids cannot;
+- **a prompt long enough to lap the ring** — nothing kept, and the same text:
+  the guard refuses and the run pays what it always paid.
+
+The last two are the ones that matter. Both are cases where reuse would be
+wrong, both refuse, and both still produce the right answer.
+
+`logits` does not read `--keep` at all — only `main_serve` primes from a file —
+so a comparison taken through that task tests nothing here. This was found the
+hard way, and it is why every row above is greedy `chat` text.
+
+### Code
+
+- `session_hold`, `session_ring_least`: the wind back, and the shortest ring it
+  is refused against.
+- `main_keep_stamp`: the whole reel rather than a prefix of it, which is what
+  lets one stored number answer for every prefix.
+- `main_keep_prime`: a partial prefix accepted, wound back to, and given up on
+  where the wind back is refused.
+- `KEEP_MARK_TEXT`: `igllm cache 3`.
+
+### Tests
+
+Twenty-four added, on the synthetic checkpoint, whose sliding window is four so
+that a prompt of six ids laps the ring where the shipped export would need five
+hundred: a wind back to a shared head and a different tail reaching the same
+logits as a fresh prime bit for bit, with a check that the two tails differ at
+all so the first check has teeth; a wind back to what is already there moving
+nothing, down to the echo history; a turned-over ring refused and moving
+nothing; and refusals for no session, a negative count, a count past the fill,
+and a block in flight. **871 pass**, 847 before.
+
+---
+
+## 0.9.13 — a clip's rows, kept and beyond one process
+
+### What was missing
+
+0.9.7 gave a picture's rows a store on the model, 0.9.11 gave that store a file,
+and 0.9.12 made a kept cache reusable as far as it agrees. Each of those closed
+an entry in `TODO.md` and each left the same sentence behind it: *a clip's rows
+are not kept at all, in memory or on disk, and whether that is worth having is a
+question nobody has asked.*
+
+This asks it. The answer is yes, and it is worth less than the picture's store
+was — for a reason that is the most useful thing in this entry.
+
+### What it took
+
+Almost nothing that was not already written. `media_audio` now does what
+`media_image` does: take an identity, look for it, and file the rows against it
+when the tower has made them.
+
+**The identity, and where "decoded" falls.** A picture's identity is taken on
+the raster before the resize, so the container and the decoder are outside it
+while the resize is inside it by way of the configuration that drives it. The
+same line for a clip is the samples `wave_read` hands back — **before**
+`wave_rate` moves them onto the processor's rate and before the budget cuts
+them. So one recording stored as sixteen-bit pcm and as float is one entry, and
+the same recording at another sample rate is not, which is right both times: the
+second resamples to something else and would not make these rows. Into the mix
+go the samples, the clip's own two numbers, the front end that frames them —
+rate, mel count, frame size and step, window, pad, and the floor the log is
+taken above — the budget, the tower's shape, the width the projector lifts into,
+and the checkpoint's mapped size. Two independent mixes, for the reason
+`media_mark` gives at length: a silent hit on a clip the caller never played is
+the one failure a store like this must not have.
+
+**`cut_flag` is kept beside the rows and not derived from them.** A clip past
+the budget is cut and `media_audio` says so; that is part of what a caller is
+handed and not a property of the rows, so a hit has to carry it. Without it a
+caller would learn whether its clip was cut from whether it had asked before.
+
+**Two numbers copied out before the work starts.** `wave_rate` resamples in
+place and the budget cuts in place, so by the time the rows exist the clip's
+count and rate are the processor's and not the file's — and it is the file's
+that the entry is filed under. `sound_recall` and `sound_keep` therefore take
+those two as arguments where the picture's take a `flat_grid`.
+
+**Two stores rather than one with two kinds of entry**, in memory and on disk
+both. The eviction is the argument: a loop comparing four photographs would
+otherwise throw away the clip the whole conversation is about. It also means a
+checkpoint with one tower and not the other never has to write a file it can
+never read back, and a caller with only pictures carries no clip section.
+`--audio-keep <path>` is `--image-keep`'s twin and is separate from it for the
+same reason `--keep` is separate from both.
+
+The file carries `igllm clip 1` and its own `SOUND_KEEP_VERSION`, and its mark
+holds the backend name, `desk->level_live` beside it, and the whole front end —
+the three things 0.9.11 established a file needs before it is safe. A file that
+is not this engine's, this backend's or this checkpoint's is refused whole; a
+truncated one is refused whole as well, and nothing that did arrive is kept.
+
+### What it is worth, and the number that matters more
+
+Fourth host, i5-7600K, four cores, AVX2 with FMA and no AVX-512. A synthetic
+ten-second clip at the tower's own rate — 250 soft tokens, 265 prompt ids — and
+four questions about it, each asked in its own process, greedy:
+
+| run | no store | `--audio-keep` | `--audio-keep` and `--keep` |
+| --- | --- | --- | --- |
+| the first, cold | 14.46 s | 14.50 s | 14.81 s |
+| a question never asked | 14.55 | 11.34 | 1.87 |
+| another | 14.73 | 11.09 | 1.83 |
+| another | 14.66 | 11.10 | 1.71 |
+
+So the clip store on its own is **14.5 s to 11.1, about 1.31x**, and beside a
+kept cache it is **14.7 s to about 1.8, some 8.1x**.
+
+At the budget's own ceiling — a thirty-second clip, 750 soft tokens, 765 ids —
+the same shape: **40.56 s cold to 30.83 and 30.42 warm, 1.32x.**
+
+**And that 1.3x is the finding.** 0.9.11 measured a picture as half encoder and
+half text stack. A clip is not:
+
+- the conformer is the difference between a cold turn and a warm one, which
+  needs no assumption about anything else: **3.4 s of a 14.5 s turn** at ten
+  seconds and **10.1 s of 40.6** at thirty — **a quarter of the turn, both
+  times**, and 13.6 then 13.5 ms a soft token, which is as linear as this file
+  gets;
+- the prefill of the soft tokens is **10.04 s of 14.5** and **28.75 s of 40.6** —
+  265 and 765 ids at 26.4 and 26.6 tokens a second — **about 70%**.
+
+Against 0.9.11's picture at 35.6 ms a row, **the audio encoder is 2.7 times
+cheaper per soft token than the vision one**, while the text stack charges both
+of them the same ~38 ms. That is why this store is worth 1.3x where the
+picture's was 1.9x, and it is the honest way to read the table above: **for a
+clip the store is not the prize, the prefill is.** `--audio-keep` alone buys a
+quarter; it is `--keep` beside it that buys the rest, and a caller told to
+expect a picture's numbers from a clip has been misled.
+
+One more number a caller needs: the file holds post-projector rows at the text
+stack's width, so one thirty-second clip is 4.6 MiB — 750 × 1536 × 4 — and a
+full store of four is about 18 MiB. It is a working set and not an archive, as
+`--image-keep`'s is.
+
+### That it is the same answer
+
+Greedy `chat` text, on the shipped export, with the store and without it, in
+separate processes:
+
+- *"What do you hear?"* — same text.
+- *"Is there a voice in it?"* — same text.
+
+Both against a run with no file at all, which is what the store has to be
+indistinguishable from.
+
+### Code
+
+- `sound_note`, `model->audio_note`, `model->sound_turn`: the store, beside the
+  picture's and evicting separately from it.
+- `sound_mark`, `sound_recall`, `sound_keep`: the identity, the hit and the
+  file, with the clip's two numbers passed rather than read back.
+- `sound_keep_mark`, `sound_store_save`, `sound_store_load`,
+  `SOUND_KEEP_VERSION`, `SOUND_KEEP_TEXT`, `SOUND_ROW_LIMIT`: the file.
+- `media_audio`: the recall in front of `wave_rate` and the keep behind
+  `audio_run`.
+- `--audio-keep <path>` in `app_main.c`, read at the start of a run and written
+  at the end, exactly as `--image-keep` is.
+
+### Tests
+
+Forty-three added, on the synthetic checkpoint: a clip asked twice coming back
+bit for bit and copied out; one sample moved being a different clip in both
+mixes, with the sample restored by assignment so the check is of the mix and not
+of whether a float round trips; another clip missing and getting rows of its
+own; a cut clip still saying it was cut on a hit and through the file; five
+clips through a store of four evicting each other and leaving the picture beside
+them alone; and the file — written, the store emptied by hand, read back bit for
+bit, a missing path told apart from a damaged one, a damaged mark refused, and a
+truncation refused.
+
+Two of those are worth naming. The truncation is cut **inside an entry's rows**
+rather than inside its header, which is the case that could have left the store
+half filled — the header parsed, the allocation made, the read that fills it
+coming up short — and which the picture's own truncation test does not reach.
+And each store refuses the other's file, so a caller that swaps two paths gets a
+refusal rather than a store full of the wrong tower's rows.
+
+The tests were checked against the implementation rather than assumed to bite:
+dropping `cut_flag` from a recall fails two, and taking the samples out of the
+identity fails three — including `a clip that sounds different reaches a
+different answer`, which is 0.8.x's and which fails there because the store
+hands back the wrong clip. That is the silent-collision failure mode, caught by
+a test written before this store existed.
+
+**914 pass**, 871 before.
+
+---
+
+## 0.9.14 — a kept cache divided by media run
+
+### What it was
+
+0.9.12 made a kept cache reusable as a *prefix* rather than only as a whole
+match, and it did that by folding every embedding row the prompt carried into
+one number. That was the right shape for what it was for: a stamp taken at a
+length can only be checked at that length, and the file holds one number, so a
+fold over the whole reel is the same number for two prompts that show the same
+pictures however differently they go on, and it answers for every prefix of them
+at once.
+
+What it could not do is answer for *part* of the pictures. One number can say
+*these are not the same prompts* and cannot say *they agree for the first two of
+three*. `TODO.md` recorded it plainly: **a different picture behind identical
+ids costs a full re-prime, which is correct and is not optimal.** A prompt
+showing two pictures where only the second changed kept nothing at all — not
+even the first picture's soft tokens, which are identical and which are the
+expensive part.
+
+### What it took
+
+**The fold is divided along the runs the towers filled.** A run is a stretch of
+ids the reel carries rows for; `main_keep_note` folds each one on its own and
+records where it begins and ends. `app_keep_note` carries up to `APP_KEEP_RUNS`
+of them beside the cache, written in front of the echo ids, and `KEEP_MARK_TEXT`
+goes to `igllm cache 4` because the file holds something it did not.
+
+**A prompt with more runs than there is room for folds the rest into the last
+slot** and stretches that slot's `till` over them, so the tail can only be
+checked whole. That is exactly what the single stamp did, applied to the tail —
+so the overflow is safe by construction rather than by a bound anyone has to
+remember to keep.
+
+**`keep_note_share` is the rule, and it lives in the core rather than in the
+caller.** It takes the length the ids agreed on and hands back the length that
+survives comparing the runs, which is that length or less and is never more.
+Three ways a run can fail and all three end the prefix at the same place: either
+side missing a run the other has, the two disagreeing on where it sits or how
+long it is, or the two agreeing on all of that and folding to different numbers
+— which is the case this exists for, since two pictures lay down the same
+placeholder ids. **A run that reaches past the shared ids ends it too**, because
+a run is folded whole and its number cannot speak for part of one.
+
+It is in the core because it is the piece a mistake would be silent in, and the
+core is what the test suite can reach. It is **symmetric** on purpose: walking
+only the file's runs and trusting that the new prompt cannot carry a run the
+file did not would be safe only because a placeholder id appearing as ordinary
+text is unlikely, and a rule that is safe only because something is unlikely is
+not a rule.
+
+**The whole-reel stamp is gone rather than kept beside it.** The run note says
+everything it said and more, and leaving it to fill a field nothing reads would
+have been the sort of thing this file exists to prevent. A prompt file now
+writes zero there; a conversation file still uses that field for its turn count,
+which is what it was always for.
+
+### What it is worth
+
+Fourth host, two synthetic 768×512 rasters at `--image-tokens 128`, `--keep` and
+`--image-keep` both given, greedy, each run its own process. The budget is there
+because it has to be: two pictures at the checkpoint's own 280 rows come to some
+574 ids, the shipped export's sliding window is 512, and **a prompt that laps
+the ring cannot be wound back at all** — so nothing here reaches that case, and
+that is a limit of 0.9.12's wind back rather than of this entry.
+
+| the second turn | 0.9.12 | 0.9.14 |
+| --- | --- | --- |
+| the second picture changed | nothing kept, 14.50 s | **124 of 251 ids, 10.03 s** |
+| a picture added in front of the question | nothing kept, 14.54 s | **123 of 251, 9.91 s** |
+| a picture dropped | nothing kept, 7.97 s | **123 of 132, 1.93 s** |
+| nothing changed, a new question | 242 of 251, 1.94 s | 242 of 251, 1.92 s |
+
+So **1.45x** where the second of two pictures moved, **1.47x** where one was
+added, and **4.1x** where one was dropped — and the case 0.9.12 already handled
+is untouched, which is the row that says this took nothing away.
+
+The 124 ids kept in the first row are the first picture's soft tokens and the
+frame in front of them. The second picture's are paid, as they must be.
+
+### That it is the same answer
+
+Every row above was run twice: once with both files and once with no files at
+all, and the greedy text compared. **All six cases are byte for byte the same**,
+including the three that have to refuse:
+
+- the second picture changed — 124 kept, same text;
+- the **first** picture changed — 5 kept, same text: everything behind a changed
+  picture is refused, which is the case a wrong rule would answer with rows from
+  a picture the caller never showed;
+- both changed — 5 kept, same text;
+- nothing changed, a new question — 242 kept, same text;
+- a picture dropped — 123 kept, same text;
+- a picture added — 123 kept, same text.
+
+### Code
+
+- `app_keep_note`, `APP_KEEP_RUNS`: the runs a kept prompt carries.
+- `keep_note_share`: the rule, in the core so the suite can reach it.
+- `keep_note_sane`: a run list this engine could not have written, refused on
+  the way out as well as on the way in.
+- `session_save`, `session_load`: the note beside the cache;
+  `KEEP_MARK_TEXT` to `igllm cache 4`.
+- `main_keep_note` replaces `main_keep_stamp`; `main_keep_prime` cuts its
+  prefix with `keep_note_share` instead of throwing it away on one number.
+
+### Tests
+
+Twenty-four added. Fourteen are `keep_note_share` stated as *what the caller may
+keep*: the same pictures keeping everything, a second picture that changed
+keeping what is in front of it, a first picture that changed keeping only what
+is in front of **it**, a run that moved, a run whose length moved, a run dropped,
+a run added, shared ids ending inside a run and exactly at the end of one, two
+prompts with no pictures at all, and a full list of sixteen runs with one that
+differs — swept at every length, checking that the answer is never more than it
+was given and never reaches past the run that differs.
+
+The rest are the file: runs written and read back exactly, an empty run,
+overlapping runs and more runs than there is room for all refused on the way out,
+and a run count damaged in a written file refused on the way in.
+
+**938 pass**, 914 before.

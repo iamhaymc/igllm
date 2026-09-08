@@ -43,6 +43,17 @@ typedef struct main_flag {
    * none: a block of one lane is an ordinary step with the block path's
    * bookkeeping around it. */
   int         guess_span;
+  /* Soft tokens one picture may cost, zero for the checkpoint's own maximum.
+   * It buys most of what a picture costs and it costs detail, so it is a flag
+   * and never a default. */
+  int         image_rows;
+  /* A file the pictures' rows are read from at the start and written to at the
+   * end, so that a photograph asked about in two runs is encoded in one. */
+  const char *image_keep;
+  /* And the same for clips' rows.  A second path rather than a section of the
+   * first, because the two stores evict separately and a caller with only one
+   * kind of media should not be made to carry a file for the other. */
+  const char *audio_keep;
   const char *keep_path;
   app_taste   taste;
 } main_flag;
@@ -113,13 +124,16 @@ static void main_usage(void) {
   printf("  --serve <count>     tokens to produce, default 128\n");
   printf("  --threads <count>   worker threads, default host count\n");
   printf("  --window <count>    context length cap\n");
+  printf("  --image-tokens <n>  soft tokens a picture may cost, fewer for a faster read\n");
+  printf("  --image-keep <path> hold pictures' rows here, and reuse them next run\n");
+  printf("  --audio-keep <path> hold clips' rows here, and reuse them next run\n");
   printf("  --cache <bits>      key and value cache storage, 0 float or 8 quantized\n");
   printf("  --heat <value>      temperature, 0 for greedy\n");
   printf("  --top-k <count>     top-k cutoff, 0 disables\n");
   printf("  --top-p <value>     top-p cutoff\n");
   printf("  --echo-penalty <v>  repetition penalty\n");
   printf("  --seed <value>      sampler seed\n");
-  printf("  --guess <lanes>     speculative block, greedy only, 0 or 1 for none\n");
+  printf("  --guess <lanes>     speculative block, 0 or 1 for none\n");
   printf("  --loop              keep the chat task open for more turns\n");
   printf("  --keep <path>       hold the prompt's cache here, and reuse it next time\n");
   printf("  --raw               skip the chat frame in the chat task\n");
@@ -160,6 +174,9 @@ static int main_flags(int argc, char **argv, main_flag *flag_out) {
     else if (strcmp(name_text, "--guess") == 0 && value_text) flag_out->guess_span = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--threads") == 0 && value_text) flag_out->thread_count = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--window") == 0 && value_text) flag_out->window_limit = atoi(argv[++argument_index]);
+    else if (strcmp(name_text, "--image-tokens") == 0 && value_text) flag_out->image_rows = atoi(argv[++argument_index]);
+    else if (strcmp(name_text, "--image-keep") == 0 && value_text) flag_out->image_keep = argv[++argument_index];
+    else if (strcmp(name_text, "--audio-keep") == 0 && value_text) flag_out->audio_keep = argv[++argument_index];
     else if (strcmp(name_text, "--cache") == 0 && value_text) flag_out->cache_bits = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--heat") == 0 && value_text) flag_out->taste.heat_value = (float)atof(argv[++argument_index]);
     else if (strcmp(name_text, "--top-k") == 0 && value_text) flag_out->taste.top_count = atoi(argv[++argument_index]);
@@ -207,6 +224,12 @@ static int main_media_load(app_model *model, const main_flag *flag, app_media *m
      * reference does with one.  Saying so is the difference between an answer
      * about the whole clip and an answer about its first half, and with more
      * than one clip in a prompt the line has to say which of them was cut. */
+    /* What the picture actually came to, which is not the budget: both sides of
+     * the resize round down to a whole pooling window, so the rows land under
+     * whatever cap was in force rather than on it. */
+    if (!audio_flag && flag->verbose_level > 0)
+      fprintf(stderr, "[image %s: %d rows of at most %d]\n", show->path_text,
+              media_list[show_index].row_count, model_image_rows(model));
     if (audio_flag && media_list[show_index].cut_flag)
       fprintf(stderr, "audio: the clip runs past the budget of %d s and is cut to it (%s)\n",
               (model_audio_rows(model) * model_audio_span_ms(model) + 999) / 1000,
@@ -311,45 +334,96 @@ static void main_emit(app_model *model, int32_t id_value) {
   }
 }
 
-/* What a kept cache is stamped with: the embedding rows a tower filled, which
+/* What a kept cache is marked with: the embedding rows a tower filled, which
  * the ids cannot speak for.  Two pictures lay down the same placeholder ids, so
- * without this a cache kept for one prompt would be restored for the other. */
-static uint64_t main_keep_stamp(const main_reel *reel, int id_count) {
-  uint64_t stamp_value = 0xCBF29CE484222325ull;
-  int id_index, value_index;
-  for (id_index = 0; id_index < id_count; ++id_index) {
-    if (!reel->state_flag[id_index]) continue;
-    for (value_index = 0; value_index < reel->state_size; ++value_index) {
-      float value_now = reel->state_list[(size_t)id_index * (size_t)reel->state_size +
-                                         (size_t)value_index];
-      uint32_t raw_value;
-      memcpy(&raw_value, &value_now, sizeof(raw_value));
-      stamp_value = (stamp_value ^ raw_value) * 0x100000001B3ull;
+ * without this a cache kept for one prompt would be restored for the other.
+ *
+ * **A run at a time, and not one number over the whole prompt.**  0.9.12 folded
+ * every row the reel carried into one stamp, and that is what let a cache be
+ * reused as a *prefix* at all: a stamp taken at a length can only be checked at
+ * that length, while one over the whole reel is the same number for two prompts
+ * that show the same pictures however differently they go on, so it answers for
+ * every prefix of them at once.  What it could not do is answer for *part* of
+ * the pictures.  It could say *these are not the same prompts* and not *they
+ * agree for the first two of three*, so a prompt showing two pictures where
+ * only the second moved kept nothing at all.
+ *
+ * This divides the same fold along the runs the towers filled — a run is a
+ * stretch of ids the reel carries rows for — and folds each on its own.  A
+ * caller then compares them in order and keeps the ids in front of the first
+ * run that disagrees.  The ids either side are still compared directly, which
+ * is what places the rows; these only have to say the rows are the same rows.
+ *
+ * A prompt with more runs than `APP_KEEP_RUNS` folds the rest into the last
+ * slot and stretches that slot's `till` over them, so the tail can only be
+ * checked whole.  That is exactly the old single stamp's behaviour applied to
+ * the tail, so the overflow is safe by construction rather than by a bound
+ * anyone has to remember to keep. */
+static void main_keep_note(const main_reel *reel, app_keep_note *note_out) {
+  int id_index = 0;
+  memset(note_out, 0, sizeof(*note_out));
+  if (!reel->state_flag) return;
+  while (id_index < reel->id_count) {
+    int slot, from_id;
+    if (!reel->state_flag[id_index]) { ++id_index; continue; }
+    from_id = id_index;
+    while (id_index < reel->id_count && reel->state_flag[id_index]) ++id_index;
+    /* The last slot swallows everything past it, and its `till` grows to cover
+     * what it swallowed. */
+    slot = note_out->run_count < APP_KEEP_RUNS ? note_out->run_count : APP_KEEP_RUNS - 1;
+    if (slot == note_out->run_count) {
+      note_out->from_list[slot] = (int32_t)from_id;
+      note_out->mark_list[slot] = 0xCBF29CE484222325ull;
+      note_out->run_count += 1;
+    }
+    note_out->till_list[slot] = (int32_t)id_index;
+    {
+      uint64_t mark_value = note_out->mark_list[slot];
+      int row_index, value_index;
+      for (row_index = from_id; row_index < id_index; ++row_index)
+        for (value_index = 0; value_index < reel->state_size; ++value_index) {
+          float value_now = reel->state_list[(size_t)row_index * (size_t)reel->state_size +
+                                             (size_t)value_index];
+          uint32_t raw_value;
+          memcpy(&raw_value, &value_now, sizeof(raw_value));
+          mark_value = (mark_value ^ raw_value) * 0x100000001B3ull;
+        }
+      note_out->mark_list[slot] = mark_value;
     }
   }
-  return stamp_value;
 }
 
-/* Primes a prompt, reusing a cache kept from an earlier run where the file
- * holds a prompt this one begins with.
+/* Primes a prompt, reusing whatever a cache kept from an earlier run shares
+ * with it.
  *
- * What is reused is a prefix and not a match: a kept cache of six hundred ids
- * in front of a prompt of six hundred and four is six hundred ids that need not
- * be primed again, and the four are primed onto it.  A file that does not
- * begin this prompt is a different conversation and is replaced. */
+ * What is reused is a **prefix, and not only a whole one**.  Where the file's
+ * prompt is entirely in front of this one, all of it is kept and the rest is
+ * primed onto it.  Where the two agree for a while and then part — the same
+ * picture and a different question about it, which is the case this is for —
+ * the cache is wound back to where they part and only the tail is primed.  A
+ * picture's soft tokens sit at the front of a prompt and the question behind
+ * them, so that shared head is nearly all of what a multi-modal prompt costs.
+ *
+ * Two things have to hold and both are checked.  The ids have to match, which
+ * places the rows; and the stamp has to match, which says the rows under those
+ * ids came from the same pictures — the ids cannot say it, because two pictures
+ * lay down the same placeholder ids.  Winding back can also be refused outright
+ * where a ring has turned over, and then this primes from nothing, which is
+ * what it did before any of this. */
 static app_code main_keep_prime(const main_flag *flag, app_session *session,
                                 const main_reel *reel) {
   int32_t *held_list = NULL;
   int held_count = 0, same_count = 0, held_kind = APP_KEEP_PROMPT;
-  uint64_t stamp_value = 0, held_stamp = 0;
+  app_keep_note held_note, now_note;
   app_code code;
 
   if (!flag->keep_path) return session_prime_media(session, reel->id_list, reel->id_count,
                                                    reel->state_list, reel->state_flag);
+  main_keep_note(reel, &now_note);
   /* Only a prompt file is a prompt cache.  A conversation holds an answer and
    * every id of it, so priming a prompt onto it would be a turn the model never
    * had; the loop's `/open` is what a conversation is read with. */
-  if (session_load(session, flag->keep_path, &held_stamp, &held_kind) == APP_OKAY &&
+  if (session_load(session, flag->keep_path, NULL, &held_note, &held_kind) == APP_OKAY &&
       held_kind == APP_KEEP_PROMPT) {
     held_count = session_ids(session, NULL, 0);
     held_list = (int32_t *)calloc((size_t)(held_count > 0 ? held_count : 1), sizeof(int32_t));
@@ -359,8 +433,19 @@ static app_code main_keep_prime(const main_flag *flag, app_session *session,
     while (held_list && same_count < held_count && same_count < reel->id_count - 1 &&
            held_list[same_count] == reel->id_list[same_count])
       ++same_count;
-    stamp_value = main_keep_stamp(reel, same_count);
-    if (same_count != held_count || held_stamp != stamp_value) same_count = 0;
+    /* The ids have taken this as far as they can.  What they cannot say is
+     * that the rows under them came from the same pictures, and that is what
+     * the run marks are for: the prefix is cut back to the front of the first
+     * run that disagrees, rather than thrown away because some later run
+     * does. */
+    same_count = keep_note_share(&held_note, &now_note, same_count);
+    /* Where the two prompts part before the file runs out, the cache holds rows
+     * this prompt does not want and has to be wound back off them.  A session
+     * that will not wind back is not an error: it is primed from nothing, which
+     * costs what it cost before there was a file. */
+    if (same_count > 0 && same_count < held_count &&
+        session_hold(session, same_count) != APP_OKAY)
+      same_count = 0;
     free(held_list);
   }
   if (same_count < 1) {
@@ -379,9 +464,9 @@ static app_code main_keep_prime(const main_flag *flag, app_session *session,
    * a token is sampled and a rerun of the same prompt starts where this one
    * did. */
   if (same_count < reel->id_count - 1) {
-    app_code keep_code = session_save(session, flag->keep_path,
-                                      main_keep_stamp(reel, reel->id_count - 1),
-                                      APP_KEEP_PROMPT);
+    /* A prompt's identity is the run note; the bare stamp beside it is what a
+     * conversation file uses for its turn count and is nothing here. */
+    app_code keep_code = session_save(session, flag->keep_path, 0, &now_note, APP_KEEP_PROMPT);
     if (keep_code != APP_OKAY)
       fprintf(stderr, "keep: %s\n", app_code_text(keep_code));
   }
@@ -929,7 +1014,8 @@ static int main_loop(app_model *model, const main_flag *flag) {
       if (strncmp(line_text, "/save ", 6) == 0) {
         main_talk *talk = &talk_list[talk_slot];
         app_code keep_code =
-            session_save(talk->session, line_text + 6, (uint64_t)talk->turn_count, APP_KEEP_TALK);
+            session_save(talk->session, line_text + 6, (uint64_t)talk->turn_count, NULL,
+                         APP_KEEP_TALK);
         if (keep_code != APP_OKAY)
           printf("save: %s\n", app_code_text(keep_code));
         else
@@ -941,7 +1027,8 @@ static int main_loop(app_model *model, const main_flag *flag) {
         main_talk *talk = &talk_list[talk_slot];
         uint64_t held_stamp = 0;
         int held_kind = APP_KEEP_PROMPT;
-        app_code keep_code = session_load(talk->session, line_text + 6, &held_stamp, &held_kind);
+        app_code keep_code =
+            session_load(talk->session, line_text + 6, &held_stamp, NULL, &held_kind);
         if (keep_code != APP_OKAY) {
           printf("open: %s\n", app_code_text(keep_code));
           continue;
@@ -1520,6 +1607,39 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  /* The picture budget is the model's rather than a turn's, so it is set once
+   * here and every task below reads its pictures under it.  A checkpoint with
+   * no vision tower cannot honour it, and a caller that asked is told so rather
+   * than given a run that quietly ignored the flag. */
+  if (flag.image_rows > 0) {
+    code = model_image_budget(model, flag.image_rows);
+    if (code != APP_OKAY) {
+      fprintf(stderr, "image-tokens: %s\n", app_code_text(code));
+      model_free(model);
+      return 1;
+    }
+  }
+
+  /* Pictures kept from an earlier run.  A file that is not there is the first
+   * run and is not worth a word; one that is there and is refused is worth
+   * saying, because it means the tower is about to run over pictures the caller
+   * thought were already encoded — but it is not a failure, since running the
+   * tower is exactly what the engine would have done without the flag. */
+  if (flag.image_keep) {
+    code = media_store_load(model, flag.image_keep);
+    if (code != APP_OKAY && code != APP_FAIL_MISSING)
+      fprintf(stderr, "image-keep: %s, so the pictures are encoded again (%s)\n",
+              app_code_text(code), flag.image_keep);
+  }
+
+  /* And the clips, on the same terms and out of a file of their own. */
+  if (flag.audio_keep) {
+    code = sound_store_load(model, flag.audio_keep);
+    if (code != APP_OKAY && code != APP_FAIL_MISSING)
+      fprintf(stderr, "audio-keep: %s, so the clips are encoded again (%s)\n",
+              app_code_text(code), flag.audio_keep);
+  }
+
   if (strcmp(flag.task_text, "chat") == 0 && flag.loop_flag)
     result_code = main_loop(model, &flag);
   else if (strcmp(flag.task_text, "chat") == 0 || strcmp(flag.task_text, "complete") == 0)
@@ -1539,6 +1659,22 @@ int main(int argc, char **argv) {
   else {
     main_usage();
     result_code = 1;
+  }
+
+  /* And back out again, whatever the task made of them.  Writing is worth a
+   * word when it fails: the caller asked for a file and there will not be one,
+   * so the next run pays the tower again without knowing why. */
+  if (flag.image_keep && model_vision_ready(model)) {
+    code = media_store_save(model, flag.image_keep);
+    if (code != APP_OKAY)
+      fprintf(stderr, "image-keep: %s, so nothing is held for the next run (%s)\n",
+              app_code_text(code), flag.image_keep);
+  }
+  if (flag.audio_keep && model_audio_ready(model)) {
+    code = sound_store_save(model, flag.audio_keep);
+    if (code != APP_OKAY)
+      fprintf(stderr, "audio-keep: %s, so nothing is held for the next run (%s)\n",
+              app_code_text(code), flag.audio_keep);
   }
 
   model_free(model);

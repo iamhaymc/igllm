@@ -722,7 +722,69 @@ without the mixture branch, which is why `tower_feed` is one function.
 It takes a **variable resolution** rather than a fixed square. `vision_grid_pick`
 preserves the aspect ratio, caps the area by the patch budget the soft-token
 limit implies, and rounds both sides down to a multiple of `pool_size *
-patch_size` so the pooler's windows divide exactly. `vision_patch_cut` then cuts
+patch_size` so the pooler's windows divide exactly.
+
+That soft-token limit is the checkpoint's unless the caller has asked for less.
+`model_image_budget` lowers it and `vision_soft_cap` is the one place the two
+are reconciled; `--image-tokens <n>` is the flag on the command line. It moves
+the resize and **nothing else** — the pooling geometry, the position tables and
+the emitted row count are all still what they would be for a grid of that size,
+so a budgeted picture is a smaller picture properly encoded rather than a full
+one truncated. It is a cap and never a floor: more than the checkpoint carries
+is what the checkpoint carries, and zero puts the maximum back.
+
+Because both sides round down to a whole pooling window, a picture lands *under*
+its budget rather than on it — 40 rows at a budget of 48. `--verbose` prints
+what a picture actually came to beside the cap in force.
+
+The store of those rows can also be written to a file. `media_store_save` and
+`media_store_load` put the working set on disk and read it back, behind
+`--image-keep <path>`, so a photograph asked about in two runs is encoded in
+one. What a file needs that memory does not is in `media_keep_mark`: the
+backend's name, `desk->level_live` beside it because an AVX-512 build and an
+AVX-512-with-VNNI build share a name and not a code path, and
+`MEDIA_KEEP_VERSION` — **bump that by hand whenever anything between the resize
+and the projector changes**, or an older file will be read back as rows this
+engine would not have made. They sit in the file's mark rather than in each
+picture's identity so that a stale file is refused whole and reported, instead
+of missing silently on every entry. A refusal leaves the store exactly as it
+was, and a truncated file is refused whole rather than read half.
+
+**A clip has the same pair**, `sound_store_save` and `sound_store_load` behind
+`--audio-keep <path>`, over a `sound_note` store of its own with its own
+`SOUND_KEEP_VERSION` and its own `igllm clip 1` mark. Two stores and not one,
+in memory and on disk both, because the eviction is what separates them: a loop
+comparing four photographs must not throw away the clip the conversation is
+about, and a checkpoint with one tower should never write a file it cannot read
+back. Each reader refuses the other's file on the mark.
+
+The identity is `sound_mark`, and the line it draws is `media_mark`'s: a
+picture is hashed on the raster **before** the resize, and a clip on the samples
+`wave_read` hands back **before** `wave_rate` and before the budget cuts them,
+with the front end that turns them into frames folded in beside. So the
+container and the sample format are outside it and the resampler is inside it.
+Two things follow that are worth stating. `cut_flag` is kept beside the rows,
+because a clip past the budget has to say so on a hit exactly as on a miss and
+that is not recoverable from the rows. And `sound_recall` and `sound_keep` take
+the clip's count and rate as arguments where the picture's take a `flat_grid`,
+because `wave_rate` and the budget both work in place — by the time the rows
+exist those two numbers are the processor's, and it is the file's that the entry
+is filed under.
+
+**What the store is worth is not what the picture's is, and the difference is
+the useful part.** `CHANGES.md` 0.9.13 measures a clip as a quarter conformer
+and about seventy percent prefill of its own soft tokens, against the picture's
+even half; the audio encoder charges 13.5 ms a soft token where the vision one
+charges 35.6. So this file alone buys 1.31x and it is `--keep` beside it that
+takes a repeated turn to 8.1x — for a clip, the caching that pays is the text
+stack's.
+
+The budget is inside the picture store's identity (§3.8), which it has to be:
+the same photograph under two budgets is two different sets of rows, and an
+identity that left the budget out would hand the second call the first call's
+answer. It buys most of what a picture costs — the tower is close to linear in
+patches — and it costs detail, so it is a flag and never a default;
+`CHANGES.md` 0.9.10 has the latency curve and the quality curves beside it. `vision_patch_cut` then cuts
 the picture into patches; inside one patch the samples run row, then column,
 then band — the band is the fastest axis, which is what the reference's flatten
 produces. Pixels arrive in `[0,1]` and are scaled to `[-1,1]`, a step the
@@ -1122,8 +1184,48 @@ hands `session_save` is written beside it and handed back unread: the ids alone
 cannot say that a picture in a prompt is the same picture, because two pictures
 lay down the same placeholder ids, so what identifies the rest of a prompt is
 the caller's to decide. `session_ids` hands the ids back, which is how the front
-end finds out whether the prompt it is about to run begins with the one in the
+end finds out how far the prompt it is about to run agrees with the one in the
 file and primes only the difference.
+
+**That agreement does not have to reach the end of the file.** `session_hold`
+winds a session back to its first `keep_count` ids, so a cache kept for one
+prompt is reusable as the *prefix* of another — the same picture and a different
+question about it, which is the case it exists for, since a picture's soft
+tokens sit in front of the question and are nearly all of what the prompt costs.
+Attention here is causal, so the rows of the first `keep_count` ids depend on
+nothing after them and priming a different tail onto them produces what priming
+the whole prompt would have; that is checked as bit equality and not as
+closeness.
+
+It is refused where a ring has turned over, and that refusal is the reason the
+call can fail. A layer whose `cache_span` is shorter than what has been primed
+holds its rows at slots whose meaning is fixed by `fill_count`, so winding the
+fill back does not wind the rows back with it and nothing downstream could tell.
+The cache peaks are deliberately not wound back: they are running maxima that
+cannot be un-maxed, but no arithmetic reads one — the quantized store takes its
+scale from the export's calibration — so a held-back session only over-reports
+what `session_cache_peak` shows.
+
+**The fold is per media run, not per prompt** — `app_keep_note`, and
+`keep_note_share` is the rule for comparing two of them. One number over a whole
+prompt can say *these are not the same pictures* and cannot say *they agree for
+the first two of three*, so a prompt whose second picture changed used to keep
+nothing; now the prefix is cut at the front of the first run that disagrees.
+Three ways a run fails and all end it in the same place — either side missing
+it, the two placing it differently, or the two folding to different numbers —
+and a run reaching past the shared ids ends it too, because a run is folded
+whole. The rule is in the core rather than in the caller because it is where a
+mistake would be silent, and the core is what the suite can reach; it is
+symmetric between the two lists for the same reason. A prompt with more runs
+than `APP_KEEP_RUNS` folds the rest into the last slot, which is the old
+whole-prompt behaviour applied to the tail and so is safe by construction.
+
+The stamp is what makes a prefix checkable at all. It folds **every** embedding
+row the caller's prompt carries rather than the rows under some prefix of it,
+because the file holds one number and a number taken at a length can only be
+checked at that length; folded over the whole prompt it is the same number for
+two prompts that show the same pictures however differently they go on, so it
+answers for every prefix of them at once.
 
 `session_cache_room_at` says what the cache costs at either storage, and
 `session_cache_bytes` asks the layer rather than assuming a float, so what

@@ -129,6 +129,31 @@ engine and found the ceiling held down by the output head, so the head entries
 now come before the speculative one rather than beside it. Where an entry is
 only a size, its size is given against a 34.95 ms step floor on the third host.
 
+**Two entries below are out of order on purpose and are worth naming here.**
+The first several are the text stack's, and every one of them is either finished
+or waiting on a host this project does not currently have — a PMU, or AVX-512
+with more bandwidth. Meanwhile 0.9.10 to 0.9.12 measured a multi-modal turn
+properly for the first time and found the largest unclaimed number in the file
+sitting in the caching rather than in a kernel: a second question about an
+encoded picture cost 10.5 s where the same question again cost 0.53, because a
+kept cache was used only when the whole of it was a prefix. **0.9.12 took it and
+that turn is now 0.93 s**, and 0.9.13 gave a clip the store a picture had, so
+0.9.14 divided that stamp along the media runs, so what stands there is the
+remainder — prompts that do not begin the same way, and prompts past the sliding
+window, which 0.9.14 found is the binding limit of the multi-picture case rather
+than the stamp ever was. *Row-blocking the batched float dot
+product* beside it is a refusal, placed there because it explains why the AVX2
+float kernels are where they are.
+
+**And 0.9.13 found the thing that most changes how the two towers should be
+read.** A picture is half encoder and half prefill of its own soft tokens; a
+clip is a **quarter** encoder and about **seventy percent** prefill. The audio
+encoder charges 13.5 ms a soft token where the vision one charges 35.6, and the
+text stack charges both the same ~38. So a store in front of the audio tower is
+worth 1.3x where the picture's was 1.9x, and **for a clip the caching that
+matters is the text stack's and not the tower's.** Any future entry about the
+audio tower should be sized against that before it is written.
+
 - **The feed-forward planes, which are half of every token and are closer to
   the memory than this entry used to say.** 18.96 ms of a 36.9 ms step —
   **52%** — reading 475.3 MiB at 24.44 GiB/s.
@@ -614,7 +639,15 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 
   **What is actually left is the arithmetic, and the loose axis is spent.**
   After 0.9.6 the phase is 34 to 41% of a picture and the feed-forward is the
-  larger part of a tower. Scoring ran 6.7 G multiply-adds a second and the blend
+  larger part of a tower — *on the host 0.9.6 measured.* **0.9.11 found a host
+  where the dense pair is about a sixth of the encoder**, by answering a turn
+  with the tower skipped and fitting `a·n + b·n²` over seven grid sizes: 3.25 ms
+  a patch plus a term worth 17.8% at 2340 patches, on four AVX2 cores with no
+  AVX-512. Some of the gap to 34–41% is the denominator — that figure is against
+  a picture and this one against the encoder, and half a picture is not the
+  encoder at all — but not all of it, and the two hosts should not be assumed to
+  agree. **Take the split on the host before taking the work**, with the picture
+  file as the instrument, and prefer the patch budget where the phase is small. Scoring ran 6.7 G multiply-adds a second and the blend
   8.0, against a 256-bit FMA peak of 44.8 a core; both are now roughly twice
   that and still a long way short. Three things are known about what is left:
 
@@ -636,33 +669,66 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 
   The softmax is 6.6% of the phase and not worth opening.
 
-- **Fewer patches, before the pooling — and a budget the caller can ask for.**
-  The largest vision win available, and the one that costs behaviour.
+- **Fewer patches, before the pooling. The cheap half is built — 0.9.10 — and
+  what is left is the merging.**
 
   The tower is 16 layers of width 768, 12 heads, 16-pixel patches, and the 3×3
-  pooling that turns 2304 patches into 256 soft tokens happens **after** the
-  encoder. So every patch is paid in full and the pooling saves nothing but the
-  text stack's share. At one quarter the patches the projections are roughly a
-  quarter and the dense attention pair work roughly a sixteenth.
+  pooling that turns the patches into soft tokens happens **after** the encoder.
+  So every patch is paid in full and the pooling saves nothing but the text
+  stack's share. That is what makes both halves of this entry worth having.
 
-  Two halves, and they are separable. The cheap half is `RESEARCH.md` idea 4: a
-  patch budget the caller states, honestly plumbed, instead of the configured
-  maximum every time — with the 3×3 pool geometry, the positions and the emitted
-  token count all still valid. The expensive half is idea 5: merge redundant
-  patches inside the encoder after the first few blocks, keeping enough
-  provenance to reconstruct the pooling contract.
+  **The budget ships.** `model_image_budget` and `--image-tokens <n>` cap what a
+  picture may cost, by moving the resize and nothing else — the pool geometry,
+  the positions and the emitted row count are all still exactly what they were
+  for a grid of that size, and the cap is inside the picture store's identity so
+  that two budgets over one photograph cannot collide on one entry. On a fourth
+  host (i5-7600K, AVX2, no AVX-512) a 768×512 notice is a **19.39 s turn at the
+  checkpoint's 280 rows and 3.25 s at a budget of 40**, transcribed exactly at
+  both — 5.97x end to end, 7.81x on the tower alone. `CHANGES.md` 0.9.10 has the
+  latency curve and both quality curves.
 
-  *llama.cpp has the budget knob and not the merging* — `image_min_tokens` and
-  `image_max_tokens` in `tools/mtmd/mtmd.h`, read from metadata and overridable
-  by the caller, with no policy that escalates after a cheap pass. And no
-  merging or pruning pass in `clip.cpp`: the one mention of token merging there
-  describes a model variant whose own convolution does it, not a runtime that
-  reduces patches. So the cheap half is a known-good shape to copy and the
-  expensive half is unexplored ground on CPU.
+  Three things it found that the rest of this entry should be read against.
 
-  Both are approximate. Report a quality curve over grid sizes split by OCR
-  versus coarse understanding, not a single latency number; a fast path that
-  falls back to full resolution half the time is not a fast path.
+  - **The tower is nearly linear in patches**, not quadratic: 7.4 to 8.0 ms a
+    patch flat across 108 to 2340 patches, which puts the dense attention pair
+    at about **8% of a picture at the full grid on that host**. The entry above
+    records scoring and the blend at 34 to 41% of a picture on the reference
+    host, and the two do not agree. Whichever is right, on a host like this one
+    the per-patch work is nearly the whole of a picture and the attention is
+    not — so **fewer patches is worth more here than any attention kernel**, and
+    a kernel aimed at the attention should be measured on the host it is meant
+    for before it is written.
+  - **The two halves of the quality curve part company by about a factor of
+    two.** Reading a six line notice survives to 35 rows and breaks at 24;
+    recognising a scene of four objects is still right at 12. So a caller that
+    knows which question it is asking can spend very differently, which is the
+    argument for the knob being a knob rather than a default.
+  - **Below about six rows the model reports no picture at all** rather than a
+    coarse one — *"Please provide the picture you are referring to."* Any policy
+    that picks a budget automatically has to hold off that floor, and cannot
+    detect having crossed it from the answer.
+
+  **What is left is `RESEARCH.md` idea 5**: merge redundant patches inside the
+  encoder after the first few blocks, keeping enough provenance to reconstruct
+  the pooling contract. That is unexplored ground on CPU — there is no merging
+  or pruning pass in llama.cpp's `clip.cpp`, and the one mention of token
+  merging there describes a model variant whose own convolution does it. It is
+  strictly harder than the budget and it is worth less than the budget was,
+  because a caller that will accept fewer patches can now simply ask for fewer.
+  Its case is the caller that will not: full resolution where the picture needs
+  it and merging where it does not, inside one pass.
+
+  *llama.cpp has the budget knob* — `image_min_tokens` and `image_max_tokens` in
+  `tools/mtmd/mtmd.h`, read from metadata and overridable by the caller, with no
+  policy that escalates after a cheap pass. 0.9.10 does not have one either, and
+  deliberately: a fast path that falls back to full resolution half the time is
+  not a fast path, and nothing here knows in advance which half a picture is in.
+
+  **And the curves above are a shape rather than a study.** Two synthetic
+  rasters written for the purpose, one prompt each, greedy. A photograph of a
+  page is the case that decides what a caller should ask for, and it has not
+  been measured — that, and an escalation policy that could be trusted, are what
+  a second pass at this entry would be.
 
 - **Give a picture's rows a life beyond one process.** 0.9.6's entry above is
   built and ships — 0.9.7 — and this is what it left.
@@ -674,25 +740,46 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   two conversations. A miss costs under 2%. `CHANGES.md` 0.9.7 has the identity
   and what is deliberately outside it.
 
-  **What is left is the word "process".** The store is never written to a file,
-  which is what lets the identity leave out the backend and any notion of an
-  encoder version — a backend cannot change under an entry that cannot outlive
-  the process that made it. A store on disk is the useful next form, because the
-  ordinary case for a photograph is a run at a time rather than a loop, and it
-  needs all three of these first:
+  **The word "process" is closed — 0.9.11.** `--image-keep <path>` reads the
+  store at the start of a run and writes it at the end, and the three things
+  this entry required before a file could be safe are all in it: the backend and
+  `desk->level_live` beside it in the mark, a `MEDIA_KEEP_VERSION` bumped by
+  hand, and the path and the eviction left to the caller exactly as `--keep`
+  leaves them. A refused file leaves the store alone and the run says so; a
+  truncated one is refused whole rather than read half. A repeat run of a
+  picture is **19.60 s to 10.36 s, 1.89x**, and with a budget beside it two
+  turns about one photograph are **39.44 s to 5.58 s, 7.07x**. `CHANGES.md`
+  0.9.11 has the rest.
 
-  - **the backend in the identity**, since a scalar build and a VNNI build do
-    not produce the same rows;
-  - **an encoder version in it**, bumped by hand whenever anything from the
-    resize to the projector changes — the shipped `KEEP_MARK_TEXT` is the
-    pattern, and the reason it carries a version;
-  - **a decision about where the file lives and who evicts it**, which is a
-    caller's question and not the engine's. `--keep` is the precedent: the
-    engine reads and writes a path the caller names and refuses a file that
-    disagrees with its mark.
+  **And it turned out to be the instrument this list needed more than the
+  feature.** Answering a turn with the tower skipped is what separates the
+  encoder from the text stack's prefill of the soft tokens, and nothing before
+  it could. Doing that across seven grid sizes gives the tower's cost law
+  directly, and it corrected a number in the entry above by a factor of two.
+  **Half of what a picture costs is not the tower at all** — 9.25 s of 19.60 on
+  that host is the encoder and 9.46 is the 260 soft tokens going through the
+  text stack, at a flat 36.5 ms each. Nothing in this file had that split.
 
-  Do not persist it without all three. A stale row read back from disk is a
-  wrong answer that nothing downstream can detect.
+  **And the clip half is closed — 0.9.13.** The question this entry left open
+  was whether a clip was worth a store at all, and it is, though for a
+  different reason than a picture is. `--audio-keep <path>` is `--image-keep`'s
+  twin: the identity taken on the samples `wave_read` hands back, before the
+  resampler and before the budget, with the front end and the tower's shape
+  beside them; two stores rather than one, so that four photographs cannot
+  evict the clip a conversation is about; and `igllm clip 1` with its own
+  version, its own backend mark and its own refusals. A ten-second clip over
+  four questions is **14.5 s to 11.1, 1.31x**, and beside `--keep` **14.7 s to
+  about 1.8, some 8.1x**; at the budget's ceiling, thirty seconds and 750 soft
+  tokens, **40.6 s to 30.4**.
+
+  **The 1.3x is the part to carry forward**, and it is why this was worth
+  measuring rather than assuming. Cold minus warm is the encoder exactly, with
+  no assumption about anything else: 3.4 s of a 14.5 s turn and 10.1 s of 40.6 —
+  **a quarter, both times**, 13.6 then 13.5 ms a soft token. The prefill of the
+  soft tokens is about 70%. So the split above, which held for a picture, does
+  **not** hold for a clip, and the audio encoder is 2.7x cheaper per soft token
+  than the vision one while the text stack charges them alike. `CHANGES.md`
+  0.9.13 has the table.
 
   *llama.cpp has a narrower form of the in-memory half.* Its server pushes a
   placeholder for an encoded media chunk into the slot's prompt tokens — "the
@@ -706,6 +793,146 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 
   None of this is fresh-image acceleration and none of it must ever be reported
   as one.
+
+- **Row-blocking the batched float dot product — measured, and refused on the
+  register file rather than on the loop.**
+
+  Every single-lane path in this engine blocks rows: `KERN_ROW_WIDE`,
+  `KERN_ROW_BLOCK`, `KERN_CODE_BLOCK`. The batched one does not —
+  `kern_mat_vec_band`'s last branch calls `kern_row_code_many` a row at a time —
+  and that asymmetry looks like something left on the floor. It is not, on a
+  host with sixteen vector registers.
+
+  Why it looked worth taking. `kern_dot_real_many` holds one row against four
+  lanes with two accumulators a lane, stepping sixteen: per sixteen elements
+  that is two row loads, eight lane loads and eight multiply-adds. Ten loads
+  against eight FMAs, on a host with two of each port, so the loads are the
+  ceiling and the arithmetic waits. Blocking a second row shares the lane loads
+  between the rows and should put the loop on its arithmetic instead.
+
+  Measured on the fourth host, one thread, a 256 column group over 4096 rows,
+  minimum of fifty runs, with every lane's total read afterwards so that nothing
+  can be eliminated — **the first version of this measurement was 1.8x and was
+  wrong for exactly that reason**, two of the four lanes being dead code:
+
+  | shape | G multiply-adds a second | against the shipped | order |
+  | --- | --- | --- | --- |
+  | one row, four lanes, two accumulators, step 16 | 27.0–27.4 | — | shipped |
+  | two rows, four lanes, one accumulator, step 8 | 36.5–36.7 | **1.33x** | **different** |
+  | two rows, two lanes, two accumulators, step 16 | 28.0–28.5 | 1.04x | shipped |
+
+  **The only row block that pays changes the summation order, and the one that
+  preserves it does not pay.** Preserving the chain costs two accumulators a
+  row-lane pair, so two rows by four lanes wants sixteen accumulators and the
+  register file has sixteen registers in all — before the row and lane vectors.
+  Two rows by two lanes fits, and halves the lanes, which puts the row loads
+  straight back: four row loads and four lane loads for half the work.
+
+  So this is the same wall the tower's blend entry hit — *"sixteen accumulators
+  and four value registers do not fit in sixteen registers"* — and it is worth
+  stating once in general: **on AVX2 the register file, not the loop, is what
+  limits every batched float kernel in this engine.** Anything wider needs the
+  registers asked for rather than assumed.
+
+  Two things left, and neither is a loop.
+
+  - **1.33x is not nothing, and it is a decision about output rather than a
+    kernel question** — the same shape as the fused multiply-add refused in the
+    tower's blend (0.9.6). Taking it means prefill logits stop being byte for
+    byte what they were. It is not taken here, and it should not be taken
+    quietly if it ever is.
+  - **On AVX-512 the order-preserving form fits.** Thirty-two registers hold
+    sixteen accumulators, four row vectors and two lane vectors with room over,
+    so two rows by four lanes at the shipped chain is available there and is not
+    here. **This is a hypothesis and not a measurement** — the host it was
+    reasoned on has no AVX-512 — and it is worth an hour on a host that does,
+    with one caveat: where VNNI carries most planes onto the integer path, the
+    float many path is a smaller share of a step than it is on a host without.
+
+  This microbenchmark is contiguous rows in cache, not the engine, and it says
+  nothing about how much of a phase the inner loop is. What it does establish is
+  the ranking, and the ranking is a refusal.
+
+  **And the sibling question, which looks obvious from the source and is also a
+  refusal.** `kern_row_code_rows` — four rows of the *single lane* float path,
+  each keeping its own two accumulators and its own order, so the sum does not
+  move — is written under `APP_SIMD_AVX512` and at two bits only. Its comment
+  gives the reason: on an AVX-512 host with VNNI the output head is the only
+  plane left on the float path, so that is the one width worth writing. **On a
+  host with no VNNI that reasoning does not hold** — there is no integer path at
+  all, so every plane takes the float route, the feed-forward included at 57% of
+  a decode step — and porting the block to AVX2 and to four bits looks like free
+  money.
+
+  It is not. The same measurement, the four bit AVX2 loop over 6144 rows of a
+  128 column group, one row at a time against four blocked, bit-identical and
+  checked to be: **1.02x.** The AVX-512 head block pays because a two bit row is
+  96 vectors on two accumulators and waits on its own chain; the four bit AVX2
+  loop spends about a dozen uops per sixteen codes on the **unpack**, which is
+  per row and cannot be shared, so blocking four rows shares two activation
+  loads out of roughly fifty uops. The block is right to be AVX-512 only, for a
+  reason its comment does not give.
+
+- **Reuse a kept cache as far as it agrees — built, 0.9.12, and what is left is
+  the audio half and the store above it.**
+
+  A picture's soft tokens sit at the front of a prompt and the question behind
+  them, so a second question about the same photograph shares every expensive
+  id. `main_keep_prime` computed that shared prefix and then refused it unless
+  the whole of the held cache was a prefix of the new prompt. It no longer
+  does: `session_hold` winds a session back to the ids the two prompts share,
+  the stamp folds the whole reel so that one stored number answers for every
+  prefix of it, and a ring that has turned over is refused in front rather than
+  wound back onto the wrong rows.
+
+  On the fourth host, a 768×512 notice at 260 soft tokens with `--image-keep`
+  and `--keep`, each row a question **never asked before**: the cold run is
+  19.99 s and every one after it **0.83 to 0.98** — about 21x, and about 11x
+  against 0.9.11 where only the picture file helped. A round keeps 267 of 278
+  ids. `CHANGES.md` 0.9.12 has the six correctness cases, two of which are the
+  ones that had to refuse and do.
+
+  **What is left of it.**
+
+  - ~~A clip has no store at all.~~ **Closed by 0.9.13** — `--audio-keep`, in
+    memory and on disk, on the picture store's terms. It is worth less than the
+    picture's, and knowing by how much is the useful half: the conformer is a
+    quarter of a clip's turn where the vision encoder is half of a picture's, so
+    the store alone is 1.31x and it is the kept cache beside it that takes the
+    turn to 1.8 s. See the entry above.
+  - ~~A different picture behind identical ids costs a full re-prime.~~
+    **Closed by 0.9.14** — the fold is divided along the media runs, the file
+    carries up to `APP_KEEP_RUNS` of them, and `keep_note_share` cuts a shared
+    prefix at the front of the first run that disagrees instead of throwing it
+    away on one number. Two 768×512 rasters at `--image-tokens 128`: the second
+    picture changed is **nothing kept and 14.50 s to 124 of 251 ids and 10.03**,
+    a picture added **14.54 s to 9.91**, a picture dropped **7.97 s to 1.93**,
+    and the case 0.9.12 already handled is unmoved at 1.9. All six cases byte
+    for byte a run with no files.
+
+    **One thing it found that belongs to the entry above rather than to this
+    one.** Two pictures at the checkpoint's own 280 rows come to some 574 ids
+    and the shipped export's sliding window is 512, so **such a prompt laps the
+    ring and cannot be wound back at all** — nothing is kept whatever the
+    stamps say. Every number above is under a budget for that reason. So the
+    multi-picture case this closed is reachable only below the window, and
+    *raising what a wound-back session can be* is the entry that would unlock
+    the rest of it. That is a real item and it is not written anywhere else in
+    this file.
+  - **A prompt past the sliding window still keeps nothing**, and after 0.9.14
+    this is the binding limit rather than a footnote. `session_hold` refuses a
+    wind back once a layer's ring has turned over, because slot `i` is id `i`
+    only while it never wrapped — so the rows cannot be wound back with the
+    count. On the shipped export that is 512 ids, which two full-resolution
+    pictures exceed. What would lift it is a ring that records where it wrapped,
+    or a wind back that rewrites the slots rather than refusing; neither has
+    been scoped, and the cheap answer for now is a budget that keeps the prompt
+    under the window.
+  - **Nothing here helps a turn whose prompt does not begin the same way.** A
+    picture in the middle of a sentence — which `--text` allows and the content
+    list means — puts the words in front of the rows, so the shared prefix ends
+    before the expensive part. The store still saves the tower; the prefill is
+    paid again.
 
 - **The other widths of the integer dot product.** 0.8.9's path is written for
   AVX-512 VNNI and nothing else. A host with `avx_vnni` and no AVX-512 —
@@ -821,3 +1048,15 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | Speculative decoding under a temperature (answered: the scout's proposal is a point mass, which is a `q` like any other — accept with `p(t)`, resample from `p` with the guess removed) | 0.9.8 |
 | The sampler's shaped distribution, lifted out of the draw so two paths sit on one definition of what a taste means | 0.9.8 |
 | The batched path's per-lane epilogue, which 0.9.5 measured and left (taken: the row's totals off the destination, prefill 4.4% and the marginal lane a tenth) | 0.9.9 |
+| A patch budget the caller states, honestly plumbed — the resize moved and nothing else, and the budget inside the picture store's identity so two budgets cannot collide on one entry | 0.9.10 |
+| What a patch budget costs, split by reading and by recognising as the entry demanded (answered: a six line notice survives to 35 rows, a four object scene to 12, and below six rows the model reports no picture at all) | 0.9.10 |
+| Whether the vision tower is quadratic in patches at the grids it actually runs (answered: 3.25 ms a patch plus a term worth 17.8% at 2340, measured by skipping the tower rather than by subtracting a text turn) | 0.9.10, corrected in 0.9.11 |
+| A picture's rows beyond one process — the backend and an encoder version in the mark, the path and the eviction left to the caller, and a refused file leaving the store alone | 0.9.11 |
+| What half of a picture actually is (answered: not the tower — 9.25 s of 19.60 is the encoder and 9.46 is the 260 soft tokens through the text stack at a flat 36.5 ms each) | 0.9.11 |
+| A kept cache reused as far as it agrees rather than only where it is the whole prompt — a session wound back, a stamp that answers for every prefix, and a turned ring refused in front | 0.9.12 |
+| Whether a prefix-primed run is bit for bit a fresh one, when a batched prime lands on different lane boundaries (answered: yes, on six cases including a quantized cache) | 0.9.12 |
+| A clip's rows kept against the clip and beyond one process — the identity on the decoded samples, two stores that evict apart, and each file refusing the other's | 0.9.13 |
+| A stamp per media run rather than per reel, so a prompt whose later picture changed keeps the ids in front of it | 0.9.14 |
+| Where the rule for comparing two run lists belongs (answered: the core, because it is the piece a mistake would be silent in and the suite cannot reach the caller) | 0.9.14 |
+| Whether a clip is worth a store at all (answered: yes, and worth measuring rather than assuming — 1.31x alone, 8.1x beside a kept cache) | 0.9.13 |
+| What half of a clip actually is (answered: not the halves a picture has — a quarter is the conformer and about 70% is the prefill of its own soft tokens, at 13.5 ms a row against the vision encoder's 35.6) | 0.9.13 |
