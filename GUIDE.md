@@ -722,7 +722,27 @@ without the mixture branch, which is why `tower_feed` is one function.
 It takes a **variable resolution** rather than a fixed square. `vision_grid_pick`
 preserves the aspect ratio, caps the area by the patch budget the soft-token
 limit implies, and rounds both sides down to a multiple of `pool_size *
-patch_size` so the pooler's windows divide exactly. `vision_patch_cut` then cuts
+patch_size` so the pooler's windows divide exactly.
+
+That soft-token limit is the checkpoint's unless the caller has asked for less.
+`model_image_budget` lowers it and `vision_soft_cap` is the one place the two
+are reconciled; `--image-tokens <n>` is the flag on the command line. It moves
+the resize and **nothing else** — the pooling geometry, the position tables and
+the emitted row count are all still what they would be for a grid of that size,
+so a budgeted picture is a smaller picture properly encoded rather than a full
+one truncated. It is a cap and never a floor: more than the checkpoint carries
+is what the checkpoint carries, and zero puts the maximum back.
+
+Because both sides round down to a whole pooling window, a picture lands *under*
+its budget rather than on it — 40 rows at a budget of 48. `--verbose` prints
+what a picture actually came to beside the cap in force.
+
+The budget is inside the picture store's identity (§3.8), which it has to be:
+the same photograph under two budgets is two different sets of rows, and an
+identity that left the budget out would hand the second call the first call's
+answer. It buys most of what a picture costs — the tower is close to linear in
+patches — and it costs detail, so it is a flag and never a default;
+`CHANGES.md` 0.9.10 has the latency curve and the quality curves beside it. `vision_patch_cut` then cuts
 the picture into patches; inside one patch the samples run row, then column,
 then band — the band is the fastest axis, which is what the reference's flatten
 produces. Pixels arrive in `[0,1]` and are scaled to `[-1,1]`, a step the

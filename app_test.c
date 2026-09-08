@@ -5378,6 +5378,69 @@ static void test_tower(void) {
     }
   }
 
+  { /* -- the patch budget --------------------------------------------- */
+    /* A caller may ask a picture to cost fewer soft tokens than the checkpoint
+     * allows.  It moves the resize and nothing else, so what is checked here is
+     * that the whole contract downstream of the resize still holds: fewer rows
+     * out, the pooling geometry still exact, and — the one that matters — two
+     * budgets over one picture kept apart in the store. */
+    app_media small;
+    uint64_t low_wide = 0, high_wide = 0, low_thin = 0, high_thin = 0;
+    flat_grid same_grid;
+
+    test_true(model_image_rows(model) == TOWER_SOFT,
+              "with nothing asked for, the cap is the checkpoint's");
+    test_true(model_image_budget(model, -1) == APP_FAIL_ARGUMENT,
+              "a budget below zero is refused rather than clamped");
+    test_true(model_image_budget(model, TOWER_SOFT + 40) == APP_OKAY &&
+                  model_image_rows(model) == TOWER_SOFT,
+              "a budget above the checkpoint's maximum is that maximum");
+    test_true(model_image_rows_most(model) == TOWER_SOFT,
+              "the checkpoint's own maximum is reported whatever is asked for");
+
+    /* The identity is taken under each budget in turn, on one raster, so that
+     * what separates the two marks is the budget alone. */
+    memset(&same_grid, 0, sizeof(same_grid));
+    if (image_read(path_text, &same_grid) == APP_OKAY) {
+      test_true(model_image_budget(model, 0) == APP_OKAY, "zero puts the maximum back");
+      media_mark(model, &same_grid, &low_wide, &high_wide);
+      test_true(model_image_budget(model, 2) == APP_OKAY, "a budget of two is taken");
+      media_mark(model, &same_grid, &low_thin, &high_thin);
+      test_true(low_wide != low_thin && high_wide != high_thin,
+                "one picture under two budgets is two identities, in both mixes");
+      grid_free(&same_grid);
+    } else {
+      test_true(0, "the picture is read for the budget identity check");
+    }
+
+    /* Twelve by eight, patches of two pooled two by two: a budget of two allows
+     * eight patches, so the resize lands on four by four, a two by two patch
+     * grid, and a single pooled row. */
+    test_true(model_image_rows(model) == 2, "the cap in force is the budget");
+    test_true(media_image(model, path_text, &small) == APP_OKAY,
+              "a picture runs the tower under a budget");
+    test_true(small.row_count == 1 && small.row_count < media.row_count,
+              "a budget the resize honours gives fewer rows than the maximum did");
+    test_true(small.state_size == media.state_size,
+              "a budget moves the row count and never the row width");
+    okay_flag = 1;
+    for (value_index = 0; value_index < small.state_size; ++value_index) {
+      float value_now = small.state_data[value_index];
+      if (!(value_now == value_now) || fabs((double)value_now) > 1e6) okay_flag = 0;
+    }
+    test_true(okay_flag, "every value a budgeted picture emits is finite");
+    /* The whole point of keeping the two identities apart: the wide entry is
+     * still in the store and the narrow call must not have been given it. */
+    test_true(small.row_count != media.row_count,
+              "the budgeted picture did not come back off the maximum's entry");
+    media_free(&small);
+
+    /* Put the checkpoint's maximum back, so that nothing after this reads a
+     * model the budget is still narrowing. */
+    test_true(model_image_budget(model, 0) == APP_OKAY && model_image_rows(model) == TOWER_SOFT,
+              "the budget is put away again");
+  }
+
   /* -- audio --------------------------------------------------------- */
   {
     app_media sound;

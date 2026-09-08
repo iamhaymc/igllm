@@ -614,7 +614,13 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 
   **What is actually left is the arithmetic, and the loose axis is spent.**
   After 0.9.6 the phase is 34 to 41% of a picture and the feed-forward is the
-  larger part of a tower. Scoring ran 6.7 G multiply-adds a second and the blend
+  larger part of a tower — *on the host 0.9.6 measured.* **0.9.10 found a host
+  where it is about 8%**, by timing whole pictures across seven grid sizes and
+  fitting the quadratic term: 7.4 to 8.0 ms a patch, flat from 108 patches to
+  2340, on four AVX2 cores with no AVX-512. Both numbers cannot describe the
+  same phase, and which of them a given host sees decides whether anything below
+  is worth building at all. **Take the split on the host before taking the
+  work**, and prefer the patch budget where the phase is small. Scoring ran 6.7 G multiply-adds a second and the blend
   8.0, against a 256-bit FMA peak of 44.8 a core; both are now roughly twice
   that and still a long way short. Three things are known about what is left:
 
@@ -636,33 +642,66 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 
   The softmax is 6.6% of the phase and not worth opening.
 
-- **Fewer patches, before the pooling — and a budget the caller can ask for.**
-  The largest vision win available, and the one that costs behaviour.
+- **Fewer patches, before the pooling. The cheap half is built — 0.9.10 — and
+  what is left is the merging.**
 
   The tower is 16 layers of width 768, 12 heads, 16-pixel patches, and the 3×3
-  pooling that turns 2304 patches into 256 soft tokens happens **after** the
-  encoder. So every patch is paid in full and the pooling saves nothing but the
-  text stack's share. At one quarter the patches the projections are roughly a
-  quarter and the dense attention pair work roughly a sixteenth.
+  pooling that turns the patches into soft tokens happens **after** the encoder.
+  So every patch is paid in full and the pooling saves nothing but the text
+  stack's share. That is what makes both halves of this entry worth having.
 
-  Two halves, and they are separable. The cheap half is `RESEARCH.md` idea 4: a
-  patch budget the caller states, honestly plumbed, instead of the configured
-  maximum every time — with the 3×3 pool geometry, the positions and the emitted
-  token count all still valid. The expensive half is idea 5: merge redundant
-  patches inside the encoder after the first few blocks, keeping enough
-  provenance to reconstruct the pooling contract.
+  **The budget ships.** `model_image_budget` and `--image-tokens <n>` cap what a
+  picture may cost, by moving the resize and nothing else — the pool geometry,
+  the positions and the emitted row count are all still exactly what they were
+  for a grid of that size, and the cap is inside the picture store's identity so
+  that two budgets over one photograph cannot collide on one entry. On a fourth
+  host (i5-7600K, AVX2, no AVX-512) a 768×512 notice is a **19.39 s turn at the
+  checkpoint's 280 rows and 3.25 s at a budget of 40**, transcribed exactly at
+  both — 5.97x end to end, 7.81x on the tower alone. `CHANGES.md` 0.9.10 has the
+  latency curve and both quality curves.
 
-  *llama.cpp has the budget knob and not the merging* — `image_min_tokens` and
-  `image_max_tokens` in `tools/mtmd/mtmd.h`, read from metadata and overridable
-  by the caller, with no policy that escalates after a cheap pass. And no
-  merging or pruning pass in `clip.cpp`: the one mention of token merging there
-  describes a model variant whose own convolution does it, not a runtime that
-  reduces patches. So the cheap half is a known-good shape to copy and the
-  expensive half is unexplored ground on CPU.
+  Three things it found that the rest of this entry should be read against.
 
-  Both are approximate. Report a quality curve over grid sizes split by OCR
-  versus coarse understanding, not a single latency number; a fast path that
-  falls back to full resolution half the time is not a fast path.
+  - **The tower is nearly linear in patches**, not quadratic: 7.4 to 8.0 ms a
+    patch flat across 108 to 2340 patches, which puts the dense attention pair
+    at about **8% of a picture at the full grid on that host**. The entry above
+    records scoring and the blend at 34 to 41% of a picture on the reference
+    host, and the two do not agree. Whichever is right, on a host like this one
+    the per-patch work is nearly the whole of a picture and the attention is
+    not — so **fewer patches is worth more here than any attention kernel**, and
+    a kernel aimed at the attention should be measured on the host it is meant
+    for before it is written.
+  - **The two halves of the quality curve part company by about a factor of
+    two.** Reading a six line notice survives to 35 rows and breaks at 24;
+    recognising a scene of four objects is still right at 12. So a caller that
+    knows which question it is asking can spend very differently, which is the
+    argument for the knob being a knob rather than a default.
+  - **Below about six rows the model reports no picture at all** rather than a
+    coarse one — *"Please provide the picture you are referring to."* Any policy
+    that picks a budget automatically has to hold off that floor, and cannot
+    detect having crossed it from the answer.
+
+  **What is left is `RESEARCH.md` idea 5**: merge redundant patches inside the
+  encoder after the first few blocks, keeping enough provenance to reconstruct
+  the pooling contract. That is unexplored ground on CPU — there is no merging
+  or pruning pass in llama.cpp's `clip.cpp`, and the one mention of token
+  merging there describes a model variant whose own convolution does it. It is
+  strictly harder than the budget and it is worth less than the budget was,
+  because a caller that will accept fewer patches can now simply ask for fewer.
+  Its case is the caller that will not: full resolution where the picture needs
+  it and merging where it does not, inside one pass.
+
+  *llama.cpp has the budget knob* — `image_min_tokens` and `image_max_tokens` in
+  `tools/mtmd/mtmd.h`, read from metadata and overridable by the caller, with no
+  policy that escalates after a cheap pass. 0.9.10 does not have one either, and
+  deliberately: a fast path that falls back to full resolution half the time is
+  not a fast path, and nothing here knows in advance which half a picture is in.
+
+  **And the curves above are a shape rather than a study.** Two synthetic
+  rasters written for the purpose, one prompt each, greedy. A photograph of a
+  page is the case that decides what a caller should ask for, and it has not
+  been measured — that, and an escalation policy that could be trusted, are what
+  a second pass at this entry would be.
 
 - **Give a picture's rows a life beyond one process.** 0.9.6's entry above is
   built and ships — 0.9.7 — and this is what it left.
@@ -821,3 +860,6 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | Speculative decoding under a temperature (answered: the scout's proposal is a point mass, which is a `q` like any other — accept with `p(t)`, resample from `p` with the guess removed) | 0.9.8 |
 | The sampler's shaped distribution, lifted out of the draw so two paths sit on one definition of what a taste means | 0.9.8 |
 | The batched path's per-lane epilogue, which 0.9.5 measured and left (taken: the row's totals off the destination, prefill 4.4% and the marginal lane a tenth) | 0.9.9 |
+| A patch budget the caller states, honestly plumbed — the resize moved and nothing else, and the budget inside the picture store's identity so two budgets cannot collide on one entry | 0.9.10 |
+| What a patch budget costs, split by reading and by recognising as the entry demanded (answered: a six line notice survives to 35 rows, a four object scene to 12, and below six rows the model reports no picture at all) | 0.9.10 |
+| Whether the vision tower is quadratic in patches at the grids it actually runs (answered: no — 7.4 to 8.0 ms a patch flat from 108 to 2340, which puts the dense attention pair at about 8% of a picture on an AVX2 host) | 0.9.10 |

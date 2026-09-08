@@ -6385,3 +6385,158 @@ moves no number, and that is checked the way the rest of this file checks it —
 `logits` byte for byte against the previous build on a text prompt, a picture, a
 clip and a long prefill, and greedy `--guess 8` byte for byte. 822 pass on the
 wide build, 813 without the integer dot product and 813 on SSE2.
+
+---
+
+## 0.9.10 — a patch budget the caller can ask for
+
+### Scope
+
+The cheap half of `TODO.md`'s *fewer patches, before the pooling* — `RESEARCH.md`
+idea 4, and the entry called it the largest vision win available. The tower is
+16 layers of width 768 over every patch, and the 3×3 pooling that turns those
+patches into soft tokens happens **after** the encoder, so every patch is paid
+in full whatever the pooling later does with it. Until now the resize always
+filled the checkpoint's configured maximum, and a caller who wanted a cheaper
+look at a picture had no way to say so.
+
+It now has one. `model_image_budget(model, rows)` caps what a picture may cost
+in soft tokens, and `--image-tokens <n>` is that flag on the command line.
+
+### What it moves, and what it deliberately does not
+
+Only the resize. `vision_grid_pick` sized the picture from `form->soft_limit`;
+it now sizes it from `vision_soft_cap`, which is `soft_limit` unless the caller
+has asked for less. Everything downstream is untouched — the 3×3 pool geometry,
+the two position tables, the patch cut, the projector, and the count of rows the
+tower emits are all still exactly what they were for a grid of that size. **A
+budgeted picture is a smaller picture honestly encoded, not a full one
+truncated**, which is the property that makes the flag safe to hand to a caller.
+
+The budget is a cap and never a floor. Asking for more than the checkpoint
+carries gives the checkpoint's own maximum rather than raising it, because the
+position table is sized for that maximum and not for more; asking for zero puts
+it back. A negative budget is refused rather than clamped.
+
+**Both sides of the resize round down to a whole pooling window, so the rows
+land under the budget rather than on it** — 40 rows at a budget of 48, 35 at 40.
+`--verbose` now prints what a picture actually came to beside the cap in force,
+because a number the caller asked for and a number they got are different
+numbers, and the flag is not honestly plumbed if only the first is visible.
+
+### The identity, which is the one thing that could have gone wrong
+
+A picture's rows are kept against the picture (0.9.7), keyed on the decoded
+samples and the tower configuration. The budget changes what the tower produces
+from the same samples, so it has to be **inside that identity or the store hands
+back the wrong answer** — the same photograph asked for cheaply once and fully
+once would collide on one entry, and nothing downstream could detect it. The
+mix takes `vision_soft_cap` where it took `soft_limit`. A test holds it: one
+raster, two budgets, and both mixes required to differ.
+
+### What it is worth
+
+On a fourth host — four cores of an i5-7600K at 3.8 GHz, AVX2 with FMA and no
+AVX-512, so the integer kernels compile away and the float path is the whole
+engine, the tuned build — over a 768×512 notice in block capitals, minimum of
+three runs each, a one-token turn so that the picture is nearly the whole of it.
+A turn with no picture at all is **0.878 s** on the same line, which is what the
+tower column has taken off.
+
+| budget | rows | patches | turn | tower | tower vs the maximum |
+| --- | --- | --- | --- | --- | --- |
+| the checkpoint's 280 | 260 | 2340 | 19.39 s | 18.51 s | 1.00x |
+| 128 | 117 | 1053 | 8.84 s | 7.96 s | 2.33x |
+| 64 | 54 | 486 | 4.48 s | 3.61 s | 5.13x |
+| 48 | 40 | 360 | 3.57 s | 2.69 s | 6.88x |
+| 40 | 35 | 315 | 3.25 s | 2.37 s | 7.81x |
+| 32 | 24 | 216 | 2.52 s | 1.64 s | 11.3x |
+| 16 | 12 | 108 | 1.74 s | 0.86 s | 21.5x |
+
+**And the tower is very nearly linear in patches over that whole range**, which
+is not what this entry expected. Milliseconds a patch run 7.91, 7.56, 7.43,
+7.47, 7.52, 7.59, 7.96 top to bottom — flat inside 7%, with the two ends the
+highest. Fitting `a·n + b·n²` to the top two points puts the quadratic term at
+**8% of the tower at the full 2340 patches**, so on this host the dense
+attention pair is a small part of a picture and the per-patch work is nearly all
+of it. That is worth knowing before anyone spends more on the attention here:
+`TODO.md`'s vision attention entry records scoring and the blend at 34 to 41% of
+a picture on the reference host, and this host does not agree.
+
+### What it costs, which is the half that has to be reported
+
+The entry's own instruction was to report a quality curve split by reading
+versus recognising, not a latency number. Two pictures, greedy, the same prompt
+at every budget.
+
+**Reading** — a notice of six lines, transcribed:
+
+| budget | rows | what came back |
+| --- | --- | --- |
+| 280 | 260 | every line exact |
+| 128 | 117 | every line exact |
+| 64 | 54 | every line exact |
+| 48 | 40 | every line exact |
+| 40 | 35 | every line exact |
+| 32 | 24 | the heading lost, the remaining five lines exact |
+| 16 | 12 | the heading and the last line both lost |
+
+**Recognising** — a scene of a house, a tree, a sun and three balls:
+
+| budget | rows | what came back |
+| --- | --- | --- |
+| 280 | 266 | house and its colour, door, window, tree |
+| 64 | 54 | house and its colour, roof, tree |
+| 32 | 24 | house, tree, sun, grass — four for four |
+| 16 | 12 | house, tree, sun, ground — still four for four |
+| 8 | 6 | **no picture seen at all** |
+
+So the two halves part company by about a factor of two in rows, and both cliffs
+are sharp rather than gradual. Reading this notice survives to 35 rows and
+breaks at 24; recognising this scene survives to 12. **Six rows is the failure
+worth naming**: the model does not describe a blurred picture, it answers as
+though no picture was attached — *"Please provide the picture you are referring
+to."* A budget that low is not a cheap look, it is a dropped attachment, and a
+caller has no way to tell which it got from the answer alone.
+
+Taking the last budget that keeps the transcription, a picture-reading turn is
+**19.39 s to 3.25 s, 5.97x**, and the tower inside it 18.51 to 2.37, **7.81x**.
+Taking the last that keeps the scene, **19.39 s to 1.74 s, 11.2x**.
+
+None of this is a policy and none of it is a default. The flag ships off, the
+shipped path is untouched, and what a caller should ask for depends on their
+picture and their question — which is why the two curves above are given as
+curves rather than reduced to a recommendation. Two pictures are also not a
+quality study: they are a shape, taken on synthetic rasters written for the
+purpose, and the cliff on a photograph of a page has not been measured.
+
+### That the shipped path is untouched
+
+By construction: with no budget asked for, `vision_soft_cap` returns
+`soft_limit` and every caller of it reads what it read before. Held end to end
+against a binary built from the previous commit — `logits` byte for byte on a
+text prompt and on both pictures, and, on the new build, the default,
+`--image-tokens 280` and `--image-tokens 400` byte for byte with each other.
+Two runs at one budget are byte for byte, and a budget against the default
+differs, so the flag is neither a no-op nor a source of noise.
+
+### Code
+
+- `tower_form`: `soft_budget`, the caller's cap, zero for the checkpoint's own.
+- `vision_soft_cap`: the cap in force, and the one place the two are reconciled.
+- `vision_grid_pick`, `media_mark`, `model_image_rows`: all three read it.
+- `model_image_budget`, `model_image_rows_most`: the setter, and the way to ask
+  what the checkpoint itself allows.
+- `app_main.c`: `--image-tokens`, put in force once between the load and the
+  task; the `--verbose` line reporting a picture's actual rows; and the
+  `--guess` usage line, which still said *greedy only* three versions after
+  0.9.8 gave the block path a temperature.
+
+### Tests
+
+Fourteen added, all in the tower test beside the picture store: the default cap,
+a negative budget refused, a budget over the maximum clamped to it, zero putting
+it back, the rows a budgeted picture emits, the row width unmoved, every value
+finite, and — the one that matters — one raster under two budgets giving two
+identities in both mixes, and the narrow call not being served the wide entry.
+**827 pass** on the tuned AVX2 build, 813 before.

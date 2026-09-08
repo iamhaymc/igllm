@@ -43,6 +43,10 @@ typedef struct main_flag {
    * none: a block of one lane is an ordinary step with the block path's
    * bookkeeping around it. */
   int         guess_span;
+  /* Soft tokens one picture may cost, zero for the checkpoint's own maximum.
+   * It buys most of what a picture costs and it costs detail, so it is a flag
+   * and never a default. */
+  int         image_rows;
   const char *keep_path;
   app_taste   taste;
 } main_flag;
@@ -113,13 +117,14 @@ static void main_usage(void) {
   printf("  --serve <count>     tokens to produce, default 128\n");
   printf("  --threads <count>   worker threads, default host count\n");
   printf("  --window <count>    context length cap\n");
+  printf("  --image-tokens <n>  soft tokens a picture may cost, fewer for a faster read\n");
   printf("  --cache <bits>      key and value cache storage, 0 float or 8 quantized\n");
   printf("  --heat <value>      temperature, 0 for greedy\n");
   printf("  --top-k <count>     top-k cutoff, 0 disables\n");
   printf("  --top-p <value>     top-p cutoff\n");
   printf("  --echo-penalty <v>  repetition penalty\n");
   printf("  --seed <value>      sampler seed\n");
-  printf("  --guess <lanes>     speculative block, greedy only, 0 or 1 for none\n");
+  printf("  --guess <lanes>     speculative block, 0 or 1 for none\n");
   printf("  --loop              keep the chat task open for more turns\n");
   printf("  --keep <path>       hold the prompt's cache here, and reuse it next time\n");
   printf("  --raw               skip the chat frame in the chat task\n");
@@ -160,6 +165,7 @@ static int main_flags(int argc, char **argv, main_flag *flag_out) {
     else if (strcmp(name_text, "--guess") == 0 && value_text) flag_out->guess_span = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--threads") == 0 && value_text) flag_out->thread_count = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--window") == 0 && value_text) flag_out->window_limit = atoi(argv[++argument_index]);
+    else if (strcmp(name_text, "--image-tokens") == 0 && value_text) flag_out->image_rows = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--cache") == 0 && value_text) flag_out->cache_bits = atoi(argv[++argument_index]);
     else if (strcmp(name_text, "--heat") == 0 && value_text) flag_out->taste.heat_value = (float)atof(argv[++argument_index]);
     else if (strcmp(name_text, "--top-k") == 0 && value_text) flag_out->taste.top_count = atoi(argv[++argument_index]);
@@ -207,6 +213,12 @@ static int main_media_load(app_model *model, const main_flag *flag, app_media *m
      * reference does with one.  Saying so is the difference between an answer
      * about the whole clip and an answer about its first half, and with more
      * than one clip in a prompt the line has to say which of them was cut. */
+    /* What the picture actually came to, which is not the budget: both sides of
+     * the resize round down to a whole pooling window, so the rows land under
+     * whatever cap was in force rather than on it. */
+    if (!audio_flag && flag->verbose_level > 0)
+      fprintf(stderr, "[image %s: %d rows of at most %d]\n", show->path_text,
+              media_list[show_index].row_count, model_image_rows(model));
     if (audio_flag && media_list[show_index].cut_flag)
       fprintf(stderr, "audio: the clip runs past the budget of %d s and is cut to it (%s)\n",
               (model_audio_rows(model) * model_audio_span_ms(model) + 999) / 1000,
@@ -1518,6 +1530,19 @@ int main(int argc, char **argv) {
   if (code != APP_OKAY) {
     fprintf(stderr, "load: %s\n", app_code_text(code));
     return 1;
+  }
+
+  /* The picture budget is the model's rather than a turn's, so it is set once
+   * here and every task below reads its pictures under it.  A checkpoint with
+   * no vision tower cannot honour it, and a caller that asked is told so rather
+   * than given a run that quietly ignored the flag. */
+  if (flag.image_rows > 0) {
+    code = model_image_budget(model, flag.image_rows);
+    if (code != APP_OKAY) {
+      fprintf(stderr, "image-tokens: %s\n", app_code_text(code));
+      model_free(model);
+      return 1;
+    }
   }
 
   if (strcmp(flag.task_text, "chat") == 0 && flag.loop_flag)

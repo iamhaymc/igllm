@@ -57,7 +57,7 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 | `cache`    | print the export's calibrated cache ranges    |
 | `guess`    | what a block of guesses is worth, against a proposer's ceiling; `--verbose` divides a round and prices its marginal lane |
 
-Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
+Common flags: `--model`, `--prompt`, `--text`, `--image`, `--image-tokens`, `--audio`, `--serve`,
 `--threads`, `--window`, `--cache`, `--heat`, `--top-k`, `--top-p`,
 `--echo-penalty`, `--seed`, `--guess`, `--loop`, `--keep`, `--raw`,
 `--verbose`. Run `igllm --help` for the full list.
@@ -238,6 +238,24 @@ python3 run.py run -- chat --model model \
 python3 run.py run -- chat --model model \
     --text "Compare" --image left.png \
     --text "against" --image right.png
+```
+
+`--image-tokens <n>` says what a picture may cost. The encoder runs before the
+pooling, so every patch is paid in full and a picture is close to linear in
+patches: asking for fewer soft tokens shrinks the resize and takes the tower
+down with it. On four AVX2 cores a 768x512 notice is a **19.4 s turn at the
+checkpoint's 280 rows and 3.3 s at `--image-tokens 40`**, transcribed exactly at
+both.
+
+It costs detail, which is why it is off by default and why there is no policy
+that picks a number. The two halves of the curve part company: reading a six
+line notice survives down to 35 rows, recognising a scene of four objects down
+to 12, and below about six rows the model answers as though no picture were
+attached at all. `CHANGES.md` 0.9.10 has both curves.
+
+```sh
+python3 run.py run -- chat --model model --image-tokens 64 \
+    --image photo.png --prompt "What is in this picture?"
 ```
 
 ## Workflows

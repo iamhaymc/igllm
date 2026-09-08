@@ -233,6 +233,13 @@ int      model_audio_token(const app_model *model);
 int      model_image_wrap(const app_model *model, int *open_out, int *shut_out);
 int      model_audio_wrap(const app_model *model, int *open_out, int *shut_out);
 int      model_image_rows(const app_model *model);   /* rows one image produces */
+int      model_image_rows_most(const app_model *model); /* rows the checkpoint allows */
+/* Asks that a picture cost no more than so many soft tokens, which is a cap on
+ * the patches the tower runs and so on nearly the whole of what a picture
+ * costs.  Zero restores the checkpoint's own maximum; more than that maximum is
+ * that maximum.  It moves the resize and nothing else, so it costs detail —
+ * report a quality curve beside any speed it is claimed to buy. */
+app_code model_image_budget(app_model *model, int row_count);
 /* The processor gives a clip a budget rather than reading all of it: so many
  * soft tokens, each standing for so many milliseconds.  A longer clip is cut to
  * fit, so these two are the ceiling on what one clip can contribute. */
@@ -7541,6 +7548,12 @@ typedef struct tower_form {
 
   /* vision */
   int patch_size, band_count, pool_size;
+  /* What the caller has asked one image to cost, in soft tokens, and zero when
+   * it has asked for nothing and the checkpoint's own `soft_limit` stands.  It
+   * is a cap and never a floor: a budget above the configured maximum is the
+   * configured maximum, because the position table and the pooling contract are
+   * sized for that and not for more. */
+  int soft_budget;
   int grid_wide, grid_high;   /* patches across and down, decided per image */
   int place_size;             /* rows in each axis of the position table */
   int standard_flag;
@@ -9561,6 +9574,19 @@ static void tower_lift_rows(app_model *model, tower_gear *gear, tower_room *room
 
 /* -- the vision tower ----------------------------------------------------- */
 
+/* The soft tokens one picture is allowed, which is the checkpoint's maximum
+ * unless the caller has asked for fewer.
+ *
+ * Everything downstream of the resize reads this rather than `soft_limit`: the
+ * grid, the rows a picture reports, and the identity a kept picture is filed
+ * under — that last one because two budgets over one photograph are two
+ * different answers and must never share an entry. */
+static int vision_soft_cap(const tower_form *form) {
+  int cap_value = form->soft_limit;
+  if (form->soft_budget > 0 && form->soft_budget < cap_value) cap_value = form->soft_budget;
+  return cap_value > 0 ? cap_value : 1;
+}
+
 /* The size the picture is resized to.
  *
  * The tower takes a variable resolution rather than a fixed square: the aspect
@@ -9570,7 +9596,7 @@ static void tower_lift_rows(app_model *model, tower_gear *gear, tower_room *room
 static void vision_grid_pick(const tower_form *form, int wide_count, int high_count,
                              int *wide_out, int *high_out) {
   int side_step = form->pool_size * form->patch_size;
-  long patch_limit = (long)form->soft_limit * (long)form->pool_size * (long)form->pool_size;
+  long patch_limit = (long)vision_soft_cap(form) * (long)form->pool_size * (long)form->pool_size;
   double target_area = (double)patch_limit * (double)form->patch_size * (double)form->patch_size;
   double shrink_value = sqrt(target_area / ((double)wide_count * (double)high_count));
   int side_limit = (int)(patch_limit / ((long)form->pool_size * (long)form->pool_size)) * side_step;
@@ -12721,10 +12747,42 @@ int model_audio_wrap(const app_model *model, int *open_out, int *shut_out) {
 
 /* The most rows one image can produce.  The tower takes a variable resolution,
  * so what a given picture yields is known only after it is read; this is the
- * cap the checkpoint sets. */
+ * cap in force, which is the checkpoint's unless the caller has lowered it. */
 int model_image_rows(const app_model *model) {
   if (!model_vision_ready(model)) return 0;
+  return vision_soft_cap(&model->tower_list[TOWER_VISION].form);
+}
+
+/* What the checkpoint itself allows one image, whatever the caller has asked
+ * for since.  A caller that wants to offer a range needs the top of it. */
+int model_image_rows_most(const app_model *model) {
+  if (!model_vision_ready(model)) return 0;
   return model->tower_list[TOWER_VISION].form.soft_limit;
+}
+
+/* Asks that a picture cost no more than `row_count` soft tokens.
+ *
+ * The tower pays for patches and not for soft tokens, and the two are the same
+ * number scaled by the pooling window, so a budget of a quarter the rows is a
+ * quarter the patches — which is roughly a quarter of the projections and a
+ * sixteenth of the dense attention pair.  It is the resize that is moved and
+ * nothing else: the pooling geometry, the position table and the emitted row
+ * count are all still exactly what they were, so a picture at a budget is a
+ * smaller picture honestly encoded rather than a full one truncated.
+ *
+ * `row_count` of zero puts the checkpoint's own maximum back.  A budget above
+ * that maximum is not an error and does not raise it — a caller asking for more
+ * detail than the export carries gets the export's.
+ *
+ * Pictures already in the store were encoded under whatever budget was in force
+ * when they ran, and the budget is part of what they are filed under, so this
+ * does not have to evict anything. */
+app_code model_image_budget(app_model *model, int row_count) {
+  if (!model) return APP_FAIL_ARGUMENT;
+  if (row_count < 0) return APP_FAIL_ARGUMENT;
+  if (!model_vision_ready(model)) return APP_FAIL_SUPPORT;
+  model->tower_list[TOWER_VISION].form.soft_budget = row_count;
+  return APP_OKAY;
 }
 
 /* The most rows one clip can produce, and what one of them is worth.  A clip
@@ -12818,7 +12876,7 @@ static void media_mark(const app_model *model, const flat_grid *grid, uint64_t *
     part_list[2] = (uint64_t)grid->band_count;
     part_list[3] = (uint64_t)form->patch_size;
     part_list[4] = (uint64_t)form->pool_size;
-    part_list[5] = (uint64_t)form->soft_limit;
+    part_list[5] = (uint64_t)vision_soft_cap(form);
     part_list[6] = (uint64_t)form->layer_count;
     part_list[7] = (uint64_t)form->state_size;
     part_list[8] = (uint64_t)form->head_count;
