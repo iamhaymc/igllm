@@ -338,6 +338,17 @@ size_t       session_cache_room(const app_session *session);
 size_t       session_cache_room_at(const app_session *session, int cache_bits);
 app_tally    session_tally(const app_session *session);
 app_phase_book session_phases(const app_session *session);
+/* The same division of a *speculative round* rather than of a decode step.
+ *
+ * A block runs the same graph several lanes wide, so its parts answer a
+ * different question from a step's and are kept in a book of their own — one
+ * `session_guess` is a round, exactly as one `session_step` is a step.  Two of
+ * these at different block widths are what says where a marginal lane goes.
+ *
+ * `session_phase_clear` zeroes both books without disarming the timer, so a
+ * caller can time one stretch of a run rather than all of it. */
+app_phase_book session_phases_block(const app_session *session);
+void         session_phase_clear(app_session *session);
 const char  *app_phase_text(int phase_slot);
 
 /* helper layer ------------------------------------------------------------*/
@@ -4921,7 +4932,15 @@ static void back_mat_mat(back_desk *desk, const plane *sheet, const float *act_d
     job.level_data = NULL;
     job.isum_data = NULL;
     job.step_list = desk->step_room;
-    job.level_stride = desk->level_limit;
+    /* The staging is laid down at the plane's own width rather than at the
+     * widest plane the model binds.  `level_room` is `level_limit` a lane, and
+     * a batch that used that whole stride put sixteen lanes of a 1536 column
+     * plane 8960 bytes apart — `ple embed`'s width, on this export — where the
+     * bytes a row actually reads are 24 KiB and would fit in the first level
+     * cache side by side.  Same room, same staging, nothing to allocate: it is
+     * only where each lane starts.  Worth 6.6% of the batched feed-forward and
+     * 0.6 ms of a speculative round's marginal lane. */
+    job.level_stride = sheet->form == PLANE_CODE ? sheet->col_count : desk->level_limit;
     job.wide_flag = 0;
     if (sheet->form == PLANE_CODE) {
       /* One product is on a grid or it is not: a lane that falls off puts the
@@ -4951,7 +4970,7 @@ static void back_mat_mat(back_desk *desk, const plane *sheet, const float *act_d
         level_flag = step_value > 0.0f &&
                      kern_level_stage(
                          sheet, step_value, exact_flag, lane_data,
-                         desk->level_room + (size_t)lane_index * (size_t)desk->level_limit,
+                         desk->level_room + (size_t)lane_index * (size_t)job.level_stride,
                          desk->isum_room + (size_t)lane_index * (size_t)sheet->group_count);
       }
       if (level_flag) {
@@ -10345,6 +10364,11 @@ struct app_session {
   int        fill_count;
   app_tally  tally;
   app_phase_book phase;
+  /* A block's parts, kept apart from a step's: the same graph several lanes
+   * wide is a different question, and mixing them would make both unreadable.
+   * `phase_ref` is whichever of the two the timer is filling. */
+  app_phase_book  phase_block;
+  app_phase_book *phase_ref;
   double     phase_mark; /* when the open part began */
   int        phase_slot; /* the part that is open, -1 for none */
   int        phase_on;   /* set while a decode step is being divided */
@@ -10440,16 +10464,18 @@ struct app_session {
  * The whole thing is a load and a predicted branch when the timer is off,
  * which is every run that did not ask for it. */
 static void phase_turn(app_session *session, int phase_slot) {
+  app_phase_book *book;
   double now_time;
   if (!session->phase_on) return;
+  book = session->phase_ref ? session->phase_ref : &session->phase;
   now_time = time_now();
   if (session->phase_slot >= 0) {
-    session->phase.seconds[session->phase_slot] += now_time - session->phase_mark;
-    session->phase.counts[session->phase_slot] += 1;
+    book->seconds[session->phase_slot] += now_time - session->phase_mark;
+    book->counts[session->phase_slot] += 1;
   }
   session->phase_slot = phase_slot;
   session->phase_mark = now_time;
-  session->phase.read_count += 1;
+  book->read_count += 1;
 }
 
 /* Closes whatever part is open without opening another.  The read is charged
@@ -11715,14 +11741,29 @@ const float *session_guess(app_session *session, const int32_t *id_list, int id_
    * smoothed: `session_guess_keep` divides these bytes by the tokens actually
    * committed, and a block that commits one carries the whole sweep against it.
    *
-   * The phase division stays off.  It is armed for a decode step, and a block
-   * runs the same graph several lanes wide; letting a block into those buckets
-   * would make both unreadable, for the reason a prime pass is kept out. */
+   * The phase division runs, into a book of its own.  A block is the same graph
+   * several lanes wide, so letting it into the step's buckets would make both
+   * unreadable — which is why there are two books rather than one, and why one
+   * `session_guess` counts as a round there and not as a step here.  A prime
+   * pass is still divided by neither. */
   session->tally.serve_bytes +=
       model_decode_bytes(session->model) + session_cache_bytes(session) * (size_t)id_count;
+  session->phase_on = session->phase.live_flag;
+  session->phase_ref = &session->phase_block;
+  session->phase_slot = -1;
   guess_from = time_now();
   logit_list = session_pass(session, id_list, NULL, NULL, id_count, PASS_LOGIT_ALL);
-  session->tally.serve_seconds += time_now() - guess_from;
+  phase_shut(session);
+  session->phase_on = 0;
+  session->phase_ref = &session->phase;
+  {
+    double round_seconds = time_now() - guess_from;
+    session->tally.serve_seconds += round_seconds;
+    if (session->phase.live_flag) {
+      session->phase_block.step_seconds += round_seconds;
+      session->phase_block.step_count += 1;
+    }
+  }
   session->tally.memory_bytes = app_total_bytes;
   if (!logit_list) {
     /* The pass refused before it wrote anything, so there is nothing to undo
@@ -12837,6 +12878,8 @@ app_code session_open(app_model *model, app_session **session_out) {
    * reports is detail and because a run that did not ask for it should not pay
    * even the branch on the caller's word alone. */
   session->phase.live_flag = model->setup.verbose_level > 0;
+  session->phase_block.live_flag = session->phase.live_flag;
+  session->phase_ref = &session->phase;
   session->phase_slot = -1;
 
   for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
@@ -12984,7 +13027,9 @@ void session_reset(app_session *session) {
      * tally beside them does not. */
     int live_flag = session->phase.live_flag;
     memset(&session->phase, 0, sizeof(session->phase));
+    memset(&session->phase_block, 0, sizeof(session->phase_block));
     session->phase.live_flag = live_flag;
+    session->phase_block.live_flag = live_flag;
     session->phase_slot = -1;
     session->phase_on = 0;
   }
@@ -13079,6 +13124,7 @@ const float *session_step_state(app_session *session, int32_t id_value, const fl
    * rather than about a token; letting it into the same buckets would make
    * both unreadable. */
   session->phase_on = session->phase.live_flag;
+  session->phase_ref = &session->phase;
   session->phase_slot = -1;
   from_time = time_now();
   logit_list = session_pass(session, &id_value, state_data, &state_mark, 1, 1);
@@ -13273,6 +13319,24 @@ app_phase_book session_phases(const app_session *session) {
   app_phase_book book;
   if (!session) { memset(&book, 0, sizeof(book)); return book; }
   return session->phase;
+}
+
+app_phase_book session_phases_block(const app_session *session) {
+  app_phase_book book;
+  if (!session) { memset(&book, 0, sizeof(book)); return book; }
+  return session->phase_block;
+}
+
+void session_phase_clear(app_session *session) {
+  int live_flag;
+  if (!session) return;
+  live_flag = session->phase.live_flag;
+  memset(&session->phase, 0, sizeof(session->phase));
+  memset(&session->phase_block, 0, sizeof(session->phase_block));
+  session->phase.live_flag = live_flag;
+  session->phase_block.live_flag = live_flag;
+  session->phase_slot = -1;
+  session->phase_on = 0;
 }
 
 const char *app_phase_text(int phase_slot) {

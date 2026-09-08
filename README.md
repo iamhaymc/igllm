@@ -55,7 +55,7 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 | `logits`   | print the next token distribution as json     |
 | `probe`    | print the resolved model shape                |
 | `cache`    | print the export's calibrated cache ranges    |
-| `guess`    | what a block of guesses is worth, against a proposer's ceiling |
+| `guess`    | what a block of guesses is worth, against a proposer's ceiling; `--verbose` divides a round and prices its marginal lane |
 
 Common flags: `--model`, `--prompt`, `--text`, `--image`, `--audio`, `--serve`,
 `--threads`, `--window`, `--cache`, `--heat`, `--top-k`, `--top-p`,
@@ -102,6 +102,21 @@ block  proposer    tok/s  ms a round  committed of drawn  vs plain  stream
 8      oracle      52.08      153.61       8.00     100%     2.11x  matches plain
 8      n-gram      44.27       83.41       3.69      95%     1.80x  matches plain
 8      null         7.37      135.66       1.00       0%     0.30x  matches plain
+```
+
+`guess --verbose` divides a round the same way `bench --verbose` divides a step,
+and subtracts the narrowest block from the widest so the difference prices the
+**marginal lane** part by part — which is the whole of what holds the ceiling
+down, because a block shares the weight sweep across its lanes and cannot share
+the arithmetic.
+
+```
+round   a block of 2 against a block of 16, both with the oracle
+part                         ms at 2     ms at 16     ms a lane    share
+mlp                           36.782      160.924         8.867    49.3%
+final norm, head               7.658       37.061         2.100    11.7%
+score, softmax, blend          4.076       31.862         1.985    11.0%
+named, in all                 67.377      319.192        17.987   100.0%
 ```
 
 `bench --verbose` prints where a decode step goes, largest part first, with the

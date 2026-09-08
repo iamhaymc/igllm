@@ -5776,6 +5776,86 @@ step 2's remaining half in the speculative entry. What made those two worth
 anything was the head's cost per byte, and the change at the top of this version
 took 46% of that instead.
 
+### A speculative round, divided
+
+The head entry above was written against the belief that the output head is
+what holds the speculative ceiling down — 0.9.0 measured the marginal lane at
+13 ms and put six of them in the head, and 0.9.1 took it to three. Nobody had
+divided a *round* the way `bench --verbose` divides a step, so the rest of the
+lane was an assertion.
+
+`igllm guess --verbose` now divides one. A block runs the same graph several
+lanes wide, so its parts answer a different question from a step's and are kept
+in a book of their own — `session_phases_block` beside `session_phases`, with
+one `session_guess` counting as a round there exactly as one `session_step`
+counts as a step here. The report subtracts the oracle's narrowest block from
+its widest, so the difference prices the marginal lane part by part. The oracle
+because it commits every lane it is given and so runs full width every round; a
+proposer that draws nothing takes an ordinary step and its rounds would be a
+mixture of two shapes.
+
+On a 49 id prompt, 128 tokens, four threads, a block of 2 against a block of 16:
+
+| part | ms at 2 | ms at 16 | ms a lane | share of the lane |
+| --- | --- | --- | --- | --- |
+| mlp | 36.782 | 160.924 | **8.867** | **49.3%** |
+| final norm, head | 7.658 | 37.061 | 2.100 | 11.7% |
+| score, softmax, blend | 4.076 | 31.862 | 1.985 | 11.0% |
+| q k v | 5.597 | 21.824 | 1.159 | 6.4% |
+| attn out | 5.079 | 21.037 | 1.140 | 6.3% |
+| ple feed | 3.224 | 15.843 | 0.901 | 5.0% |
+| named, in all | 67.377 | 319.192 | **17.987** | 100% |
+
+**The head is no longer the ceiling.** It is 2.1 ms of 18.0 after the change at
+the top of this version, and half the lane is the feed-forward. Every entry that
+reasoned from "the head is half the marginal lane" should be re-read against
+this table rather than re-derived.
+
+### Where the mlp's gap goes, and three things that are not it
+
+With the lane relocated, the mlp was measured the same way the head was — its
+own 472.5 MiB, run three ways at four threads on the reference host, one quiet
+run:
+
+| | ms | |
+| --- | --- | --- |
+| swept sequentially | 16.4 | the memory floor |
+| walked in the kernel's own pattern, no arithmetic | 18.4 | +12% |
+| the kernel | 22.6 | +23% |
+
+So the gap is two things. **Twelve percent is the row block's access pattern** —
+four rows interleaved and thirty-two byte loads — which is the price of sharing
+the staged levels and the epilogue between four rows, not something left on the
+floor. **The rest is issue**, at about 1.4 ms per port-0-or-5 uop in the inner
+loop: dropping the shift and the mask costs 19.1 ms, dropping the dot product
+instead costs 21.9, and the three uops are worth about the same each. The one
+that could be removed is the shift-and-mask pair, and `vgf2p8affineqb` already
+removes it where the host has GFNI — 0.8.14 built that path. On a host without
+it there is no single AVX-512BW instruction that shifts and masks, so this half
+is the instruction set's. The same ratios hold at one thread, so none of it is
+the fork, the join, or uneven threads.
+
+And on the *batched* lane, which is the number that now matters, three
+explanations were measured and all three came back small:
+
+- **The per-lane epilogue**: `kern_row_code_level_many` closes every row for
+  every lane on its own, 7.7 M times over the mlp at sixteen lanes, where the
+  one lane path has folded sixteen rows into a vector since 0.8.12. Replacing
+  the whole close with a raw store is worth 3.7 to 8.7% — 0.3 to 0.8 ms of a
+  9.3 ms lane.
+- **The staging stride**: every lane's levels were laid down `level_limit`
+  apart, the widest code plane the model binds, so sixteen lanes of a 1536
+  column plane sat 8960 bytes apart where the 24 KiB they read would have fitted
+  in the first level cache side by side. Staging at the plane's own width is
+  6.6% in isolation. **End to end on this host it is a wash inside the noise**,
+  and it ships because it is the same work with better locality and costs
+  nothing — not because it was measured to pay.
+- **Ports**: five port-0 uops per four lanes per block is about 2 ms a lane over
+  four threads, against 8.9 measured.
+
+Four fifths of the batched lane is therefore still unexplained, and `TODO.md`
+says so and says to take a hardware counter to it rather than another loop.
+
 ### What moved in the source
 
 - `kern_level_pick`, `kern_level_round`: the step a lane chooses, and the
@@ -5790,6 +5870,12 @@ took 46% of that instead.
 - `back_level_pick`: whether a plane will bring a step of its own, which is what
   says a row is worth scoring again.
 - `session_head_true`: the best sixty-four rows of the head, on the float path.
+- `session_phases_block`, `session_phase_clear`, and a second `app_phase_book`
+  in the session with `phase_ref` naming the one the timer is filling — so a
+  round is divided without a block's parts landing in a step's buckets.
+- `main_guess_phases`: the round division and the marginal lane, on
+  `guess --verbose`.
+- `back_mat_mat`: the level staging laid down at the plane's own width.
 
 ### Tests
 

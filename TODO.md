@@ -172,9 +172,38 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   the same plane sits at 45% of a sweep rather than 78%, and whatever is left in
   the loop would show there and cannot show here.
 
+  **0.9.5 divided the gap, and it is two things rather than one.** The plane's
+  own 472.5 MiB were run three ways on the reference host at four threads: swept
+  sequentially, walked in the kernel's own pattern — four rows interleaved, the
+  same thirty-two byte loads, added instead of decoded — and then by the kernel
+  itself. In one quiet run: **sweep 16.4 ms, walk 18.4, kernel 22.6**. So
+
+  - **12% is the access pattern**, and it is not a bug. Four rows in flight is
+    what shares the staged levels and the epilogue between them, and reading
+    them costs more than reading one stream. It is the price of the row block,
+    not something left on the floor.
+  - **the other 19% is issue**, at about 1.4 ms per port-0-or-5 uop in the inner
+    loop. Removing the shift and the mask and keeping the dot product costs
+    19.1 ms; keeping them and dropping the dot product costs 21.9. Three uops
+    per sixty-four codes a row — `vpsrlvd`, `vpandd`, `vpdpbusd` — and each is
+    worth about the same.
+
+  **Which says the one instruction worth removing is already removed where the
+  host allows it.** `vgf2p8affineqb` does the shift and the mask as one, and
+  0.8.14 built that path; it is gated on GFNI, which the reference host does not
+  have and the third host does. On a host without GFNI there is nothing cheaper
+  in AVX-512BW — the two uops are a variable shift and a mask, and no single
+  instruction in that subset does both — so this half of the gap is a property
+  of the instruction set and not of the loop.
+
+  The same measurement at **one** thread gives the same ratio (kernel at 70% of
+  its sweep, 79% of its walk), so none of it is the fork, the join, or the
+  threads landing unevenly.
+
   What is not worth retrying: the bit width (0.8.11), eight rows a block
   (0.8.11, and again in 0.8.16 on the other path), software prefetch (0.8.11),
-  the page walk (0.8.12), and the accumulator chain at either width (0.9.2).
+  the page walk (0.8.12), the accumulator chain at either width (0.9.2), and the
+  access pattern or the unpack on a host without GFNI (0.9.5).
 
 - **The output head, which used to run the float kernel and now runs the
   integer one.** 96 MiB and 12.2% of everything a decode step reads, and until
@@ -355,11 +384,59 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      orthogonal. So this step is finished, and what remains of the ceiling is
      not in the head.
 
-     **Measure the marginal lane again before writing anything else here**,
-     which is what 0.9.1 and 0.9.5 each did, and take its phase breakdown while
-     you are there: nobody has yet divided a *speculative round* into named
-     parts the way `bench --verbose` divides a step, and 18 ms a lane against a
-     45.7 ms step is now the largest unexplained number in this entry.
+     **And 0.9.5 divided a round, which says where the lane actually goes.**
+     `igllm guess --verbose` prices the marginal lane part by part, by
+     subtracting the oracle's narrowest block from its widest. On the reference
+     host, a block of 2 against a block of 16 on a 49 id prompt:
+
+     | part | ms at 2 | ms at 16 | ms a lane | share of the lane |
+     | --- | --- | --- | --- | --- |
+     | mlp | 36.782 | 160.924 | **8.867** | **49.3%** |
+     | final norm, head | 7.658 | 37.061 | 2.100 | 11.7% |
+     | score, softmax, blend | 4.076 | 31.862 | 1.985 | 11.0% |
+     | q k v | 5.597 | 21.824 | 1.159 | 6.4% |
+     | attn out | 5.079 | 21.037 | 1.140 | 6.3% |
+     | ple feed | 3.224 | 15.843 | 0.901 | 5.0% |
+     | named, in all | 67.377 | 319.192 | **17.987** | 100% |
+
+     **So the head is no longer the ceiling and the mlp is.** The entry above
+     used to read that the head was six of the original thirteen milliseconds
+     and 0.9.1 made it three; it is now **2.1 of 18.0**, and half the lane is
+     the feed-forward. Nothing above this line needs re-deriving — take the
+     table.
+
+     **And the mlp's marginal lane is nowhere near its own instruction floor,
+     which is the open question this entry now turns on.** A lane of the mlp is
+     991 M multiply-adds; `vpdpbusd` retires sixty-four of them, so that is 15.5
+     M instructions, and `KERN_LEVEL_MANY_LOOP` issues five port-0 uops per four
+     lanes per block — about 2 ms over four threads. The measured lane is
+     **8.9**, four times that.
+
+     0.9.5 measured the two obvious explanations and neither is it:
+
+     - **The epilogue is not it.** `kern_row_code_level_many` closes every row
+       for every lane on its own — a sixty-four bit subtract, a widening and two
+       float multiplies, 7.7 M times over the mlp at sixteen lanes — where the
+       one lane path has folded sixteen rows into a vector since 0.8.12.
+       Replacing the whole close with a raw store is worth **3.7 to 8.7%** of
+       the batched plane, 0.3 to 0.8 ms of a lane. Worth having eventually;
+       nowhere near four times.
+     - **The staging stride was not it either.** Every lane's levels used to be
+       laid down `desk->level_limit` apart, which is the widest code plane the
+       model binds — `ple embed`'s 8960 columns — so sixteen lanes of a 1536
+       column plane sat 8960 bytes apart where the 24 KiB they actually read
+       would have fitted in the first level cache side by side. 0.9.5 stages at
+       the plane's own width instead. In isolation that is **6.6%** of the
+       batched feed-forward; end to end on this host it is a wash inside the
+       noise, and it ships because it is the same work with better locality and
+       costs nothing, not because it was measured to pay.
+
+     So four fifths of the batched lane is still unexplained, and it is now the
+     largest single number in this list — 8.9 ms a lane against a 45.7 ms step,
+     with the ceiling in the table above riding on it. **Take a hardware counter
+     to it before writing another loop**: the three hypotheses that can be
+     reasoned about from the source have now all been measured and all three
+     came back small.
 
   3. **Done, 0.9.3: the n-gram proposer.** `app_scout` asks what followed the
      last time this stream said what it has just said — a growing array of ids
@@ -656,3 +733,6 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | The output head on the integer path — a step of the activation's own where the export gave the plane none, and the best sixty-four rows scored again on the float path so the decision is not the rounding's | 0.9.5 |
 | The float head's remaining instruction, one `vbroadcasti32x4` for three `vpbroadcastd` (refused: a wash — the three it removes are load-port uops and the loop is bound by ports 0 and 5) | 0.9.5 |
 | Whether a cluster bound can prune the head's 262144 rows (answered: no, and for every clustering rather than the one tried — the mean nearest neighbour is 0.89 of a row norm and the bound needs 0.14) | 0.9.5 |
+| A speculative round divided into named parts, and the marginal lane priced part by part by subtracting the narrowest block from the widest | 0.9.5 |
+| Where the mlp's gap to a bare sweep goes (answered: 12% is the row block's access pattern and 19% is three inner-loop uops, one of which GFNI already removes) | 0.9.5 |
+| Whether the batched path's per-lane epilogue or its staging stride explains the marginal lane (answered: neither — 4 to 9% and 7%, against a gap of four times) | 0.9.5 |

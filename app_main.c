@@ -1227,6 +1227,80 @@ static double main_guess_run(app_session *session, main_reel *reel, int block_sp
   return time_now() - from_time;
 }
 
+/* Where a speculative round goes, and what a lane of it costs.
+ *
+ * `main_phases` divides a decode step; this divides a *round*, which is the
+ * same graph several lanes wide, and it divides two of them — the narrowest
+ * block and the widest — so the difference names the marginal lane part by
+ * part.  That is the number `TODO.md`'s speculative entry is now about: a block
+ * shares the weight sweep across its lanes and cannot share the arithmetic, and
+ * what an extra lane costs is what holds the ceiling down.
+ *
+ * Both books come from the oracle, because it commits every lane it is given
+ * and so runs full width every round.  A proposer that draws nothing takes an
+ * ordinary step, and its rounds would be a mixture of two shapes. */
+static void main_guess_phases(const app_phase_book *thin_book, int thin_span,
+                              const app_phase_book *wide_book, int wide_span) {
+  int phase_slot, order_list[APP_PHASE_COUNT], order_index, order_scan;
+  double thin_total = 0.0, wide_total = 0.0;
+  double lane_span = (double)(wide_span - thin_span);
+
+  if (!thin_book->step_count || !wide_book->step_count || lane_span <= 0.0) return;
+  for (phase_slot = 0; phase_slot < APP_PHASE_COUNT; ++phase_slot) {
+    thin_total += thin_book->seconds[phase_slot];
+    wide_total += wide_book->seconds[phase_slot];
+  }
+  if (wide_total <= 0.0) return;
+
+  /* Ordered by what the lane costs rather than by what the round costs, because
+   * the lane is the question. */
+  for (phase_slot = 0; phase_slot < APP_PHASE_COUNT; ++phase_slot)
+    order_list[phase_slot] = phase_slot;
+  for (order_index = 1; order_index < APP_PHASE_COUNT; ++order_index) {
+    int keep_slot = order_list[order_index];
+    double keep_gap = wide_book->seconds[keep_slot] / (double)wide_book->step_count -
+                      thin_book->seconds[keep_slot] / (double)thin_book->step_count;
+    for (order_scan = order_index; order_scan > 0; --order_scan) {
+      int other = order_list[order_scan - 1];
+      double other_gap = wide_book->seconds[other] / (double)wide_book->step_count -
+                         thin_book->seconds[other] / (double)thin_book->step_count;
+      if (other_gap >= keep_gap) break;
+      order_list[order_scan] = other;
+    }
+    order_list[order_scan] = keep_slot;
+  }
+
+  printf("\nround   a block of %d against a block of %d, both with the oracle\n", thin_span,
+         wide_span);
+  {
+    char thin_text[24], wide_text[24];
+    sprintf(thin_text, "ms at %d", thin_span);
+    sprintf(wide_text, "ms at %d", wide_span);
+    printf("%-24s %11s %11s %13s %8s\n", "part", thin_text, wide_text, "ms a lane", "share");
+  }
+  for (order_index = 0; order_index < APP_PHASE_COUNT; ++order_index) {
+    double thin_each, wide_each, lane_each;
+    phase_slot = order_list[order_index];
+    if (!wide_book->counts[phase_slot] && !thin_book->counts[phase_slot]) continue;
+    thin_each = thin_book->seconds[phase_slot] / (double)thin_book->step_count;
+    wide_each = wide_book->seconds[phase_slot] / (double)wide_book->step_count;
+    lane_each = (wide_each - thin_each) / lane_span;
+    printf("%-24s %11.3f %11.3f %13.3f %7.1f%%\n", app_phase_text(phase_slot), thin_each * 1000.0,
+           wide_each * 1000.0, lane_each * 1000.0,
+           100.0 * (wide_each - thin_each) / (wide_total / (double)wide_book->step_count -
+                                              thin_total / (double)thin_book->step_count));
+  }
+  printf("%-24s %11.3f %11.3f %13.3f %7.1f%%\n", "named, in all",
+         thin_total / (double)thin_book->step_count * 1000.0,
+         wide_total / (double)wide_book->step_count * 1000.0,
+         (wide_total / (double)wide_book->step_count -
+          thin_total / (double)thin_book->step_count) / lane_span * 1000.0,
+         100.0);
+  printf("a lane is what a block cannot share: the weights are swept once a round however\n");
+  printf("wide it is, so every millisecond above is arithmetic, cache or staging that each\n");
+  printf("lane pays for itself.  Halve it and the ceiling in the table above doubles.\n");
+}
+
 static int main_guess(app_model *model, const main_flag *flag) {
   static const int span_list[4] = {2, 4, 8, 16};
   app_session *session = NULL;
@@ -1238,6 +1312,8 @@ static int main_guess(app_model *model, const main_flag *flag) {
   int32_t *made_list;
   double plain_seconds;
   int32_t last_id;
+  app_phase_book thin_book, wide_book;
+  int thin_span = 0, wide_span = 0;
 
   if (session_open(model, &session) != APP_OKAY || !session) {
     fprintf(stderr, "session failed\n");
@@ -1275,6 +1351,8 @@ static int main_guess(app_model *model, const main_flag *flag) {
   printf("block   at most %d lanes\n\n", session_guess_limit(session));
   printf("%-6s %-8s %8s %11s %10s %8s %9s  %s\n", "block", "proposer", "tok/s", "ms a round",
          "committed", "of drawn", "vs plain", "stream");
+  thin_book = session_phases_block(session);  /* zeroed until an oracle row fills one */
+  wide_book = thin_book;
   for (span_slot = 0; span_slot < 4; ++span_slot) {
     int block_span = span_list[span_slot];
     int mode_slot;
@@ -1287,8 +1365,14 @@ static int main_guess(app_model *model, const main_flag *flag) {
       long round_count = 0, commit_count = 0, draw_count = 0;
       double seconds;
       int same_flag = 1;
+      if (mode_value == MAIN_GUESS_ORACLE) session_phase_clear(session);
       seconds = main_guess_run(session, &reel, block_span, true_list, serve_count, mode_value,
                                made_list, vocab_count, &round_count, &commit_count, &draw_count);
+      if (mode_value == MAIN_GUESS_ORACLE) {
+        if (!thin_span) { thin_book = session_phases_block(session); thin_span = block_span; }
+        wide_book = session_phases_block(session);
+        wide_span = block_span;
+      }
       if (seconds < 0.0 || round_count < 1) {
         printf("%-6d %-8s   run failed\n", block_span, main_guess_name(mode_value));
         continue;
@@ -1303,6 +1387,7 @@ static int main_guess(app_model *model, const main_flag *flag) {
              same_flag ? "matches plain" : "DIVERGES");
     }
   }
+  if (flag->verbose_level) main_guess_phases(&thin_book, thin_span, &wide_book, wide_span);
   printf("\noracle is the ceiling of any proposer and null is its floor; n-gram is the one\n");
   printf("that ships, reads only the stream it has already seen, and takes a plain step\n");
   printf("where it has nothing to propose, exactly as --guess does.  A proposer pays where\n");
