@@ -22,6 +22,12 @@ party library, and no build system beyond a C compiler.
 - **vision and audio** — a bidirectional patch encoder at variable resolution
   with two dimensional rotary positions, and a conformer audio encoder with
   chunked local attention, each projecting into the text embedding space
+- **a picture priced by the caller** — `--image-tokens` caps what one costs,
+  and the encoder is close to linear in patches, so asking for fewer soft
+  tokens buys back most of the time
+- **and paid for once** — `--image-keep` holds a picture's rows across runs and
+  `--keep` reuses a prompt's cache as far as it agrees with the next one, so a
+  fresh question about an encoded picture is a fraction of the first
 - **its own decoders** — png at every depth and interlace, jpeg sequential and
   progressive at eight or twelve bits over one, three or four components, pnm,
   bmp and riff wave readers, a bicubic
@@ -263,9 +269,9 @@ python3 run.py run -- chat --model model --image-tokens 64 \
 run, which is what a photograph asked about a run at a time needs — the
 in-process store only reaches a second question in the same loop. A repeat run
 of the notice above is **19.60 s to 10.36 s**; what is left is the text stack
-prefilling the soft tokens, which no store can avoid, because those ids are the
-prompt. With a budget beside it, two turns about one picture are **39.44 s to
-5.58 s**.
+prefilling the soft tokens, which this file cannot help with because those ids
+are the prompt rather than the picture — `--keep`, below, is what reaches them.
+With a budget beside it, two turns about one picture are **39.44 s to 5.58 s**.
 
 The file carries the backend and an encoder version, so one written by a
 different build is refused rather than believed, and the run says so and encodes
