@@ -5891,3 +5891,166 @@ that is not finite.
 
 797 pass on the wide build, 788 on a build without the integer dot product,
 where every plane takes the float path exactly as it did before.
+
+---
+
+## 0.9.6 — a block of queries through the tower's attention, at the same arithmetic
+
+### Scope
+
+`TODO.md`'s vision entry — *the tower's own attention, tiled, with the
+normalizer carried* — opened by asking for a fresh profile before any schedule
+was written, because 0.8.9 had changed the shares 0.8.8 recorded. This takes
+that profile, finds the prize where the entry said it would be, and spends it
+on something cheaper than the tiling the entry proposed: a block of queries
+rather than a block of keys, which needs no running maximum, no normalizer
+carried across tiles, and no change to the order of any sum.
+
+Every number below is from the reference host: four cores of a Xeon at 2.8 GHz,
+AVX-512 with VNNI and no GFNI, the `--wide` build, four threads, the checkpoint
+in the page cache. The picture is 768 by 768 at the full patch budget, which is
+2304 patches through 16 layers of width 768 and 12 heads.
+
+### The profile, which is the entry's own first step
+
+A picture divided into its named parts, one tower forward, four threads:
+
+| part | s | share |
+| --- | --- | --- |
+| **score, softmax, blend** | **5.44** | **52.7%** |
+| feed-forward | 2.63 | 25.5% |
+| q k v | 1.34 | 13.0% |
+| attn out | 0.46 | 4.4% |
+| head norms, rotary | 0.26 | 2.5% |
+| gather k v | 0.08 | 0.8% |
+| named, in all | 10.33 | 100% |
+
+So the entry's premise holds and is if anything understated: the projections
+took the integer path in 0.8.9 and the attention did not, and it is now over
+half of a picture. Split further, scoring is 51% of that phase, the blend 43%
+and the softmax 6.6%.
+
+**Both are far off this host's arithmetic, which says it is not a memory
+schedule that is missing.** Scoring runs 65.2 G multiply-adds in 9.75 thread
+seconds and the blend the same 65.2 in 8.18 — 6.7 and 8.0 G a second against a
+256-bit FMA peak of 44.8 a core. A gathered head is 590 KiB of keys and 590 KiB
+of values, and the two are walked in separate loops, so each sits inside this
+host's 1 MiB of private second level cache for the whole of the band. Neither
+loop is waiting on memory; both are waiting on their own shape.
+
+### What the shape was
+
+`tower_attend_band` took one query at a time. For that query it scored against
+every one of the 2304 gathered keys — 2304 calls to `kern_dot_real`, each of
+them eight multiply-adds over sixty-four columns followed by a horizontal
+reduction into a float and a scalar store — softmaxed the row, and blended.
+Then it read the same 590 KiB of keys again for the next query, and again for
+the one after that.
+
+Two costs, and the second is the larger. **The run is read once per query where
+it could be read once per block of queries**, and **a sixty-four column dot
+pays a close that costs about as much as the eight multiply-adds it closes**.
+
+### The block, and why it is not the tiling the entry asked for
+
+`RESEARCH.md` idea 11 is flash attention's schedule: tile the keys, carry a
+running maximum and normalizer across tiles, accumulate the blend, and never
+materialize the score matrix. Its prize is the score matrix, which at 2304
+patches is 2304 by 2304.
+
+**This engine never materialized that matrix in the first place.** A band holds
+one score row, not the grid, so the memory the tiling would save was already
+saved and what is left of the idea is the summation-order change it costs. The
+axis that is actually loose is the other one: the queries, which share every
+byte both loops read and shared nothing.
+
+So the block is four queries wide. `kern_score_block` loads a key row once and
+multiplies it into four queries' accumulators; `kern_blend_rows_many` loads a
+value row once and folds it into four queries' blocks of running sums. The
+softmax between them stays per query, because that is what it is.
+
+**Four, and not more, for the reason `KERN_CODE_LANE` is four.** Four queries
+against a thirty-two column block of values is sixteen live accumulators, which
+is every vector register an AVX2 host has; a host with AVX-512's thirty-two was
+measured at the same width and does not need more to cover the multiply-add's
+latency.
+
+### The arithmetic is the one lane path's, and that is checked rather than argued
+
+Neither kernel reassociates anything.
+
+**Scoring.** Each lane keeps the same two accumulators over the same slots in
+the same order `kern_dot_real` keeps them in. The close is the only thing that
+changes shape: `kern_dot_total` adds a vector's two halves and then pairs what
+is left twice, and a pair of `_mm_hadd_ps` over four lanes at once pairs
+exactly the same four floats in exactly the same order — `(a0+a1)+(a2+a3)` —
+for four lanes in one lane's worth of instructions.
+
+**The blend.** Value `v` still takes span 0 first and span `span_count - 1`
+last, into an accumulator of its own. The multiply and the add stay a multiply
+and an add: **the fused multiply-add is deliberately not taken here.** It is
+the obvious next instruction, it measured 2.2x against the shipped loop where
+the multiply and add measured 1.4x, and it is refused anyway, because it drops
+the intermediate rounding and a picture's rows would stop being the rows that
+ship. It is also the *worse* kernel on a plain AVX2 host — 1.28x against 1.32x
+— where sixteen accumulators and four value registers do not fit in sixteen
+registers and the fused form spills. The 0.6x left on the table is written into
+`TODO.md` as a decision someone can take later with their eyes open.
+
+Two cases in the `kernel` group hold both kernels to the one lane kernels for
+**equality and not for nearness**, on shapes chosen to be awkward: a span count
+that is not a multiple of sixteen, a row count that is not a multiple of
+anything, and a lane count of six, which runs one full block and a two lane
+tail through the one lane path. Swapping the blend's multiply-and-add for the
+fused form fails the second case, which is what it is there for.
+
+### What it is worth
+
+The phase, over runs alternating between the two builds in both orders:
+
+| part | before | after |
+| --- | --- | --- |
+| **score, softmax, blend** | **5.26 – 5.61 s** | **2.72 – 3.01 s** |
+| tower, named parts in all | 10.05 – 11.08 s | 6.67 – 8.53 s |
+
+**The phase is about 1.9x** and the ranges do not overlap. End to end, a
+picture through the tower on the uninstrumented builds is **10.64 s to 8.10 s**
+— minimum of three alternating runs each, less the 0.44 s the model takes to
+map — and the same measurement on a 512 by 384 picture and a 896 by 896 one
+gives 1.40x and 1.37x on the whole run including the load.
+
+Note what the first table's other rows do *not* say. `q k v` and the
+feed-forward appeared to move by five to ten percent between the two builds in
+one direction, and the control — the same series run with the order of the two
+builds reversed — put the first run of *either* build ahead of the runs after
+it. That is the host drifting over a series, not the change, and neither part
+is touched by it.
+
+The text stack is not affected at all: the towers are not in the token loop,
+and decode measures the same on both builds.
+
+**The output is byte for byte what it was.** `logits` after a picture, after a
+clip, after both, and after neither is byte-identical between the two builds on
+every size tried, and 799 tests pass on the wide build, 788 on a build with no
+integer dot product, and 788 on an SSE2 build.
+
+### Where it leaves the entry
+
+Scoring and the blend are now 34 to 41% of a picture against 52.7%, and the
+feed-forward has become the largest part of a tower. What is left in the
+attention is a phase running at roughly twice the multiply-adds a second it
+was, which is still well short of this host's FMA peak — and the query axis,
+which was the loose one, is now spent. The remaining routes are in `TODO.md`.
+
+### Code
+
+- `KERN_GRID_LANE`, `kern_score_block`, `kern_blend_rows_many`: the two block
+  kernels, beside `kern_blend_rows` which they are a block of.
+- `tower_attend_band`: a block of queries a turn, with the softmax still per
+  query between the two halves.
+- `tower_room_open`: a band's score scratch is a block of rows rather than one.
+
+### Tests
+
+The `kernel` group grew the two equality cases described above. 799 pass on the
+wide build, 788 on a build without the integer dot product and 788 on SSE2.

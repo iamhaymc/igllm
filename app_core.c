@@ -4309,6 +4309,250 @@ static void kern_blend_rows(const float *from_data, int from_stride, const float
   }
 }
 
+/* How many queries of a bidirectional block are scored and blended together.
+ *
+ * A tower's attention is every patch against every patch, so the keys one query
+ * reads are exactly the keys the next one reads.  Taken a query at a time that
+ * run is walked once per query; taken four at a time it is walked once per four,
+ * and the multiply-adds that were waiting on the load have something to do.
+ *
+ * Four for the reason `KERN_CODE_LANE` is four: it is what the sixteen vector
+ * registers of an AVX2 host hold beside a block of accumulators without
+ * spilling, and a host with thirty-two does not need more to cover the
+ * multiply-add's latency. */
+#define KERN_GRID_LANE 4
+
+/* Several queries against one gathered run of key rows: for each lane and each
+ * row, the dot product of the two.
+ *
+ * This is `kern_dot_real` with the loop turned inside out.  The one lane form
+ * loads the row, multiplies it by the single activation it was given, and closes
+ * the accumulators into a float — so scoring a block of queries against a run of
+ * keys reads the whole run once per query and pays a horizontal reduction for
+ * every sixty-four columns.  Here the row is loaded once for the whole block and
+ * the four lanes' closes are folded into one three-instruction sequence.
+ *
+ * The arithmetic is the one lane path's exactly.  Each lane keeps the same two
+ * accumulators over the same slots in the same order, and the fold below reaches
+ * the same float `kern_dot_total` reaches: `(a0+a1)+(a2+a3)` over the same four
+ * partial sums, because that is what a pair of `hadd`s does. */
+static void kern_score_block(const float *row_data, int row_stride, int row_count,
+                             const float *act_data, int act_stride, int lane_count,
+                             int span_count, float *into_data, int into_stride) {
+  int row_index;
+  if (lane_count != KERN_GRID_LANE) {
+    /* The block's tail, and every build without a vector path.  A lane on its
+     * own is the kernel this one is a block of. */
+    int lane_index;
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      for (row_index = 0; row_index < row_count; ++row_index)
+        into_data[(size_t)lane_index * (size_t)into_stride + row_index] =
+            kern_dot_real(row_data + (size_t)row_index * (size_t)row_stride, STORE_F32,
+                          act_data + (size_t)lane_index * (size_t)act_stride, span_count);
+    return;
+  }
+  {
+    const float *lane_a = act_data;
+    const float *lane_b = lane_a + act_stride;
+    const float *lane_c = lane_b + act_stride;
+    const float *lane_d = lane_c + act_stride;
+    float *into_a = into_data;
+    float *into_b = into_a + into_stride;
+    float *into_c = into_b + into_stride;
+    float *into_d = into_c + into_stride;
+    for (row_index = 0; row_index < row_count; ++row_index) {
+      const float *row_head = row_data + (size_t)row_index * (size_t)row_stride;
+      int slot = 0;
+#if defined(APP_SIMD_AVX2)
+      __m256 part_a0 = _mm256_setzero_ps(), part_a1 = _mm256_setzero_ps();
+      __m256 part_b0 = _mm256_setzero_ps(), part_b1 = _mm256_setzero_ps();
+      __m256 part_c0 = _mm256_setzero_ps(), part_c1 = _mm256_setzero_ps();
+      __m256 part_d0 = _mm256_setzero_ps(), part_d1 = _mm256_setzero_ps();
+      for (; slot + 16 <= span_count; slot += 16) {
+        __m256 row_low = _mm256_loadu_ps(row_head + slot);
+        __m256 row_high = _mm256_loadu_ps(row_head + slot + 8);
+        part_a0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_a + slot), part_a0);
+        part_a1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_a + slot + 8), part_a1);
+        part_b0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_b + slot), part_b0);
+        part_b1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_b + slot + 8), part_b1);
+        part_c0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_c + slot), part_c0);
+        part_c1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_c + slot + 8), part_c1);
+        part_d0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_d + slot), part_d0);
+        part_d1 = _mm256_fmadd_ps(row_high, _mm256_loadu_ps(lane_d + slot + 8), part_d1);
+      }
+      for (; slot + 8 <= span_count; slot += 8) {
+        __m256 row_low = _mm256_loadu_ps(row_head + slot);
+        part_a0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_a + slot), part_a0);
+        part_b0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_b + slot), part_b0);
+        part_c0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_c + slot), part_c0);
+        part_d0 = _mm256_fmadd_ps(row_low, _mm256_loadu_ps(lane_d + slot), part_d0);
+      }
+      {
+        /* Four closes folded into one.  `kern_dot_total` adds the two halves of
+         * a lane's vector and then pairs what is left twice; a pair of `hadd`s
+         * over four lanes at once pairs exactly the same floats in exactly the
+         * same order, four lanes to a lane's worth of instructions. */
+        __m256 whole_a = _mm256_add_ps(part_a0, part_a1);
+        __m256 whole_b = _mm256_add_ps(part_b0, part_b1);
+        __m256 whole_c = _mm256_add_ps(part_c0, part_c1);
+        __m256 whole_d = _mm256_add_ps(part_d0, part_d1);
+        __m128 half_a = _mm_add_ps(_mm256_castps256_ps128(whole_a),
+                                   _mm256_extractf128_ps(whole_a, 1));
+        __m128 half_b = _mm_add_ps(_mm256_castps256_ps128(whole_b),
+                                   _mm256_extractf128_ps(whole_b, 1));
+        __m128 half_c = _mm_add_ps(_mm256_castps256_ps128(whole_c),
+                                   _mm256_extractf128_ps(whole_c, 1));
+        __m128 half_d = _mm_add_ps(_mm256_castps256_ps128(whole_d),
+                                   _mm256_extractf128_ps(whole_d, 1));
+        __m128 fold_low = _mm_hadd_ps(half_a, half_b);
+        __m128 fold_high = _mm_hadd_ps(half_c, half_d);
+        __m128 total_wide = _mm_hadd_ps(fold_low, fold_high);
+        float total_a = _mm_cvtss_f32(total_wide);
+        float total_b = _mm_cvtss_f32(_mm_shuffle_ps(total_wide, total_wide, 0x55));
+        float total_c = _mm_cvtss_f32(_mm_movehl_ps(total_wide, total_wide));
+        float total_d = _mm_cvtss_f32(_mm_shuffle_ps(total_wide, total_wide, 0xff));
+        for (; slot < span_count; ++slot) {
+          float row_value = row_head[slot];
+          total_a += row_value * lane_a[slot];
+          total_b += row_value * lane_b[slot];
+          total_c += row_value * lane_c[slot];
+          total_d += row_value * lane_d[slot];
+        }
+        into_a[row_index] = total_a;
+        into_b[row_index] = total_b;
+        into_c[row_index] = total_c;
+        into_d[row_index] = total_d;
+      }
+#else
+      /* Every other build: the one lane kernel, four times over.  The block is
+       * still worth taking here — the row it reads is read once for the four
+       * rather than once each — and nothing about the arithmetic changes. */
+      (void)slot;
+      into_a[row_index] = kern_dot_real(row_head, STORE_F32, lane_a, span_count);
+      into_b[row_index] = kern_dot_real(row_head, STORE_F32, lane_b, span_count);
+      into_c[row_index] = kern_dot_real(row_head, STORE_F32, lane_c, span_count);
+      into_d[row_index] = kern_dot_real(row_head, STORE_F32, lane_d, span_count);
+#endif
+    }
+  }
+}
+
+/* Several blends over one gathered run of value rows: `kern_blend_rows` for a
+ * block of weight rows at once.
+ *
+ * The run is the same for every lane of the block, so reading it once for four
+ * lanes is three quarters of the loads gone.  Each lane keeps its own
+ * accumulators over the same value block and takes the spans in the same order,
+ * and each path multiplies and adds the way `kern_blend_rows` does on that
+ * build, so a lane reaches the float it would have reached alone. */
+static void kern_blend_rows_many(const float *from_data, int from_stride,
+                                 const float *weight_data, int weight_stride, int lane_count,
+                                 int span_count, int value_count, float *into_data,
+                                 int into_stride) {
+  int base_index;
+  if (lane_count != KERN_GRID_LANE) {
+    int lane_index;
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      kern_blend_rows(from_data, from_stride,
+                      weight_data + (size_t)lane_index * (size_t)weight_stride, span_count,
+                      value_count, into_data + (size_t)lane_index * (size_t)into_stride);
+    return;
+  }
+  for (base_index = 0; base_index < value_count; base_index += KERN_BLEND_BLOCK) {
+    const float *from_head = from_data + base_index;
+    const float *weight_a = weight_data;
+    const float *weight_b = weight_a + weight_stride;
+    const float *weight_c = weight_b + weight_stride;
+    const float *weight_d = weight_c + weight_stride;
+    int chunk_count = value_count - base_index;
+    int span_index;
+    if (chunk_count > KERN_BLEND_BLOCK) chunk_count = KERN_BLEND_BLOCK;
+#if defined(APP_SIMD_AVX2)
+    if (chunk_count == KERN_BLEND_BLOCK) {
+      __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+      __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+      __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+      __m256 b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+      __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps();
+      __m256 c2 = _mm256_setzero_ps(), c3 = _mm256_setzero_ps();
+      __m256 d0 = _mm256_setzero_ps(), d1 = _mm256_setzero_ps();
+      __m256 d2 = _mm256_setzero_ps(), d3 = _mm256_setzero_ps();
+      for (span_index = 0; span_index < span_count; ++span_index, from_head += from_stride) {
+        __m256 from_0 = _mm256_loadu_ps(from_head);
+        __m256 from_1 = _mm256_loadu_ps(from_head + 8);
+        __m256 from_2 = _mm256_loadu_ps(from_head + 16);
+        __m256 from_3 = _mm256_loadu_ps(from_head + 24);
+        __m256 weight_wide;
+        weight_wide = _mm256_broadcast_ss(weight_a + span_index);
+        a0 = _mm256_add_ps(a0, _mm256_mul_ps(weight_wide, from_0));
+        a1 = _mm256_add_ps(a1, _mm256_mul_ps(weight_wide, from_1));
+        a2 = _mm256_add_ps(a2, _mm256_mul_ps(weight_wide, from_2));
+        a3 = _mm256_add_ps(a3, _mm256_mul_ps(weight_wide, from_3));
+        weight_wide = _mm256_broadcast_ss(weight_b + span_index);
+        b0 = _mm256_add_ps(b0, _mm256_mul_ps(weight_wide, from_0));
+        b1 = _mm256_add_ps(b1, _mm256_mul_ps(weight_wide, from_1));
+        b2 = _mm256_add_ps(b2, _mm256_mul_ps(weight_wide, from_2));
+        b3 = _mm256_add_ps(b3, _mm256_mul_ps(weight_wide, from_3));
+        weight_wide = _mm256_broadcast_ss(weight_c + span_index);
+        c0 = _mm256_add_ps(c0, _mm256_mul_ps(weight_wide, from_0));
+        c1 = _mm256_add_ps(c1, _mm256_mul_ps(weight_wide, from_1));
+        c2 = _mm256_add_ps(c2, _mm256_mul_ps(weight_wide, from_2));
+        c3 = _mm256_add_ps(c3, _mm256_mul_ps(weight_wide, from_3));
+        weight_wide = _mm256_broadcast_ss(weight_d + span_index);
+        d0 = _mm256_add_ps(d0, _mm256_mul_ps(weight_wide, from_0));
+        d1 = _mm256_add_ps(d1, _mm256_mul_ps(weight_wide, from_1));
+        d2 = _mm256_add_ps(d2, _mm256_mul_ps(weight_wide, from_2));
+        d3 = _mm256_add_ps(d3, _mm256_mul_ps(weight_wide, from_3));
+      }
+      {
+        float *into_a = into_data + base_index;
+        float *into_b = into_a + into_stride;
+        float *into_c = into_b + into_stride;
+        float *into_d = into_c + into_stride;
+        _mm256_storeu_ps(into_a, a0); _mm256_storeu_ps(into_a + 8, a1);
+        _mm256_storeu_ps(into_a + 16, a2); _mm256_storeu_ps(into_a + 24, a3);
+        _mm256_storeu_ps(into_b, b0); _mm256_storeu_ps(into_b + 8, b1);
+        _mm256_storeu_ps(into_b + 16, b2); _mm256_storeu_ps(into_b + 24, b3);
+        _mm256_storeu_ps(into_c, c0); _mm256_storeu_ps(into_c + 8, c1);
+        _mm256_storeu_ps(into_c + 16, c2); _mm256_storeu_ps(into_c + 24, c3);
+        _mm256_storeu_ps(into_d, d0); _mm256_storeu_ps(into_d + 8, d1);
+        _mm256_storeu_ps(into_d + 16, d2); _mm256_storeu_ps(into_d + 24, d3);
+      }
+      continue;
+    }
+#endif
+    /* The tail block, and the whole of it on a build with no AVX2 path.  Four
+     * lanes still share the row's load, and each lane's block of scratch keeps
+     * this the same arithmetic in the same order as `kern_blend_rows`. */
+    {
+      float part_a[KERN_BLEND_BLOCK], part_b[KERN_BLEND_BLOCK];
+      float part_c[KERN_BLEND_BLOCK], part_d[KERN_BLEND_BLOCK];
+      int value_index;
+      for (value_index = 0; value_index < chunk_count; ++value_index) {
+        part_a[value_index] = 0.0f; part_b[value_index] = 0.0f;
+        part_c[value_index] = 0.0f; part_d[value_index] = 0.0f;
+      }
+      for (span_index = 0; span_index < span_count; ++span_index, from_head += from_stride) {
+        float weight_av = weight_a[span_index], weight_bv = weight_b[span_index];
+        float weight_cv = weight_c[span_index], weight_dv = weight_d[span_index];
+        for (value_index = 0; value_index < chunk_count; ++value_index) {
+          float from_value = from_head[value_index];
+          part_a[value_index] += weight_av * from_value;
+          part_b[value_index] += weight_bv * from_value;
+          part_c[value_index] += weight_cv * from_value;
+          part_d[value_index] += weight_dv * from_value;
+        }
+      }
+      for (value_index = 0; value_index < chunk_count; ++value_index) {
+        into_data[base_index + value_index] = part_a[value_index];
+        into_data[into_stride + base_index + value_index] = part_b[value_index];
+        into_data[2 * (size_t)into_stride + base_index + value_index] = part_c[value_index];
+        into_data[3 * (size_t)into_stride + base_index + value_index] = part_d[value_index];
+      }
+    }
+  }
+}
+
 /* `into[v] += left[v] * right[v]`, the element-wise multiply-add a depthwise
  * convolution reduces to once its kernel is laid out tap-major. */
 static void kern_fma_row(const float *left_data, const float *right_data, int value_count,
@@ -8905,6 +9149,7 @@ static app_code tower_bind(app_model *model, tower_gear *gear, int kind_mark) {
 
 /* -- tower forward ------------------------------------------------------- */
 
+
 /* One tower's scratch.  Nothing here outlives a single image or clip, so it is
  * allocated per call rather than per session: a tower runs once for a prompt
  * and never inside the token loop. */
@@ -8994,10 +9239,12 @@ static app_code tower_room_open(tower_room *room, const tower_gear *gear, int la
       (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)form->head_size);
   room->value_pack =
       (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)form->head_size);
-  /* One slice of scores per band, because the bands run at the same time. */
+  /* One slice of scores per band, because the bands run at the same time — and
+   * a block of rows inside each, because a band scores `KERN_GRID_LANE` queries
+   * against the whole grid before it softmaxes any of them. */
   if (band_count < 1) band_count = 1;
-  room->score_data =
-      (float *)mem_clear(sizeof(float) * (size_t)band_count * (size_t)lane_count);
+  room->score_data = (float *)mem_clear(sizeof(float) * (size_t)band_count *
+                                        (size_t)KERN_GRID_LANE * (size_t)lane_count);
   room->cos_data = (float *)mem_clear(sizeof(float) * (size_t)(form->head_size / 2 + 1));
   room->sin_data = (float *)mem_clear(sizeof(float) * (size_t)(form->head_size / 2 + 1));
   room->quant_data = (float *)mem_clear(sizeof(float) * (size_t)KERN_LANE_LIMIT * (size_t)wide_peak);
@@ -9069,21 +9316,32 @@ static void tower_attend_band(void *state, int slice_index, int slice_count) {
   tower_room *room = job->room;
   int head_size = job->head_size;
   int head_wide = room->head_wide;
-  float *score_data = room->score_data + (size_t)slice_index * (size_t)job->lane_count;
-  int from_lane, upto_lane, lane_index, span_index;
+  float *score_data =
+      room->score_data + (size_t)slice_index * (size_t)KERN_GRID_LANE * (size_t)job->lane_count;
+  int from_lane, upto_lane, lane_index, span_index, block_index;
   slice_span(job->lane_count, slice_index, slice_count, &from_lane, &upto_lane);
-  for (lane_index = from_lane; lane_index < upto_lane; ++lane_index) {
-    const float *query_head = room->query_data + (size_t)lane_index * (size_t)head_wide +
-                              (size_t)job->head_index * head_size;
-    float *blend_head = room->blend_data + (size_t)lane_index * (size_t)head_wide +
-                        (size_t)job->head_index * head_size;
-    for (span_index = 0; span_index < job->lane_count; ++span_index)
-      score_data[span_index] =
-          kern_dot_real(job->key_pack + (size_t)span_index * (size_t)head_size, STORE_F32,
-                        query_head, head_size) *
-          job->head_gain;
-    job->model->desk.soft_max(&job->model->desk, score_data, job->lane_count);
-    kern_blend_rows(job->value_pack, head_size, score_data, job->lane_count, head_size, blend_head);
+  /* A block of queries at a time rather than one.  Every query in the band
+   * scores against the same gathered keys and blends over the same gathered
+   * values, so a block reads each of those runs once for four queries where a
+   * query on its own read them once each.  The softmax between the two stays
+   * per query, because that is what it is. */
+  for (lane_index = from_lane; lane_index < upto_lane; lane_index += KERN_GRID_LANE) {
+    int block_wide = upto_lane - lane_index;
+    const float *query_block = room->query_data + (size_t)lane_index * (size_t)head_wide +
+                               (size_t)job->head_index * head_size;
+    float *blend_block = room->blend_data + (size_t)lane_index * (size_t)head_wide +
+                         (size_t)job->head_index * head_size;
+    if (block_wide > KERN_GRID_LANE) block_wide = KERN_GRID_LANE;
+    kern_score_block(job->key_pack, head_size, job->lane_count, query_block, head_wide, block_wide,
+                     head_size, score_data, job->lane_count);
+    for (block_index = 0; block_index < block_wide; ++block_index) {
+      float *score_row = score_data + (size_t)block_index * (size_t)job->lane_count;
+      for (span_index = 0; span_index < job->lane_count; ++span_index)
+        score_row[span_index] *= job->head_gain;
+      job->model->desk.soft_max(&job->model->desk, score_row, job->lane_count);
+    }
+    kern_blend_rows_many(job->value_pack, head_size, score_data, job->lane_count, block_wide,
+                         job->lane_count, head_size, blend_block, head_wide);
   }
 }
 

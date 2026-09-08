@@ -354,6 +354,16 @@ in isolation and slower in the engine, and taken out again — see
   on that build, so the towers reach the numbers they reached before. Both
   towers use it; the stride argument is the head width where the rows are heads
   of a wider array and the head size where they have been gathered into a run.
+- `kern_score_block` and `kern_blend_rows_many` — the same two things for a
+  block of `KERN_GRID_LANE` queries at once, which is what a tower's
+  bidirectional attention wants: every query in a band scores against the same
+  gathered keys and blends over the same gathered values, so a block reads each
+  run once for four queries where a query on its own read it once each. Both are
+  the one lane kernel's arithmetic in its order rather than to a tolerance — the
+  four-lane close pairs exactly the floats `kern_dot_total` pairs, and the blend
+  keeps a multiply and an add where a fused multiply-add would drop the
+  intermediate rounding — and the `kernel` group holds both to it bit for bit.
+  The audio tower does not use them: its window is thirteen keys wide.
 - `kern_fma_row` — `into[v] += left[v] * right[v]`, which is what the
   conformer's depthwise convolution becomes once its kernel is held tap-major.
 - `kern_dot_real_many` — one row of floats against four activation vectors at

@@ -1681,6 +1681,85 @@ static void test_kernel(void) {
     test_true(okay_flag, "kern_blend_rows matches the row-at-a-time blend it replaces");
   }
 
+  { /* The two block kernels a tower's attention runs, against the one lane
+     * kernels they are a block of.  Both claim to be the same arithmetic in the
+     * same order rather than the same arithmetic to a tolerance, so both are
+     * checked for equality and not for nearness — a reassociation anywhere in
+     * either would move a last bit and fail here.
+     *
+     * The shapes are deliberately awkward: a span count that is not a multiple
+     * of sixteen exercises the eight wide loop and the scalar tail behind the
+     * wide one, a row count that is not a multiple of anything exercises the
+     * row loop's end, and a lane count of six runs one full block and a
+     * two lane tail through the one lane path. */
+    int span_count = 37, row_count = 23, lane_count = 6;
+    int act_stride = span_count + 5, into_stride = row_count + 3;
+    int value_count = 41, from_stride = value_count + 7, weight_stride = row_count + 2;
+    float *row_data = (float *)mem_clear(sizeof(float) * (size_t)row_count * (size_t)span_count);
+    float *act_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)act_stride);
+    float *want_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)into_stride);
+    float *have_data = (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)into_stride);
+    float *from_data = (float *)mem_clear(sizeof(float) * (size_t)row_count * (size_t)from_stride);
+    float *weight_data =
+        (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)weight_stride);
+    float *want_blend =
+        (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)from_stride);
+    float *have_blend =
+        (float *)mem_clear(sizeof(float) * (size_t)lane_count * (size_t)from_stride);
+    int lane_index, row_index, slot, bad_count = 0;
+    for (slot = 0; slot < row_count * span_count; ++slot)
+      row_data[slot] = (float)sin((double)slot * 0.29) * 1.7f;
+    for (slot = 0; slot < lane_count * act_stride; ++slot)
+      act_data[slot] = (float)cos((double)slot * 0.13) * 0.9f;
+    for (slot = 0; slot < row_count * from_stride; ++slot)
+      from_data[slot] = (float)sin((double)slot * 0.07 + 1.1) * 1.3f;
+    for (slot = 0; slot < lane_count * weight_stride; ++slot)
+      weight_data[slot] = (float)cos((double)slot * 0.23 + 0.4) * 0.6f;
+
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      for (row_index = 0; row_index < row_count; ++row_index)
+        want_data[(size_t)lane_index * (size_t)into_stride + row_index] =
+            kern_dot_real(row_data + (size_t)row_index * (size_t)span_count, STORE_F32,
+                          act_data + (size_t)lane_index * (size_t)act_stride, span_count);
+    for (lane_index = 0; lane_index < lane_count; lane_index += KERN_GRID_LANE) {
+      int block_wide = lane_count - lane_index;
+      if (block_wide > KERN_GRID_LANE) block_wide = KERN_GRID_LANE;
+      kern_score_block(row_data, span_count, row_count,
+                       act_data + (size_t)lane_index * (size_t)act_stride, act_stride, block_wide,
+                       span_count, have_data + (size_t)lane_index * (size_t)into_stride,
+                       into_stride);
+    }
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      for (row_index = 0; row_index < row_count; ++row_index)
+        if (want_data[(size_t)lane_index * (size_t)into_stride + row_index] !=
+            have_data[(size_t)lane_index * (size_t)into_stride + row_index])
+          bad_count += 1;
+    test_true(bad_count == 0, "kern_score_block is kern_dot_real bit for bit, a block at a time");
+
+    bad_count = 0;
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      kern_blend_rows(from_data, from_stride,
+                      weight_data + (size_t)lane_index * (size_t)weight_stride, row_count,
+                      value_count, want_blend + (size_t)lane_index * (size_t)from_stride);
+    for (lane_index = 0; lane_index < lane_count; lane_index += KERN_GRID_LANE) {
+      int block_wide = lane_count - lane_index;
+      if (block_wide > KERN_GRID_LANE) block_wide = KERN_GRID_LANE;
+      kern_blend_rows_many(from_data, from_stride,
+                           weight_data + (size_t)lane_index * (size_t)weight_stride, weight_stride,
+                           block_wide, row_count, value_count,
+                           have_blend + (size_t)lane_index * (size_t)from_stride, from_stride);
+    }
+    for (lane_index = 0; lane_index < lane_count; ++lane_index)
+      for (slot = 0; slot < value_count; ++slot)
+        if (want_blend[(size_t)lane_index * (size_t)from_stride + slot] !=
+            have_blend[(size_t)lane_index * (size_t)from_stride + slot])
+          bad_count += 1;
+    test_true(bad_count == 0, "kern_blend_rows_many is kern_blend_rows bit for bit, four at a time");
+
+    mem_free(row_data); mem_free(act_data); mem_free(want_data); mem_free(have_data);
+    mem_free(from_data); mem_free(weight_data); mem_free(want_blend); mem_free(have_blend);
+  }
+
 }
 
 /* ======================================================================== */

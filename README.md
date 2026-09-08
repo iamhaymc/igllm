@@ -537,3 +537,63 @@ it. The same 96 MiB of the mapped checkpoint costs **32.4 GiB/s back to back and
 43.4 with a gigabyte of the rest of the file swept in between**: no penalty, and
 anonymous memory of the same size is no faster than the file. The hypothesis is
 gone and the puzzle is not.
+
+## Where a picture goes, and the tiling that was not the answer
+
+`TODO.md` had carried an entry for the tower's own attention since 0.8.9 put the
+projections on the integer path and left the scoring and the blend on the float
+one, and it opened by refusing to be acted on: retake the profile first, because
+0.8.9 changed the shares the last one recorded.
+
+0.9.6 retook it. A 768 by 768 picture at the full patch budget is 2304 patches
+through 16 layers of width 768 and 12 heads, and on four threads it divides:
+**scoring, softmax and blend 52.7%**, the feed-forward 25.5%, `q k v` 13.0%,
+everything else under 5% each. So the entry's premise held, and understated
+itself — a picture had become mostly one phase.
+
+The phase is not waiting on memory, which is the thing that decided what to do
+about it. A gathered head is 590 KiB of keys and 590 KiB of values, and scoring
+and blending walk them in separate loops, so each sits inside this host's
+megabyte of private second level cache for a whole band. What the two loops were
+actually doing was reading that run **once per query** — 2304 times over, for a
+run every query in the band shares — and paying a horizontal reduction on every
+sixty-four column dot product, a close that costs about what the eight
+multiply-adds it closes cost.
+
+`RESEARCH.md`'s idea for this was flash attention's schedule: tile the keys,
+carry a running maximum and normalizer between tiles, and never materialize the
+2304 by 2304 score matrix. **That is refused, and the reason is worth keeping.**
+A band here holds one score row and never held the grid, so the memory the
+tiling exists to save was never spent — the schedule arrives with nothing to
+save and a change to the order of every sum to pay for it. llama.cpp's tiled
+kernel is written against a runtime that does materialize the matrix.
+
+The axis that was actually loose was the other one. Four queries share every
+byte both loops read, and shared nothing. So a band now takes **four queries at
+a time**: one key row loaded into four queries' accumulators, four closes folded
+into the three instructions one close took, one value row folded into four
+queries' running sums, and the softmax still per query in between.
+
+**Nothing is reassociated, and that is the point rather than a caveat.** Each
+lane keeps the same accumulators over the same slots in the same order; the
+four-lane close pairs exactly the floats `kern_dot_total` pairs, in its order;
+and the blend's multiply and add stay a multiply and an add. The fused
+multiply-add is the obvious next instruction and it is **deliberately not
+taken** — it measured 2.2x against the 1.4x the unfused form gives, and it drops
+the intermediate rounding, so a picture's rows would stop being the rows that
+ship. It is also the slower kernel on a plain AVX2 host, where sixteen
+accumulators and four value registers do not fit in sixteen registers.
+
+The phase goes **5.26–5.61 s to 2.72–3.01 s**, about 1.9x, with no overlap
+between the two builds' ranges over six alternating runs. A picture through the
+tower is **10.64 s to 8.10 s**. `logits` after a picture, after a clip, after
+both and after neither is byte for byte what it was, and two tests in the
+`kernel` group hold each new kernel to the one it is a block of for equality
+rather than for nearness — swapping the blend's multiply-and-add for the fused
+form fails one of them, which is what it is there for.
+
+One thing the table above does not say, and the control is why. `q k v` and the
+feed-forward appeared to move five to ten percent between the two builds, in
+code neither of them touches; running the same series with the order of the
+builds reversed put the first run of *whichever* build went first ahead of the
+runs after it. That is the host drifting over a series, not the change.

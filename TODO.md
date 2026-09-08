@@ -557,28 +557,44 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   Together the two are 2.6 ms of a 34.8 ms step, so the ceiling on this entry
   was about 5% of a token and 0.8.12 took 2.4% of it.
 
-- **The tower's own attention, tiled, with the normalizer carried.** A picture
-  is now mostly this. On the reference host at one thread, the same 768 by 768
-  picture at the full patch budget costs 48.3 s where it cost 105.0 before
-  0.8.9; of that, prefilling the 256 soft tokens through the text stack is 16.3
-  s where it was 50.7, so about **32 s is the tower** where it was about 54. The
-  projections took the integer path with everything else. The scoring and the
-  blend did not — they are float, untouched since they were written, and a
-  larger share of a tower than they have ever been.
+- **What is left of the tower's own attention.** 0.9.6 retook the profile this
+  entry asked for and took the largest thing in it. Scoring and the blend were
+  **52.7% of a picture**; a block of four queries sharing every byte both loops
+  read made the phase **1.9x** and a picture 10.64 s to 8.10 s, at the same
+  arithmetic in the same order — `logits` after a picture is byte for byte what
+  it was. `CHANGES.md` 0.9.6 has the division and every number.
 
-  `RESEARCH.md` idea 11: score a tile, carry the running maximum and normalizer,
-  accumulate the blend into the output, and never hold the whole score matrix.
-  It is a memory schedule rather than a kernel, and at 2304 patches the score
-  matrix it stops materializing is 2304 by 2304.
+  **The tiling itself is refused, and it is worth knowing why before anyone
+  reopens it.** `RESEARCH.md` idea 11's prize is the score matrix it stops
+  materializing, which at 2304 patches is 2304 by 2304 — but a band here holds
+  **one score row, not the grid**, so that memory was never spent and the idea
+  arrives with nothing to save and a summation-order change to pay. llama.cpp's
+  `ggml_compute_forward_flash_attn_ext_tiled` is written against a runtime that
+  does materialize it. Do not port it on the strength of that.
 
-  *llama.cpp has this on CPU* —
-  `ggml_compute_forward_flash_attn_ext_tiled` with a partial-reduction pass, in
-  `ggml/src/ggml-cpu/ops.cpp`. Which is the strongest argument that it is worth
-  the summation-order change it costs.
+  **What is actually left is the arithmetic, and the loose axis is spent.**
+  After 0.9.6 the phase is 34 to 41% of a picture and the feed-forward is the
+  larger part of a tower. Scoring ran 6.7 G multiply-adds a second and the blend
+  8.0, against a 256-bit FMA peak of 44.8 a core; both are now roughly twice
+  that and still a long way short. Three things are known about what is left:
 
-  Retake 0.8.8's profile first — projections, scoring, blend, softmax, one
-  thread — because 0.8.9 changed the shares it recorded and the schedule should
-  be written against the new ones.
+  - **The fused multiply-add in the blend is worth another 0.6x and was
+    refused, not missed.** `kern_blend_rows_many` keeps a multiply and an add
+    because dropping the intermediate rounding would stop a picture's rows being
+    the rows that ship. Measured: 2.2x fused against 1.4x not, on the AVX-512
+    host. It is a decision about output rather than a kernel question, and the
+    test that holds the kernel bit for bit fails on it deliberately. Taking it
+    means saying so in `CHANGES.md` and re-taking the media parity run.
+  - **It is also the worse kernel on a plain AVX2 host** — 1.28x against 1.32x —
+    because sixteen accumulators and four value registers do not fit in sixteen
+    registers. Anything wider than `KERN_GRID_LANE` has the same problem, so a
+    wider block needs the register file asked for rather than assumed.
+  - **The key axis is untouched and is the one left.** Four queries share the
+    key row; nothing shares the *query*. A block of keys against a block of
+    queries is the register-blocked matrix product this loop really is, and it
+    is the only route here that does not need the summation order.
+
+  The softmax is 6.6% of the phase and not worth opening.
 
 - **Fewer patches, before the pooling — and a budget the caller can ask for.**
   The largest vision win available, and the one that costs behaviour.
@@ -736,3 +752,7 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | A speculative round divided into named parts, and the marginal lane priced part by part by subtracting the narrowest block from the widest | 0.9.5 |
 | Where the mlp's gap to a bare sweep goes (answered: 12% is the row block's access pattern and 19% is three inner-loop uops, one of which GFNI already removes) | 0.9.5 |
 | Whether the batched path's per-lane epilogue or its staging stride explains the marginal lane (answered: neither — 4 to 9% and 7%, against a gap of four times) | 0.9.5 |
+| A fresh profile of a picture, part by part, which the vision entry opened by asking for (answered: scoring and the blend are 52.7% of a tower, and neither is waiting on memory) | 0.9.6 |
+| A block of queries through the tower's attention, sharing the gathered run both loops read — at the one lane path's arithmetic in its order, held to it bit for bit by two tests | 0.9.6 |
+| Whether flash attention's tiling is worth porting into this tower (refused: a band holds one score row and never held the grid, so the schedule arrives with nothing to save) | 0.9.6 |
+| The fused multiply-add in the tower's blend (refused, and deliberately: 0.6x more, at the cost of a picture's rows no longer being the rows that ship) | 0.9.6 |
