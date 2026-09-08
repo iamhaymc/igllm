@@ -5584,3 +5584,224 @@ is opened on demand.
 Sampling, which is step 4 of `TODO.md`'s entry and needs the modified rejection
 rule and a proposer that carries a distribution. `--guess` refuses a temperature
 in the loop exactly as it does in the single turn tasks.
+
+---
+
+## 0.9.5 — the output head on a grid of the activation's own, and two ideas measured out of the list
+
+### Scope
+
+`TODO.md`'s head entry had three routes left and this takes the largest of
+them, refuses the smallest with a measurement, and closes the entry beneath it
+— *stop scoring 262144 rows to pick one* — with a geometry that holds for every
+clustering there is rather than for the one that was tried.
+
+Every number below is from the reference host: four cores of a Xeon at 2.8 GHz,
+AVX-512 with VNNI, the `--wide` build, four threads, the checkpoint in the page
+cache, and each figure the **minimum a phase reaches over runs alternating
+between the two builds**. A bare four thread sweep on this host is **28.43
+GiB/s** — quote it beside any ratio below or the ratio means nothing.
+
+### The head runs the float kernel, and now it does not have to
+
+0.8.14 established why the output head is the slowest plane in the step per
+multiply-add: `kern_level_ready` needs `sheet->enter_gain > 0`, and this export
+ships `lm_head.input_activation_scale` as `0.0` where every other projection
+has a real one. So the head fell to `kern_row_code`'s float spread on every
+token, by construction, and every kernel change 0.8.11 through 0.8.16 made to
+the integer path could never reach it.
+
+The entry's answer was to give the head a step and take the integer path, and
+to treat it as a decision about output quality rather than as a kernel change.
+That is what this is.
+
+**The step is the activation's own, per token.** `kern_level_pick` takes the
+lane's largest magnitude over the 127 levels a signed byte carries, so nothing
+clips and the whole range is used. `kern_level_stage` takes the step as an
+argument now rather than reading it off the plane, with a flag saying which of
+the two things it is: where the export calibrated the activation the caller has
+already rounded onto that grid and the staging *verifies* it, exactly as
+before; where it did not, the staging *rounds*. A chosen step is per lane and
+not per plane — sixteen prefill lanes have sixteen different peaks — so the job
+carries a list of them and the row kernels take the step from there instead of
+from `sheet->enter_gain`.
+
+Nothing else in this export is touched by it. Of its code planes only three
+carry no step — the token embedding table, the per-layer embedding table, and
+the head — and the first two are lookups that are never multiplied. Both towers
+and all thirty-five layers are calibrated and take exactly the path they took
+before.
+
+### What it costs, and why it is then paid back
+
+Rounding the activation onto an int8 grid is a real rounding. Over eight
+ordinary prompts and forty-eight greedy steps each, the head's row disagrees
+with the float path's by **0.04 root mean square and 0.49 at worst**, over the
+whole vocabulary rather than at the argmax, against logits whose top runs to
+twenty-seven.
+
+Almost everywhere that is far under the gap the top token wins by. Once in 384
+steps it was not: on one prompt two tokens **0.023 apart** changed places, and
+the answer went a different and equally good way from there. A quantized head
+that reorders a coin toss is not a quality regression — but it is a difference
+a caller can see, and it does not have to be paid.
+
+**So the sweep is taken on the grid and the decision is not.** `session_head_true`
+scores the best sixty-four rows again with `kern_row_code`, the same float
+product the whole plane used to take, on the unrounded activation, and writes
+their exact values back. Sixty-four rows of 262144 is a four thousandth of the
+plane. It is skipped where the plane brought a step from the export, because
+then the levels *are* the activation and scoring a row again returns the same
+number.
+
+With it, over the same eight prompts and 384 steps:
+
+| | integer head | and the best 64 rescored |
+| --- | --- | --- |
+| top token moved | 1 of 384 | **0 of 384** |
+| top five reordered | 22 of 384 | **0 of 384** |
+| greedy text against the float build, 96 tokens a prompt | 7 of 8 identical | **8 of 8 identical** |
+
+The one risk the rescoring does not cover is a row *outside* the sixty-four
+that should have been inside, which needs its error and the leader's to differ
+by more than the gap from rank one to rank sixty-five. Over the same eight
+prompts that gap never fell under **13.66 logits** against a worst error of
+0.49 — a margin of twenty-eight. The tail keeps its integer values, which is
+where a rounding of 0.04 is beneath a softmax's notice.
+
+### What it is worth
+
+| | float head | on the grid | |
+| --- | --- | --- | --- |
+| `final norm, head` | 7.864 ms | **5.384 ms** | **1.46x** |
+| the head in multiply-adds | 51.2 G a second | **74.8 G** | |
+| decode step floor | 48.38 ms | **45.70 ms** | 5.5% |
+| decode | 20.67 tok/s | **21.88 tok/s** | 5.9% |
+| a picture then forty tokens | 17.80 tok/s | **19.21 tok/s** | 7.9% |
+
+The head is now **11.5% of a decode step against 16.0%**, and 5.38 ms against a
+bare four thread sweep of its own 97 MiB, which is 3.41 ms. So it is at 63% of
+this host's memory where it was at 43%, and what is left in the plane is worth
+less than half what it was.
+
+**And the batched head came with it, which is the speculative ceiling.**
+`session_guess` verifies a block through the same `mat_mat`, so every lane of a
+block now stages its own levels and the whole block takes `vpdpbusd`. On a 49 id
+prompt, 128 tokens greedily:
+
+| block | proposer | before | after |
+| --- | --- | --- | --- |
+| 8 | oracle | 2.09x | **2.35x** |
+| 16 | oracle | 2.18x | **2.40x** |
+
+The marginal lane at a block of sixteen is **22.76 ms to 18.08**, 21% cheaper.
+`igllm guess` still reports `matches plain` on every row of the table, which is
+the block path's token stream held against the plain run's, so the batch and the
+sequence of steps still agree token for token.
+
+### The broadcast, measured and refused
+
+The entry's other kernel route was to replace three of the float loop's sixteen
+instructions per sixty-four codes with one `vbroadcasti32x4` — thirteen rather
+than sixteen — at the cost of a staging pass, because the four quarters come out
+in the unpack's order rather than the column's.
+
+It was built and run against the shipped loop over the real head:
+
+| | ms | G multiply-adds a second |
+| --- | --- | --- |
+| the code bytes swept and nothing else | 3.411 | — |
+| the shipped loop | 7.763 | 51.9 |
+| the broadcast, with the activations staged | 7.880 | 51.1 |
+
+**A wash, and it is not close.** The three instructions the route removes are
+`vpbroadcastd` from memory, which retire on the load ports; the loop is bound by
+ports 0 and 5, where the variable shift, the `vpermps` and the multiply-add sit,
+and the route touches none of them. Twelve of those uops per sixty-four codes
+before and twelve after. **Counting instructions is not counting ports**, and
+this is the second time in this entry's history that the loop under test was not
+the loop that was binding.
+
+Do not reopen it. Anything that makes the float head faster has to take work off
+ports 0 and 5, and the change above takes the whole loop off them instead.
+
+### Not scoring 262144 rows: closed, and closed generally
+
+The entry said what to measure before writing a k-means, and it was right to:
+the answer costs an afternoon and it decides the whole idea.
+
+**The bound the entry proposed prunes nothing.** A real activation out of a real
+prompt, the exact logits beside it, and the rows bucketed by a sign signature
+over random directions — a clustering cheap enough to be a load-time cost, which
+a k-means over 262144 rows is not:
+
+| cells | used | mean radius | radius over the mean row norm | rows the bound keeps |
+| --- | --- | --- | --- | --- |
+| 256 | 256 | 0.988 | 1.054 | 100.0% |
+| 1024 | 1024 | 0.963 | 1.028 | 100.0% |
+| 4096 | 4090 | 0.921 | 0.982 | 100.0% |
+| 16384 | 15563 | 0.784 | 0.837 | 99.6% |
+
+Sixty-four times more cells moved the radius from 1.05 of a row norm to 0.84.
+The bound needs it under **0.134** — measured over 32 real greedy steps as the
+top logit over `||a||`, and it ranged 0.097 to 0.201.
+
+The plain per-row Cauchy-Schwarz bound is the floor and behaves as the entry
+predicted: `||w|| ||a||` is **25.8x** the value it bounds on average, and it
+keeps 262144 rows of 262144.
+
+**And the refutation does not depend on the clustering.** A cell holding two
+rows has radius at least half the distance between them, so the tightest radius
+any clustering with more than one row a cell can reach is half the nearest
+neighbour distance in the head. Over a sample of 256 rows against all 262144:
+
+```
+nearest neighbour distance   0.1784 to 0.9869, mean 0.8367
+row norm                     mean 0.9370
+best radius a cell of two    0.4184
+radius the bound needs       0.1340
+rows whose nearest neighbour is within twice what the bound needs: 3 of 256
+```
+
+262144 rows in 1536 dimensions are very nearly mutually orthogonal — the mean
+nearest neighbour sits at 0.89 of a row norm away — so **there is no clustering
+of this head into cells of more than one row whose bound can beat a top logit**,
+and 1.2% of rows have a neighbour close enough that even a cell of exactly two
+could ever be pruned. The entry's own rule — stop if the bound needs most of a
+row to be useful — is met with room to spare, and the k-means it warned against
+is not worth writing.
+
+This closes the entry, and with it the second route of the head entry above and
+step 2's remaining half in the speculative entry. What made those two worth
+anything was the head's cost per byte, and the change at the top of this version
+took 46% of that instead.
+
+### What moved in the source
+
+- `kern_level_pick`, `kern_level_round`: the step a lane chooses, and the
+  rounding onto it.
+- `kern_level_ready`: asks about the shape of the plane and no longer about the
+  step, because the step is not always the plane's.
+- `kern_level_stage`: takes the step and a flag saying whether to verify the
+  levels or round them.
+- `kern_row_code_level`, `..._rows`, `..._wide`, `..._many`: take the step
+  rather than reading `sheet->enter_gain`; the many lane form takes one per
+  lane out of `job->step_list`.
+- `back_level_pick`: whether a plane will bring a step of its own, which is what
+  says a row is worth scoring again.
+- `session_head_true`: the best sixty-four rows of the head, on the float path.
+
+### Tests
+
+`level` grew two cases and had one rewritten. The rewrite is the interesting
+one: "a step the activations are not on changes nothing" used to take its
+baseline by leaving `enter_gain` at zero, and zero no longer means the float
+path — it means a step chosen from the activation. The baseline is now taken
+with the integer path switched off at the backend, which is what it was always
+trying to say. The two new cases are the chosen step at every lane count
+against the dense product, each lane with a peak of its own so a shared step
+would fail, and `kern_level_pick` itself on the peak, on zero, and on a value
+that is not finite.
+
+797 pass on the wide build, 788 on a build without the integer dot product,
+where every plane takes the float path exactly as it did before.
