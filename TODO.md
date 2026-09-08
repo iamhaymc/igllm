@@ -414,13 +414,15 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 
      0.9.5 measured the two obvious explanations and neither is it:
 
-     - **The epilogue is not it.** `kern_row_code_level_many` closes every row
-       for every lane on its own — a sixty-four bit subtract, a widening and two
-       float multiplies, 7.7 M times over the mlp at sixteen lanes — where the
-       one lane path has folded sixteen rows into a vector since 0.8.12.
-       Replacing the whole close with a raw store is worth **3.7 to 8.7%** of
-       the batched plane, 0.3 to 0.8 ms of a lane. Worth having eventually;
-       nowhere near four times.
+     - **The epilogue is not it, and 0.9.9 has now taken it anyway.** The close
+       accumulated straight into the destination, a group at a time and strided
+       a whole lane apart — sixteen scattered read-modify-writes per group of
+       every row. The totals now live in a local and reach the destination once
+       a row, which is `kern_blend_rows`' move and moves no number: prefill
+       **101.10 to 105.53 tokens a second**, the marginal lane **10.31 ms to
+       9.19**, the oracle at a block of sixteen 2.54–2.63x to **2.67–2.82x** and
+       the scout 1.83x to **2.02x**. That is 1.1 ms of 10.3, which is what this
+       note predicted, and it leaves the gap below where it was.
      - **The staging stride was not it either.** Every lane's levels used to be
        laid down `desk->level_limit` apart, which is the widest code plane the
        model binds — `ple embed`'s 8960 columns — so sixteen lanes of a 1536
@@ -434,9 +436,18 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      So four fifths of the batched lane is still unexplained, and it is now the
      largest single number in this list — 8.9 ms a lane against a 45.7 ms step,
      with the ceiling in the table above riding on it. **Take a hardware counter
-     to it before writing another loop**: the three hypotheses that can be
-     reasoned about from the source have now all been measured and all three
-     came back small.
+     to it before writing another loop**: the four hypotheses that can be
+     reasoned about from the source have now all been measured, and all four
+     came back small — the epilogue was the last of them, and 0.9.9 took it for
+     a tenth of the lane rather than the four times the gap needs.
+
+     **And that instruction is now the blocker rather than the advice.** The
+     host these figures were taken on exposes no performance counters at all:
+     `/sys/bus/event_source/devices` holds `breakpoint`, `msr`, `power`,
+     `software`, `tracepoint` and `uprobe`, and no `cpu`, so `perf stat` has
+     nothing to count and neither would anything else. This entry needs a host
+     with a PMU before it can move, and that is the whole of what it is waiting
+     for.
 
   3. **Done, 0.9.3: the n-gram proposer.** `app_scout` asks what followed the
      last time this stream said what it has just said — a growing array of ids
@@ -809,3 +820,4 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | Where that identity has to be taken, so the decoder and the container stay out of it (answered: on the decoded raster, which makes a lossless re-encode one entry and a lossy one two) | 0.9.7 |
 | Speculative decoding under a temperature (answered: the scout's proposal is a point mass, which is a `q` like any other — accept with `p(t)`, resample from `p` with the guess removed) | 0.9.8 |
 | The sampler's shaped distribution, lifted out of the draw so two paths sit on one definition of what a taste means | 0.9.8 |
+| The batched path's per-lane epilogue, which 0.9.5 measured and left (taken: the row's totals off the destination, prefill 4.4% and the marginal lane a tenth) | 0.9.9 |

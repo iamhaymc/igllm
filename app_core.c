@@ -4124,13 +4124,27 @@ static void kern_dot_level_many(const uint8_t *code_row, int from_index, int spa
                        code_flip);
 }
 
+/* One row of codes against every lane of the batch.
+ *
+ * A row's running total lives in a local rather than in the destination, which
+ * is the same move `kern_blend_rows` makes and for the same reason.  Written
+ * into `out_data` a group at a time it was a read and a write per lane per
+ * group, and those are strided a whole lane apart — sixteen scattered
+ * read-modify-writes for every group of every row, on a loop whose content is
+ * one subtract and two multiplies.  Held in `total_list` the groups accumulate
+ * in registers and the destination is touched once a row.
+ *
+ * Nothing about the arithmetic moves: a lane still takes group 0 first and the
+ * last group last, into an accumulator of its own, and each term is formed
+ * exactly as it was — `(gain * step) * whole`, in that association.  Only where
+ * the accumulator lives has changed. */
 static void kern_row_code_level_many(const plane *sheet, int row_index, const kern_job *job) {
   const uint8_t *code_row = sheet->code_data + (size_t)row_index * sheet->row_stride;
   size_t gain_base = (size_t)row_index * (size_t)sheet->group_count;
   int32_t part_list[KERN_LANE_LIMIT];
+  float total_list[KERN_LANE_LIMIT];
   int lane_index, group_index;
-  for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
-    job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] = 0.0f;
+  for (lane_index = 0; lane_index < job->lane_count; ++lane_index) total_list[lane_index] = 0.0f;
   for (group_index = 0; group_index < sheet->group_count; ++group_index) {
     int from_index = group_index * sheet->group_size;
     int span_count = sheet->col_count - from_index;
@@ -4146,10 +4160,12 @@ static void kern_row_code_level_many(const plane *sheet, int row_index, const ke
           (int64_t)part_list[lane_index] -
           (int64_t)bias_value * (int64_t)job->isum_data[(size_t)lane_index * (size_t)job->sum_stride +
                                                         (size_t)group_index];
-      job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] +=
-          gain_value * job->step_list[lane_index] * (float)whole_value;
+      total_list[lane_index] += gain_value * job->step_list[lane_index] * (float)whole_value;
     }
   }
+  for (lane_index = 0; lane_index < job->lane_count; ++lane_index)
+    job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] =
+        total_list[lane_index];
 }
 
 static void kern_mat_vec_band(void *state, int slice_index, int slice_count) {

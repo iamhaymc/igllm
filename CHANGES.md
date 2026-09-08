@@ -6310,3 +6310,78 @@ invented rule.
 
 822 pass on the wide build, 813 on a build without the integer dot product and
 813 on SSE2.
+
+---
+
+## 0.9.9 — the batched row's total off the destination
+
+### Scope
+
+The one thing 0.9.5 measured in the batched path and left on the floor. Its
+note read: *replacing the whole close with a raw store is worth 3.7 to 8.7% of
+the batched plane, 0.3 to 0.8 ms of a lane. Worth having eventually; nowhere
+near four times.* It is still nowhere near four times, and it is now had.
+
+### What it was
+
+`kern_row_code_level_many` accumulated straight into the caller's destination, a
+group at a time:
+
+    out_data[lane * out_stride + row] += gain * step[lane] * (float)whole;
+
+Sixteen of those per group of every row, and they are strided a **whole lane
+apart** — so a loop whose content is one subtract and two multiplies was paying
+sixteen scattered read-modify-writes for every group it closed, on a plane whose
+rows have twelve groups.
+
+### What it is
+
+The row's running totals live in a local and reach the destination once, which
+is exactly the move `kern_blend_rows` makes and makes for the same reason. A
+lane still takes group 0 first and the last group last, into an accumulator of
+its own, and each term is still formed as `(gain * step) * whole` in that
+association — only where the accumulator lives has changed, so every number the
+engine produces is the number it produced. Prefill logits, decode logits, a
+picture's logits and a clip's are byte for byte 0.9.8's, and greedy `--guess 8`
+gives the same text.
+
+The one lane path does not come here at all, so decode is untouched by
+construction.
+
+### What it is worth
+
+On the reference host at four threads, over runs alternating between the two
+builds:
+
+- **prefill 101.10 to 105.53 tokens a second on a 561 id prompt**, and the new
+  build ahead in all three paired runs — inside the 3.7 to 8.7% the note
+  predicted.
+- **the marginal lane of a speculative block 10.31 ms to 9.19**, taking the
+  minimum of three runs each, measured the way `guess --verbose` measures it:
+  the oracle's block of 2 subtracted from its block of 16, over fourteen lanes.
+- and the ceiling that rides on it, on the same prompt: the **oracle at a block
+  of sixteen 2.54–2.63x to 2.67–2.82x**, at eight 2.48–2.65x to 2.52–2.63x, and
+  the n-gram scout that ships 1.83x to 2.02x. Every row still prints `matches
+  plain`.
+
+`TODO.md`'s note that four fifths of the batched lane is unexplained still
+stands, and this does not dent it: 1.1 ms of 10.3 is the epilogue, which is what
+0.9.5 said it would be. **The rest of that entry is now blocked on a hardware
+counter and not on an idea** — and worth recording, since it cost a check: the
+host this was measured on exposes no PMU at all (`/sys/bus/event_source/devices`
+has `breakpoint`, `msr`, `power`, `software`, `tracepoint` and `uprobe`, and no
+`cpu`), so the entry's own instruction to take a counter to it cannot be
+followed here by anyone.
+
+### Code
+
+- `kern_row_code_level_many`: `total_list` beside `part_list`, and the
+  destination written once a row.
+
+### Tests
+
+None added; there is nothing new to hold. What the change claims is that it
+moves no number, and that is checked the way the rest of this file checks it —
+`logits` byte for byte against the previous build on a text prompt, a picture, a
+clip and a long prefill, and greedy `--guess 8` byte for byte. 822 pass on the
+wide build, 813 without the integer dot product and 813 on SSE2.
