@@ -34,6 +34,18 @@ which of them unlocks the others. Where those went, largest first: the output he
 11.87 ms to 5.99, the four bit planes ten to eighteen percent on the unpack, and
 every plane a little on the fork and the join. `CHANGES.md` has each of them.
 
+**0.9.5 took the head off the float kernel, which was the last large thing in
+it.** On the reference host — four cores of a Xeon at 2.8 GHz, AVX-512 with
+VNNI, a bare four thread sweep of **28.43 GiB/s** measured again there — a plane
+the export left uncalibrated now brings a step of the activation's own, and the
+head is **7.864 ms to 5.384**, the step floor 48.38 ms to **45.70** and decode
+20.67 tokens a second to **21.88**. The batched head came with it and the
+speculative ceiling at a block of eight is **2.09x to 2.35x**. Two entries below
+close with it: the head's remaining kernel route, refused on ports rather than
+on instructions, and the cluster bound, refused on the head's geometry. The mlp
+is now 56% of a step against the head's 11.5%, so what is left in this list is
+overwhelmingly a memory question and not a kernel one.
+
 0.8.10 divided the step. 0.8.11 acted on the division, and the two things it
 settles both move this list.
 
@@ -160,175 +172,147 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
   the same plane sits at 45% of a sweep rather than 78%, and whatever is left in
   the loop would show there and cannot show here.
 
+  **0.9.5 divided the gap, and it is two things rather than one.** The plane's
+  own 472.5 MiB were run three ways on the reference host at four threads: swept
+  sequentially, walked in the kernel's own pattern — four rows interleaved, the
+  same thirty-two byte loads, added instead of decoded — and then by the kernel
+  itself. In one quiet run: **sweep 16.4 ms, walk 18.4, kernel 22.6**. So
+
+  - **12% is the access pattern**, and it is not a bug. Four rows in flight is
+    what shares the staged levels and the epilogue between them, and reading
+    them costs more than reading one stream. It is the price of the row block,
+    not something left on the floor.
+  - **the other 19% is issue**, at about 1.4 ms per port-0-or-5 uop in the inner
+    loop. Removing the shift and the mask and keeping the dot product costs
+    19.1 ms; keeping them and dropping the dot product costs 21.9. Three uops
+    per sixty-four codes a row — `vpsrlvd`, `vpandd`, `vpdpbusd` — and each is
+    worth about the same.
+
+  **Which says the one instruction worth removing is already removed where the
+  host allows it.** `vgf2p8affineqb` does the shift and the mask as one, and
+  0.8.14 built that path; it is gated on GFNI, which the reference host does not
+  have and the third host does. On a host without GFNI there is nothing cheaper
+  in AVX-512BW — the two uops are a variable shift and a mask, and no single
+  instruction in that subset does both — so this half of the gap is a property
+  of the instruction set and not of the loop.
+
+  The same measurement at **one** thread gives the same ratio (kernel at 70% of
+  its sweep, 79% of its walk), so none of it is the fork, the join, or the
+  threads landing unevenly.
+
   What is not worth retrying: the bit width (0.8.11), eight rows a block
   (0.8.11, and again in 0.8.16 on the other path), software prefetch (0.8.11),
-  the page walk (0.8.12), and the accumulator chain at either width (0.9.2).
+  the page walk (0.8.12), the accumulator chain at either width (0.9.2), and the
+  access pattern or the unpack on a host without GFNI (0.9.5).
 
-- **The output head, which runs the float kernel and not the integer one.**
-  96 MiB and 12.2% of everything a decode step reads, 12.36 ms of a 44.74 ms
-  step on the third host, and **33 G multiply-adds a second against the mlp's
-  52** — because it is not on the integer path at all.
+- **The output head, which used to run the float kernel and now runs the
+  integer one.** 96 MiB and 12.2% of everything a decode step reads, and until
+  0.9.5 the slowest plane in the step per multiply-add for a reason no kernel
+  change could reach.
 
-  0.8.14 settled what three versions of this entry could not. The entry used to
-  read that the head is bound by neither the memory nor the instruction count;
-  it removed an instruction from the head's supposed inner loop — a quarter of
-  it, on every other two and four bit plane in the step — and the head did not
-  move while the four bit planes moved by ten to eighteen percent. The loop
-  under test was not the loop being run.
+  0.8.14 settled what three versions of this entry could not. `kern_level_ready`
+  required `sheet->enter_gain > 0`, the plane's `input_activation_scale`, and
+  **the export ships `lm_head.input_activation_scale` as `0.0`** where every
+  other projection has a real one — so the head fell to `kern_row_code`'s float
+  spread on every token, by construction, and 0.8.11 through 0.8.16's work on
+  the integer path could never have moved it.
 
-  `kern_level_ready` requires `sheet->enter_gain > 0`, the plane's
-  `input_activation_scale`, because the integer path rounds the activation onto
-  that step's grid and requires it to land exactly. **The export ships
-  `lm_head.input_activation_scale` as `0.0`** where every other projection has a
-  real one, so the head falls to `kern_row_code` and `kern_dot_code`'s float
-  spread on every token, by construction. `CHANGES.md` 0.8.14 has the
-  instrumentation and the confirmation — 4 × 262144 × 1536 column-products a
-  step, all of them on the float path.
+  **0.9.5 gave the head a step and took the integer path, and that is the entry
+  closed.** `kern_level_pick` takes the lane's own largest magnitude over the
+  127 levels a signed byte carries, so the step is per token and per lane rather
+  than the export's; `kern_level_stage` rounds onto it where before it verified
+  a grid the caller was already on. On the reference host the head is **7.864 ms
+  to 5.384**, 51.2 G multiply-adds a second to 74.8, the step floor 48.38 ms to
+  45.70 and decode 20.67 tok/s to 21.88. The batched head came with it, so a
+  block's marginal lane is 21% cheaper and the speculative ceiling at a block of
+  eight is **2.09x to 2.35x**.
 
-  So the old entry's puzzle is not a puzzle. The 22.7 GiB/s microbenchmark ran
-  the integer kernel; the engine runs the float one. The GiB/s gap is
-  `kern_dot_code` against `vpdpbusd`, not two bit against four. 0.8.11's
-  epilogue and 0.8.12's fold are both in the integer path and neither could ever
-  have moved this plane.
+  The rounding costs 0.04 root mean square on the row and 0.49 at worst, over
+  the whole vocabulary, which moved the top token once in 384 greedy steps — at
+  a gap of 0.023. So the sweep is taken on the grid and the decision is not:
+  `session_head_true` scores the best sixty-four rows again on the float path,
+  a four thousandth of the plane, and the top token and the top five then match
+  the float build on every one of those 384 steps and the greedy text matches
+  byte for byte on all eight prompts. `CHANGES.md` 0.9.5 has every number.
 
-  **Three routes are open, in this order.**
+  **What is left, and it is now the smaller half.** The head is 5.38 ms against
+  a bare four thread sweep of its own 97 MiB at 3.41 ms, so it is at 63% of this
+  host's memory where it was at 43%. Whatever remains is worth under 2 ms of a
+  45.7 ms step, and the plane is no longer the outlier the rest of this entry
+  was written about.
 
-  *The float loop the head actually runs, which 0.8.15 and 0.8.16 took most of.*
-  0.8.15 made the mask and the widening one `vpermps` against a repeating table,
-  four instructions a vector rather than five, and got 8.3%. 0.8.16 found the
-  factor that was left, and it was not the instruction count: the row carried
-  **two** accumulators over ninety-six vectors, so each was a chain of
-  forty-eight dependent multiply-adds at four cycles deep against two a cycle of
-  throughput, and the row was bound by its own chain at about four times what
-  its ports allow. Four rows at a time, each keeping its own pair and its own
-  order, is eight chains covering each other and the same sum to the last bit:
-  the head **11.20 ms to 5.99**, the step floor 15.0%, decode 17.6%. Eight rows
-  was built and is worse on this plane, as it was on the other path.
-
-  What is left is the broadcast. Three of the loop's sixteen instructions per
-  sixty-four codes are broadcasts that one `vbroadcasti32x4` could replace,
-  because sixteen bytes are sixty-four codes and four shifts of them reach
-  every one. Thirteen per sixty-four rather than sixteen. It costs a staging
-  pass — the four quarters come out in the unpack's order rather than the
-  column's, so the activations have to be laid down in that order, exactly as
-  `kern_level_stage` already does for the integer path. Take it only knowing
-  that the loop is no longer latency-bound, which is what makes counting its
-  instructions worth anything for the first time.
-
-  The head is now 5.99 ms of a 34.95 ms step, 17.1% against 27.3%, at 67 G
-  multiply-adds a second against 33. A bare four thread sweep of its 97 MiB on
-  this host is 1.9 ms, so there is about three times left in it and the two
-  routes below are where the rest of it is.
-
-  **The batched head has both of those now, 0.9.1, and what it cost is worth
-  reading before the next route is scoped.** 0.8.15's `vpermps` lookup and
-  0.8.16's row block were written into `kern_dot_code` and `kern_row_code`,
-  which are the one lane path; the many lane path spread the codes out to floats
-  through scratch and read them back a block of lanes at a time.
-  `kern_dot_code_many` now decodes in the vector and multiplies straight into
-  four lanes' pairs of accumulators, which is both of those changes at once and
-  takes the scratch out of both sides of it.
-
-  A speculative round is 8 to 13% cheaper for it and the marginal lane at a
-  block of eight is **12.44 ms to 10.56**. Two things it did not do, and they
-  bound what to expect from the routes below. **Prefill does not move**, because
-  a prefill pays the head once for its whole chunk — the batched head was never
-  a prefill problem, whatever the old entry said. And it is **not
-  bit-identical**: a 512 bit accumulator adds a lane's slots in a different order
-  than a 256 bit one, so the batch agrees with a lane at a time to a float's
-  tolerance, as a batch here always has. What is held exactly is `igllm guess`'s
-  `matches plain`, which is the block path's token stream against the plain one.
-
-  *Give the head a grid, and take the integer path.* This is the large one — the
-  four bit planes run at 52 G multiply-adds a second against the head's 33, and
-  the head is two bit, so the ceiling is higher than that ratio suggests. It is
-  not exact: the export declined to calibrate this activation, so the engine
-  would be choosing a step, and that is a decision about output quality rather
-  than a kernel change. Measure it as one — a step chosen per token from the
-  activation's own range, against the float path's logits, over the whole
-  vocabulary and not just the argmax, before any timing is quoted. If the top
-  token moves on ordinary prompts the answer is no.
-
-  *Do not score 262144 rows at all.* The entry below, unchanged by any of this
-  except that the plane it prunes is five times more expensive per byte than
-  that entry assumed, which makes it worth more than it looked.
+  **The float loop's broadcast is refused, and refused on ports rather than on
+  instructions.** The route was to replace three of the loop's sixteen
+  instructions per sixty-four codes with one `vbroadcasti32x4`, at the cost of
+  staging the activations in the unpack's order. It was built and measured
+  against the shipped loop over the real head: 7.763 ms to 7.880, a wash. The
+  three instructions it removes are `vpbroadcastd` from memory, which retire on
+  the **load** ports; the loop is bound by ports 0 and 5, where the variable
+  shift, the `vpermps` and the multiply-add sit, and twelve of those uops per
+  sixty-four codes is what it was before and after. **Counting instructions is
+  not counting ports** — which is the second time this entry has had the loop
+  under test not be the loop that was binding. Anything aimed at the float head
+  now has to take work off ports 0 and 5; 0.9.5 took the whole loop off them
+  instead.
 
   What is ruled out, and should not be tried again: the row epilogue (0.8.11,
   and it is in the wrong path anyway); eight rows a block instead of four
   (0.8.11, a wash); software prefetch of the code stream (0.8.11, 12 to 20%
   *worse* on every code plane — read the numbers before having the idea);
   sixteen rows closed together (0.8.12, wrong path); the page walk (0.8.12 — the
-  same 96 MiB costs the same with a gigabyte swept in between); and the affine
-  take (0.8.14, wrong path). Do not reopen any of it on a GiB/s comparison
-  across bit widths, which is not a comparison at all.
+  same 96 MiB costs the same with a gigabyte swept in between); the affine take
+  (0.8.14, wrong path); and the broadcast (0.9.5, above). Do not reopen any of
+  it on a GiB/s comparison across bit widths, which is not a comparison at all.
 
-- **Stop scoring 262144 rows to pick one.** The output head is untied on this
-  export and 2-bit: 262144 by 1536 is **96.0 MiB, 12.2% of everything a decode
-  step reads**, spent to find the largest of 262144 numbers and then throw the
-  rest away.
+- **Stop scoring 262144 rows to pick one — closed by measurement, and it is a
+  refusal.** `RESEARCH.md` idea 10 was to cluster the head's rows once at load,
+  bound each cluster by `<centroid, a> + radius * ||a||`, and discard a cluster
+  whose bound cannot beat the best candidate so far.
 
-  `RESEARCH.md` idea 10: cluster the head's rows once at load, bound each
-  cluster cheaply, evaluate the promising ones, and discard a cluster only when
-  its bound cannot beat the best candidate so far. Exact for greedy decoding,
-  and exact for top-k where every excluded row is provably under the retained
-  threshold. Arbitrary top-p cannot ignore the discarded tail and would fall
-  back to the full head.
+  The entry named the one thing to check before building any of it, and 0.9.5
+  checked it. **The bound prunes nothing, and the reason is the geometry rather
+  than the clustering.**
 
-  *Not in mainline llama.cpp* — it always computes the full head. Two reasons
-  it may be worth more here than there: this head is untied, so it is a real
-  96 MiB rather than a table the embedding lookup already touched, and 2-bit
-  codes make the per-row bound cheap to precompute.
+  A real activation, the exact logits beside it, and the rows bucketed by a sign
+  signature over random directions — a clustering cheap enough to be a load-time
+  cost, which a k-means over 262144 rows is not:
 
-  Removing the head entirely would only move the 41 tokens-a-second ceiling to
-  about 47, so this is a multiplier and not a strategy. Measure **bytes actually
-  not read**, not clusters skipped, and stop if the bound needs most of a row to
-  be useful.
+  | cells | mean radius | radius over the mean row norm | rows the bound keeps |
+  | --- | --- | --- | --- |
+  | 256 | 0.988 | 1.054 | 100.0% |
+  | 4096 | 0.921 | 0.982 | 100.0% |
+  | 16384 | 0.784 | 0.837 | 99.6% |
 
-  0.8.14 changed what this is worth without changing the entry. The head runs
-  the float kernel rather than the integer one, so the bytes this would stop
-  reading are five times more expensive per byte than the entry assumed when it
-  wrote them off as "the best rate in the step". A bound that skips half the
-  head is worth half of 5.99 ms here after 0.8.16, not half of 6.65.
+  Sixty-four times more cells moved the radius from 1.05 of a row norm to 0.84,
+  and the bound needs it under **0.134** — the top logit over `||a||`, measured
+  over 32 real greedy steps, where it ranged 0.097 to 0.201. The plain per-row
+  Cauchy-Schwarz bound is the floor and behaves as this entry predicted:
+  `||w|| ||a||` is **25.8x** the value it bounds, and it keeps every row.
 
-  **And 0.9.0 gave it a second customer, which is a better fit than the first.**
-  Speculative decoding verifies a position by asking what the model would have
-  produced there, and for greedy verification that is not the distribution — it
-  is one question, *is the proposed id the argmax*. Confirming it needs exactly
-  the bound this entry is about: score the proposed row, then discard every
-  cluster whose bound cannot beat it. Rejecting is cheaper still, because any
-  single row that beats the proposal ends the question.
+  **And the refusal holds for every clustering there is, not just that one.** A
+  cell holding two rows has radius at least half the distance between them, so
+  the best radius any clustering with more than one row a cell can reach is half
+  the nearest neighbour distance. Over a sample of 256 rows against all 262144,
+  the nearest neighbour sits at **0.837** on average against a mean row norm of
+  0.937 — half of which is 0.418, three times looser than the 0.134 the bound
+  needs — and only **1.2%** of rows have a neighbour within twice what the bound
+  needs. 262144 rows in 1536 dimensions are very nearly mutually orthogonal, and
+  no cell of more than one of them can be tight enough.
 
-  **One thing to check before building any of it, because it decides the whole
-  idea and costs an afternoon rather than a week.** A bound is only worth
-  anything if it is tight enough to prune. Cauchy-Schwarz on a row gives
-  `|<w,a>| <= ||w|| ||a||`, and over 1536 dimensions a typical alignment makes
-  that about `sqrt(1536)` — thirty-nine times — looser than the value it bounds,
-  so a plain per-row norm prunes nothing at all. Clustering replaces it with
-  `<centroid, a> + radius * ||a||`, which is tight only where the cluster radius
-  is small against the row norms. **Measure that ratio on this export's head
-  before writing a k-means**: take a few thousand rows, cluster them any way at
-  all, and compare the radius with the norm. If the radius is most of the norm
-  the bound cannot beat a top logit and the entry is closed; the entry's own
-  rule — stop if the bound needs most of a row to be useful — is the same test
-  said less precisely. The clustering itself is also a load-time cost on an
-  engine whose startup is two JSON files, which is a second reason to know the
-  answer before paying it.
+  So the entry is closed, and closed the way its own rule said to close it: stop
+  if the bound needs most of a row to be useful. It needs all of one.
 
-  So this entry is the enabler for the speculative one below rather than a
-  parallel idea, and it is worth more there than in a plain decode step: a plain
-  step pays the head once, a block of eight pays it eight times. Six of the
-  thirteen milliseconds an extra speculative lane costs are this plane, and the
-  entry's own arithmetic — that removing the head entirely moves the sweep
-  ceiling from 41 tokens a second to about 47 — badly understates it for that
-  reason. Build the bound for verification first, where it is exact, cheap to
-  state and easy to measure; the sampling case can follow.
+  What it was worth is also gone, and by the better route. This was the enabler
+  for the speculative entry's step 2 and for the head entry above, and both of
+  those wanted it because the head cost five times more per byte than any other
+  plane. 0.9.5 took 46% of that instead, by putting the head on the integer path
+  — so a bound would now be pruning bytes that are three times cheaper than when
+  this entry was written, on a plane that is 11.5% of a step rather than 16%.
 
-  This entry used to be scoped together with the logit cap, on the argument that
-  a bound which never materializes most of the head makes capping most of the
-  head moot. 0.8.11 closed the cap on its own — 4.45 ms a step to 0.28 — so the
-  two are no longer one piece of work, and what is left to win here is the head
-  itself: 6.65 ms of a 34.79 ms step, with the cap and the sampler that used to
-  ride with it now 0.28 and 0.78.
+  Do not reopen it on this export. A checkpoint whose head is *tied* to the
+  embedding table is a different question — there the rows are already read for
+  the embedding lookup — and so is one whose vocabulary is small enough that the
+  clusters could be tight; neither is this one.
 
 - **Produce more than one token per sweep of the weights.** The only idea here
   that can pass the sweep ceiling at all, because it is the only one that
@@ -385,16 +369,74 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      warned about — trusting `fill_count` — was written deliberately and the
      test fails on it.
 
-  2. **Make the batched head cheap, which is the entry above and this one at
-     once.** Two routes and they compose. The first is **done, 0.9.1**:
-     `kern_dot_code_many` gives the many lane path 0.8.15's `vpermps` lookup and
-     0.8.16's chain depth at once, and the marginal lane at a block of eight is
-     12.44 ms to 10.56 — a round 8 to 13% cheaper. The second is still open and
-     is the larger of the two: verification does not need the whole
-     distribution, because for greedy it needs only to know whether the proposed
-     id is the argmax, which is exactly the bound the entry above is about.
-     **Measure the marginal lane again before writing a proposer**, which is
-     what 0.9.1 did and what the next change here should do.
+  2. **Done, 0.9.1 and 0.9.5: make the batched head cheap.** Three routes were
+     named and all three are now settled. `kern_dot_code_many` gave the many
+     lane path 0.8.15's `vpermps` lookup and 0.8.16's chain depth at once, and
+     the marginal lane at a block of eight went 12.44 ms to 10.56 — a round 8 to
+     13% cheaper. **0.9.5 then took the head off the float kernel entirely**: a
+     step of each lane's own puts the whole block on `vpdpbusd`, the marginal
+     lane at a block of sixteen is 22.76 ms to 18.08 on the reference host, and
+     the oracle ceiling is **2.09x to 2.35x at a block of eight, 2.18x to 2.40x
+     at sixteen**. The third — verification does not need the whole
+     distribution, only whether the proposed id is the argmax — wanted the
+     cluster bound in the entry above, and that entry is now closed as a
+     refusal: the bound cannot be made tight enough on a head this nearly
+     orthogonal. So this step is finished, and what remains of the ceiling is
+     not in the head.
+
+     **And 0.9.5 divided a round, which says where the lane actually goes.**
+     `igllm guess --verbose` prices the marginal lane part by part, by
+     subtracting the oracle's narrowest block from its widest. On the reference
+     host, a block of 2 against a block of 16 on a 49 id prompt:
+
+     | part | ms at 2 | ms at 16 | ms a lane | share of the lane |
+     | --- | --- | --- | --- | --- |
+     | mlp | 36.782 | 160.924 | **8.867** | **49.3%** |
+     | final norm, head | 7.658 | 37.061 | 2.100 | 11.7% |
+     | score, softmax, blend | 4.076 | 31.862 | 1.985 | 11.0% |
+     | q k v | 5.597 | 21.824 | 1.159 | 6.4% |
+     | attn out | 5.079 | 21.037 | 1.140 | 6.3% |
+     | ple feed | 3.224 | 15.843 | 0.901 | 5.0% |
+     | named, in all | 67.377 | 319.192 | **17.987** | 100% |
+
+     **So the head is no longer the ceiling and the mlp is.** The entry above
+     used to read that the head was six of the original thirteen milliseconds
+     and 0.9.1 made it three; it is now **2.1 of 18.0**, and half the lane is
+     the feed-forward. Nothing above this line needs re-deriving — take the
+     table.
+
+     **And the mlp's marginal lane is nowhere near its own instruction floor,
+     which is the open question this entry now turns on.** A lane of the mlp is
+     991 M multiply-adds; `vpdpbusd` retires sixty-four of them, so that is 15.5
+     M instructions, and `KERN_LEVEL_MANY_LOOP` issues five port-0 uops per four
+     lanes per block — about 2 ms over four threads. The measured lane is
+     **8.9**, four times that.
+
+     0.9.5 measured the two obvious explanations and neither is it:
+
+     - **The epilogue is not it.** `kern_row_code_level_many` closes every row
+       for every lane on its own — a sixty-four bit subtract, a widening and two
+       float multiplies, 7.7 M times over the mlp at sixteen lanes — where the
+       one lane path has folded sixteen rows into a vector since 0.8.12.
+       Replacing the whole close with a raw store is worth **3.7 to 8.7%** of
+       the batched plane, 0.3 to 0.8 ms of a lane. Worth having eventually;
+       nowhere near four times.
+     - **The staging stride was not it either.** Every lane's levels used to be
+       laid down `desk->level_limit` apart, which is the widest code plane the
+       model binds — `ple embed`'s 8960 columns — so sixteen lanes of a 1536
+       column plane sat 8960 bytes apart where the 24 KiB they actually read
+       would have fitted in the first level cache side by side. 0.9.5 stages at
+       the plane's own width instead. In isolation that is **6.6%** of the
+       batched feed-forward; end to end on this host it is a wash inside the
+       noise, and it ships because it is the same work with better locality and
+       costs nothing, not because it was measured to pay.
+
+     So four fifths of the batched lane is still unexplained, and it is now the
+     largest single number in this list — 8.9 ms a lane against a 45.7 ms step,
+     with the ceiling in the table above riding on it. **Take a hardware counter
+     to it before writing another loop**: the three hypotheses that can be
+     reasoned about from the source have now all been measured and all three
+     came back small.
 
   3. **Done, 0.9.3: the n-gram proposer.** `app_scout` asks what followed the
      last time this stream said what it has just said — a growing array of ids
@@ -444,8 +486,11 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
      cannot carry an embedding row.
 
   **One thing to watch that 0.9.0 found and did not settle.** A batched pass
-  answers every lane the same way — one lane off the calibrated grid puts the
-  whole batch on the float path — while a lane stepped alone is judged alone. So
+  answers every lane the same way — one lane off the grid puts the whole batch
+  on the float path — while a lane stepped alone is judged alone. (Since 0.9.5
+  the head cannot be that lane: a plane with no step of its own gives every lane
+  one of its own, so the head's block is always on the integer path. Every other
+  plane is calibrated and can still refuse.) So
   a block and a sequence of steps can take different kernels and sum in a
   different order, and an accepted token is the token the model would have
   produced rather than the same arithmetic that would have produced it. Over 32
@@ -685,3 +730,9 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 | Whether a proposer should match on a single id (answered: no — better on both workloads at once without it) | 0.9.3 |
 | The mlp's accumulator chain, which the entry named as the first thing to check (refused: a wash on the one lane block, 15% worse on the batched one, and the plane is at 78% of this host's bare sweep) | 0.9.2 |
 | What a bare sweep of the reference host actually is, against the third host's number the mlp entry had been reasoning from | 0.9.2 |
+| The output head on the integer path — a step of the activation's own where the export gave the plane none, and the best sixty-four rows scored again on the float path so the decision is not the rounding's | 0.9.5 |
+| The float head's remaining instruction, one `vbroadcasti32x4` for three `vpbroadcastd` (refused: a wash — the three it removes are load-port uops and the loop is bound by ports 0 and 5) | 0.9.5 |
+| Whether a cluster bound can prune the head's 262144 rows (answered: no, and for every clustering rather than the one tried — the mean nearest neighbour is 0.89 of a row norm and the bound needs 0.14) | 0.9.5 |
+| A speculative round divided into named parts, and the marginal lane priced part by part by subtracting the narrowest block from the widest | 0.9.5 |
+| Where the mlp's gap to a bare sweep goes (answered: 12% is the row block's access pattern and 19% is three inner-loop uops, one of which GFNI already removes) | 0.9.5 |
+| Whether the batched path's per-lane epilogue or its staging stride explains the marginal lane (answered: neither — 4 to 9% and 7%, against a gap of four times) | 0.9.5 |

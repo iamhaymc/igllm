@@ -338,6 +338,17 @@ size_t       session_cache_room(const app_session *session);
 size_t       session_cache_room_at(const app_session *session, int cache_bits);
 app_tally    session_tally(const app_session *session);
 app_phase_book session_phases(const app_session *session);
+/* The same division of a *speculative round* rather than of a decode step.
+ *
+ * A block runs the same graph several lanes wide, so its parts answer a
+ * different question from a step's and are kept in a book of their own — one
+ * `session_guess` is a round, exactly as one `session_step` is a step.  Two of
+ * these at different block widths are what says where a marginal lane goes.
+ *
+ * `session_phase_clear` zeroes both books without disarming the timer, so a
+ * caller can time one stretch of a run rather than all of it. */
+app_phase_book session_phases_block(const app_session *session);
+void         session_phase_clear(app_session *session);
 const char  *app_phase_text(int phase_slot);
 
 /* helper layer ------------------------------------------------------------*/
@@ -2758,15 +2769,32 @@ static int kern_level_of(float value, float step_value, float back_step) {
   return level_index;
 }
 
+/* The nearest level to a value on a step the caller chose for itself.  Nothing
+ * is verified here because there is nothing to verify: the step came from the
+ * activation's own peak, so every value lands inside the range by construction,
+ * and the clamp is a guard rather than a policy. */
+static int kern_level_round(float value, float back_step) {
+  float level_value = rintf(value * back_step);
+  if (level_value < -128.0f) level_value = -128.0f;
+  if (level_value > 127.0f) level_value = 127.0f;
+  return (int)level_value;
+}
+
 /* Whether a plane's product can be taken on the grid at all: a host with the
- * integer dot product, a width whose codes divide a byte, a step to be on, and
- * groups that begin where a block does. */
+ * integer dot product, a width whose codes divide a byte, and groups that begin
+ * where a block does.
+ *
+ * The step itself is not asked for here, because it is not always the plane's.
+ * Where the export calibrated the activation this is `sheet->enter_gain` and
+ * the levels are read back off a grid the caller has already rounded onto;
+ * where it did not, `kern_level_pick` chooses one from the activation's own
+ * range and the rounding happens in the staging.  Either way it is a number the
+ * caller carries, so this asks only about the shape of the plane. */
 static int kern_level_ready(const plane *sheet) {
 #if defined(APP_SIMD_AVX512VNNI)
   int span_count;
   if (sheet->form != PLANE_CODE) return 0;
   if (sheet->bit_count != 2 && sheet->bit_count != 4 && sheet->bit_count != 8) return 0;
-  if (!(sheet->enter_gain > 0.0f)) return 0;
   if (sheet->group_count > 1 && sheet->group_size % KERN_LEVEL_BLOCK) return 0;
   /* The widest group, against what one `int32` lane of the accumulator can
    * carry: the largest code times the largest level, over the whole span. */
@@ -2780,6 +2808,29 @@ static int kern_level_ready(const plane *sheet) {
 #endif
 }
 
+/* A step for an activation the export declined to calibrate: its own largest
+ * magnitude spread over the 127 levels a signed byte carries, so nothing clips
+ * and the whole range is used.  Zero where there is no range to speak of, or
+ * where a value is not finite, and the caller takes the float path.
+ *
+ * The output head is the plane this is for: `lm_head.input_activation_scale` is
+ * `0.0` on this export where every other projection has a real one, so there is
+ * no grid for the activation to be off and the lane brings one of its own.  It
+ * is chosen per lane rather than per plane, because sixteen prefill lanes have
+ * sixteen different peaks and a step that fits the largest of them wastes most
+ * of its range on the rest. */
+static float kern_level_pick(const float *act_data, int value_count) {
+  float peak = 0.0f;
+  int value_index;
+  for (value_index = 0; value_index < value_count; ++value_index) {
+    float size = act_data[value_index] < 0.0f ? -act_data[value_index] : act_data[value_index];
+    if (!(size < 1e30f)) return 0.0f;
+    if (size > peak) peak = size;
+  }
+  if (!(peak > 0.0f)) return 0.0f;
+  return peak / 127.0f;
+}
+
 /* The activation vector as levels, in the order each width's unpack leaves its
  * codes, with each group's integer sum beside it.
  *
@@ -2790,11 +2841,18 @@ static int kern_level_ready(const plane *sheet) {
  * nothing, because this side is read once.  So the levels are written where the
  * codes will land rather than where they came from.
  *
- * Returns zero, having written nothing a caller may use, where any activation
- * is off the grid. */
-static int kern_level_stage(const plane *sheet, const float *act_data, int8_t *level_data,
-                            int32_t *sum_data) {
-  float step_value = sheet->enter_gain;
+ * `exact_flag` says which of the two steps this is, and the two behave
+ * differently at the edge.  The export's own step is a grid the caller has
+ * already rounded onto, so a value that is not exactly on it means the caller
+ * reached here without the rounding: `kern_level_of` says so and the whole
+ * staging is refused, which puts the product back on the float path.  A step
+ * the lane chose for itself has nothing to be off — it was taken from these
+ * values — so `kern_level_round` rounds and this never refuses.
+ *
+ * Returns zero, having written nothing a caller may use, where an activation is
+ * off a step the plane claimed. */
+static int kern_level_stage(const plane *sheet, float step_value, int exact_flag,
+                            const float *act_data, int8_t *level_data, int32_t *sum_data) {
   float back_step = 1.0f / step_value;
   int part_count = 8 / sheet->bit_count;                 /* codes a byte holds */
   int run_wide = KERN_LEVEL_BLOCK / part_count;          /* codes a run holds */
@@ -2809,7 +2867,8 @@ static int kern_level_stage(const plane *sheet, const float *act_data, int8_t *l
       for (part_index = 0; part_index < part_count; ++part_index)
         for (run_index = 0; run_index < run_wide; ++run_index) {
           int from_slot = from_index + slot + part_count * run_index + part_index;
-          int level_index = kern_level_of(act_data[from_slot], step_value, back_step);
+          int level_index = exact_flag ? kern_level_of(act_data[from_slot], step_value, back_step)
+                                       : kern_level_round(act_data[from_slot], back_step);
           if (level_index == KERN_LEVEL_OFF) return 0;
           level_data[from_index + slot + run_wide * part_index + run_index] = (int8_t)level_index;
           total += level_index;
@@ -2817,7 +2876,8 @@ static int kern_level_stage(const plane *sheet, const float *act_data, int8_t *l
     /* What is left of a group is under one block, and is read in the order it
      * lies rather than the order a block wants. */
     for (; slot < span_count; ++slot) {
-      int level_index = kern_level_of(act_data[from_index + slot], step_value, back_step);
+      int level_index = exact_flag ? kern_level_of(act_data[from_index + slot], step_value, back_step)
+                                   : kern_level_round(act_data[from_index + slot], back_step);
       if (level_index == KERN_LEVEL_OFF) return 0;
       level_data[from_index + slot] = (int8_t)level_index;
       total += level_index;
@@ -3140,7 +3200,7 @@ static void kern_dot_level_rows(const uint8_t *code_head, size_t row_stride, int
  * difference — so the only rounding left in a row is the two multiplies that
  * put it back in the activation's units. */
 static float kern_row_code_level(const plane *sheet, int row_index, const int8_t *level_data,
-                                 const int32_t *sum_data) {
+                                 const int32_t *sum_data, float step_value) {
   const uint8_t *code_row = sheet->code_data + (size_t)row_index * sheet->row_stride;
   const float *gain_line = plane_gain_line(sheet);
   size_t gain_base = (size_t)row_index * (size_t)sheet->group_count;
@@ -3157,7 +3217,7 @@ static float kern_row_code_level(const plane *sheet, int row_index, const int8_t
     part_value = (int64_t)kern_dot_level(code_row, from_index, span_count, level_data,
                                          sheet->bit_count, sheet->code_flip);
     part_value -= (int64_t)bias_value * (int64_t)sum_data[group_index];
-    total += gain_value * sheet->enter_gain * (float)part_value;
+    total += gain_value * step_value * (float)part_value;
   }
   return total;
 }
@@ -3170,7 +3230,7 @@ static float kern_row_code_level(const plane *sheet, int row_index, const int8_t
  * flight, so the reduction that closes one overlaps the dot products of the
  * next three instead of standing at the end of a chain on its own. */
 static void kern_row_code_level_rows(const plane *sheet, int row_index, const int8_t *level_data,
-                                     const int32_t *sum_data, float *out_data) {
+                                     const int32_t *sum_data, float step_value, float *out_data) {
   const uint8_t *code_head = sheet->code_data + (size_t)row_index * sheet->row_stride;
   const float *gain_line = plane_gain_line(sheet);
   int32_t part_list[KERN_ROW_BLOCK];
@@ -3191,7 +3251,7 @@ static void kern_row_code_level_rows(const plane *sheet, int row_index, const in
           (int32_t)sheet->code_bias + (sheet->bias_data ? (int32_t)sheet->bias_data[gain_slot] : 0);
       int64_t part_value = (int64_t)part_list[block_slot];
       part_value -= (int64_t)bias_value * (int64_t)sum_data[group_index];
-      total_list[block_slot] += gain_value * sheet->enter_gain * (float)part_value;
+      total_list[block_slot] += gain_value * step_value * (float)part_value;
     }
   }
   for (block_slot = 0; block_slot < KERN_ROW_BLOCK; ++block_slot)
@@ -3284,7 +3344,7 @@ static int kern_level_wide_ready(const plane *sheet) {
   } while (0)
 
 static void kern_row_code_level_wide(const plane *sheet, int row_index, const int8_t *level_data,
-                                     const int32_t *sum_data, float *out_data) {
+                                     const int32_t *sum_data, float step_value, float *out_data) {
 #if defined(APP_SIMD_AVX512VNNI)
   const uint8_t *code_head = sheet->code_data + (size_t)row_index * sheet->row_stride;
   const int8_t *lane_head = level_data;
@@ -3322,14 +3382,14 @@ static void kern_row_code_level_wide(const plane *sheet, int row_index, const in
       whole_wide, _mm512_mullo_epi32(bias_wide, _mm512_set1_epi32(sum_data[0])));
 
   gain_wide = _mm512_mul_ps(_mm512_loadu_ps(gain_line + (size_t)row_index),
-                            _mm512_set1_ps(sheet->enter_gain));
+                            _mm512_set1_ps(step_value));
   _mm512_storeu_ps(out_data + (size_t)row_index,
                    _mm512_mul_ps(gain_wide, _mm512_cvtepi32_ps(whole_wide)));
 #else
   int block_slot;
   for (block_slot = 0; block_slot < KERN_ROW_WIDE; ++block_slot)
     out_data[row_index + block_slot] =
-        kern_row_code_level(sheet, row_index + block_slot, level_data, sum_data);
+        kern_row_code_level(sheet, row_index + block_slot, level_data, sum_data, step_value);
 #endif
 }
 
@@ -3697,11 +3757,16 @@ typedef struct kern_job {
   const float *act_data;  /* lane_count rows of col_count, act_stride apart */
   const float *sum_data;  /* lane_count rows of group_count, sum_stride apart */
   float       *out_data;  /* lane_count rows of row_count, out_stride apart */
-  /* The same activations as levels on the plane's own step, and their integer
-   * group sums, where `kern_level_stage` found every one of them on it.  NULL
-   * says the product is the float one. */
+  /* The same activations as levels on a step, and their integer group sums,
+   * where `kern_level_stage` put them there.  NULL says the product is the
+   * float one.
+   *
+   * The step is the plane's where the export calibrated the activation, and a
+   * lane's own where it did not — so it is one number per lane rather than one
+   * per plane, and the row kernels take it from here. */
   const int8_t  *level_data;
   const int32_t *isum_data;
+  const float   *step_list;
   int          level_stride;
   int          act_stride;
   int          sum_stride;
@@ -4062,7 +4127,7 @@ static void kern_row_code_level_many(const plane *sheet, int row_index, const ke
   for (group_index = 0; group_index < sheet->group_count; ++group_index) {
     int from_index = group_index * sheet->group_size;
     int span_count = sheet->col_count - from_index;
-    float gain_value = plane_gain(sheet, gain_base + (size_t)group_index) * sheet->enter_gain;
+    float gain_value = plane_gain(sheet, gain_base + (size_t)group_index);
     int32_t bias_value =
         (int32_t)sheet->code_bias +
         (sheet->bias_data ? (int32_t)sheet->bias_data[gain_base + (size_t)group_index] : 0);
@@ -4075,7 +4140,7 @@ static void kern_row_code_level_many(const plane *sheet, int row_index, const ke
           (int64_t)bias_value * (int64_t)job->isum_data[(size_t)lane_index * (size_t)job->sum_stride +
                                                         (size_t)group_index];
       job->out_data[(size_t)lane_index * (size_t)job->out_stride + (size_t)row_index] +=
-          gain_value * (float)whole_value;
+          gain_value * job->step_list[lane_index] * (float)whole_value;
     }
   }
 }
@@ -4103,15 +4168,18 @@ static void kern_mat_vec_band(void *state, int slice_index, int slice_count) {
      * for what is left of the slice, then a row at a time for the tail — three
      * forms of the same arithmetic, and a slice takes each of them at most as
      * far as the next one's width. */
+    float step_value = job->step_list[0];
     row_index = row_from;
     if (job->wide_flag)
       for (; row_index + KERN_ROW_WIDE <= row_upto; row_index += KERN_ROW_WIDE)
-        kern_row_code_level_wide(sheet, row_index, job->level_data, job->isum_data, job->out_data);
+        kern_row_code_level_wide(sheet, row_index, job->level_data, job->isum_data, step_value,
+                                 job->out_data);
     for (; row_index + KERN_ROW_BLOCK <= row_upto; row_index += KERN_ROW_BLOCK)
-      kern_row_code_level_rows(sheet, row_index, job->level_data, job->isum_data, job->out_data);
+      kern_row_code_level_rows(sheet, row_index, job->level_data, job->isum_data, step_value,
+                               job->out_data);
     for (; row_index < row_upto; ++row_index)
       job->out_data[row_index] =
-          kern_row_code_level(sheet, row_index, job->level_data, job->isum_data);
+          kern_row_code_level(sheet, row_index, job->level_data, job->isum_data, step_value);
   } else if (job->lane_count == 1) {
     /* The block of four where the plane admits it, then a row at a time for
      * what is left — the same arithmetic either way, and the block is the one
@@ -4832,6 +4900,7 @@ typedef struct back_desk {
    * code plane the model binds, so the token loop still allocates nothing. */
   int8_t     *level_room;
   int32_t    *isum_room;
+  float       step_room[KERN_LANE_LIMIT]; /* the step each lane's levels sit on */
   int         level_limit; /* columns one lane's staging holds */
   int         level_live;  /* the host has the integer dot product */
   void (*mat_vec)(struct back_desk *desk, const plane *sheet, const float *act_data, float *out_data);
@@ -4862,22 +4931,48 @@ static void back_mat_mat(back_desk *desk, const plane *sheet, const float *act_d
     job.sum_data = NULL;
     job.level_data = NULL;
     job.isum_data = NULL;
-    job.level_stride = desk->level_limit;
+    job.step_list = desk->step_room;
+    /* The staging is laid down at the plane's own width rather than at the
+     * widest plane the model binds.  `level_room` is `level_limit` a lane, and
+     * a batch that used that whole stride put sixteen lanes of a 1536 column
+     * plane 8960 bytes apart — `ple embed`'s width, on this export — where the
+     * bytes a row actually reads are 24 KiB and would fit in the first level
+     * cache side by side.  Same room, same staging, nothing to allocate: it is
+     * only where each lane starts.  Worth 6.6% of the batched feed-forward and
+     * 0.6 ms of a speculative round's marginal lane. */
+    job.level_stride = sheet->form == PLANE_CODE ? sheet->col_count : desk->level_limit;
     job.wide_flag = 0;
     if (sheet->form == PLANE_CODE) {
-      /* One product is on the calibrated grid or it is not: a lane that falls
-       * off it puts the whole batch back on the float path, so every lane of
-       * one call is answered the same way.  The staging is tried first because
-       * where it succeeds the float group sums are not wanted, and they are the
-       * same pass over the same activations. */
+      /* One product is on a grid or it is not: a lane that falls off puts the
+       * whole batch back on the float path, so every lane of one call is
+       * answered the same way.  The staging is tried first because where it
+       * succeeds the float group sums are not wanted, and they are the same
+       * pass over the same activations.
+       *
+       * Which grid, though, is the lane's own question.  Where the export
+       * calibrated this activation the step is the plane's, the caller has
+       * already rounded onto it, and the staging reads the levels back and
+       * refuses anything that is not exactly on them.  Where the export left
+       * the step at zero — `lm_head.input_activation_scale` on this checkpoint
+       * — there is no grid to be off, so the lane brings one of its own from
+       * its largest magnitude and the staging rounds onto that.  A chosen step
+       * is per lane rather than per plane, which is why the job carries a list
+       * of them. */
       int level_flag = desk->level_live && sheet->col_count <= desk->level_limit &&
                        kern_level_ready(sheet);
+      int exact_flag = sheet->enter_gain > 0.0f;
       int lane_index;
-      for (lane_index = 0; lane_index < chunk_count && level_flag; ++lane_index)
-        level_flag = kern_level_stage(
-            sheet, job.act_data + (size_t)lane_index * (size_t)act_stride,
-            desk->level_room + (size_t)lane_index * (size_t)desk->level_limit,
-            desk->isum_room + (size_t)lane_index * (size_t)sheet->group_count);
+      for (lane_index = 0; lane_index < chunk_count && level_flag; ++lane_index) {
+        const float *lane_data = job.act_data + (size_t)lane_index * (size_t)act_stride;
+        float step_value = exact_flag ? sheet->enter_gain
+                                      : kern_level_pick(lane_data, sheet->col_count);
+        desk->step_room[lane_index] = step_value;
+        level_flag = step_value > 0.0f &&
+                     kern_level_stage(
+                         sheet, step_value, exact_flag, lane_data,
+                         desk->level_room + (size_t)lane_index * (size_t)job.level_stride,
+                         desk->isum_room + (size_t)lane_index * (size_t)sheet->group_count);
+      }
       if (level_flag) {
         job.level_data = desk->level_room;
         job.isum_data = desk->isum_room;
@@ -4973,6 +5068,18 @@ static const char *back_flavor(void) {
 #else
   return "cpu/plain";
 #endif
+}
+
+/* Whether a product on this plane will be taken on a step the activation
+ * chooses for itself rather than on one the export calibrated.
+ *
+ * A caller that cares about the exact value of a few rows — the output head's
+ * is the only one that does — asks this to know whether those rows are worth
+ * taking again on the float path.  Where the export gave the plane a step there
+ * is nothing to take again: the levels are the activation, exactly. */
+static int back_level_pick(const back_desk *desk, const plane *sheet) {
+  return desk->level_live && sheet->form == PLANE_CODE && !(sheet->enter_gain > 0.0f) &&
+         sheet->col_count <= desk->level_limit && kern_level_ready(sheet);
 }
 
 static app_code back_open(back_desk *desk, pool_group *pool_ref, int sum_limit, int col_limit) {
@@ -10257,6 +10364,11 @@ struct app_session {
   int        fill_count;
   app_tally  tally;
   app_phase_book phase;
+  /* A block's parts, kept apart from a step's: the same graph several lanes
+   * wide is a different question, and mixing them would make both unreadable.
+   * `phase_ref` is whichever of the two the timer is filling. */
+  app_phase_book  phase_block;
+  app_phase_book *phase_ref;
   double     phase_mark; /* when the open part began */
   int        phase_slot; /* the part that is open, -1 for none */
   int        phase_on;   /* set while a decode step is being divided */
@@ -10352,16 +10464,18 @@ struct app_session {
  * The whole thing is a load and a predicted branch when the timer is off,
  * which is every run that did not ask for it. */
 static void phase_turn(app_session *session, int phase_slot) {
+  app_phase_book *book;
   double now_time;
   if (!session->phase_on) return;
+  book = session->phase_ref ? session->phase_ref : &session->phase;
   now_time = time_now();
   if (session->phase_slot >= 0) {
-    session->phase.seconds[session->phase_slot] += now_time - session->phase_mark;
-    session->phase.counts[session->phase_slot] += 1;
+    book->seconds[session->phase_slot] += now_time - session->phase_mark;
+    book->counts[session->phase_slot] += 1;
   }
   session->phase_slot = phase_slot;
   session->phase_mark = now_time;
-  session->phase.read_count += 1;
+  book->read_count += 1;
 }
 
 /* Closes whatever part is open without opening another.  The read is charged
@@ -11223,6 +11337,84 @@ static void session_cap_band(void *state, int slice_index, int slice_count) {
 #define PASS_LOGIT_LAST 1 /* the last lane only, which is what a step wants */
 #define PASS_LOGIT_ALL  2 /* one row a lane, which is what verifying a block wants */
 
+/* The head's best rows, scored again on the float path.
+ *
+ * The output head is the one plane in this engine whose export carries no
+ * activation step — `lm_head.input_activation_scale` is `0.0` where every other
+ * projection has a real one — so `back_mat_mat` gives it a step of the
+ * activation's own and the whole row comes back off the integer grid.  That is
+ * worth about thirty percent of the plane, and it costs a rounding: over eight
+ * ordinary prompts and forty-eight greedy steps each, the row disagrees with
+ * the float path by 0.04 root mean square and 0.49 at worst, against logits
+ * whose top runs to twenty-seven.
+ *
+ * Almost everywhere that is far below the gap the top token wins by and nothing
+ * moves.  Once in three hundred and eighty-four steps it was not: two tokens
+ * 0.023 apart changed places, and the answer went a different and equally good
+ * way from there.  A quantized head that reorders a coin toss is not a quality
+ * regression, but it is a difference a caller can see, and it does not have to
+ * be paid.
+ *
+ * So the sweep is taken on the grid and the decision is not.  The best
+ * `SESSION_TRUE_ROWS` rows by the integer score are scored again by
+ * `kern_row_code` — the same float product the whole plane used to take, on the
+ * unrounded activation — and their exact values written back.  That is 64 rows
+ * of 262144, a four thousandth of the plane, and it puts the argmax, the
+ * top-k's members and the head of the distribution back where the float path
+ * had them.  The tail keeps its integer values, which is where the rounding is
+ * beneath a softmax's notice.
+ *
+ * It is skipped entirely where the plane brought its own step from the export,
+ * because then the levels *are* the activation and scoring a row again would
+ * return the same number.
+ *
+ * A row outside the sixty-four could in principle still have beaten them, which
+ * needs its error and the leader's to differ by more than the gap between rank
+ * one and rank sixty-five.  Over the same eight prompts the gap from rank one
+ * to rank sixty-five never fell under 13.66 logits against a worst error of
+ * 0.49, which is a margin of twenty-eight; `CHANGES.md` 0.9.5 has the
+ * measurement.
+ */
+#define SESSION_TRUE_ROWS 64
+
+static void session_head_true(app_session *session, const float *act_data, float *logit_data) {
+  app_model *model = session->model;
+  const plane *sheet = &model->head_sheet;
+  int   pick_list[SESSION_TRUE_ROWS];
+  float pick_value[SESSION_TRUE_ROWS];
+  int row_count = sheet->row_count;
+  int take_count = 0, row_index, take_slot;
+  float floor_value = 0.0f;
+
+  if (!back_level_pick(&model->desk, sheet)) return;
+  if (row_count <= SESSION_TRUE_ROWS) return;
+  if (sheet->group_count > model->desk.sum_limit) return;
+
+  /* The best sixty-four, kept sorted.  Once the list is full the whole of a
+   * row's cost is one compare against the smallest of them, which almost every
+   * row fails: the insertions expected over 262144 rows are a few hundred. */
+  for (row_index = 0; row_index < row_count; ++row_index) {
+    float value = logit_data[row_index];
+    if (take_count == SESSION_TRUE_ROWS && !(value > floor_value)) continue;
+    take_slot = take_count < SESSION_TRUE_ROWS ? take_count : SESSION_TRUE_ROWS - 1;
+    while (take_slot > 0 && pick_value[take_slot - 1] < value) {
+      pick_value[take_slot] = pick_value[take_slot - 1];
+      pick_list[take_slot] = pick_list[take_slot - 1];
+      --take_slot;
+    }
+    pick_value[take_slot] = value;
+    pick_list[take_slot] = row_index;
+    if (take_count < SESSION_TRUE_ROWS) ++take_count;
+    floor_value = pick_value[take_count - 1];
+  }
+
+  /* The float path's own group sums, and then its own product, row by row. */
+  kern_group_sum(sheet, act_data, model->desk.sum_room);
+  for (take_slot = 0; take_slot < take_count; ++take_slot)
+    logit_data[pick_list[take_slot]] =
+        kern_row_code(sheet, pick_list[take_slot], act_data, model->desk.sum_room);
+}
+
 static const float *session_pass(app_session *session, const int32_t *id_list,
                                  const float *state_list, const uint8_t *state_flag, int lane_count,
                                  int want_logits) {
@@ -11319,6 +11511,11 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
                form->state_size);
     session_lift_many(session, &model->head_sheet, session->scrap_room, session->state_stride,
                       logit_span, session->logit_room, model->head_sheet.row_count);
+    for (logit_slot = 0; logit_slot < logit_span; ++logit_slot)
+      session_head_true(session,
+                        session->scrap_room + (size_t)logit_slot * session->state_stride,
+                        session->logit_room +
+                            (size_t)logit_slot * (size_t)model->head_sheet.row_count);
     session->logit_span = logit_span;
   }
   if (form->logit_cap > 0.0f) {
@@ -11544,14 +11741,29 @@ const float *session_guess(app_session *session, const int32_t *id_list, int id_
    * smoothed: `session_guess_keep` divides these bytes by the tokens actually
    * committed, and a block that commits one carries the whole sweep against it.
    *
-   * The phase division stays off.  It is armed for a decode step, and a block
-   * runs the same graph several lanes wide; letting a block into those buckets
-   * would make both unreadable, for the reason a prime pass is kept out. */
+   * The phase division runs, into a book of its own.  A block is the same graph
+   * several lanes wide, so letting it into the step's buckets would make both
+   * unreadable — which is why there are two books rather than one, and why one
+   * `session_guess` counts as a round there and not as a step here.  A prime
+   * pass is still divided by neither. */
   session->tally.serve_bytes +=
       model_decode_bytes(session->model) + session_cache_bytes(session) * (size_t)id_count;
+  session->phase_on = session->phase.live_flag;
+  session->phase_ref = &session->phase_block;
+  session->phase_slot = -1;
   guess_from = time_now();
   logit_list = session_pass(session, id_list, NULL, NULL, id_count, PASS_LOGIT_ALL);
-  session->tally.serve_seconds += time_now() - guess_from;
+  phase_shut(session);
+  session->phase_on = 0;
+  session->phase_ref = &session->phase;
+  {
+    double round_seconds = time_now() - guess_from;
+    session->tally.serve_seconds += round_seconds;
+    if (session->phase.live_flag) {
+      session->phase_block.step_seconds += round_seconds;
+      session->phase_block.step_count += 1;
+    }
+  }
   session->tally.memory_bytes = app_total_bytes;
   if (!logit_list) {
     /* The pass refused before it wrote anything, so there is nothing to undo
@@ -12666,6 +12878,8 @@ app_code session_open(app_model *model, app_session **session_out) {
    * reports is detail and because a run that did not ask for it should not pay
    * even the branch on the caller's word alone. */
   session->phase.live_flag = model->setup.verbose_level > 0;
+  session->phase_block.live_flag = session->phase.live_flag;
+  session->phase_ref = &session->phase;
   session->phase_slot = -1;
 
   for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
@@ -12813,7 +13027,9 @@ void session_reset(app_session *session) {
      * tally beside them does not. */
     int live_flag = session->phase.live_flag;
     memset(&session->phase, 0, sizeof(session->phase));
+    memset(&session->phase_block, 0, sizeof(session->phase_block));
     session->phase.live_flag = live_flag;
+    session->phase_block.live_flag = live_flag;
     session->phase_slot = -1;
     session->phase_on = 0;
   }
@@ -12908,6 +13124,7 @@ const float *session_step_state(app_session *session, int32_t id_value, const fl
    * rather than about a token; letting it into the same buckets would make
    * both unreadable. */
   session->phase_on = session->phase.live_flag;
+  session->phase_ref = &session->phase;
   session->phase_slot = -1;
   from_time = time_now();
   logit_list = session_pass(session, &id_value, state_data, &state_mark, 1, 1);
@@ -13102,6 +13319,24 @@ app_phase_book session_phases(const app_session *session) {
   app_phase_book book;
   if (!session) { memset(&book, 0, sizeof(book)); return book; }
   return session->phase;
+}
+
+app_phase_book session_phases_block(const app_session *session) {
+  app_phase_book book;
+  if (!session) { memset(&book, 0, sizeof(book)); return book; }
+  return session->phase_block;
+}
+
+void session_phase_clear(app_session *session) {
+  int live_flag;
+  if (!session) return;
+  live_flag = session->phase.live_flag;
+  memset(&session->phase, 0, sizeof(session->phase));
+  memset(&session->phase_block, 0, sizeof(session->phase_block));
+  session->phase.live_flag = live_flag;
+  session->phase_block.live_flag = live_flag;
+  session->phase_slot = -1;
+  session->phase_on = 0;
 }
 
 const char *app_phase_text(int phase_slot) {

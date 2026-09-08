@@ -759,7 +759,7 @@ static void test_level(void) {
         want_level[col_index] = ((col_index * 37 + bit_count * 11) % 255) - 127;
         act_list[col_index] = (float)want_level[col_index] * step_value;
       }
-      stage_flag = kern_level_stage(&kit.sheet, act_list, level_list, isum_list);
+      stage_flag = kern_level_stage(&kit.sheet, step_value, 1, act_list, level_list, isum_list);
       test_true(stage_flag, "activations on the step stage as levels");
 
       { /* The staging is a permutation of the levels, and its sum is theirs. */
@@ -797,7 +797,7 @@ static void test_level(void) {
         okay_flag = 1;
         for (row_index = 0; row_index < row_count; ++row_index) {
           double want_value = 0.0;
-          float have_value = kern_row_code_level(&kit.sheet, row_index, level_list, isum_list);
+          float have_value = kern_row_code_level(&kit.sheet, row_index, level_list, isum_list, step_value);
           float gap;
           for (col_index = 0; col_index < col_count; ++col_index)
             want_value += (double)kit.dense_list[row_index * col_count + col_index] *
@@ -822,12 +822,13 @@ static void test_level(void) {
         okay_flag = 1;
         for (row_index = 0; row_index + KERN_ROW_BLOCK <= row_count;
              row_index += KERN_ROW_BLOCK)
-          kern_row_code_level_rows(&kit.sheet, row_index, level_list, isum_list, block_list);
+          kern_row_code_level_rows(&kit.sheet, row_index, level_list, isum_list, step_value,
+                                   block_list);
         for (; row_index < row_count; ++row_index)
-          block_list[row_index] = kern_row_code_level(&kit.sheet, row_index, level_list, isum_list);
+          block_list[row_index] = kern_row_code_level(&kit.sheet, row_index, level_list, isum_list, step_value);
         for (row_index = 0; row_index < row_count; ++row_index)
           if (block_list[row_index] !=
-              kern_row_code_level(&kit.sheet, row_index, level_list, isum_list))
+              kern_row_code_level(&kit.sheet, row_index, level_list, isum_list, step_value))
             okay_flag = 0;
         test_true(okay_flag, "a block of rows is the one row path bit for bit");
         mem_free(block_list);
@@ -861,15 +862,17 @@ static void test_level(void) {
 #endif
         if (ready_flag) {
           for (row_index = 0; row_index + KERN_ROW_WIDE <= row_count; row_index += KERN_ROW_WIDE)
-            kern_row_code_level_wide(&kit.sheet, row_index, level_list, isum_list, wide_list);
+            kern_row_code_level_wide(&kit.sheet, row_index, level_list, isum_list, step_value,
+                                     wide_list);
           for (; row_index + KERN_ROW_BLOCK <= row_count; row_index += KERN_ROW_BLOCK)
-            kern_row_code_level_rows(&kit.sheet, row_index, level_list, isum_list, wide_list);
+            kern_row_code_level_rows(&kit.sheet, row_index, level_list, isum_list, step_value,
+                                     wide_list);
           for (; row_index < row_count; ++row_index)
             wide_list[row_index] =
-                kern_row_code_level(&kit.sheet, row_index, level_list, isum_list);
+                kern_row_code_level(&kit.sheet, row_index, level_list, isum_list, step_value);
           for (row_index = 0; row_index < row_count; ++row_index)
             if (wide_list[row_index] !=
-                kern_row_code_level(&kit.sheet, row_index, level_list, isum_list))
+                kern_row_code_level(&kit.sheet, row_index, level_list, isum_list, step_value))
               okay_flag = 0;
           test_true(okay_flag, "the wide block is the one row path bit for bit");
         }
@@ -878,7 +881,7 @@ static void test_level(void) {
 
       { /* One activation off the grid puts the whole product back on floats. */
         act_list[col_count / 2] += 0.5f * step_value;
-        test_true(!kern_level_stage(&kit.sheet, act_list, level_list, isum_list),
+        test_true(!kern_level_stage(&kit.sheet, step_value, 1, act_list, level_list, isum_list),
                   "one activation off the step refuses the whole staging");
         act_list[col_count / 2] -= 0.5f * step_value;
       }
@@ -938,8 +941,13 @@ static void test_level(void) {
     }
   }
 
-  { /* A plane whose activations are not on its step is answered by the float
-     * path, and answers the same thing. */
+  { /* A plane whose activations are not on the step it *claims* is answered by
+     * the float path, and answers exactly what the float path answers.
+     *
+     * The baseline has to be taken with the integer path switched off at the
+     * backend rather than by leaving the step at zero, because a plane with no
+     * step of its own no longer means the float path: it means a step chosen
+     * from the activation, which is the case below. */
     test_plane_kit kit;
     int row_count = 70, col_count = 194;
     float *act_list = (float *)mem_clear(sizeof(float) * (size_t)col_count);
@@ -953,18 +961,111 @@ static void test_level(void) {
       act_list[col_index] = (float)sin((double)col_index * 0.19);
     pool_open(&pool, 3);
     back_open(&desk, &pool, kit.sheet.group_count, kit.sheet.col_count);
-    desk.mat_vec(&desk, &kit.sheet, act_list, free_list);
+    {
+      int level_live = desk.level_live;
+      desk.level_live = 0;
+      desk.mat_vec(&desk, &kit.sheet, act_list, free_list);
+      desk.level_live = level_live;
+    }
     kit.sheet.enter_gain = step_value; /* claimed, but the activations are not on it */
     desk.mat_vec(&desk, &kit.sheet, act_list, grid_list);
     for (row_index = 0; row_index < row_count; ++row_index)
       if (grid_list[row_index] != free_list[row_index]) okay_flag = 0;
-    test_true(okay_flag, "a step the activations are not on changes nothing");
+    test_true(okay_flag, "a step the activations are not on falls back to the float path");
     back_close(&desk);
     pool_close(&pool);
     mem_free(act_list);
     mem_free(grid_list);
     mem_free(free_list);
     test_plane_close(&kit);
+  }
+
+  { /* And a plane the export left no step for takes one of the activation's
+     * own, at every lane count.
+     *
+     * This is the output head's case: `lm_head.input_activation_scale` is zero
+     * on the shipped checkpoint, so there is no grid to be on and the lane
+     * brings its own — its largest magnitude over the 127 levels a signed byte
+     * carries.  The claim is nearness rather than equality, because rounding
+     * the activation onto that step is a real rounding; the bar is the step
+     * itself, which is the most one column can move by, times what the row can
+     * multiply it by.
+     *
+     * Each lane's peak is different on purpose, so a shared step would be wrong
+     * for all but one of them and the test would say so. */
+    int lane_list[4] = {1, 4, 7, 16};
+    int lane_slot, bit_slot2;
+    int bit_list2[3] = {2, 4, 8};
+    for (bit_slot2 = 0; bit_slot2 < 3; ++bit_slot2)
+      for (lane_slot = 0; lane_slot < 4; ++lane_slot) {
+        int bit_count = bit_list2[bit_slot2];
+        int lane_count = lane_list[lane_slot];
+        int row_count = 70, col_count = 192;
+        test_plane_kit kit;
+        float *act_list = (float *)mem_clear(sizeof(float) * (size_t)(col_count * lane_count));
+        float *pick_list = (float *)mem_clear(sizeof(float) * (size_t)(row_count * lane_count));
+        pool_group pool;
+        back_desk desk;
+        int lane_index, row_index, col_index, okay_flag = 1;
+
+        test_plane_open(&kit, row_count, col_count, bit_count, col_count, 1);
+        kit.sheet.enter_gain = 0.0f;
+        for (lane_index = 0; lane_index < lane_count; ++lane_index)
+          for (col_index = 0; col_index < col_count; ++col_index)
+            act_list[lane_index * col_count + col_index] =
+                (float)((lane_index + 1) * 3) * (float)sin((double)(col_index * 7 + lane_index) * 0.11);
+        pool_open(&pool, 3);
+        back_open(&desk, &pool, kit.sheet.group_count, kit.sheet.col_count);
+        desk.mat_mat(&desk, &kit.sheet, act_list, col_count, lane_count, pick_list, row_count);
+        for (lane_index = 0; lane_index < lane_count; ++lane_index) {
+          float peak = 0.0f, bar;
+          double weight_total = 0.0;
+          for (col_index = 0; col_index < col_count; ++col_index) {
+            float size = (float)fabs((double)act_list[lane_index * col_count + col_index]);
+            if (size > peak) peak = size;
+          }
+          for (row_index = 0; row_index < row_count; ++row_index)
+            for (col_index = 0; col_index < col_count; ++col_index) {
+              double size = fabs((double)kit.dense_list[row_index * col_count + col_index]);
+              if (size > weight_total) weight_total = size;
+            }
+          /* Half a step a column, over every column, times the largest weight:
+           * the worst the rounding can do to one row. */
+          bar = (float)(0.5 * (double)(peak / 127.0f) * weight_total * (double)col_count);
+          for (row_index = 0; row_index < row_count; ++row_index) {
+            double want_value = 0.0;
+            float gap;
+            for (col_index = 0; col_index < col_count; ++col_index)
+              want_value += (double)kit.dense_list[row_index * col_count + col_index] *
+                            (double)act_list[lane_index * col_count + col_index];
+            gap = pick_list[lane_index * row_count + row_index] - (float)want_value;
+            if (gap < 0.0f) gap = -gap;
+            if (gap > bar) okay_flag = 0;
+          }
+        }
+        test_true(okay_flag,
+                  "a plane with no step of its own takes the activation's, at every lane count");
+        back_close(&desk);
+        pool_close(&pool);
+        mem_free(act_list);
+        mem_free(pick_list);
+        test_plane_close(&kit);
+      }
+  }
+
+  { /* And the step a lane chooses is the one that uses the whole range: the
+     * largest magnitude lands on level 127 and nothing clips. */
+    float act_list[8] = {0.0f, -3.5f, 1.25f, 7.0f, -7.0f, 0.5f, -0.25f, 2.0f};
+    float step_pick = kern_level_pick(act_list, 8);
+    float zero_list[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float wild_list[3] = {1.0f, 2.0f, 0.0f};
+    test_near(step_pick, 7.0 / 127.0, 1e-9, "the step is the peak over 127 levels");
+    test_true(kern_level_round(7.0f, 1.0f / step_pick) == 127, "the peak lands on the top level");
+    test_true(kern_level_round(-7.0f, 1.0f / step_pick) == -127, "and on the bottom one");
+    test_true(kern_level_round(0.0f, 1.0f / step_pick) == 0, "and zero lands on zero");
+    test_true(kern_level_pick(zero_list, 4) == 0.0f, "an activation of nothing has no step");
+    wild_list[2] = (float)(1.0 / 0.0) * 0.0f; /* a NaN, however the host spells it */
+    test_true(kern_level_pick(wild_list, 3) == 0.0f, "and neither has one that is not finite");
   }
 }
 
