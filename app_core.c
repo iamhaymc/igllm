@@ -256,6 +256,14 @@ void     media_free(app_media *media);
  * that wants two of them names two paths. */
 app_code media_store_save(const app_model *model, const char *path_text);
 app_code media_store_load(app_model *model, const char *path_text);
+/* The same for clips' rows, on the same terms and in a file of its own.  The
+ * two stores are separate because their working sets are: a run that asks about
+ * four pictures must not push a clip out, and a caller that has one of the two
+ * should not be made to carry a file for the other.  `media_store_*` is the
+ * picture's by name as well as by meaning, which is an asymmetry this pair
+ * inherits rather than one it introduces. */
+app_code sound_store_save(const app_model *model, const char *path_text);
+app_code sound_store_load(app_model *model, const char *path_text);
 
 /* session layer -----------------------------------------------------------*/
 app_code     session_open(app_model *model, app_session **session_out);
@@ -348,17 +356,50 @@ float        session_cache_peak(const app_session *session, int layer_index, int
  * `stamp_value` is written beside the cache and handed back unread.  The ids
  * alone cannot say that a picture in a prompt is the same picture — two
  * pictures lay down the same placeholder ids — so what identifies the rest of
- * a prompt is the caller's to decide and to put here.
+ * a prompt is the caller's to decide and to put here.  `app_keep_note` below is
+ * the same thing divided by media run, which is what lets a caller reuse the
+ * front of a prompt whose later pictures changed; both are written, and the
+ * engine reads neither.
  *
  * `session_ids` hands back the ids a session holds, which is how a caller finds
  * out whether the prompt it is about to run begins with the one in the file.
  * It returns the count it needs when the room given is too small. */
 #define APP_KEEP_PROMPT 0 /* a prompt primed and not yet answered */
 #define APP_KEEP_TALK   1 /* a conversation the model has answered in */
+
+/* And the same question asked a run at a time, which is what lets a cache be
+ * reused up to the first picture that changed rather than refused whole.
+ *
+ * `stamp_value` above is one number over a whole prompt, so it can say *these
+ * are not the same pictures* and cannot say *they agree for the first two of
+ * three*.  A prompt showing two pictures where only the second moved therefore
+ * kept nothing, which is correct and is not optimal.  This is the same identity
+ * taken per media run: where each run begins and ends, and its own rows folded.
+ * A caller compares them in order and reuses the ids in front of the first run
+ * that disagrees.
+ *
+ * `APP_KEEP_RUNS` is a working set and not a limit on a prompt.  A prompt with
+ * more runs than this folds every run past the last slot into it, so that slot
+ * covers a wide span and can only be checked whole — which is exactly the
+ * behaviour of the single stamp, and so is safe by construction. */
+#define APP_KEEP_RUNS 16
+
+typedef struct app_keep_note {
+  int      run_count;
+  int32_t  from_list[APP_KEEP_RUNS]; /* the id the run begins at */
+  int32_t  till_list[APP_KEEP_RUNS]; /* one past the id it ends at */
+  uint64_t mark_list[APP_KEEP_RUNS]; /* that run's rows, folded */
+} app_keep_note;
+
+/* How far a run of shared ids may actually be trusted, once the rows under it
+ * are taken into account.  `same_count` comes from comparing the ids, which
+ * cannot tell two pictures apart; this hands back the length that survives
+ * comparing the runs, which is `same_count` or less and is never more. */
+int         keep_note_share(const app_keep_note *held, const app_keep_note *now, int same_count);
 app_code    session_save(const app_session *session, const char *path_text, uint64_t stamp_value,
-                         int kind_mark);
+                         const app_keep_note *note_in, int kind_mark);
 app_code    session_load(app_session *session, const char *path_text, uint64_t *stamp_out,
-                         int *kind_out);
+                         app_keep_note *note_out, int *kind_out);
 int         session_ids(const app_session *session, int32_t *id_list, int id_limit);
 
 size_t       session_cache_room(const app_session *session);
@@ -7698,6 +7739,26 @@ typedef struct media_note {
   float   *state_data;
 } media_note;
 
+/* One kept clip: the identity of the samples that made the rows, and the rows.
+ *
+ * The shape held beside the mix is the clip's own — how many samples were
+ * decoded and at what rate — where a picture's is its raster's three sides.
+ * `cut_flag` is in it because it is part of what `media_audio` hands back and
+ * not a property of the rows: a clip the budget cut has to say so on a hit
+ * exactly as it does on a miss, or a caller learns whether it was cut from
+ * whether it asked before. */
+typedef struct sound_note {
+  uint64_t low_mark;    /* the identity, as two independent mixes */
+  uint64_t high_mark;
+  int      value_count; /* the decoded clip, compared exactly beside the mix */
+  int      rate_value;
+  int      cut_flag;
+  int      row_count;
+  int      state_size;
+  uint64_t turn_value;  /* when it was last wanted, for the eviction pick */
+  float   *state_data;
+} sound_note;
+
 struct app_model {
   app_setup  setup;
   model_form form;
@@ -7730,6 +7791,13 @@ struct app_model {
    * caller at a time — the same assumption `pool_group` already makes. */
   media_note vision_note[MEDIA_KEEP_COUNT];
   uint64_t   media_turn;
+
+  /* And a clip's, on exactly those terms.  It is a second store rather than a
+   * second kind of entry in the first, so that the eviction of one cannot reach
+   * the other: a loop that compares four photographs would otherwise throw away
+   * the clip the whole conversation is about. */
+  sound_note audio_note[MEDIA_KEEP_COUNT];
+  uint64_t   sound_turn;
 };
 
 /* Rounds the activation onto whatever grid the checkpoint declares, multiplies,
@@ -12524,6 +12592,8 @@ static void media_keep_free(app_model *model) {
   for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
     mem_free(model->vision_note[note_index].state_data);
     model->vision_note[note_index].state_data = NULL;
+    mem_free(model->audio_note[note_index].state_data);
+    model->audio_note[note_index].state_data = NULL;
   }
 }
 
@@ -12967,6 +13037,167 @@ static void media_keep(app_model *model, uint64_t low_mark, uint64_t high_mark,
   pick->turn_value = ++model->media_turn;
 }
 
+/* -- the same store, for a clip -------------------------------------------
+ *
+ * A picture's soft tokens were given a store because the tower that makes them
+ * is nearly the whole of what a picture costs and a caller asks about one
+ * photograph more than once.  Neither half of that is peculiar to pixels.  The
+ * conformer is the same shape of expense over a waveform, and a caller with a
+ * recording asks what was said, then who said it, then when — three turns over
+ * one encode.  So this is the picture's store with the identity taken over
+ * samples instead of over a raster, and the reasoning above it is not repeated
+ * where it is unchanged. */
+
+/* The identity of a clip, and of everything about this engine that decides what
+ * rows it turns into.
+ *
+ * **Where "decoded" falls.**  For a picture the identity is taken on the raster
+ * before the resize, so that the container and the decoder are out of it while
+ * the resize is in it by way of the configuration that drives it.  The same
+ * line here is the samples `wave_read` hands back — before `wave_rate` moves
+ * them onto the processor's rate and before the budget cuts them.  A recording
+ * stored as sixteen-bit pcm and as float is therefore one entry, and the same
+ * recording at another sample rate is not, which is right both times: the
+ * second resamples to something else and would not make these rows.
+ *
+ * **What that puts in the mix.**  The samples and the clip's own two numbers,
+ * then the front end that turns them into frames — the rate the processor
+ * wants, the mel count, the frame size and step, the window and the pad, and
+ * the floor the log is taken above — then the budget, since a clip past it is
+ * cut and a clip filed under one budget is not the clip another would make,
+ * then the tower's own shape and the width the projector lifts into, and the
+ * checkpoint's mapped size the way `media_mark` uses it.
+ *
+ * **Two mixes and not one**, for the reason `media_mark` gives at length: a
+ * silent hit on a clip the caller never played is the one failure a store like
+ * this must not have, and two independent mixes over the same bytes put it out
+ * of reach. */
+static void sound_mark(const app_model *model, const wave_clip *clip, uint64_t *low_out,
+                       uint64_t *high_out) {
+  const tower_form *form = &model->tower_list[TOWER_AUDIO].form;
+  uint64_t low_value = 0xCBF29CE484222325ull;
+  uint64_t high_value = 0x9E3779B97F4A7C15ull;
+  const unsigned char *byte_data = (const unsigned char *)clip->value_data;
+  size_t byte_count = clip->value_count > 0 ? (size_t)clip->value_count * sizeof(float) : 0;
+  size_t byte_index;
+
+  /* Eight bytes at a time, assembled rather than loaded through a cast, so the
+   * mix does not depend on the host's alignment rules or its byte order.  A
+   * minute of audio is a couple of megabytes of samples and a byte at a time is
+   * a measurable share of what this saves. */
+  for (byte_index = 0; byte_data && byte_index + 8 <= byte_count; byte_index += 8) {
+    uint64_t word_value = (uint64_t)byte_data[byte_index] |
+                          ((uint64_t)byte_data[byte_index + 1] << 8) |
+                          ((uint64_t)byte_data[byte_index + 2] << 16) |
+                          ((uint64_t)byte_data[byte_index + 3] << 24) |
+                          ((uint64_t)byte_data[byte_index + 4] << 32) |
+                          ((uint64_t)byte_data[byte_index + 5] << 40) |
+                          ((uint64_t)byte_data[byte_index + 6] << 48) |
+                          ((uint64_t)byte_data[byte_index + 7] << 56);
+    low_value = (low_value ^ word_value) * 1099511628211ull;
+    high_value = keep_mix(high_value, word_value);
+  }
+  for (; byte_data && byte_index < byte_count; ++byte_index) {
+    low_value = (low_value ^ (uint64_t)byte_data[byte_index]) * 1099511628211ull;
+    high_value = keep_mix(high_value, (uint64_t)byte_data[byte_index]);
+  }
+
+  {
+    /* The clip's shape and everything about the engine that decides what it
+     * becomes, into both mixes.  `mel_floor` is folded by its bits, because it
+     * is a configured number like the rest and rounding it to an integer would
+     * file two different floors under one identity. */
+    uint64_t part_list[16];
+    uint32_t floor_bits = 0;
+    int part_index;
+    memcpy(&floor_bits, &form->mel_floor, sizeof(floor_bits));
+    part_list[0]  = (uint64_t)clip->value_count;
+    part_list[1]  = (uint64_t)clip->rate_value;
+    part_list[2]  = (uint64_t)form->rate_value;
+    part_list[3]  = (uint64_t)form->mel_count;
+    part_list[4]  = (uint64_t)form->frame_size;
+    part_list[5]  = (uint64_t)form->frame_step;
+    part_list[6]  = (uint64_t)form->turn_size;
+    part_list[7]  = (uint64_t)form->lead_pad;
+    part_list[8]  = (uint64_t)floor_bits;
+    part_list[9]  = (uint64_t)form->soft_limit;
+    part_list[10] = (uint64_t)form->token_ms;
+    part_list[11] = (uint64_t)form->layer_count;
+    part_list[12] = (uint64_t)form->state_size;
+    part_list[13] = (uint64_t)form->head_count;
+    part_list[14] = (uint64_t)model->form.state_size;
+    part_list[15] = (uint64_t)model_memory_bytes(model);
+    for (part_index = 0; part_index < 16; ++part_index) {
+      low_value = (low_value ^ part_list[part_index]) * 1099511628211ull;
+      high_value = keep_mix(high_value, part_list[part_index]);
+    }
+  }
+  *low_out = low_value;
+  *high_out = high_value;
+}
+
+/* Hands back a kept clip's rows, or says there are none.
+ *
+ * The two numbers arrive as arguments rather than as a `wave_clip` because
+ * `wave_rate` resamples in place: by the time the caller is done with the clip
+ * they are the processor's numbers and not the file's, and it is the file's
+ * that this is filed under.  The rows are copied out rather than lent, exactly
+ * as a picture's are, so nothing on the calling side changes with a hit. */
+static int sound_recall(app_model *model, uint64_t low_mark, uint64_t high_mark, int value_count,
+                        int rate_value, app_media *media_out) {
+  int note_index;
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    sound_note *note = &model->audio_note[note_index];
+    float *state_data;
+    if (!note->state_data) continue;
+    if (note->low_mark != low_mark || note->high_mark != high_mark) continue;
+    if (note->value_count != value_count || note->rate_value != rate_value) continue;
+    state_data = (float *)mem_clear(sizeof(float) * (size_t)note->row_count *
+                                    (size_t)note->state_size);
+    if (!state_data) return 0; /* out of memory is a miss, not a failure */
+    memcpy(state_data, note->state_data,
+           sizeof(float) * (size_t)note->row_count * (size_t)note->state_size);
+    media_out->state_data = state_data;
+    media_out->row_count = note->row_count;
+    media_out->state_size = note->state_size;
+    media_out->cut_flag = note->cut_flag;
+    note->turn_value = ++model->sound_turn;
+    return 1;
+  }
+  return 0;
+}
+
+/* Keeps a clip's rows, over the entry that was wanted longest ago.  Failing to
+ * keep them is not an error and is not reported, for the reason `media_keep`
+ * gives: the rows are already made and already handed over. */
+static void sound_keep(app_model *model, uint64_t low_mark, uint64_t high_mark, int value_count,
+                       int rate_value, const app_media *media_in) {
+  sound_note *pick = &model->audio_note[0];
+  int note_index;
+  size_t row_bytes;
+  float *state_data;
+  if (media_in->row_count < 1 || media_in->state_size < 1) return;
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    sound_note *note = &model->audio_note[note_index];
+    if (!note->state_data) { pick = note; break; }
+    if (note->turn_value < pick->turn_value) pick = note;
+  }
+  row_bytes = sizeof(float) * (size_t)media_in->row_count * (size_t)media_in->state_size;
+  state_data = (float *)mem_clear(row_bytes);
+  if (!state_data) return;
+  memcpy(state_data, media_in->state_data, row_bytes);
+  mem_free(pick->state_data);
+  pick->low_mark = low_mark;
+  pick->high_mark = high_mark;
+  pick->value_count = value_count;
+  pick->rate_value = rate_value;
+  pick->cut_flag = media_in->cut_flag;
+  pick->row_count = media_in->row_count;
+  pick->state_size = media_in->state_size;
+  pick->state_data = state_data;
+  pick->turn_value = ++model->sound_turn;
+}
+
 /* -- the same store, on disk ----------------------------------------------
  *
  * The store above cannot outlive the process that made it, and the ordinary
@@ -13172,6 +13403,194 @@ app_code media_store_load(app_model *model, const char *path_text) {
   return APP_OKAY;
 }
 
+/* -- the clip's store, on disk --------------------------------------------
+ *
+ * Everything the long comment above says about a picture's file is true of this
+ * one word for word, so it is not said twice: the backend and an encoder
+ * version in the file's mark rather than in each entry's identity, the path and
+ * the eviction the caller's, the working set rather than an archive, and the
+ * host's own byte order left to the mark to catch.
+ *
+ * The one thing that is this file's rather than the other's is that it is a
+ * *separate* file.  Two stores could have been two sections of one, and the
+ * argument against it is the argument for two stores in memory: a caller with
+ * only pictures should not carry a clip section, the eviction of one working
+ * set must not reach the other, and a checkpoint with one tower and not the
+ * other would otherwise have to write a file it can never read back. */
+
+/* Bump this by hand whenever anything between `wave_read` and the projector
+ * changes what a clip becomes — the resampler, the mel filterbank, the frame
+ * geometry, the conformer, the subsampler.  A file written by an older engine
+ * is then refused rather than read back as rows this one would not have made. */
+#define SOUND_KEEP_VERSION 1
+#define SOUND_KEEP_TEXT    "igllm clip 1\n"
+#define SOUND_KEEP_SIZE    13
+/* A ceiling on a stored row count for a checkpoint whose processor states no
+ * budget, and so has no ceiling of its own.  It is here to refuse a damaged
+ * file before its numbers size an allocation, and not to describe a clip. */
+#define SOUND_ROW_LIMIT    1048576
+
+/* Everything outside a clip's own identity that decides what its rows are: the
+ * encoder's version, the backend that ran it, and the checkpoint.  `level_live`
+ * sits beside the backend's name for the reason `media_keep_mark` gives — the
+ * name does not carry it, and it decides which kernels the tower takes. */
+static uint64_t sound_keep_mark(const app_model *model) {
+  const tower_form *form = &model->tower_list[TOWER_AUDIO].form;
+  const char *name_text = model->desk.name_text ? model->desk.name_text : "";
+  uint64_t mark_value = 0xD1B54A32D192ED03ull;
+  uint32_t floor_bits = 0;
+  int text_index;
+  memcpy(&floor_bits, &form->mel_floor, sizeof(floor_bits));
+  mark_value = keep_mix(mark_value, (uint64_t)SOUND_KEEP_VERSION);
+  for (text_index = 0; name_text[text_index]; ++text_index)
+    mark_value = keep_mix(mark_value, (uint64_t)(unsigned char)name_text[text_index]);
+  mark_value = keep_mix(mark_value, (uint64_t)model->desk.level_live);
+  mark_value = keep_mix(mark_value, (uint64_t)form->layer_count);
+  mark_value = keep_mix(mark_value, (uint64_t)form->state_size);
+  mark_value = keep_mix(mark_value, (uint64_t)form->head_count);
+  mark_value = keep_mix(mark_value, (uint64_t)form->head_size);
+  mark_value = keep_mix(mark_value, (uint64_t)form->mel_count);
+  mark_value = keep_mix(mark_value, (uint64_t)form->rate_value);
+  mark_value = keep_mix(mark_value, (uint64_t)form->frame_size);
+  mark_value = keep_mix(mark_value, (uint64_t)form->frame_step);
+  mark_value = keep_mix(mark_value, (uint64_t)form->turn_size);
+  mark_value = keep_mix(mark_value, (uint64_t)form->lead_pad);
+  mark_value = keep_mix(mark_value, (uint64_t)floor_bits);
+  mark_value = keep_mix(mark_value, (uint64_t)form->soft_limit);
+  mark_value = keep_mix(mark_value, (uint64_t)form->token_ms);
+  mark_value = keep_mix(mark_value, (uint64_t)model->form.state_size);
+  mark_value = keep_mix(mark_value, (uint64_t)model_memory_bytes(model));
+  return mark_value;
+}
+
+/* Writes the clips the store is holding. */
+app_code sound_store_save(const app_model *model, const char *path_text) {
+  FILE *handle;
+  uint64_t head_list[3];
+  int note_index, live_count = 0;
+  app_code code = APP_OKAY;
+  if (!model || !path_text) return APP_FAIL_ARGUMENT;
+  if (!model_audio_ready(model)) return APP_FAIL_SUPPORT;
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index)
+    if (model->audio_note[note_index].state_data) live_count += 1;
+  handle = fopen(path_text, "wb");
+  if (!handle) return APP_FAIL_FILE;
+  head_list[0] = sound_keep_mark(model);
+  head_list[1] = (uint64_t)live_count;
+  head_list[2] = (uint64_t)model->sound_turn;
+  if (fwrite(SOUND_KEEP_TEXT, 1, SOUND_KEEP_SIZE, handle) != SOUND_KEEP_SIZE ||
+      fwrite(head_list, sizeof(uint64_t), 3, handle) != 3)
+    code = APP_FAIL_FORMAT;
+  for (note_index = 0; code == APP_OKAY && note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    const sound_note *note = &model->audio_note[note_index];
+    uint64_t note_list[8];
+    size_t value_count;
+    if (!note->state_data) continue;
+    value_count = (size_t)note->row_count * (size_t)note->state_size;
+    note_list[0] = note->low_mark;
+    note_list[1] = note->high_mark;
+    note_list[2] = (uint64_t)note->value_count;
+    note_list[3] = (uint64_t)note->rate_value;
+    note_list[4] = (uint64_t)(note->cut_flag ? 1 : 0);
+    note_list[5] = (uint64_t)note->row_count;
+    note_list[6] = (uint64_t)note->state_size;
+    note_list[7] = note->turn_value;
+    if (fwrite(note_list, sizeof(uint64_t), 8, handle) != 8 ||
+        fwrite(note->state_data, sizeof(float), value_count, handle) != value_count)
+      code = APP_FAIL_FORMAT;
+  }
+  if (fclose(handle) != 0) code = APP_FAIL_FORMAT;
+  return code;
+}
+
+/* Reads a file back into the store, over whatever it is holding.  A file that
+ * is not this engine's, this backend's or this checkpoint's is
+ * `APP_FAIL_FORMAT` and leaves the store exactly as it was; a truncated one is
+ * the same refusal, and nothing that did arrive is kept. */
+app_code sound_store_load(app_model *model, const char *path_text) {
+  FILE *handle;
+  char mark_room[SOUND_KEEP_SIZE];
+  uint64_t head_list[3];
+  sound_note load_list[MEDIA_KEEP_COUNT];
+  long row_most;
+  int note_index, live_count, take_count = 0;
+  app_code code = APP_OKAY;
+  if (!model || !path_text) return APP_FAIL_ARGUMENT;
+  if (!model_audio_ready(model)) return APP_FAIL_SUPPORT;
+  handle = fopen(path_text, "rb");
+  if (!handle) return APP_FAIL_MISSING;
+  memset(load_list, 0, sizeof(load_list));
+  if (fread(mark_room, 1, SOUND_KEEP_SIZE, handle) != SOUND_KEEP_SIZE ||
+      memcmp(mark_room, SOUND_KEEP_TEXT, SOUND_KEEP_SIZE) != 0 ||
+      fread(head_list, sizeof(uint64_t), 3, handle) != 3 ||
+      head_list[0] != sound_keep_mark(model)) {
+    fclose(handle);
+    return APP_FAIL_FORMAT;
+  }
+  live_count = (int)head_list[1];
+  if (live_count < 0 || live_count > MEDIA_KEEP_COUNT) {
+    fclose(handle);
+    return APP_FAIL_FORMAT;
+  }
+  /* The budget is the ceiling on a clip's rows where the processor states one.
+   * An export that states none has no ceiling at all, so the fixed bound stands
+   * in — see `SOUND_ROW_LIMIT`. */
+  row_most = (long)model_audio_rows(model);
+  if (row_most < 1) row_most = SOUND_ROW_LIMIT;
+  for (note_index = 0; code == APP_OKAY && note_index < live_count; ++note_index) {
+    sound_note *note = &load_list[take_count];
+    uint64_t note_list[8];
+    size_t value_count;
+    if (fread(note_list, sizeof(uint64_t), 8, handle) != 8) {
+      code = APP_FAIL_FORMAT;
+      break;
+    }
+    /* Every count is bounded against what this checkpoint could have produced
+     * before a byte of it is used to size an allocation.  A row count the tower
+     * cannot reach, or a width that is not the text stack's, is a damaged file
+     * and not a clip. */
+    if (note_list[5] < 1 || note_list[5] > (uint64_t)row_most ||
+        note_list[6] != (uint64_t)model->form.state_size ||
+        note_list[2] < 1 || note_list[2] > (uint64_t)INT32_MAX ||
+        note_list[3] < 1 || note_list[3] > (uint64_t)INT32_MAX || note_list[4] > 1) {
+      code = APP_FAIL_FORMAT;
+      break;
+    }
+    note->low_mark = note_list[0];
+    note->high_mark = note_list[1];
+    note->value_count = (int)note_list[2];
+    note->rate_value = (int)note_list[3];
+    note->cut_flag = (int)note_list[4];
+    note->row_count = (int)note_list[5];
+    note->state_size = (int)note_list[6];
+    note->turn_value = note_list[7];
+    value_count = (size_t)note->row_count * (size_t)note->state_size;
+    note->state_data = (float *)mem_clear(sizeof(float) * value_count);
+    if (!note->state_data) {
+      code = APP_FAIL_MEMORY;
+      break;
+    }
+    take_count += 1;
+    if (fread(note->state_data, sizeof(float), value_count, handle) != value_count)
+      code = APP_FAIL_FORMAT;
+  }
+  fclose(handle);
+  if (code != APP_OKAY) {
+    /* Nothing read is kept, for the reason `media_store_load` gives: half a
+     * store answers for some clips and silently runs the tower for the rest,
+     * and the caller has no way to tell the file was bad. */
+    for (note_index = 0; note_index < take_count; ++note_index)
+      mem_free(load_list[note_index].state_data);
+    return code;
+  }
+  for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+    mem_free(model->audio_note[note_index].state_data);
+    model->audio_note[note_index] = load_list[note_index];
+  }
+  model->sound_turn = head_list[2];
+  return APP_OKAY;
+}
+
 app_code media_image(app_model *model, const char *path_text, app_media *media_out) {
   flat_grid grid;
   uint64_t low_mark = 0, high_mark = 0;
@@ -13203,6 +13622,8 @@ app_code media_audio(app_model *model, const char *path_text, app_media *media_o
   tower_form *form;
   wave_clip clip;
   flat_grid mel_grid;
+  uint64_t low_mark = 0, high_mark = 0;
+  int seed_count, seed_rate;
   app_code code;
   if (!model || !path_text || !media_out) return APP_FAIL_ARGUMENT;
   memset(media_out, 0, sizeof(*media_out));
@@ -13210,7 +13631,28 @@ app_code media_audio(app_model *model, const char *path_text, app_media *media_o
   if (!form->live_flag) return APP_FAIL_SUPPORT;
   memset(&mel_grid, 0, sizeof(mel_grid));
   code = wave_read(path_text, &clip);
-  if (code == APP_OKAY) code = wave_rate(&clip, form->rate_value);
+  if (code != APP_OKAY) {
+    wave_free(&clip);
+    return code;
+  }
+  /* The identity is taken on the decoded samples, before the resampler and the
+   * budget touch them, so the container and the sample format are out of it and
+   * the same recording twice is one entry however it arrived.  Reading and
+   * decoding the file is still paid on a hit; what is saved is the conformer,
+   * which is all but the whole of what a clip costs.
+   *
+   * The clip's own two numbers are copied out here rather than read back at the
+   * end, because `wave_rate` resamples in place and the budget cuts in place:
+   * by the time the rows exist they are the processor's numbers, and it is the
+   * file's that the entry is filed under. */
+  seed_count = clip.value_count;
+  seed_rate = clip.rate_value;
+  sound_mark(model, &clip, &low_mark, &high_mark);
+  if (sound_recall(model, low_mark, high_mark, seed_count, seed_rate, media_out)) {
+    wave_free(&clip);
+    return APP_OKAY;
+  }
+  code = wave_rate(&clip, form->rate_value);
   if (code == APP_OKAY) {
     /* The budget is spent in the processor's units, so it is applied here, on
      * the resampled clip, and before a frame is taken from it. */
@@ -13229,6 +13671,7 @@ app_code media_audio(app_model *model, const char *path_text, app_media *media_o
   grid_free(&mel_grid);
   if (code != APP_OKAY) return code;
   media_out->state_size = model->form.state_size;
+  sound_keep(model, low_mark, high_mark, seed_count, seed_rate, media_out);
   return APP_OKAY;
 }
 
@@ -13416,7 +13859,7 @@ static int token_frame_inner(const app_model *model, const app_part *part_list, 
  * The mark text carries a version because this word was not in the first
  * layout: a file written before it is refused rather than read as a prompt it
  * might not be. */
-#define KEEP_MARK_TEXT "igllm cache 3\n\0\0"
+#define KEEP_MARK_TEXT "igllm cache 4\n\0\0"
 #define KEEP_MARK_SIZE 16
 
 /* Everything about a model and a session that decides how the cache is laid
@@ -13505,15 +13948,75 @@ static int keep_row_count(const app_session *session, const layer_wing *wing) {
   return fill_count < wing->cache_span ? fill_count : wing->cache_span;
 }
 
+/* Refuses a run list that is not one this engine could have written: runs in
+ * order, each non-empty, none reaching past the context.  Nothing here sizes an
+ * allocation — the arrays are fixed — so this is about never reusing rows on
+ * the strength of a number that means nothing. */
+static int keep_note_sane(const app_keep_note *note, int window_limit) {
+  int run_index;
+  if (note->run_count < 0 || note->run_count > APP_KEEP_RUNS) return 0;
+  for (run_index = 0; run_index < note->run_count; ++run_index) {
+    if (note->from_list[run_index] < 0 || note->till_list[run_index] <= note->from_list[run_index])
+      return 0;
+    if (note->till_list[run_index] > window_limit) return 0;
+    if (run_index > 0 && note->from_list[run_index] < note->till_list[run_index - 1]) return 0;
+  }
+  return 1;
+}
+
+/* How far a run of shared ids may actually be trusted.
+ *
+ * The ids place the rows and cannot say what made them, so every media run that
+ * falls inside the shared prefix has to be the same run on both sides — same
+ * place, same length, same fold.  The first that is not ends the prefix where
+ * that run begins, and everything in front of it is still good: that is the
+ * whole point, and it is what a single stamp over the reel could not do.
+ *
+ * Three ways a run can fail, and all three end the prefix at the same place.
+ * Either side may be missing the run the other has; the two may disagree on
+ * where it sits or how long it is; or they may agree on all of that and fold to
+ * different numbers, which is the case this exists for — two pictures lay down
+ * the same placeholder ids.
+ *
+ * **And a run that reaches past the shared ids ends it too.**  A run is folded
+ * whole, so its number cannot speak for part of it, and rows inside a straddled
+ * run are therefore not reusable however far the ids happen to agree.
+ *
+ * The comparison is symmetric on purpose.  It would be tempting to walk the
+ * held list and trust that the new one cannot carry a run the file did not,
+ * since the ids matched — but the ids matching is exactly what a placeholder id
+ * appearing as ordinary text would fake, and a rule that is safe only because
+ * something is unlikely is not a rule. */
+int keep_note_share(const app_keep_note *held, const app_keep_note *now, int same_count) {
+  int run_index, run_most;
+  if (!held || !now || same_count < 0) return 0;
+  run_most = held->run_count > now->run_count ? held->run_count : now->run_count;
+  for (run_index = 0; run_index < run_most; ++run_index) {
+    int held_from = run_index < held->run_count ? held->from_list[run_index] : same_count;
+    int now_from = run_index < now->run_count ? now->from_list[run_index] : same_count;
+    int from_id = held_from < now_from ? held_from : now_from;
+    if (from_id >= same_count) break;
+    if (run_index >= held->run_count || run_index >= now->run_count || held_from != now_from ||
+        held->till_list[run_index] != now->till_list[run_index] ||
+        held->mark_list[run_index] != now->mark_list[run_index] ||
+        held->till_list[run_index] > same_count)
+      return from_id;
+  }
+  return same_count;
+}
+
 app_code session_save(const app_session *session, const char *path_text, uint64_t stamp_value,
-                      int kind_mark) {
+                      const app_keep_note *note_in, int kind_mark) {
   FILE *handle;
   uint64_t head_list[7];
-  int layer_index;
+  uint64_t run_count;
+  int layer_index, run_index;
   app_code code = APP_OKAY;
   if (!session || !path_text) return APP_FAIL_ARGUMENT;
   if (session->guess_count > 0) return APP_FAIL_STATE;
   if (kind_mark != APP_KEEP_PROMPT && kind_mark != APP_KEEP_TALK) return APP_FAIL_ARGUMENT;
+  if (note_in && !keep_note_sane(note_in, session->model->form.window_limit))
+    return APP_FAIL_ARGUMENT;
   handle = fopen(path_text, "wb");
   if (!handle) return APP_FAIL_MISSING;
   head_list[0] = keep_mark(session);
@@ -13523,9 +14026,20 @@ app_code session_save(const app_session *session, const char *path_text, uint64_
   head_list[4] = (uint64_t)session->model->form.layer_count;
   head_list[5] = (uint64_t)session->model->setup.cache_bits;
   head_list[6] = (uint64_t)kind_mark;
+  run_count = (uint64_t)(note_in ? note_in->run_count : 0);
   if (fwrite(KEEP_MARK_TEXT, 1, KEEP_MARK_SIZE, handle) != KEEP_MARK_SIZE ||
-      fwrite(head_list, sizeof(uint64_t), 7, handle) != 7)
+      fwrite(head_list, sizeof(uint64_t), 7, handle) != 7 ||
+      fwrite(&run_count, sizeof(uint64_t), 1, handle) != 1)
     code = APP_FAIL_FORMAT;
+  /* The runs go in front of the echo ids, so that a reader has them before it
+   * has touched anything the session owns. */
+  for (run_index = 0; code == APP_OKAY && run_index < (int)run_count; ++run_index) {
+    uint64_t run_list[3];
+    run_list[0] = (uint64_t)(uint32_t)note_in->from_list[run_index];
+    run_list[1] = (uint64_t)(uint32_t)note_in->till_list[run_index];
+    run_list[2] = note_in->mark_list[run_index];
+    if (fwrite(run_list, sizeof(uint64_t), 3, handle) != 3) code = APP_FAIL_FORMAT;
+  }
   if (code == APP_OKAY && session->echo_count > 0 &&
       fwrite(session->echo_room, sizeof(int32_t), (size_t)session->echo_count, handle) !=
           (size_t)session->echo_count)
@@ -13558,21 +14072,48 @@ app_code session_save(const app_session *session, const char *path_text, uint64_
 }
 
 app_code session_load(app_session *session, const char *path_text, uint64_t *stamp_out,
-                      int *kind_out) {
+                      app_keep_note *note_out, int *kind_out) {
   FILE *handle;
   char mark_room[KEEP_MARK_SIZE];
   uint64_t head_list[7];
-  int layer_index, fill_count, echo_count;
+  uint64_t run_count = 0;
+  app_keep_note note_room;
+  int layer_index, run_index, fill_count, echo_count;
   app_code code = APP_OKAY;
   if (!session || !path_text) return APP_FAIL_ARGUMENT;
   if (session->guess_count > 0) return APP_FAIL_STATE;
   if (stamp_out) *stamp_out = 0;
   if (kind_out) *kind_out = APP_KEEP_PROMPT;
+  memset(&note_room, 0, sizeof(note_room));
+  if (note_out) memset(note_out, 0, sizeof(*note_out));
   handle = fopen(path_text, "rb");
   if (!handle) return APP_FAIL_MISSING;
   if (fread(mark_room, 1, KEEP_MARK_SIZE, handle) != KEEP_MARK_SIZE ||
       memcmp(mark_room, KEEP_MARK_TEXT, KEEP_MARK_SIZE) != 0 ||
-      fread(head_list, sizeof(uint64_t), 7, handle) != 7) {
+      fread(head_list, sizeof(uint64_t), 7, handle) != 7 ||
+      fread(&run_count, sizeof(uint64_t), 1, handle) != 1) {
+    fclose(handle);
+    return APP_FAIL_FORMAT;
+  }
+  if (run_count > (uint64_t)APP_KEEP_RUNS) {
+    fclose(handle);
+    return APP_FAIL_FORMAT;
+  }
+  note_room.run_count = (int)run_count;
+  for (run_index = 0; run_index < note_room.run_count; ++run_index) {
+    uint64_t run_list[3];
+    if (fread(run_list, sizeof(uint64_t), 3, handle) != 3) {
+      fclose(handle);
+      return APP_FAIL_FORMAT;
+    }
+    note_room.from_list[run_index] = (int32_t)(uint32_t)run_list[0];
+    note_room.till_list[run_index] = (int32_t)(uint32_t)run_list[1];
+    note_room.mark_list[run_index] = run_list[2];
+  }
+  /* A run list that is not one this engine could have written is a damaged
+   * file, and it is refused here rather than handed back for a caller to reuse
+   * rows against. */
+  if (!keep_note_sane(&note_room, session->model->form.window_limit)) {
     fclose(handle);
     return APP_FAIL_FORMAT;
   }
@@ -13632,6 +14173,7 @@ app_code session_load(app_session *session, const char *path_text, uint64_t *sta
   }
   session->echo_count = echo_count;
   if (stamp_out) *stamp_out = head_list[1];
+  if (note_out) *note_out = note_room;
   if (kind_out) *kind_out = (int)head_list[6];
   return APP_OKAY;
 }

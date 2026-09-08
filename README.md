@@ -25,9 +25,10 @@ party library, and no build system beyond a C compiler.
 - **a picture priced by the caller** — `--image-tokens` caps what one costs,
   and the encoder is close to linear in patches, so asking for fewer soft
   tokens buys back most of the time
-- **and paid for once** — `--image-keep` holds a picture's rows across runs and
-  `--keep` reuses a prompt's cache as far as it agrees with the next one, so a
-  fresh question about an encoded picture is a fraction of the first
+- **and paid for once** — `--image-keep` holds a picture's rows across runs,
+  `--audio-keep` a clip's, and `--keep` reuses a prompt's cache as far as it
+  agrees with the next one, so a fresh question about encoded media is a
+  fraction of the first
 - **its own decoders** — png at every depth and interlace, jpeg sequential and
   progressive at eight or twelve bits over one, three or four components, pnm,
   bmp and riff wave readers, a bicubic
@@ -64,7 +65,7 @@ other folder in the same layout serves just as well — `--model /path/to/folder
 | `guess`    | what a block of guesses is worth, against a proposer's ceiling; `--verbose` divides a round and prices its marginal lane |
 
 Common flags: `--model`, `--prompt`, `--text`, `--image`, `--image-tokens`,
-`--image-keep`, `--audio`, `--serve`,
+`--image-keep`, `--audio`, `--audio-keep`, `--serve`,
 `--threads`, `--window`, `--cache`, `--heat`, `--top-k`, `--top-p`,
 `--echo-penalty`, `--seed`, `--guess`, `--loop`, `--keep`, `--raw`,
 `--verbose`. Run `igllm --help` for the full list.
@@ -283,6 +284,27 @@ python3 run.py run -- chat --model model --image-keep pics.keep \
     --image photo.png --prompt "What is in this picture?"
 ```
 
+`--audio-keep <path>` is the same file for a clip's rows, and it is a second
+path rather than a section of the first so that four photographs cannot evict
+the clip a conversation is about. Each reader refuses the other's file.
+
+**Expect less of it than of `--image-keep`, and here is the number.** A picture
+is half encoder and half text stack; a clip is only a **quarter** encoder, with
+about seventy percent going on the prefill of its own soft tokens. So a
+ten-second clip over four questions is **14.5 s to 11.1, 1.31x** on this file's
+fourth host, and a thirty-second one — 750 soft tokens, the budget's ceiling —
+is **40.6 s to 30.4**. The audio encoder costs 13.5 ms a soft token where the
+vision one costs 35.6, and the text stack charges both about 38. **For a clip
+the caching that matters is `--keep`**: with it beside this file, the same
+ten-second clip answers a question it has never been asked in **about 1.8 s**,
+some 8.1x. One thirty-second clip is 4.6 MiB of file, so a full store of four is
+about 18 MiB.
+
+```sh
+python3 run.py run -- chat --model model --audio-keep clips.keep \
+    --keep turn.cache --audio talk.wav --prompt "What do you hear?"
+```
+
 **With `--keep` beside it, a repeated turn costs almost nothing.** The two files
 hold the two halves of a picture — `--image-keep` the encoder's rows and
 `--keep` the prompt's cache, which is where the soft tokens have already been
@@ -294,6 +316,14 @@ python3 run.py run -- chat --model model \
     --image-keep pics.keep --keep turn.cache \
     --image photo.png --prompt "What is in this picture?"
 ```
+
+**And changing one of several pictures keeps the ones in front of it.** The
+cache is marked a media run at a time rather than once over the whole prompt, so
+a second turn that swaps the second of two pictures still reuses the first
+picture's soft tokens: **14.50 s to 10.03**, where before it kept nothing.
+Dropping a picture is **7.97 s to 1.93**. A prompt longer than the export's
+512-id sliding window keeps nothing whatever it shows, so two pictures at full
+resolution need `--image-tokens` beside these files to fit.
 
 **Changing the question is nearly as cheap.** The kept cache is reused as far as
 it agrees with the new prompt rather than only where the whole of it is a

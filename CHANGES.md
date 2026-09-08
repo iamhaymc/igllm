@@ -6813,3 +6813,284 @@ all so the first check has teeth; a wind back to what is already there moving
 nothing, down to the echo history; a turned-over ring refused and moving
 nothing; and refusals for no session, a negative count, a count past the fill,
 and a block in flight. **871 pass**, 847 before.
+
+---
+
+## 0.9.13 — a clip's rows, kept and beyond one process
+
+### What was missing
+
+0.9.7 gave a picture's rows a store on the model, 0.9.11 gave that store a file,
+and 0.9.12 made a kept cache reusable as far as it agrees. Each of those closed
+an entry in `TODO.md` and each left the same sentence behind it: *a clip's rows
+are not kept at all, in memory or on disk, and whether that is worth having is a
+question nobody has asked.*
+
+This asks it. The answer is yes, and it is worth less than the picture's store
+was — for a reason that is the most useful thing in this entry.
+
+### What it took
+
+Almost nothing that was not already written. `media_audio` now does what
+`media_image` does: take an identity, look for it, and file the rows against it
+when the tower has made them.
+
+**The identity, and where "decoded" falls.** A picture's identity is taken on
+the raster before the resize, so the container and the decoder are outside it
+while the resize is inside it by way of the configuration that drives it. The
+same line for a clip is the samples `wave_read` hands back — **before**
+`wave_rate` moves them onto the processor's rate and before the budget cuts
+them. So one recording stored as sixteen-bit pcm and as float is one entry, and
+the same recording at another sample rate is not, which is right both times: the
+second resamples to something else and would not make these rows. Into the mix
+go the samples, the clip's own two numbers, the front end that frames them —
+rate, mel count, frame size and step, window, pad, and the floor the log is
+taken above — the budget, the tower's shape, the width the projector lifts into,
+and the checkpoint's mapped size. Two independent mixes, for the reason
+`media_mark` gives at length: a silent hit on a clip the caller never played is
+the one failure a store like this must not have.
+
+**`cut_flag` is kept beside the rows and not derived from them.** A clip past
+the budget is cut and `media_audio` says so; that is part of what a caller is
+handed and not a property of the rows, so a hit has to carry it. Without it a
+caller would learn whether its clip was cut from whether it had asked before.
+
+**Two numbers copied out before the work starts.** `wave_rate` resamples in
+place and the budget cuts in place, so by the time the rows exist the clip's
+count and rate are the processor's and not the file's — and it is the file's
+that the entry is filed under. `sound_recall` and `sound_keep` therefore take
+those two as arguments where the picture's take a `flat_grid`.
+
+**Two stores rather than one with two kinds of entry**, in memory and on disk
+both. The eviction is the argument: a loop comparing four photographs would
+otherwise throw away the clip the whole conversation is about. It also means a
+checkpoint with one tower and not the other never has to write a file it can
+never read back, and a caller with only pictures carries no clip section.
+`--audio-keep <path>` is `--image-keep`'s twin and is separate from it for the
+same reason `--keep` is separate from both.
+
+The file carries `igllm clip 1` and its own `SOUND_KEEP_VERSION`, and its mark
+holds the backend name, `desk->level_live` beside it, and the whole front end —
+the three things 0.9.11 established a file needs before it is safe. A file that
+is not this engine's, this backend's or this checkpoint's is refused whole; a
+truncated one is refused whole as well, and nothing that did arrive is kept.
+
+### What it is worth, and the number that matters more
+
+Fourth host, i5-7600K, four cores, AVX2 with FMA and no AVX-512. A synthetic
+ten-second clip at the tower's own rate — 250 soft tokens, 265 prompt ids — and
+four questions about it, each asked in its own process, greedy:
+
+| run | no store | `--audio-keep` | `--audio-keep` and `--keep` |
+| --- | --- | --- | --- |
+| the first, cold | 14.46 s | 14.50 s | 14.81 s |
+| a question never asked | 14.55 | 11.34 | 1.87 |
+| another | 14.73 | 11.09 | 1.83 |
+| another | 14.66 | 11.10 | 1.71 |
+
+So the clip store on its own is **14.5 s to 11.1, about 1.31x**, and beside a
+kept cache it is **14.7 s to about 1.8, some 8.1x**.
+
+At the budget's own ceiling — a thirty-second clip, 750 soft tokens, 765 ids —
+the same shape: **40.56 s cold to 30.83 and 30.42 warm, 1.32x.**
+
+**And that 1.3x is the finding.** 0.9.11 measured a picture as half encoder and
+half text stack. A clip is not:
+
+- the conformer is the difference between a cold turn and a warm one, which
+  needs no assumption about anything else: **3.4 s of a 14.5 s turn** at ten
+  seconds and **10.1 s of 40.6** at thirty — **a quarter of the turn, both
+  times**, and 13.6 then 13.5 ms a soft token, which is as linear as this file
+  gets;
+- the prefill of the soft tokens is **10.04 s of 14.5** and **28.75 s of 40.6** —
+  265 and 765 ids at 26.4 and 26.6 tokens a second — **about 70%**.
+
+Against 0.9.11's picture at 35.6 ms a row, **the audio encoder is 2.7 times
+cheaper per soft token than the vision one**, while the text stack charges both
+of them the same ~38 ms. That is why this store is worth 1.3x where the
+picture's was 1.9x, and it is the honest way to read the table above: **for a
+clip the store is not the prize, the prefill is.** `--audio-keep` alone buys a
+quarter; it is `--keep` beside it that buys the rest, and a caller told to
+expect a picture's numbers from a clip has been misled.
+
+One more number a caller needs: the file holds post-projector rows at the text
+stack's width, so one thirty-second clip is 4.6 MiB — 750 × 1536 × 4 — and a
+full store of four is about 18 MiB. It is a working set and not an archive, as
+`--image-keep`'s is.
+
+### That it is the same answer
+
+Greedy `chat` text, on the shipped export, with the store and without it, in
+separate processes:
+
+- *"What do you hear?"* — same text.
+- *"Is there a voice in it?"* — same text.
+
+Both against a run with no file at all, which is what the store has to be
+indistinguishable from.
+
+### Code
+
+- `sound_note`, `model->audio_note`, `model->sound_turn`: the store, beside the
+  picture's and evicting separately from it.
+- `sound_mark`, `sound_recall`, `sound_keep`: the identity, the hit and the
+  file, with the clip's two numbers passed rather than read back.
+- `sound_keep_mark`, `sound_store_save`, `sound_store_load`,
+  `SOUND_KEEP_VERSION`, `SOUND_KEEP_TEXT`, `SOUND_ROW_LIMIT`: the file.
+- `media_audio`: the recall in front of `wave_rate` and the keep behind
+  `audio_run`.
+- `--audio-keep <path>` in `app_main.c`, read at the start of a run and written
+  at the end, exactly as `--image-keep` is.
+
+### Tests
+
+Forty-three added, on the synthetic checkpoint: a clip asked twice coming back
+bit for bit and copied out; one sample moved being a different clip in both
+mixes, with the sample restored by assignment so the check is of the mix and not
+of whether a float round trips; another clip missing and getting rows of its
+own; a cut clip still saying it was cut on a hit and through the file; five
+clips through a store of four evicting each other and leaving the picture beside
+them alone; and the file — written, the store emptied by hand, read back bit for
+bit, a missing path told apart from a damaged one, a damaged mark refused, and a
+truncation refused.
+
+Two of those are worth naming. The truncation is cut **inside an entry's rows**
+rather than inside its header, which is the case that could have left the store
+half filled — the header parsed, the allocation made, the read that fills it
+coming up short — and which the picture's own truncation test does not reach.
+And each store refuses the other's file, so a caller that swaps two paths gets a
+refusal rather than a store full of the wrong tower's rows.
+
+The tests were checked against the implementation rather than assumed to bite:
+dropping `cut_flag` from a recall fails two, and taking the samples out of the
+identity fails three — including `a clip that sounds different reaches a
+different answer`, which is 0.8.x's and which fails there because the store
+hands back the wrong clip. That is the silent-collision failure mode, caught by
+a test written before this store existed.
+
+**914 pass**, 871 before.
+
+---
+
+## 0.9.14 — a kept cache divided by media run
+
+### What it was
+
+0.9.12 made a kept cache reusable as a *prefix* rather than only as a whole
+match, and it did that by folding every embedding row the prompt carried into
+one number. That was the right shape for what it was for: a stamp taken at a
+length can only be checked at that length, and the file holds one number, so a
+fold over the whole reel is the same number for two prompts that show the same
+pictures however differently they go on, and it answers for every prefix of them
+at once.
+
+What it could not do is answer for *part* of the pictures. One number can say
+*these are not the same prompts* and cannot say *they agree for the first two of
+three*. `TODO.md` recorded it plainly: **a different picture behind identical
+ids costs a full re-prime, which is correct and is not optimal.** A prompt
+showing two pictures where only the second changed kept nothing at all — not
+even the first picture's soft tokens, which are identical and which are the
+expensive part.
+
+### What it took
+
+**The fold is divided along the runs the towers filled.** A run is a stretch of
+ids the reel carries rows for; `main_keep_note` folds each one on its own and
+records where it begins and ends. `app_keep_note` carries up to `APP_KEEP_RUNS`
+of them beside the cache, written in front of the echo ids, and `KEEP_MARK_TEXT`
+goes to `igllm cache 4` because the file holds something it did not.
+
+**A prompt with more runs than there is room for folds the rest into the last
+slot** and stretches that slot's `till` over them, so the tail can only be
+checked whole. That is exactly what the single stamp did, applied to the tail —
+so the overflow is safe by construction rather than by a bound anyone has to
+remember to keep.
+
+**`keep_note_share` is the rule, and it lives in the core rather than in the
+caller.** It takes the length the ids agreed on and hands back the length that
+survives comparing the runs, which is that length or less and is never more.
+Three ways a run can fail and all three end the prefix at the same place: either
+side missing a run the other has, the two disagreeing on where it sits or how
+long it is, or the two agreeing on all of that and folding to different numbers
+— which is the case this exists for, since two pictures lay down the same
+placeholder ids. **A run that reaches past the shared ids ends it too**, because
+a run is folded whole and its number cannot speak for part of one.
+
+It is in the core because it is the piece a mistake would be silent in, and the
+core is what the test suite can reach. It is **symmetric** on purpose: walking
+only the file's runs and trusting that the new prompt cannot carry a run the
+file did not would be safe only because a placeholder id appearing as ordinary
+text is unlikely, and a rule that is safe only because something is unlikely is
+not a rule.
+
+**The whole-reel stamp is gone rather than kept beside it.** The run note says
+everything it said and more, and leaving it to fill a field nothing reads would
+have been the sort of thing this file exists to prevent. A prompt file now
+writes zero there; a conversation file still uses that field for its turn count,
+which is what it was always for.
+
+### What it is worth
+
+Fourth host, two synthetic 768×512 rasters at `--image-tokens 128`, `--keep` and
+`--image-keep` both given, greedy, each run its own process. The budget is there
+because it has to be: two pictures at the checkpoint's own 280 rows come to some
+574 ids, the shipped export's sliding window is 512, and **a prompt that laps
+the ring cannot be wound back at all** — so nothing here reaches that case, and
+that is a limit of 0.9.12's wind back rather than of this entry.
+
+| the second turn | 0.9.12 | 0.9.14 |
+| --- | --- | --- |
+| the second picture changed | nothing kept, 14.50 s | **124 of 251 ids, 10.03 s** |
+| a picture added in front of the question | nothing kept, 14.54 s | **123 of 251, 9.91 s** |
+| a picture dropped | nothing kept, 7.97 s | **123 of 132, 1.93 s** |
+| nothing changed, a new question | 242 of 251, 1.94 s | 242 of 251, 1.92 s |
+
+So **1.45x** where the second of two pictures moved, **1.47x** where one was
+added, and **4.1x** where one was dropped — and the case 0.9.12 already handled
+is untouched, which is the row that says this took nothing away.
+
+The 124 ids kept in the first row are the first picture's soft tokens and the
+frame in front of them. The second picture's are paid, as they must be.
+
+### That it is the same answer
+
+Every row above was run twice: once with both files and once with no files at
+all, and the greedy text compared. **All six cases are byte for byte the same**,
+including the three that have to refuse:
+
+- the second picture changed — 124 kept, same text;
+- the **first** picture changed — 5 kept, same text: everything behind a changed
+  picture is refused, which is the case a wrong rule would answer with rows from
+  a picture the caller never showed;
+- both changed — 5 kept, same text;
+- nothing changed, a new question — 242 kept, same text;
+- a picture dropped — 123 kept, same text;
+- a picture added — 123 kept, same text.
+
+### Code
+
+- `app_keep_note`, `APP_KEEP_RUNS`: the runs a kept prompt carries.
+- `keep_note_share`: the rule, in the core so the suite can reach it.
+- `keep_note_sane`: a run list this engine could not have written, refused on
+  the way out as well as on the way in.
+- `session_save`, `session_load`: the note beside the cache;
+  `KEEP_MARK_TEXT` to `igllm cache 4`.
+- `main_keep_note` replaces `main_keep_stamp`; `main_keep_prime` cuts its
+  prefix with `keep_note_share` instead of throwing it away on one number.
+
+### Tests
+
+Twenty-four added. Fourteen are `keep_note_share` stated as *what the caller may
+keep*: the same pictures keeping everything, a second picture that changed
+keeping what is in front of it, a first picture that changed keeping only what
+is in front of **it**, a run that moved, a run whose length moved, a run dropped,
+a run added, shared ids ending inside a run and exactly at the end of one, two
+prompts with no pictures at all, and a full list of sixteen runs with one that
+differs — swept at every length, checking that the answer is never more than it
+was given and never reaches past the run that differs.
+
+The rest are the file: runs written and read back exactly, an empty run,
+overlapping runs and more runs than there is room for all refused on the way out,
+and a run count damaged in a written file refused on the way in.
+
+**938 pass**, 914 before.

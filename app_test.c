@@ -5834,6 +5834,339 @@ static void test_tower(void) {
       media_free(&brim);
       media_free(&over);
     }
+
+    /* -- a clip's rows, kept against the clip -------------------------- */
+    /* The conformer is nearly the whole of what a clip costs and a caller with
+     * a recording asks about it more than once, so a clip has the store a
+     * picture has.  What is checked here is what the picture's store is checked
+     * for: that a hit hands back the tower's own rows rather than rows like
+     * them, that the identity really is the samples, and that the one failure a
+     * store like this must not have — a silent hit on something else — does
+     * not happen. */
+    {
+      app_media first, again, other;
+      uint64_t low_mark = 0, high_mark = 0;
+      int bad_count = 0;
+      int note_index;
+
+      /* Emptied by hand first: the blocks above ran five clips through the
+       * store, and a hit on one of those would pass what follows for the wrong
+       * reason. */
+      for (note_index = 0; note_index < MEDIA_KEEP_COUNT; ++note_index) {
+        mem_free(model->audio_note[note_index].state_data);
+        memset(&model->audio_note[note_index], 0, sizeof(model->audio_note[note_index]));
+      }
+      memset(&first, 0, sizeof(first));
+      memset(&again, 0, sizeof(again));
+      memset(&other, 0, sizeof(other));
+
+      test_true(test_wave_write("clip.wav", 8000, 600), "a clip for the store is written");
+      test_true(media_audio(model, path_text, &first) == APP_OKAY,
+                "the clip runs the tower once");
+      test_true(media_audio(model, path_text, &again) == APP_OKAY,
+                "the same clip is asked about again");
+      test_true(again.row_count == first.row_count && again.state_size == first.state_size,
+                "the kept rows have the shape the tower's did");
+      if (again.row_count == first.row_count && again.state_size == first.state_size) {
+        for (row_index = 0; row_index < again.row_count; ++row_index)
+          for (value_index = 0; value_index < again.state_size; ++value_index)
+            if (again.state_data[(size_t)row_index * (size_t)again.state_size + value_index] !=
+                first.state_data[(size_t)row_index * (size_t)first.state_size + value_index])
+              bad_count += 1;
+      } else {
+        bad_count = 1;
+      }
+      test_true(bad_count == 0, "a kept clip's rows are the tower's bit for bit");
+      test_true(again.state_data != first.state_data,
+                "a kept clip's rows are copied out, so the caller owns them either way");
+      media_free(&again);
+
+      /* One sample moved is a different clip.  The sample is put back by
+       * assignment rather than by subtracting what was added, so the check is
+       * of the mix and not of whether a float round trips. */
+      {
+        wave_clip twin;
+        uint64_t low_one = 0, high_one = 0, low_two = 0, high_two = 0;
+        memset(&twin, 0, sizeof(twin));
+        if (wave_read(path_text, &twin) == APP_OKAY && twin.value_count > 0) {
+          float seed_value = twin.value_data[0];
+          sound_mark(model, &twin, &low_one, &high_one);
+          twin.value_data[0] = seed_value + 0.125f;
+          sound_mark(model, &twin, &low_two, &high_two);
+          test_true(low_one != low_two && high_one != high_two,
+                    "one sample moved is a different clip, in both mixes");
+          twin.value_data[0] = seed_value;
+          sound_mark(model, &twin, &low_two, &high_two);
+          test_true(low_one == low_two && high_one == high_two,
+                    "a clip's identity is its samples and nothing about the call");
+          low_mark = low_one;
+          high_mark = high_one;
+        } else {
+          test_true(0, "the clip is read for the identity check");
+        }
+        wave_free(&twin);
+      }
+      test_true(sound_recall(model, low_mark, high_mark, 600, 8000, &other) == 1,
+                "the identity taken by hand finds the entry the tower filed");
+      media_free(&other);
+      memset(&other, 0, sizeof(other));
+
+      /* A clip that sounds different is a miss and gets rows of its own. */
+      test_true(test_wave_write_at("clip.wav", 8000, 600, 0.77),
+                "a clip that sounds different is written");
+      test_true(media_audio(model, path_text, &other) == APP_OKAY,
+                "the clip that sounds different runs");
+      {
+        int same_count = 0;
+        for (value_index = 0; value_index < other.state_size; ++value_index)
+          if (other.state_data[value_index] == first.state_data[value_index]) same_count += 1;
+        test_true(same_count < other.state_size,
+                  "another clip is a miss and gets rows of its own");
+      }
+      media_free(&other);
+
+      /* A clip the budget cut has to say so on a hit as well as on a miss:
+       * `cut_flag` is part of what `media_audio` hands back and not a property
+       * of the rows, so it has to be kept beside them. */
+      {
+        app_media over, back;
+        memset(&over, 0, sizeof(over));
+        memset(&back, 0, sizeof(back));
+        test_true(test_wave_write("clip.wav", 8000, 4 * SOUND_BUDGET * SOUND_SPAN * 8),
+                  "a clip past the budget is written for the store");
+        test_true(media_audio(model, path_text, &over) == APP_OKAY && over.cut_flag,
+                  "the long clip runs and says it was cut");
+        test_true(media_audio(model, path_text, &back) == APP_OKAY,
+                  "the long clip is asked about again");
+        test_true(back.cut_flag && back.row_count == over.row_count,
+                  "a cut clip off the store is cut, and is worth what it was worth");
+        media_free(&over);
+        media_free(&back);
+      }
+
+      /* The two stores are two.  Five clips through a store of four throws the
+       * oldest clip away, and it must not reach the picture beside it — which
+       * is the whole argument for a second store rather than a second kind of
+       * entry in the first. */
+      {
+        app_media lone;
+        flat_grid pic_grid;
+        char pic_text[1024];
+        int fill_index, fill_okay = 1;
+        memset(&lone, 0, sizeof(lone));
+        memset(&pic_grid, 0, sizeof(pic_grid));
+        path_join(pic_text, sizeof(pic_text), test_yard_path, "image.png");
+        test_true(media_image(model, pic_text, &lone) == APP_OKAY,
+                  "a picture is put in its own store");
+        media_free(&lone);
+        for (fill_index = 0; fill_index < MEDIA_KEEP_COUNT + 1; ++fill_index) {
+          app_media fill;
+          memset(&fill, 0, sizeof(fill));
+          if (!test_wave_write_at("clip.wav", 8000, 600 + fill_index * 40,
+                                  0.11 + 0.07 * (double)fill_index))
+            fill_okay = 0;
+          else if (media_audio(model, path_text, &fill) != APP_OKAY)
+            fill_okay = 0;
+          else
+            media_free(&fill);
+        }
+        test_true(fill_okay, "five clips are run through a store of four");
+        if (image_read(pic_text, &pic_grid) == APP_OKAY) {
+          app_media hit;
+          uint64_t pic_low = 0, pic_high = 0;
+          memset(&hit, 0, sizeof(hit));
+          media_mark(model, &pic_grid, &pic_low, &pic_high);
+          test_true(media_recall(model, pic_low, pic_high, &pic_grid, &hit) == 1,
+                    "clips evicting each other leave the picture where it was");
+          media_free(&hit);
+          grid_free(&pic_grid);
+        } else {
+          test_true(0, "the picture is read for the eviction check");
+        }
+      }
+
+      { /* -- the clip store on disk ------------------------------------ */
+        /* The picture file's three requirements are this one's, and the file
+         * proves the same three things: it comes back as the same rows, it
+         * refuses to come back at all when it was not this engine that wrote
+         * it, and it leaves the store alone when it refuses. */
+        char keep_text[1024];
+        app_media kept;
+        wave_clip mark_clip;
+        uint64_t file_low = 0, file_high = 0;
+        int seed_count = 0, seed_rate = 0;
+        int wipe_index;
+
+        path_join(keep_text, sizeof(keep_text), test_yard_path, "clips.keep");
+        memset(&kept, 0, sizeof(kept));
+        memset(&mark_clip, 0, sizeof(mark_clip));
+        test_true(test_wave_write("clip.wav", 8000, 640), "a clip for the file is written");
+        test_true(media_audio(model, path_text, &kept) == APP_OKAY,
+                  "a clip is in the store to be written");
+        test_true(sound_store_save(model, keep_text) == APP_OKAY, "the clip store is written");
+
+        if (wave_read(path_text, &mark_clip) == APP_OKAY) {
+          seed_count = mark_clip.value_count;
+          seed_rate = mark_clip.rate_value;
+          sound_mark(model, &mark_clip, &file_low, &file_high);
+        } else {
+          test_true(0, "the clip is read for the file check");
+        }
+        wave_free(&mark_clip);
+
+        /* Emptied by hand rather than by a second model, so that what is read
+         * back is known to have come from the file. */
+        for (wipe_index = 0; wipe_index < MEDIA_KEEP_COUNT; ++wipe_index) {
+          mem_free(model->audio_note[wipe_index].state_data);
+          memset(&model->audio_note[wipe_index], 0, sizeof(model->audio_note[wipe_index]));
+        }
+        {
+          app_media hit;
+          memset(&hit, 0, sizeof(hit));
+          test_true(sound_recall(model, file_low, file_high, seed_count, seed_rate, &hit) == 0,
+                    "the clip store really is empty before the file is read");
+          media_free(&hit);
+          test_true(sound_store_load(model, keep_text) == APP_OKAY,
+                    "the clip store is read back");
+          memset(&hit, 0, sizeof(hit));
+          test_true(sound_recall(model, file_low, file_high, seed_count, seed_rate, &hit) == 1,
+                    "a clip written to the file is a hit when it is read back");
+          bad_count = 0;
+          if (hit.state_data && hit.row_count == kept.row_count &&
+              hit.state_size == kept.state_size) {
+            for (row_index = 0; row_index < hit.row_count; ++row_index)
+              for (value_index = 0; value_index < hit.state_size; ++value_index)
+                if (hit.state_data[(size_t)row_index * (size_t)hit.state_size + value_index] !=
+                    kept.state_data[(size_t)row_index * (size_t)kept.state_size + value_index])
+                  bad_count += 1;
+          } else {
+            bad_count = 1;
+          }
+          test_true(bad_count == 0, "the clip's rows off the file are the tower's bit for bit");
+          media_free(&hit);
+        }
+
+        {
+          char gone_text[1024];
+          path_join(gone_text, sizeof(gone_text), test_yard_path, "nothing.keep");
+          remove(gone_text);
+          test_true(sound_store_load(model, gone_text) == APP_FAIL_MISSING,
+                    "a clip file that is not there is missing rather than malformed");
+        }
+
+        /* The two files are two, and each reader says so before it reads a byte
+         * as rows.  A caller that hands one path where the other belonged gets
+         * a refusal rather than a store full of the wrong tower's rows. */
+        {
+          char cross_text[1024];
+          path_join(cross_text, sizeof(cross_text), test_yard_path, "cross.keep");
+          test_true(media_store_save(model, cross_text) == APP_OKAY,
+                    "a picture store is written for the crossed-path check");
+          test_true(sound_store_load(model, cross_text) == APP_FAIL_FORMAT,
+                    "a picture's file is refused by the clip store");
+          test_true(media_store_load(model, keep_text) == APP_FAIL_FORMAT,
+                    "and a clip's file is refused by the picture store");
+          remove(cross_text);
+        }
+
+        /* A file some other engine wrote.  The mark is the first thirteen
+         * bytes, so moving one of them is the cheapest version of every way a
+         * file can fail to be this one's. */
+        {
+          FILE *handle = fopen(keep_text, "r+b");
+          int wrote_flag = 0;
+          app_media hit;
+          if (handle) {
+            wrote_flag = fseek(handle, 8, SEEK_SET) == 0 && fputc('X', handle) != EOF;
+            fclose(handle);
+          }
+          test_true(wrote_flag, "the clip file's mark is damaged for the test");
+          test_true(sound_store_load(model, keep_text) == APP_FAIL_FORMAT,
+                    "a clip file this engine did not write is refused");
+          memset(&hit, 0, sizeof(hit));
+          test_true(sound_recall(model, file_low, file_high, seed_count, seed_rate, &hit) == 1,
+                    "a refused clip file leaves the store exactly as it was");
+          media_free(&hit);
+        }
+
+        /* A file this engine did write and then lost the end of.  It is cut
+         * inside an entry's *rows* rather than inside its header, which is the
+         * case that could have left the store half filled: the header parsed,
+         * the allocation was made, and the read that fills it came up short. */
+        {
+          long byte_count = 0;
+          FILE *handle;
+          app_media hit;
+          test_true(sound_store_save(model, keep_text) == APP_OKAY,
+                    "the clip store is written again");
+          handle = fopen(keep_text, "rb");
+          if (handle) {
+            fseek(handle, 0, SEEK_END);
+            byte_count = ftell(handle);
+            fclose(handle);
+          }
+          test_true(byte_count > 256, "the written clip store has a body to lose");
+          {
+            unsigned char *head_data = (unsigned char *)mem_clear((size_t)byte_count);
+            size_t took_count = 0;
+            handle = fopen(keep_text, "rb");
+            if (handle && head_data) {
+              took_count = fread(head_data, 1, (size_t)byte_count, handle);
+              fclose(handle);
+              handle = fopen(keep_text, "wb");
+              if (handle) {
+                fwrite(head_data, 1, took_count > 160 ? 160 : took_count, handle);
+                fclose(handle);
+              }
+            } else if (handle) {
+              fclose(handle);
+            }
+            mem_free(head_data);
+          }
+          test_true(sound_store_load(model, keep_text) == APP_FAIL_FORMAT,
+                    "a truncated clip file is refused rather than half read");
+          memset(&hit, 0, sizeof(hit));
+          test_true(sound_recall(model, file_low, file_high, seed_count, seed_rate, &hit) == 1,
+                    "a truncated clip file leaves the store exactly as it was");
+          media_free(&hit);
+        }
+
+        /* And the cut travels through the file, for the reason it travels
+         * through memory: it is part of what a hit hands back. */
+        {
+          app_media over, back;
+          memset(&over, 0, sizeof(over));
+          memset(&back, 0, sizeof(back));
+          for (wipe_index = 0; wipe_index < MEDIA_KEEP_COUNT; ++wipe_index) {
+            mem_free(model->audio_note[wipe_index].state_data);
+            memset(&model->audio_note[wipe_index], 0, sizeof(model->audio_note[wipe_index]));
+          }
+          test_true(test_wave_write("clip.wav", 8000, 4 * SOUND_BUDGET * SOUND_SPAN * 8),
+                    "a cut clip is written for the file");
+          test_true(media_audio(model, path_text, &over) == APP_OKAY && over.cut_flag,
+                    "the cut clip runs and says it was cut");
+          test_true(sound_store_save(model, keep_text) == APP_OKAY,
+                    "the cut clip's store is written");
+          for (wipe_index = 0; wipe_index < MEDIA_KEEP_COUNT; ++wipe_index) {
+            mem_free(model->audio_note[wipe_index].state_data);
+            memset(&model->audio_note[wipe_index], 0, sizeof(model->audio_note[wipe_index]));
+          }
+          test_true(sound_store_load(model, keep_text) == APP_OKAY,
+                    "the cut clip's store is read back");
+          test_true(media_audio(model, path_text, &back) == APP_OKAY,
+                    "the cut clip is asked about again off the file");
+          test_true(back.cut_flag && back.row_count == over.row_count,
+                    "a cut clip off the file is cut, and is worth what it was worth");
+          media_free(&over);
+          media_free(&back);
+        }
+
+        remove(keep_text);
+        media_free(&kept);
+      }
+
+      media_free(&first);
+    }
     media_free(&sound);
   }
 
@@ -6192,8 +6525,8 @@ static void test_keep(void) {
   test_true(session_ids(from_session, back_list, 24) == id_count - 1 &&
                 memcmp(back_list, id_list, sizeof(int32_t) * (size_t)(id_count - 1)) == 0,
             "and hands them back in the order it was fed them");
-  test_true(session_save(from_session, path_text, 0x1234567890ABCDEFull, APP_KEEP_PROMPT) ==
-                APP_OKAY,
+  test_true(session_save(from_session, path_text, 0x1234567890ABCDEFull, NULL,
+                         APP_KEEP_PROMPT) == APP_OKAY,
             "the conversation is written out");
   peak_key = session_cache_peak(from_session, 0, 0);
   peak_value = session_cache_peak(from_session, 0, 1);
@@ -6206,7 +6539,7 @@ static void test_keep(void) {
     memcpy(keep_list, logit_list, sizeof(float) * (size_t)model->head_sheet.row_count);
   test_true(logit_list != NULL, "the prompt reaches the head");
 
-  test_true(session_load(into_session, path_text, &stamp_back, &kind_back) == APP_OKAY,
+  test_true(session_load(into_session, path_text, &stamp_back, NULL, &kind_back) == APP_OKAY,
             "the conversation is read back");
   test_true(stamp_back == 0x1234567890ABCDEFull, "the caller's stamp comes back unread");
   test_true(kind_back == APP_KEEP_PROMPT, "and says it holds a prompt rather than a conversation");
@@ -6221,6 +6554,202 @@ static void test_keep(void) {
     if (logit_list[slot_index] != keep_list[slot_index]) okay_flag = 0;
   test_true(logit_list && okay_flag, "a restored conversation reaches the same logits, bit for bit");
 
+
+  /* -- the run marks a prompt's media carries ------------------------------ */
+  /* 0.9.12 folded every row a prompt carried into one number, which could say
+   * *these are not the same pictures* and could not say *they agree for the
+   * first two of three*.  0.9.13 divides it along the runs, and what has to
+   * hold is that the division travels through the file intact and that a
+   * caller comparing two of them cuts a shared prefix in the right place. */
+  {
+    app_keep_note wrote_note, read_note;
+    int run_index, same_flag = 1;
+
+    memset(&wrote_note, 0, sizeof(wrote_note));
+    wrote_note.run_count = 2;
+    wrote_note.from_list[0] = 3;
+    wrote_note.till_list[0] = 9;
+    wrote_note.mark_list[0] = 0xFEEDFACECAFEBEEFull;
+    wrote_note.from_list[1] = 11;
+    wrote_note.till_list[1] = 14;
+    wrote_note.mark_list[1] = 0x0123456789ABCDEFull;
+
+    test_true(session_save(from_session, path_text, 7, &wrote_note, APP_KEEP_PROMPT) == APP_OKAY,
+              "a prompt is written with its media runs");
+    memset(&read_note, 0, sizeof(read_note));
+    test_true(session_load(into_session, path_text, NULL, &read_note, NULL) == APP_OKAY,
+              "and is read back");
+    if (read_note.run_count != wrote_note.run_count) same_flag = 0;
+    for (run_index = 0; same_flag && run_index < wrote_note.run_count; ++run_index)
+      if (read_note.from_list[run_index] != wrote_note.from_list[run_index] ||
+          read_note.till_list[run_index] != wrote_note.till_list[run_index] ||
+          read_note.mark_list[run_index] != wrote_note.mark_list[run_index])
+        same_flag = 0;
+    test_true(same_flag, "the runs come back exactly as they went in");
+
+    /* A file whose runs are not runs this engine could have written is a
+     * damaged file.  It is refused on the way in rather than handed back for a
+     * caller to reuse rows against, and it is refused on the way out too, so a
+     * caller cannot write one by accident. */
+    {
+      app_keep_note bad_note = wrote_note;
+      bad_note.till_list[0] = bad_note.from_list[0]; /* an empty run */
+      test_true(session_save(from_session, path_text, 7, &bad_note, APP_KEEP_PROMPT) ==
+                    APP_FAIL_ARGUMENT,
+                "an empty run is refused rather than written");
+      bad_note = wrote_note;
+      bad_note.from_list[1] = bad_note.till_list[0] - 1; /* two runs overlapping */
+      test_true(session_save(from_session, path_text, 7, &bad_note, APP_KEEP_PROMPT) ==
+                    APP_FAIL_ARGUMENT,
+                "runs that overlap are refused rather than written");
+      bad_note = wrote_note;
+      bad_note.run_count = APP_KEEP_RUNS + 1;
+      test_true(session_save(from_session, path_text, 7, &bad_note, APP_KEEP_PROMPT) ==
+                    APP_FAIL_ARGUMENT,
+                "more runs than there is room for are refused rather than written");
+    }
+
+    /* And a file this engine wrote whose run list was moved afterwards.  The
+     * count is the byte with the most reach — it decides how much of what
+     * follows is read as runs — so that is the one moved. */
+    {
+      test_true(session_save(from_session, path_text, 7, &wrote_note, APP_KEEP_PROMPT) == APP_OKAY,
+                "a good file is written for the damage check");
+      {
+        FILE *handle = fopen(path_text, "r+b");
+        int wrote_flag = 0;
+        unsigned char many_room[8];
+        memset(many_room, 0, sizeof(many_room));
+        many_room[0] = (unsigned char)(APP_KEEP_RUNS + 1);
+        if (handle) {
+          /* The run count follows the sixteen byte mark and the seven word
+           * head. */
+          wrote_flag = fseek(handle, 16 + 7 * 8, SEEK_SET) == 0 &&
+                       fwrite(many_room, 1, sizeof(many_room), handle) == sizeof(many_room);
+          fclose(handle);
+        }
+        test_true(wrote_flag, "the file's run count is damaged for the test");
+      }
+      test_true(session_load(into_session, path_text, NULL, &read_note, NULL) == APP_FAIL_FORMAT,
+                "a run count past the room for it is refused");
+    }
+
+
+    /* -- how far two run lists agree ---------------------------------- */
+    /* This is the rule the whole entry turns on, and it is the one place a
+     * mistake would be silent: too small a prefix costs time, too large a one
+     * answers with rows from a picture the caller never showed.  Every case
+     * below is stated as *what the caller may keep*, and the cases are the
+     * three ways a run can differ plus the two ways the shared ids can end in
+     * the middle of one. */
+    {
+      app_keep_note held, now;
+      int run_index;
+
+      memset(&held, 0, sizeof(held));
+      held.run_count = 2;
+      held.from_list[0] = 3;  held.till_list[0] = 9;  held.mark_list[0] = 0xAAAAull;
+      held.from_list[1] = 11; held.till_list[1] = 14; held.mark_list[1] = 0xBBBBull;
+      now = held;
+
+      test_true(keep_note_share(&held, &now, 20) == 20,
+                "two prompts that show the same pictures keep every id the ids gave them");
+
+      /* The case the entry exists for: the first picture is the same and the
+       * second is not.  Everything in front of the second is still good. */
+      now.mark_list[1] = 0xCCCCull;
+      test_true(keep_note_share(&held, &now, 20) == 11,
+                "a second picture that changed keeps the ids in front of it");
+      test_true(keep_note_share(&held, &now, 11) == 11,
+                "and asking only for what is in front of it is unaffected by it");
+
+      /* The first picture changing throws the second away with it, because the
+       * second sits behind ids that are no longer the same rows. */
+      now = held;
+      now.mark_list[0] = 0xCCCCull;
+      test_true(keep_note_share(&held, &now, 20) == 3,
+                "a first picture that changed keeps only the ids in front of it");
+
+      /* A run in a different place, and a run of a different length, are both
+       * different runs.  The second is the ordinary case of a picture whose row
+       * count moved — a budget changed between runs, say. */
+      now = held;
+      now.from_list[1] = 12;
+      now.till_list[1] = 15;
+      test_true(keep_note_share(&held, &now, 20) == 11,
+                "a run that moved ends the prefix where the earlier of the two begins");
+      now = held;
+      now.till_list[1] = 15;
+      test_true(keep_note_share(&held, &now, 20) == 11,
+                "and so does a run whose length moved");
+
+      /* Either side carrying a run the other does not. */
+      now = held;
+      now.run_count = 1;
+      test_true(keep_note_share(&held, &now, 20) == 11,
+                "a prompt that dropped the second picture keeps what is in front of it");
+      now = held;
+      now.run_count = 3;
+      now.from_list[2] = 16; now.till_list[2] = 18; now.mark_list[2] = 0xDDDDull;
+      test_true(keep_note_share(&held, &now, 20) == 16,
+                "a prompt that added a third keeps what is in front of that");
+      test_true(keep_note_share(&held, &now, 15) == 15,
+                "and the added run is nothing when the ids never reach it");
+
+      /* The shared ids ending inside a run.  A run is folded whole, so its
+       * number cannot speak for part of it and nothing inside it is reusable —
+       * which is the case of a picture whose rows begin the same way and then
+       * differ, and the one a whole-run fold must not be trusted through. */
+      now = held;
+      test_true(keep_note_share(&held, &now, 12) == 11,
+                "ids ending inside a run keep only what is in front of that run");
+      test_true(keep_note_share(&held, &now, 14) == 14,
+                "and ids ending exactly where a run ends keep the whole of it");
+      test_true(keep_note_share(&held, &now, 5) == 3,
+                "the same holds for the first run");
+
+      /* Nothing to compare is not a reason to refuse: a prompt that showed no
+       * pictures has no rows the ids cannot speak for. */
+      memset(&held, 0, sizeof(held));
+      memset(&now, 0, sizeof(now));
+      test_true(keep_note_share(&held, &now, 20) == 20,
+                "two prompts with no pictures keep every id the ids gave them");
+
+      /* And the rule never hands back more than it was given, whatever it is
+       * given — which is the property that makes a mistake here cost time and
+       * not correctness. */
+      {
+        int bad_flag = 0;
+        memset(&held, 0, sizeof(held));
+        memset(&now, 0, sizeof(now));
+        held.run_count = APP_KEEP_RUNS;
+        now.run_count = APP_KEEP_RUNS;
+        for (run_index = 0; run_index < APP_KEEP_RUNS; ++run_index) {
+          held.from_list[run_index] = (int32_t)(run_index * 4);
+          held.till_list[run_index] = (int32_t)(run_index * 4 + 3);
+          held.mark_list[run_index] = (uint64_t)run_index * 7u + 1u;
+          now.from_list[run_index] = held.from_list[run_index];
+          now.till_list[run_index] = held.till_list[run_index];
+          now.mark_list[run_index] = held.mark_list[run_index] ^ (run_index == 9 ? 1u : 0u);
+        }
+        for (run_index = 0; run_index <= APP_KEEP_RUNS * 4; ++run_index) {
+          int share = keep_note_share(&held, &now, run_index);
+          if (share < 0 || share > run_index) bad_flag = 1;
+          /* Nothing past the run that differs, wherever the ids reached. */
+          if (run_index > 36 && share > 36) bad_flag = 1;
+        }
+        test_true(!bad_flag,
+                  "a full list of runs with one that differs never shares past it, at any length");
+      }
+    }
+
+    /* The file is left good behind this block, because the checks that follow
+     * damage it themselves and have to start from one this engine wrote. */
+    test_true(session_save(from_session, path_text, 0x1234567890ABCDEFull, NULL,
+                           APP_KEEP_PROMPT) == APP_OKAY,
+              "a good prompt file is left for the checks that follow");
+  }
+
   /* A file that is not one of these, or is one that stops short, is refused,
    * and a session that tried to read it is left cleared rather than half fed. */
   {
@@ -6234,14 +6763,14 @@ static void test_keep(void) {
       path_join(other_text, sizeof(other_text), test_yard_path, "short.cache");
       test_true(test_file_write("short.cache", file_data, file_size / 2),
                 "a truncated cache is written");
-      test_true(session_load(into_session, other_text, NULL, NULL) != APP_OKAY,
+      test_true(session_load(into_session, other_text, NULL, NULL, NULL) != APP_OKAY,
                 "a cache that stops short is refused");
       test_true(session_fill(into_session) == 0, "and leaves the session cleared");
 
       file_data[3] ^= 0xFF;
       path_join(other_text, sizeof(other_text), test_yard_path, "wrong.cache");
       test_true(test_file_write("wrong.cache", file_data, file_size), "a damaged cache is written");
-      test_true(session_load(into_session, other_text, NULL, NULL) != APP_OKAY,
+      test_true(session_load(into_session, other_text, NULL, NULL, NULL) != APP_OKAY,
                 "a file that is not one of these is refused");
       file_data[3] ^= 0xFF;
 
@@ -6250,11 +6779,11 @@ static void test_keep(void) {
       file_data[KEEP_MARK_SIZE] ^= 0x01;
       path_join(other_text, sizeof(other_text), test_yard_path, "alien.cache");
       test_true(test_file_write("alien.cache", file_data, file_size), "an alien cache is written");
-      test_true(session_load(into_session, other_text, NULL, NULL) == APP_FAIL_STATE,
+      test_true(session_load(into_session, other_text, NULL, NULL, NULL) == APP_FAIL_STATE,
                 "a cache written from other shapes is refused");
       mem_free(file_data);
     }
-    test_true(session_load(into_session, "no_such_cache_file", NULL, NULL) == APP_FAIL_MISSING,
+    test_true(session_load(into_session, "no_such_cache_file", NULL, NULL, NULL) == APP_FAIL_MISSING,
               "a cache that is not there is refused");
   }
 
@@ -6279,9 +6808,9 @@ static void test_keep(void) {
     test_true(step_list != NULL, "and the answer is fed back");
     test_true(session_ids(from_session, NULL, 0) == id_count + 1,
               "a conversation holds every id it was fed");
-    test_true(session_save(from_session, talk_text, 3, APP_KEEP_TALK) == APP_OKAY,
+    test_true(session_save(from_session, talk_text, 3, NULL, APP_KEEP_TALK) == APP_OKAY,
               "a conversation is written out");
-    test_true(session_load(into_session, talk_text, &stamp_back, &kind_back) == APP_OKAY &&
+    test_true(session_load(into_session, talk_text, &stamp_back, NULL, &kind_back) == APP_OKAY &&
                   kind_back == APP_KEEP_TALK && stamp_back == 3,
               "and reads back as a conversation, with what the caller stamped it");
     test_true(session_fill(into_session) == id_count + 1,

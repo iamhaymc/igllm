@@ -750,6 +750,35 @@ picture's identity so that a stale file is refused whole and reported, instead
 of missing silently on every entry. A refusal leaves the store exactly as it
 was, and a truncated file is refused whole rather than read half.
 
+**A clip has the same pair**, `sound_store_save` and `sound_store_load` behind
+`--audio-keep <path>`, over a `sound_note` store of its own with its own
+`SOUND_KEEP_VERSION` and its own `igllm clip 1` mark. Two stores and not one,
+in memory and on disk both, because the eviction is what separates them: a loop
+comparing four photographs must not throw away the clip the conversation is
+about, and a checkpoint with one tower should never write a file it cannot read
+back. Each reader refuses the other's file on the mark.
+
+The identity is `sound_mark`, and the line it draws is `media_mark`'s: a
+picture is hashed on the raster **before** the resize, and a clip on the samples
+`wave_read` hands back **before** `wave_rate` and before the budget cuts them,
+with the front end that turns them into frames folded in beside. So the
+container and the sample format are outside it and the resampler is inside it.
+Two things follow that are worth stating. `cut_flag` is kept beside the rows,
+because a clip past the budget has to say so on a hit exactly as on a miss and
+that is not recoverable from the rows. And `sound_recall` and `sound_keep` take
+the clip's count and rate as arguments where the picture's take a `flat_grid`,
+because `wave_rate` and the budget both work in place — by the time the rows
+exist those two numbers are the processor's, and it is the file's that the entry
+is filed under.
+
+**What the store is worth is not what the picture's is, and the difference is
+the useful part.** `CHANGES.md` 0.9.13 measures a clip as a quarter conformer
+and about seventy percent prefill of its own soft tokens, against the picture's
+even half; the audio encoder charges 13.5 ms a soft token where the vision one
+charges 35.6. So this file alone buys 1.31x and it is `--keep` beside it that
+takes a repeated turn to 8.1x — for a clip, the caching that pays is the text
+stack's.
+
 The budget is inside the picture store's identity (§3.8), which it has to be:
 the same photograph under two budgets is two different sets of rows, and an
 identity that left the budget out would hand the second call the first call's
@@ -1176,6 +1205,20 @@ The cache peaks are deliberately not wound back: they are running maxima that
 cannot be un-maxed, but no arithmetic reads one — the quantized store takes its
 scale from the export's calibration — so a held-back session only over-reports
 what `session_cache_peak` shows.
+
+**The fold is per media run, not per prompt** — `app_keep_note`, and
+`keep_note_share` is the rule for comparing two of them. One number over a whole
+prompt can say *these are not the same pictures* and cannot say *they agree for
+the first two of three*, so a prompt whose second picture changed used to keep
+nothing; now the prefix is cut at the front of the first run that disagrees.
+Three ways a run fails and all end it in the same place — either side missing
+it, the two placing it differently, or the two folding to different numbers —
+and a run reaching past the shared ids ends it too, because a run is folded
+whole. The rule is in the core rather than in the caller because it is where a
+mistake would be silent, and the core is what the suite can reach; it is
+symmetric between the two lists for the same reason. A prompt with more runs
+than `APP_KEEP_RUNS` folds the rest into the last slot, which is the old
+whole-prompt behaviour applied to the tail and so is safe by construction.
 
 The stamp is what makes a prefix checkable at all. It folds **every** embedding
 row the caller's prompt carries rather than the rows under some prefix of it,

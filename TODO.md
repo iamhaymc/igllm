@@ -137,10 +137,22 @@ properly for the first time and found the largest unclaimed number in the file
 sitting in the caching rather than in a kernel: a second question about an
 encoded picture cost 10.5 s where the same question again cost 0.53, because a
 kept cache was used only when the whole of it was a prefix. **0.9.12 took it and
-that turn is now 0.93 s**, so what stands there is the remainder — a clip with
-no store, and prompts that do not begin the same way. *Row-blocking the batched
-float dot product* beside it is a refusal, placed there because it explains why
-the AVX2 float kernels are where they are.
+that turn is now 0.93 s**, and 0.9.13 gave a clip the store a picture had, so
+0.9.14 divided that stamp along the media runs, so what stands there is the
+remainder — prompts that do not begin the same way, and prompts past the sliding
+window, which 0.9.14 found is the binding limit of the multi-picture case rather
+than the stamp ever was. *Row-blocking the batched float dot
+product* beside it is a refusal, placed there because it explains why the AVX2
+float kernels are where they are.
+
+**And 0.9.13 found the thing that most changes how the two towers should be
+read.** A picture is half encoder and half prefill of its own soft tokens; a
+clip is a **quarter** encoder and about **seventy percent** prefill. The audio
+encoder charges 13.5 ms a soft token where the vision one charges 35.6, and the
+text stack charges both the same ~38. So a store in front of the audio tower is
+worth 1.3x where the picture's was 1.9x, and **for a clip the caching that
+matters is the text stack's and not the tower's.** Any future entry about the
+audio tower should be sized against that before it is written.
 
 - **The feed-forward planes, which are half of every token and are closer to
   the memory than this entry used to say.** 18.96 ms of a 36.9 ms step —
@@ -748,10 +760,26 @@ the AVX2 float kernels are where they are.
   that host is the encoder and 9.46 is the 260 soft tokens going through the
   text stack, at a flat 36.5 ms each. Nothing in this file had that split.
 
-  What is left of the entry is small and is not the file. A picture's rows are
-  reusable across processes now; a *clip's* are not, and the audio tower has no
-  store at all, in memory or on disk. Whether that is worth having is a question
-  about how often the same clip is asked about twice, and nobody has asked it.
+  **And the clip half is closed — 0.9.13.** The question this entry left open
+  was whether a clip was worth a store at all, and it is, though for a
+  different reason than a picture is. `--audio-keep <path>` is `--image-keep`'s
+  twin: the identity taken on the samples `wave_read` hands back, before the
+  resampler and before the budget, with the front end and the tower's shape
+  beside them; two stores rather than one, so that four photographs cannot
+  evict the clip a conversation is about; and `igllm clip 1` with its own
+  version, its own backend mark and its own refusals. A ten-second clip over
+  four questions is **14.5 s to 11.1, 1.31x**, and beside `--keep` **14.7 s to
+  about 1.8, some 8.1x**; at the budget's ceiling, thirty seconds and 750 soft
+  tokens, **40.6 s to 30.4**.
+
+  **The 1.3x is the part to carry forward**, and it is why this was worth
+  measuring rather than assuming. Cold minus warm is the encoder exactly, with
+  no assumption about anything else: 3.4 s of a 14.5 s turn and 10.1 s of 40.6 —
+  **a quarter, both times**, 13.6 then 13.5 ms a soft token. The prefill of the
+  soft tokens is about 70%. So the split above, which held for a picture, does
+  **not** hold for a clip, and the audio encoder is 2.7x cheaper per soft token
+  than the vision one while the text stack charges them alike. `CHANGES.md`
+  0.9.13 has the table.
 
   *llama.cpp has a narrower form of the in-memory half.* Its server pushes a
   placeholder for an encoded media chunk into the slot's prompt tokens — "the
@@ -866,16 +894,40 @@ the AVX2 float kernels are where they are.
 
   **What is left of it.**
 
-  - **A clip has no store at all**, in memory or on disk, where a picture now
-    has both. The machinery is all written and the identity question is the
-    same one; whether it is worth having is a question about how often the same
-    clip is asked about twice, and nobody has asked it.
-  - **A different picture behind identical ids costs a full re-prime**, which is
-    correct and is not optimal: the stamp is one number over the whole reel, so
-    it can say *these are not the same pictures* but not *they agree for the
-    first two of three*. A prompt showing two pictures where only the second
-    changed keeps nothing. Fixing it means a stamp per media run rather than per
-    reel, and it is worth doing only where prompts carry several pictures.
+  - ~~A clip has no store at all.~~ **Closed by 0.9.13** — `--audio-keep`, in
+    memory and on disk, on the picture store's terms. It is worth less than the
+    picture's, and knowing by how much is the useful half: the conformer is a
+    quarter of a clip's turn where the vision encoder is half of a picture's, so
+    the store alone is 1.31x and it is the kept cache beside it that takes the
+    turn to 1.8 s. See the entry above.
+  - ~~A different picture behind identical ids costs a full re-prime.~~
+    **Closed by 0.9.14** — the fold is divided along the media runs, the file
+    carries up to `APP_KEEP_RUNS` of them, and `keep_note_share` cuts a shared
+    prefix at the front of the first run that disagrees instead of throwing it
+    away on one number. Two 768×512 rasters at `--image-tokens 128`: the second
+    picture changed is **nothing kept and 14.50 s to 124 of 251 ids and 10.03**,
+    a picture added **14.54 s to 9.91**, a picture dropped **7.97 s to 1.93**,
+    and the case 0.9.12 already handled is unmoved at 1.9. All six cases byte
+    for byte a run with no files.
+
+    **One thing it found that belongs to the entry above rather than to this
+    one.** Two pictures at the checkpoint's own 280 rows come to some 574 ids
+    and the shipped export's sliding window is 512, so **such a prompt laps the
+    ring and cannot be wound back at all** — nothing is kept whatever the
+    stamps say. Every number above is under a budget for that reason. So the
+    multi-picture case this closed is reachable only below the window, and
+    *raising what a wound-back session can be* is the entry that would unlock
+    the rest of it. That is a real item and it is not written anywhere else in
+    this file.
+  - **A prompt past the sliding window still keeps nothing**, and after 0.9.14
+    this is the binding limit rather than a footnote. `session_hold` refuses a
+    wind back once a layer's ring has turned over, because slot `i` is id `i`
+    only while it never wrapped — so the rows cannot be wound back with the
+    count. On the shipped export that is 512 ids, which two full-resolution
+    pictures exceed. What would lift it is a ring that records where it wrapped,
+    or a wind back that rewrites the slots rather than refusing; neither has
+    been scoped, and the cheap answer for now is a budget that keeps the prompt
+    under the window.
   - **Nothing here helps a turn whose prompt does not begin the same way.** A
     picture in the middle of a sentence — which `--text` allows and the content
     list means — puts the words in front of the rows, so the shared prefix ends
@@ -1003,3 +1055,8 @@ the AVX2 float kernels are where they are.
 | What half of a picture actually is (answered: not the tower — 9.25 s of 19.60 is the encoder and 9.46 is the 260 soft tokens through the text stack at a flat 36.5 ms each) | 0.9.11 |
 | A kept cache reused as far as it agrees rather than only where it is the whole prompt — a session wound back, a stamp that answers for every prefix, and a turned ring refused in front | 0.9.12 |
 | Whether a prefix-primed run is bit for bit a fresh one, when a batched prime lands on different lane boundaries (answered: yes, on six cases including a quantized cache) | 0.9.12 |
+| A clip's rows kept against the clip and beyond one process — the identity on the decoded samples, two stores that evict apart, and each file refusing the other's | 0.9.13 |
+| A stamp per media run rather than per reel, so a prompt whose later picture changed keeps the ids in front of it | 0.9.14 |
+| Where the rule for comparing two run lists belongs (answered: the core, because it is the piece a mistake would be silent in and the suite cannot reach the caller) | 0.9.14 |
+| Whether a clip is worth a store at all (answered: yes, and worth measuring rather than assuming — 1.31x alone, 8.1x beside a kept cache) | 0.9.13 |
+| What half of a clip actually is (answered: not the halves a picture has — a quarter is the conformer and about 70% is the prefill of its own soft tokens, at 13.5 ms a row against the vision encoder's 35.6) | 0.9.13 |
