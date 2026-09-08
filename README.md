@@ -113,11 +113,14 @@ continuation with three proposers — one that is always right, the n-gram
 proposer that ships, and one that is always wrong — and holds all three to the
 plain run's token stream, so it checks the block path as much as it measures it.
 The first is the ceiling of any proposer and the last is its floor. On the
-shipped export the ceiling is about 2.2x at a block of eight — 2.35x since 0.9.5
-put the output head on the integer path and made a block's marginal lane 21%
-cheaper — and `CHANGES.md` 0.9.0 says why it is not higher still. The proposer
-reaches 85% of it where it applies. The table below was taken before 0.9.5, on a
-host whose numbers `CHANGES.md` names; run `igllm guess` for this host's own.
+shipped export the ceiling was about 2.2x at a block of eight when 0.9.0
+measured it; 0.9.5 put the output head on the integer path and 0.9.9 took the
+batched row's close off the destination, and between them the marginal lane is
+about a third cheaper, so a block of sixteen now brackets **2.67 to 2.82x** and
+a block of eight 2.5 to 2.65 — with `CHANGES.md` 0.9.0 still saying why it is
+not higher than that. The proposer reaches 77 to 85% of it where it applies. The
+table below was taken before 0.9.5, on a host whose numbers `CHANGES.md` names;
+run `igllm guess` for this host's own.
 
 ```
 block  proposer    tok/s  ms a round  committed of drawn  vs plain  stream
