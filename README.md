@@ -289,11 +289,20 @@ python3 run.py run -- chat --model model \
     --image photo.png --prompt "What is in this picture?"
 ```
 
-Change the question, though, and only the first file helps: the second is used
-only where the whole of it is a prefix of the new prompt, so a different
-question about the same picture is 10.5 s and prefills the soft tokens again.
-`chat --loop` does not have that limitation, because a conversation carries its
-cache; across runs it is the open entry at the top of `TODO.md`'s speed list.
+**Changing the question is nearly as cheap.** The kept cache is reused as far as
+it agrees with the new prompt rather than only where the whole of it is a
+prefix, and a picture's soft tokens sit in front of the question, so a question
+never asked before costs **0.93 s** against the 19.99 s it costs cold — around
+267 of 278 ids come off the file and only the question is primed.
+
+Both files refuse rather than guess. A picture file written by another build is
+refused and the pictures are encoded again; a cache whose prompt shows a
+*different* picture behind the same placeholder ids is refused by a stamp the
+ids cannot supply; and a prompt long enough to have lapped the sliding window is
+primed from nothing, because rows in a ring that has turned over cannot be wound
+back. Each of those costs what it cost before there was a file, and none of them
+changes an answer: greedy output with the flags is byte for byte greedy output
+without them.
 
 ## Workflows
 

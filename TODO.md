@@ -132,15 +132,15 @@ only a size, its size is given against a 34.95 ms step floor on the third host.
 **Two entries below are out of order on purpose and are worth naming here.**
 The first several are the text stack's, and every one of them is either finished
 or waiting on a host this project does not currently have — a PMU, or AVX-512
-with more bandwidth. Meanwhile 0.9.10 and 0.9.11 measured a multi-modal turn
+with more bandwidth. Meanwhile 0.9.10 to 0.9.12 measured a multi-modal turn
 properly for the first time and found the largest unclaimed number in the file
-sitting in the caching, not in a kernel: **a second question about an encoded
-picture costs 10.5 s where the same question again costs 0.53**, because a kept
-cache is used only when the whole of it is a prefix. That is *reuse a kept cache
-up to the longest shared prefix*, and on a host that runs pictures it is the
-first thing to take. *Row-blocking the batched float dot product* beside it is a
-refusal, and is placed there because it explains why the AVX2 float kernels are
-where they are.
+sitting in the caching rather than in a kernel: a second question about an
+encoded picture cost 10.5 s where the same question again cost 0.53, because a
+kept cache was used only when the whole of it was a prefix. **0.9.12 took it and
+that turn is now 0.93 s**, so what stands there is the remainder — a clip with
+no store, and prompts that do not begin the same way. *Row-blocking the batched
+float dot product* beside it is a refusal, placed there because it explains why
+the AVX2 float kernels are where they are.
 
 - **The feed-forward planes, which are half of every token and are closer to
   the memory than this entry used to say.** 18.96 ms of a 36.9 ms step —
@@ -825,73 +825,42 @@ where they are.
   nothing about how much of a phase the inner loop is. What it does establish is
   the ranking, and the ranking is a refusal.
 
-- **Reuse a kept cache up to the longest shared prefix, not only where it is
-  the whole prompt.** The largest measured win left in this list on a
-  multi-modal host, and it is worth more than anything above it that is not
-  already built.
+- **Reuse a kept cache as far as it agrees — built, 0.9.12, and what is left is
+  the audio half and the store above it.**
 
-  0.9.11 made the split visible and this is what it exposed. A picture's soft
-  tokens sit at the **front** of the prompt and the question sits behind them,
-  so a second question about the same photograph shares every expensive id and
-  differs only in the cheap ones. On the fourth host, a 768×512 notice at 260
-  soft tokens:
+  A picture's soft tokens sit at the front of a prompt and the question behind
+  them, so a second question about the same photograph shares every expensive
+  id. `main_keep_prime` computed that shared prefix and then refused it unless
+  the whole of the held cache was a prefix of the new prompt. It no longer
+  does: `session_hold` winds a session back to the ids the two prompts share,
+  the stamp folds the whole reel so that one stored number answers for every
+  prefix of it, and a ring that has turned over is refused in front rather than
+  wound back onto the wrong rows.
 
-  | run | seconds |
-  | --- | --- |
-  | the same question again, `--image-keep --keep` | **0.53** |
-  | a different question, `--image-keep --keep` | 10.53 |
-  | a different question, `--image-keep` alone | 10.52 |
+  On the fourth host, a 768×512 notice at 260 soft tokens with `--image-keep`
+  and `--keep`, each row a question **never asked before**: the cold run is
+  19.99 s and every one after it **0.83 to 0.98** — about 21x, and about 11x
+  against 0.9.11 where only the picture file helped. A round keeps 267 of 278
+  ids. `CHANGES.md` 0.9.12 has the six correctness cases, two of which are the
+  ones that had to refuse and do.
 
-  The second row is the entry. **The session file buys nothing at all when the
-  question changes**, and what it fails to save is the 9.46 s of prefilling 260
-  soft tokens that the new question shares with the old one — 36.5 ms an id, and
-  not one of them has moved.
+  **What is left of it.**
 
-  `main_keep_prime` already computes the shared prefix, and its own comment
-  describes the behaviour this entry wants: *"What is reused is a prefix and not
-  a match."* Then the next line throws it away — `if (same_count != held_count
-  || held_stamp != stamp_value) same_count = 0;` — so a held cache is reused
-  only when the whole of it is a prefix of the new prompt, which is the case
-  where the question did not change. The prefix is computed and then refused.
-
-  **Four things stand between here and it, and the last two are the reason it
-  was not simply done.**
-
-  - **The stamp cannot be checked at a prefix.** `main_keep_stamp(reel, k)`
-    folds the media rows over the first `k` ids, and the file stores it only at
-    the length that was saved, so there is nothing to compare a shorter fold
-    against. Ids alone cannot stand in for it: two pictures lay down the same
-    placeholder ids, which is why the stamp exists. The fix is to store the fold
-    over the media rows beside the id index just past the last of them, and to
-    accept a prefix only at or past that index — where the media contribution is
-    complete and fixed, one stamp answers for every prefix length.
-  - **The echo history has to be cut with it.** `echo_count` and `echo_room`
-    are the repetition penalty's memory and are as long as the cache.
-  - **The ring may have turned over.** A layer whose `cache_span` is shorter
-    than the held prompt holds its rows at slots whose meaning depends on
-    `fill_count`, so moving `fill_count` back does not move the rows back with
-    it. Either refuse a prefix wherever anything has turned over — which the
-    common case is nowhere near — or teach the file to record the ring's base.
-  - **The cache peaks cannot be un-maxed.** `key_peak` and `value_peak` are
-    running maxima over everything ever written, and truncating the cache leaves
-    them describing rows that are no longer in it. Under `--cache 8` they scale
-    the quantization, so a truncated session would quantize differently from a
-    fresh one and the run would stop being byte for byte — which is the property
-    this engine holds every cache path to. Recompute them over the kept rows, or
-    refuse a prefix under a quantized cache and say so.
-
-  None of these is hard; together they are a careful change to the one part of
-  the engine where a mistake is silent, and it should be taken with the
-  reference comparison available rather than without it. `session_guess_keep`
-  is the nearest precedent for putting a cache back, and the test that holds it
-  — a window narrow enough that every block laps the ring — is the shape the
-  test for this wants.
-
-  *llama.cpp does exactly this and calls it the same thing*: its server matches
-  a new prompt against a slot's cached tokens and keeps the common prefix, which
-  is how a follow-up question about an encoded picture is cheap there. This
-  engine has the harder half of it already — the stamp that knows a picture is
-  the same picture, which a token comparison cannot.
+  - **A clip has no store at all**, in memory or on disk, where a picture now
+    has both. The machinery is all written and the identity question is the
+    same one; whether it is worth having is a question about how often the same
+    clip is asked about twice, and nobody has asked it.
+  - **A different picture behind identical ids costs a full re-prime**, which is
+    correct and is not optimal: the stamp is one number over the whole reel, so
+    it can say *these are not the same pictures* but not *they agree for the
+    first two of three*. A prompt showing two pictures where only the second
+    changed keeps nothing. Fixing it means a stamp per media run rather than per
+    reel, and it is worth doing only where prompts carry several pictures.
+  - **Nothing here helps a turn whose prompt does not begin the same way.** A
+    picture in the middle of a sentence — which `--text` allows and the content
+    list means — puts the words in front of the rows, so the shared prefix ends
+    before the expensive part. The store still saves the tower; the prefill is
+    paid again.
 
 - **The other widths of the integer dot product.** 0.8.9's path is written for
   AVX-512 VNNI and nothing else. A host with `avx_vnni` and no AVX-512 —
@@ -1012,3 +981,5 @@ where they are.
 | Whether the vision tower is quadratic in patches at the grids it actually runs (answered: 3.25 ms a patch plus a term worth 17.8% at 2340, measured by skipping the tower rather than by subtracting a text turn) | 0.9.10, corrected in 0.9.11 |
 | A picture's rows beyond one process — the backend and an encoder version in the mark, the path and the eviction left to the caller, and a refused file leaving the store alone | 0.9.11 |
 | What half of a picture actually is (answered: not the tower — 9.25 s of 19.60 is the encoder and 9.46 is the 260 soft tokens through the text stack at a flat 36.5 ms each) | 0.9.11 |
+| A kept cache reused as far as it agrees rather than only where it is the whole prompt — a session wound back, a stamp that answers for every prefix, and a turned ring refused in front | 0.9.12 |
+| Whether a prefix-primed run is bit for bit a fresh one, when a batched prime lands on different lane boundaries (answered: yes, on six cases including a quantized cache) | 0.9.12 |

@@ -4203,6 +4203,142 @@ static uint64_t test_guess_mark(const app_session *session) {
   return mark;
 }
 
+/* Winding a session back to a prefix of what it has primed.
+ *
+ * The synthetic checkpoint again, and for the same reason `test_guess` uses it:
+ * its sliding window is **four**, so a prompt of a handful of ids laps the ring
+ * and the one case this call has to refuse is reachable in a test rather than
+ * only on a prompt of five hundred ids.
+ *
+ * The shape is the one `main_keep_prime` uses: a prompt of `n` ids primes `n-1`
+ * of them and the last is stepped.  What is being held is that a session wound
+ * back to a shared head and then given a different tail reaches exactly the
+ * logits a session that primed the whole of that prompt from nothing reaches —
+ * equality and not closeness, because a cache reused as a prefix is a cache
+ * whose rows have to be the rows. */
+static void test_hold(void) {
+  /* Five ids each, agreeing for three and parting after. */
+  static const int32_t prompt_one[5] = {1, 7, 8, 9, 10};
+  static const int32_t prompt_two[5] = {1, 7, 8, 11, 12};
+  /* Six, so that priming five laps the four row ring. */
+  static const int32_t prompt_long[6] = {1, 7, 8, 9, 10, 11};
+  app_setup setup = app_setup_plain();
+  app_model *model = NULL;
+  app_session *session = NULL;
+  app_session *other = NULL;
+  test_open("hold");
+  if (!test_wing_write(0)) { test_true(0, "the synthetic checkpoint is written"); return; }
+  if (model_load(test_yard_path, &setup, &model) != APP_OKAY || !model) {
+    test_true(0, "a checkpoint loads for the hold path");
+    return;
+  }
+  if (session_open(model, &session) != APP_OKAY || !session ||
+      session_open(model, &other) != APP_OKAY || !other) {
+    test_true(0, "two sessions open for the hold path");
+    model_free(model);
+    return;
+  }
+
+  test_true(session_hold(NULL, 0) == APP_FAIL_ARGUMENT, "no session is an argument failure");
+  test_true(session_hold(session, -1) == APP_FAIL_ARGUMENT,
+            "a count below zero is refused rather than clamped");
+  test_true(session_hold(session, 1) == APP_FAIL_ARGUMENT,
+            "a count past what has been primed is refused");
+
+  /* Priming a prompt lays down every id but the last, so five ids fill four —
+   * which is the ring exactly, and has not yet lapped it. */
+  test_true(session_prime(session, prompt_one, 5) == APP_OKAY, "a five id prompt primes");
+  test_true(session_fill(session) == 4, "a prompt primes every id but the one that is stepped");
+  {
+    uint64_t before_mark = test_guess_mark(session);
+    test_true(session_hold(session, 4) == APP_OKAY, "holding to what is there is allowed");
+    test_true(test_guess_mark(session) == before_mark,
+              "and moves nothing at all, down to the echo history");
+  }
+
+  { /* The whole point: a shared head, two different tails, against the same two
+     * primed from nothing. */
+    const float *have_two;
+    const float *want_two;
+    float keep_one[TEST_WING_VOCAB];
+    int value_index, bad_count = 0;
+
+    {
+      /* What the first tail reaches, kept to prove the second is different. */
+      const float *want_one = session_step(session, prompt_one[4]);
+      test_true(want_one != NULL, "the first prompt reaches logits");
+      if (!want_one) { session_close(session); session_close(other); model_free(model); return; }
+      for (value_index = 0; value_index < TEST_WING_VOCAB; ++value_index)
+        keep_one[value_index] = want_one[value_index];
+    }
+
+    /* The step above laid down a fifth row and lapped the ring, so the wind
+     * back has to start from a session that has only primed. */
+    session_reset(session);
+    test_true(session_prime(session, prompt_one, 5) == APP_OKAY, "the first prompt primes again");
+    test_true(session_hold(session, 3) == APP_OKAY, "the session winds back to the shared head");
+    test_true(session_fill(session) == 3, "and holds only the head");
+    test_true(session_prime(session, prompt_two + 3, 2) == APP_OKAY,
+              "the other prompt's tail primes onto it");
+    test_true(session_fill(session) == 4, "which fills the same four rows the whole prompt would");
+    have_two = session_step(session, prompt_two[4]);
+
+    session_reset(other);
+    test_true(session_prime(other, prompt_two, 5) == APP_OKAY,
+              "the reference primes the other prompt from nothing");
+    want_two = session_step(other, prompt_two[4]);
+
+    test_true(have_two != NULL && want_two != NULL, "both sides reach logits");
+    if (have_two && want_two) {
+      for (value_index = 0; value_index < TEST_WING_VOCAB; ++value_index)
+        if (have_two[value_index] != want_two[value_index]) bad_count += 1;
+    } else {
+      bad_count = 1;
+    }
+    test_true(bad_count == 0,
+              "a wound-back prefix and a fresh prime reach the same logits, bit for bit");
+
+    /* And the two tails really do differ, or the check above would pass on a
+     * session that had ignored the tail entirely. */
+    bad_count = 0;
+    if (have_two)
+      for (value_index = 0; value_index < TEST_WING_VOCAB; ++value_index)
+        if (have_two[value_index] != keep_one[value_index]) bad_count += 1;
+    test_true(bad_count > 0, "the two tails reach different logits, so the check has teeth");
+  }
+
+  { /* The refusal, which is the reason this call can fail at all.  Past the
+     * four row ring the rows sit at slots whose meaning is fixed by the fill,
+     * so winding the fill back would leave the wrong rows in front of the
+     * attention — and nothing downstream could tell. */
+    session_reset(session);
+    test_true(session_prime(session, prompt_long, 6) == APP_OKAY, "a six id prompt primes");
+    test_true(session_fill(session) == 5, "the fill is past the four row window");
+    {
+      uint64_t before_mark = test_guess_mark(session);
+      test_true(session_hold(session, 2) == APP_FAIL_SUPPORT,
+                "a session whose ring has turned over refuses to wind back");
+      test_true(test_guess_mark(session) == before_mark, "and a refused wind back moves nothing");
+    }
+  }
+
+  { /* Mid-block it is a state failure, as every other cache mover is. */
+    static const int32_t block_list[2] = {7, 8};
+    session_reset(session);
+    test_true(session_prime(session, prompt_one, 3) == APP_OKAY, "a prompt primes for the block");
+    if (session_guess(session, block_list, 2) != NULL) {
+      test_true(session_hold(session, 1) == APP_FAIL_STATE, "a wind back is refused mid-block");
+      test_true(session_guess_keep(session, 0) == APP_OKAY, "the block is dropped");
+    } else {
+      test_true(0, "a block of two runs on the synthetic checkpoint");
+    }
+  }
+
+  session_close(session);
+  session_close(other);
+  model_free(model);
+}
+
 /* The block path: every position's logits out of one pass, and a cache that can
  * be put back.
  *
@@ -6449,6 +6585,7 @@ int main(void) {
   test_mel();
   test_wing();
   test_guess();
+  test_hold();
   test_scout();
   test_tower();
   test_turn();

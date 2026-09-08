@@ -6686,3 +6686,130 @@ file. **847 pass** on the tuned AVX2 build, 827 before.
 The cross-backend refusal is not in the unit suite, because a second backend is
 a second binary and the suite is one: it is checked by building the default
 scalar target beside the tuned one and offering each the other's file.
+
+---
+
+## 0.9.12 — a kept cache reused as far as it agrees
+
+### Scope
+
+The entry 0.9.11 put at the top of the speed list, taken. It was the largest
+unclaimed number in that list and it was not in a kernel.
+
+A picture's soft tokens sit at the **front** of a prompt and the question sits
+behind them, so a second question about the same photograph shares every
+expensive id and differs only in the cheap ones. `main_keep_prime` already
+computed that shared prefix — its own comment said *"What is reused is a prefix
+and not a match"* — and then the next line threw it away unless the whole of the
+held cache was a prefix of the new prompt, which is the case where the question
+did not change. **The prefix was computed and then refused.**
+
+### What it took
+
+**A session that can be wound back.** `session_hold(session, keep_count)` puts a
+session back to its first `keep_count` ids. Attention here is causal, so those
+rows depend on nothing after them: dropping the rest leaves the session in the
+state it was in when it had primed that many, and priming a different tail onto
+it produces what priming the whole of that prompt would have.
+
+**And a stamp that answers for a prefix.** The old one folded the tower's
+embedding rows over the first `k` ids, and the file holds one number, so it
+could only ever be checked at the length it was taken. It now folds **every** row
+the reel carries, whatever the length — which is the same number for two prompts
+that show the same pictures however differently they go on, so one number
+answers for every prefix of them at once. The ids either side are compared
+directly and are what place the rows; the stamp only has to say the rows are the
+same rows, which the ids cannot, because two pictures lay down the same
+placeholder ids. `KEEP_MARK_TEXT` goes to `igllm cache 3` because the number
+behind it means something else now.
+
+### The refusal, which is the reason the call can fail
+
+**A ring that has turned over cannot be wound back.** A layer whose `cache_span`
+is shorter than what has been primed holds its rows at slots whose meaning is
+fixed by `fill_count` — slot `i` is id `i` only while the ring has never wrapped
+— so winding `fill_count` back does not wind the rows back with it, and the
+attention would then read the wrong rows with nothing downstream able to tell.
+It is refused in front instead, and the caller primes from nothing, which costs
+what it cost before there was a file at all. On the shipped export the sliding
+window is 512, so every prompt short of that is covered and the ones past it
+lose nothing they had.
+
+**The cache peaks are deliberately left alone**, and it is worth saying why
+rather than leaving it to be rediscovered. They are running maxima over
+everything a session has written and cannot be un-maxed by a wind back — but
+nothing reads them except `session_cache_peak`, which reports them, and the
+quantized store takes its scale from the export's calibration rather than from
+what a prompt reached. No arithmetic depends on a peak. So a wound-back session
+reports a peak covering rows it no longer holds, which is conservative in the
+only direction that matters, and `--cache 8` stays byte for byte. That was
+checked and not assumed.
+
+### What it is worth
+
+On the fourth host, the 768×512 notice at 260 soft tokens, `--image-keep` and
+`--keep` both given. Each row after the first is a question that had **never
+been asked before**, so the prefix is genuinely partial every time — measuring
+the same question twice measures the old whole-prefix path and says nothing
+about this change:
+
+| run | seconds |
+| --- | --- |
+| the first, cold | 19.990 |
+| a question never asked | 0.931 |
+| another | 0.833 |
+| another | 0.912 |
+| another | 0.979 |
+| another | 0.933 |
+
+**20.0 s to about 0.93, some 21x** — and against 0.9.11, where only the picture
+file helped and the soft tokens were prefilled again, **10.5 s to 0.93, about
+11x**. A typical round keeps 267 of 278 ids.
+
+### That it is the same answer
+
+A prefix-primed run has to be **bit for bit** a fresh one, and this is checked
+rather than reasoned about, because it could have failed: a batched prime is
+sixteen lanes wide, so priming a tail alone lands on different batch boundaries
+than priming the whole prompt, and `TODO.md` already warns that a batch and a
+sequence of steps can take different kernels. They do not here.
+
+Greedy `chat` output compared against a run with no files at all, on the shipped
+export:
+
+- a picture and a question never asked — same text, 267 of 278 ids kept;
+- text with no picture at all and a shared opening — same text, 23 of 33 kept;
+- the same under `--cache 8` — same text, 23 of 33 kept;
+- a new prompt *shorter* than the held one — same text, 9 of 14 kept;
+- **a different picture behind identical ids** — nothing kept, and the same
+  text: the stamp catches what the ids cannot;
+- **a prompt long enough to lap the ring** — nothing kept, and the same text:
+  the guard refuses and the run pays what it always paid.
+
+The last two are the ones that matter. Both are cases where reuse would be
+wrong, both refuse, and both still produce the right answer.
+
+`logits` does not read `--keep` at all — only `main_serve` primes from a file —
+so a comparison taken through that task tests nothing here. This was found the
+hard way, and it is why every row above is greedy `chat` text.
+
+### Code
+
+- `session_hold`, `session_ring_least`: the wind back, and the shortest ring it
+  is refused against.
+- `main_keep_stamp`: the whole reel rather than a prefix of it, which is what
+  lets one stored number answer for every prefix.
+- `main_keep_prime`: a partial prefix accepted, wound back to, and given up on
+  where the wind back is refused.
+- `KEEP_MARK_TEXT`: `igllm cache 3`.
+
+### Tests
+
+Twenty-four added, on the synthetic checkpoint, whose sliding window is four so
+that a prompt of six ids laps the ring where the shipped export would need five
+hundred: a wind back to a shared head and a different tail reaching the same
+logits as a fresh prime bit for bit, with a check that the two tails differ at
+all so the first check has teeth; a wind back to what is already there moving
+nothing, down to the echo history; a turned-over ring refused and moving
+nothing; and refusals for no session, a negative count, a count past the fill,
+and a block in flight. **871 pass**, 847 before.

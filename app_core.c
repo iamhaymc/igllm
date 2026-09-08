@@ -261,6 +261,11 @@ app_code media_store_load(app_model *model, const char *path_text);
 app_code     session_open(app_model *model, app_session **session_out);
 void         session_close(app_session *session);
 void         session_reset(app_session *session);
+/* Puts a session back to its first `keep_count` ids, so that a cache kept for
+ * one prompt can be reused as the *prefix* of another.  `APP_FAIL_SUPPORT`
+ * where a ring has turned over, which is the one case the rows cannot be wound
+ * back with the count; the caller primes from nothing instead. */
+app_code    session_hold(app_session *session, int keep_count);
 app_code     session_prime(app_session *session, const int32_t *id_list, int id_count);
 /* The same, with an embedding row supplied for every id a tower filled. */
 app_code     session_prime_media(app_session *session, const int32_t *id_list, int id_count,
@@ -13411,7 +13416,7 @@ static int token_frame_inner(const app_model *model, const app_part *part_list, 
  * The mark text carries a version because this word was not in the first
  * layout: a file written before it is refused rather than read as a prompt it
  * might not be. */
-#define KEEP_MARK_TEXT "igllm cache 2\n\0\0"
+#define KEEP_MARK_TEXT "igllm cache 3\n\0\0"
 #define KEEP_MARK_SIZE 16
 
 /* Everything about a model and a session that decides how the cache is laid
@@ -13439,6 +13444,57 @@ static uint64_t keep_mark(const app_session *session) {
     mark_value = keep_mix(mark_value, (uint64_t)cache_slot_bytes(session->value_grid[layer_index]));
   }
   return mark_value;
+}
+
+/* The shortest ring any layer of this session keeps.
+ *
+ * `guess_lane_room` asks the same question and then caps the answer at the lane
+ * limit, because that is all a block can want; this one wants the span itself.
+ */
+static int session_ring_least(const app_session *session) {
+  const model_form *form = &session->model->form;
+  int layer_index, span_least = form->window_limit;
+  for (layer_index = 0; layer_index < form->layer_count; ++layer_index) {
+    const layer_wing *wing = &session->model->wing_list[layer_index];
+    if (wing->share_flag) continue;
+    if (wing->cache_span < span_least) span_least = wing->cache_span;
+  }
+  return span_least;
+}
+
+/* Puts a session back to its first `keep_count` ids.
+ *
+ * Attention here is causal, so the cached rows of the first `keep_count` ids
+ * depend on nothing after them: dropping the rest leaves a session in exactly
+ * the state it was in when it had primed that many, and priming the rest of a
+ * different prompt onto it produces what priming the whole of that prompt would
+ * have.  That is what makes a kept cache reusable as a *prefix* rather than
+ * only as a whole, which is the difference between a second question about an
+ * encoded picture costing the tower's rows again or costing nothing.
+ *
+ * **It is refused where any ring has turned over**, and this is the reason the
+ * call can fail at all.  A layer whose `cache_span` is shorter than what has
+ * been primed holds its rows at slots whose meaning is fixed by `fill_count` —
+ * slot `i` is id `i` only while the ring has never wrapped — so winding
+ * `fill_count` back does not wind the rows back with it, and the rows the
+ * attention would then read are the wrong ones.  Nothing here can detect that
+ * afterwards, so it is refused in front.
+ *
+ * The cache peaks are deliberately left alone.  They are running maxima over
+ * everything the session has written and cannot be un-maxed, but nothing reads
+ * them except `session_cache_peak`, which reports them: no arithmetic depends
+ * on a peak, and the quantized store takes its scale from the export's
+ * calibration rather than from what a prompt reached.  So a held-back session
+ * reports a peak covering rows it no longer holds, which is conservative in the
+ * only direction that matters and is not a wrong answer to anything. */
+app_code session_hold(app_session *session, int keep_count) {
+  if (!session || keep_count < 0) return APP_FAIL_ARGUMENT;
+  if (session->guess_count > 0) return APP_FAIL_STATE;
+  if (keep_count > session->fill_count) return APP_FAIL_ARGUMENT;
+  if (session->fill_count > session_ring_least(session)) return APP_FAIL_SUPPORT;
+  session->fill_count = keep_count;
+  session->echo_count = keep_count < session->echo_limit ? keep_count : session->echo_limit;
+  return APP_OKAY;
 }
 
 /* How many of a layer's rows carry anything.  A ring that has turned over holds

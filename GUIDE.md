@@ -1155,8 +1155,34 @@ hands `session_save` is written beside it and handed back unread: the ids alone
 cannot say that a picture in a prompt is the same picture, because two pictures
 lay down the same placeholder ids, so what identifies the rest of a prompt is
 the caller's to decide. `session_ids` hands the ids back, which is how the front
-end finds out whether the prompt it is about to run begins with the one in the
+end finds out how far the prompt it is about to run agrees with the one in the
 file and primes only the difference.
+
+**That agreement does not have to reach the end of the file.** `session_hold`
+winds a session back to its first `keep_count` ids, so a cache kept for one
+prompt is reusable as the *prefix* of another — the same picture and a different
+question about it, which is the case it exists for, since a picture's soft
+tokens sit in front of the question and are nearly all of what the prompt costs.
+Attention here is causal, so the rows of the first `keep_count` ids depend on
+nothing after them and priming a different tail onto them produces what priming
+the whole prompt would have; that is checked as bit equality and not as
+closeness.
+
+It is refused where a ring has turned over, and that refusal is the reason the
+call can fail. A layer whose `cache_span` is shorter than what has been primed
+holds its rows at slots whose meaning is fixed by `fill_count`, so winding the
+fill back does not wind the rows back with it and nothing downstream could tell.
+The cache peaks are deliberately not wound back: they are running maxima that
+cannot be un-maxed, but no arithmetic reads one — the quantized store takes its
+scale from the export's calibration — so a held-back session only over-reports
+what `session_cache_peak` shows.
+
+The stamp is what makes a prefix checkable at all. It folds **every** embedding
+row the caller's prompt carries rather than the rows under some prefix of it,
+because the file holds one number and a number taken at a length can only be
+checked at that length; folded over the whole prompt it is the same number for
+two prompts that show the same pictures however differently they go on, so it
+answers for every prefix of them at once.
 
 `session_cache_room_at` says what the cache costs at either storage, and
 `session_cache_bytes` asks the layer rather than assuming a float, so what

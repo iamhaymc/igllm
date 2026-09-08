@@ -330,11 +330,19 @@ static void main_emit(app_model *model, int32_t id_value) {
 
 /* What a kept cache is stamped with: the embedding rows a tower filled, which
  * the ids cannot speak for.  Two pictures lay down the same placeholder ids, so
- * without this a cache kept for one prompt would be restored for the other. */
-static uint64_t main_keep_stamp(const main_reel *reel, int id_count) {
+ * without this a cache kept for one prompt would be restored for the other.
+ *
+ * **Every row the reel carries, and not the rows under some prefix of it**, and
+ * that is what lets a cache be reused as a prefix at all.  A stamp taken at a
+ * length can only be checked at that length, and the file holds one number; a
+ * stamp over the whole reel is the same number for two prompts that show the
+ * same pictures however differently they go on, so it answers for every prefix
+ * of them at once.  The ids either side of it are compared directly, which is
+ * what places the rows — this only has to say the rows are the same rows. */
+static uint64_t main_keep_stamp(const main_reel *reel) {
   uint64_t stamp_value = 0xCBF29CE484222325ull;
   int id_index, value_index;
-  for (id_index = 0; id_index < id_count; ++id_index) {
+  for (id_index = 0; id_index < reel->id_count; ++id_index) {
     if (!reel->state_flag[id_index]) continue;
     for (value_index = 0; value_index < reel->state_size; ++value_index) {
       float value_now = reel->state_list[(size_t)id_index * (size_t)reel->state_size +
@@ -347,13 +355,23 @@ static uint64_t main_keep_stamp(const main_reel *reel, int id_count) {
   return stamp_value;
 }
 
-/* Primes a prompt, reusing a cache kept from an earlier run where the file
- * holds a prompt this one begins with.
+/* Primes a prompt, reusing whatever a cache kept from an earlier run shares
+ * with it.
  *
- * What is reused is a prefix and not a match: a kept cache of six hundred ids
- * in front of a prompt of six hundred and four is six hundred ids that need not
- * be primed again, and the four are primed onto it.  A file that does not
- * begin this prompt is a different conversation and is replaced. */
+ * What is reused is a **prefix, and not only a whole one**.  Where the file's
+ * prompt is entirely in front of this one, all of it is kept and the rest is
+ * primed onto it.  Where the two agree for a while and then part — the same
+ * picture and a different question about it, which is the case this is for —
+ * the cache is wound back to where they part and only the tail is primed.  A
+ * picture's soft tokens sit at the front of a prompt and the question behind
+ * them, so that shared head is nearly all of what a multi-modal prompt costs.
+ *
+ * Two things have to hold and both are checked.  The ids have to match, which
+ * places the rows; and the stamp has to match, which says the rows under those
+ * ids came from the same pictures — the ids cannot say it, because two pictures
+ * lay down the same placeholder ids.  Winding back can also be refused outright
+ * where a ring has turned over, and then this primes from nothing, which is
+ * what it did before any of this. */
 static app_code main_keep_prime(const main_flag *flag, app_session *session,
                                 const main_reel *reel) {
   int32_t *held_list = NULL;
@@ -376,8 +394,15 @@ static app_code main_keep_prime(const main_flag *flag, app_session *session,
     while (held_list && same_count < held_count && same_count < reel->id_count - 1 &&
            held_list[same_count] == reel->id_list[same_count])
       ++same_count;
-    stamp_value = main_keep_stamp(reel, same_count);
-    if (same_count != held_count || held_stamp != stamp_value) same_count = 0;
+    stamp_value = main_keep_stamp(reel);
+    if (held_stamp != stamp_value) same_count = 0;
+    /* Where the two prompts part before the file runs out, the cache holds rows
+     * this prompt does not want and has to be wound back off them.  A session
+     * that will not wind back is not an error: it is primed from nothing, which
+     * costs what it cost before there was a file. */
+    if (same_count > 0 && same_count < held_count &&
+        session_hold(session, same_count) != APP_OKAY)
+      same_count = 0;
     free(held_list);
   }
   if (same_count < 1) {
@@ -397,7 +422,7 @@ static app_code main_keep_prime(const main_flag *flag, app_session *session,
    * did. */
   if (same_count < reel->id_count - 1) {
     app_code keep_code = session_save(session, flag->keep_path,
-                                      main_keep_stamp(reel, reel->id_count - 1),
+                                      main_keep_stamp(reel),
                                       APP_KEEP_PROMPT);
     if (keep_code != APP_OKAY)
       fprintf(stderr, "keep: %s\n", app_code_text(keep_code));
