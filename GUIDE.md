@@ -359,8 +359,10 @@ in isolation and slower in the engine, and taken out again — see
   decoded samples and of every part of the tower configuration that decides what
   they become. Four pictures, least-wanted evicted. The identity is taken after
   the decoder, so the container is out of it; the backend is out of it too, and
-  may be only because the store never reaches a file — `TODO.md` says what has
-  to go in before it does.
+  may be, because a store on the model cannot outlive the process that made it.
+  The *file* is a different matter and carries both — see `media_keep_mark`
+  below. `sound_mark`, `sound_recall` and `sound_keep` are the same three for a
+  clip, over a store of their own.
 - `kern_score_block` and `kern_blend_rows_many` — the same two things for a
   block of `KERN_GRID_LANE` queries at once, which is what a tower's
   bidirectional attention wants: every query in a band scores against the same
@@ -410,7 +412,7 @@ in isolation and slower in the engine, and taken out again — see
 - `kern_level_of`, `kern_level_ready`, `kern_level_stage`, `kern_dot_level`,
   `kern_dot_level_many`, `kern_row_code_level`, `kern_row_code_level_many` —
   the same products taken on the calibrated integer grid instead, which is
-  0.8.9 and `RESEARCH.md` idea 2.
+  0.8.9, and idea 2 of the research list `TODO.md` now carries.
 
   Every code plane in a Gemma export carries an `input_activation_scale`, and
   `plane_lift_many` rounds what goes into the product onto that step before any

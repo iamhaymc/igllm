@@ -2,6 +2,200 @@
 
 Development progress and the reasoning behind each decision.
 
+The version log starts below the standing results and runs oldest first.
+Every engine change takes the next version number and is appended to the end
+of it; nothing already written there is rewritten.
+
+---
+
+## Standing results
+
+The version log below is the record of each change. This section holds the few
+facts that span it — the hosts every number is quoted against, the shape of what
+a token and a picture and a clip cost, and the register of things that were
+measured and refused. `TODO.md` reasons from these and does not restate them.
+
+Nothing here is new work. It is here because it belongs to no single version,
+and because a list of open tasks is the wrong place to keep an archive.
+
+### The hosts
+
+Every rate in this file is a host's and not the engine's, and the single most
+misread number in the project is a ceiling quoted without the host that set it.
+**Quote a host's own bare sweep beside any step or ratio taken on it.**
+
+| host | cores | instructions | bare sweep, four threads |
+| --- | --- | --- | --- |
+| reference | 4 × Xeon 2.8 GHz | AVX-512, VNNI | 32.18 GiB/s (0.8.9), 31.29 (0.9.2), 28.43 (0.9.5) |
+| second | 4 × Xeon 2.1 GHz | AVX-512, VNNI | 40–49 GiB/s |
+| third | 4 × Xeon 2.1 GHz, virtualized | AVX-512, VNNI, GFNI | 49.80 GiB/s; 24.60 at two, 13.04 at one |
+| fourth | i5-7600K, 4 cores | AVX2 with FMA, **no** AVX-512 | — |
+
+A decode step reads **784.4 MiB**, so the reference host's sweep ceiling is 24 ms
+a token — **41 tokens a second and no more** — and the third host's is 14.9 ms,
+or **67**. The engine reaches 28.61 on the third. The second and third are both
+2.1 GHz Xeons and may be one machine described twice; the entries that quote
+them say which they used, and that ambiguity is recorded rather than resolved.
+
+The reference host **exposes no performance counters**:
+`/sys/bus/event_source/devices` holds `breakpoint`, `msr`, `power`, `software`,
+`tracepoint` and `uprobe`, and no `cpu`, so `perf stat` has nothing to count.
+`TODO.md`'s first item waits on a host with a PMU, and this is why.
+
+Take any figure as the minimum a phase reaches over runs alternating between the
+two builds, on a quiet machine with the checkpoint in the page cache. 0.8.12
+recorded two false results before adopting that rule — one from a `pip install`
+running beside the bench, one from an evicted page cache — and 0.9.6 found a
+host that drifts over a series, which reversing the order of the builds exposed.
+
+### What a token costs
+
+0.8.10 divided a step and found the premise of every entry before it wrong: the
+step was never mostly outside the kernels. The norms and residual adds are 0.9%
+of it, the rotary turn and cache write 0.6%.
+
+**`GiB/s` is not comparable across bit widths**, and reading it as though it were
+cost this project two versions of a wrong entry. `vpdpbusd` consumes sixty-four
+codes whatever their width, so a two bit plane spends the same instruction on
+16 bytes that a four bit plane spends on 32. Count multiply-adds.
+
+After 0.9.5 the feed-forward is 56% of a step and the output head 11.5%, so what
+is left is overwhelmingly a memory question rather than a kernel one. The
+feed-forward sits at **78% of the reference host's bare sweep**: 12% of the gap
+is the row block's access pattern and is the price of the block rather than a
+bug, and 19% is issue, at about 1.4 ms per port-0-or-5 uop — three uops per
+sixty-four codes a row, `vpsrlvd`, `vpandd` and `vpdpbusd`, each worth about the
+same. `vgf2p8affineqb` removes two of the three and is gated on GFNI, which the
+reference host lacks; on a host without it there is nothing cheaper in AVX-512BW,
+so that half of the gap is the instruction set's and not the loop's.
+
+### What half of a picture and half of a clip are
+
+0.9.11 built the instrument this needed — answering a turn with the tower
+skipped, which separates the encoder from the text stack's prefill of the soft
+tokens — and 0.9.13 turned it on a clip. The two do not divide the same way, and
+assuming they do is the mistake this paragraph exists to prevent.
+
+| | encoder | prefill of its own soft tokens | ms a soft token, encoder |
+| --- | --- | --- | --- |
+| a picture | about half | about half | 35.6 |
+| a clip | **a quarter** | **about 70%** | **13.5** |
+
+The text stack charges both about 38 ms a soft token. So the audio encoder is
+2.7x cheaper per soft token than the vision one, a store in front of the audio
+tower is worth 1.3x where the picture's is 1.9x, and **for a clip the caching
+that pays is the text stack's rather than the tower's**. Size any entry about
+either tower against this before writing it.
+
+The vision tower is **nearly linear in patches**, not quadratic: 3.25 ms a patch
+plus a term worth 17.8% at 2340 patches (0.9.11, seven grid sizes). On a host
+where the dense attention pair is a sixth of the encoder, fewer patches is worth
+more than any attention kernel. 0.9.6 measured 34–41% for that pair on a
+different host against a different denominator; the two should not be assumed to
+agree, and the split should be taken on the host before the work is.
+
+### The refusal register
+
+Measured and rejected. Do not reopen any of these without new evidence or a host
+that changes the premise; the version named has the method and the numbers.
+
+| what was tried | what happened | version |
+| --- | --- | --- |
+| The per-group gain mirror | nothing to convert — this export's scales are already one `F32` a row | 0.8.4 |
+| Vectorizing the conformer's score loop | the window is thirteen keys wide | 0.8.4 |
+| Eight lanes a block | 16% of one loop, and 0.8.9 spent the effort somewhere larger | 0.8.8 |
+| The logit cap across the pool | a single fork after the output head does not settle | 0.8.10 |
+| Eight rows a block, integer path | a wash on every plane, for eight live accumulators | 0.8.11 |
+| Software prefetch ahead of the row loop | **12 to 20% worse** on every code plane | 0.8.11 |
+| The page walk, as the output head's puzzle | the same 96 MiB costs the same with a gigabyte swept in between | 0.8.12 |
+| Widening a block of rows on its own | the ratio of close to work is fixed by the columns, at any width | 0.8.12 |
+| Eight rows a block, float path | worse on the one plane it is for | 0.8.16 |
+| A proposer matching on a single id | better on both workloads at once without it | 0.9.3 |
+| The mlp's accumulator chain | a wash on the one lane block, **15% worse** batched — the batched integer path is at its register limit, not its latency limit | 0.9.2 |
+| The float head's `vbroadcasti32x4` | a wash: the three uops it removes are load-port, and the loop is bound by ports 0 and 5. Counting instructions is not counting ports | 0.9.5 |
+| A cluster bound over the head's 262144 rows | the mean nearest neighbour is 0.89 of a row norm and the bound needs 0.14 — and that holds for **every** clustering, since a cell of two rows has radius at least half the distance between them | 0.9.5 |
+| Flash attention's tiling in the vision tower | a band holds one score row and never held the grid, so the schedule arrives with nothing to save and a summation-order change to pay | 0.9.6 |
+| The fused multiply-add in the tower's blend | 0.6x more and **deliberately refused**: it drops the intermediate rounding, so a picture's rows would stop being the rows that ship | 0.9.6 |
+
+Two more were measured after 0.9.14 and have no version of their own, because
+neither changed a line of the engine. Both are the same wall.
+
+**Row-blocking the batched float dot product.** Every single-lane path blocks
+rows and the batched one does not, which looks like something left on the floor.
+On the fourth host, one thread, a 256 column group over 4096 rows, minimum of
+fifty runs, every lane's total read afterwards so nothing can be eliminated —
+the first version of this measurement said 1.8x and was wrong for exactly that
+reason, two of the four lanes being dead code:
+
+| shape | G multiply-adds a second | against the shipped | order |
+| --- | --- | --- | --- |
+| one row, four lanes, two accumulators, step 16 | 27.0–27.4 | — | shipped |
+| two rows, four lanes, one accumulator, step 8 | 36.5–36.7 | **1.33x** | **different** |
+| two rows, two lanes, two accumulators, step 16 | 28.0–28.5 | 1.04x | shipped |
+
+**The only row block that pays changes the summation order, and the one that
+preserves it does not pay.** Preserving the chain costs two accumulators a
+row-lane pair, so two rows by four lanes wants sixteen accumulators where the
+file has sixteen registers in all, before the row and lane vectors. This is the
+same wall the tower's blend hit, and it is worth stating once in general: **on
+AVX2 the register file, not the loop, limits every batched float kernel in this
+engine.** On AVX-512 the order-preserving form fits — thirty-two registers hold
+sixteen accumulators, four row vectors and two lane vectors with room over — but
+that is a hypothesis reasoned on a host with no AVX-512, and it is an open item
+rather than a result.
+
+**And the four-row float block ported down from AVX-512.** `kern_row_code_rows`
+is AVX-512 and two bits only, and its comment justifies that by saying the other
+planes take the integer path anyway — which on a host with no VNNI they do not,
+so porting it looks like free money. The same measurement on the four bit AVX2
+loop over 6144 rows of a 128 column group, bit-identical and checked to be:
+**1.02x.** The AVX-512 head block pays because a two bit row is 96 vectors on two
+accumulators and waits on its own chain; the four bit AVX2 loop spends about a
+dozen uops per sixteen codes on the **unpack**, which is per row and cannot be
+shared, so blocking four rows shares two activation loads out of roughly fifty
+uops. The block is right to be AVX-512 only, for a reason its comment does not
+give.
+
+### Reading llama.cpp
+
+Where an idea appears in mainline llama.cpp, its value is known to be real and
+the work is porting rather than research; where it does not, either the idea is
+worse than it looks or nobody has spent the time. That is a prior and not a
+scoreboard. Several ideas look better here than they would there, because this
+export's calibrated grid and untied 2-bit head are unusual.
+
+The notes throughout were checked against `ggml-org/llama.cpp` at commit
+`465e49b`, 2026-09-07, by reading the tree. *Not in mainline* means a search of
+that tree found nothing, not that an exhaustive audit was done, and it says
+nothing about the forks.
+
+### Where the other documents went
+
+`TODO.md` used to carry this file's reasoning alongside its open items — the
+ceiling, the profiles, the refusals, the progress of each entry — under headings
+`Speed`, `Not speed` and a closed-item ledger. All of that is here now, and
+`TODO.md` is a flat numbered list of what is left, ordered by impact. **Entries
+below that point at a heading in `TODO.md` are pointing at something that no
+longer exists**; the item itself is either still on that list under a new number
+or closed and written up here, and searching this file is how to tell which.
+
+`README.md` likewise carried a pass-by-pass account of every kernel version.
+That is here too; the README keeps what the engine is, how to run it, and where
+it stands.
+
+### Where `RESEARCH.md` went
+
+`RESEARCH.md` was a shortlist of twelve numbered ideas kept beside `TODO.md`.
+Six of them became ordinary engineering and moved to `TODO.md`; one was built
+(idea 2, the calibrated integer grid, 0.8.9); three were closed as refusals by
+measurement (10 in 0.9.5, 11 in 0.9.6, and 12 built in 0.9.7). The file has been
+folded into the end of `TODO.md`, which now carries the remainder as a flat list
+with the numbering intact.
+
+**Version entries below that cite `RESEARCH.md` by idea number still resolve**:
+the numbers are the same numbers, and the ideas that are still open are at the
+end of `TODO.md` under those numbers. The literature anchors moved with them.
+
 ---
 
 ## 0.1.0 — initial engine
