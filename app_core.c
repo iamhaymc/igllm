@@ -11955,8 +11955,8 @@ static const float *session_pass(app_session *session, const int32_t *id_list,
      * milliseconds, and the swing is what a caller feels.
      *
      * What would make it pay is not a better fork.  It is not calling `tanhf`
-     * 262144 times: `RESEARCH.md`'s series, which 0.8.6 already put in the
-     * picture's softmax, or capping only the rows the sampler will look at. */
+     * 262144 times: the series 0.8.6 already put in the picture's softmax,
+     * or capping only the rows the sampler will look at. */
     cap_job job;
     int cap_slot;
     phase_turn(session, APP_PHASE_CAP);

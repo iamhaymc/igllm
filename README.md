@@ -121,14 +121,12 @@ continuation with three proposers — one that is always right, the n-gram
 proposer that ships, and one that is always wrong — and holds all three to the
 plain run's token stream, so it checks the block path as much as it measures it.
 The first is the ceiling of any proposer and the last is its floor. On the
-shipped export the ceiling was about 2.2x at a block of eight when 0.9.0
-measured it; 0.9.5 put the output head on the integer path and 0.9.9 took the
-batched row's close off the destination, and between them the marginal lane is
-about a third cheaper, so a block of sixteen now brackets **2.67 to 2.82x** and
-a block of eight 2.5 to 2.65 — with `CHANGES.md` 0.9.0 still saying why it is
-not higher than that. The proposer reaches 77 to 85% of it where it applies. The
-table below was taken before 0.9.5, on a host whose numbers `CHANGES.md` names;
-run `igllm guess` for this host's own.
+shipped export a block of sixteen brackets **2.67 to 2.82x** and a block of
+eight 2.5 to 2.65, and the proposer reaches 77 to 85% of that where it applies.
+A block shares the weight sweep across its lanes and cannot share the
+arithmetic, which is why the ceiling is not higher; `CHANGES.md` 0.9.0 has the
+argument. Run `igllm guess` for this host's own numbers — the table below is
+another host's.
 
 ```
 block  proposer    tok/s  ms a round  committed of drawn  vs plain  stream
@@ -207,15 +205,12 @@ after a `/open`.
 the export calibrates static ranges for. It is off by default. On the shipped
 export it takes the cache at full span from 1803.0 MiB to 450.8 MiB — a saving
 larger than the checkpoint's own mapped weights — and a decode step reads a
-quarter of the cache bytes it read as floats. Until 0.8.5 it was a footprint option that cost speed —
-0.8.4 measured the byte cache a third behind the float cache on the tuned build
-— because every head decoded the same cached row for itself and on AVX2 the
-table is read with a gather. The cache is now read blocked by row instead, once
-per row for the whole group of heads that shares it, and on the same host the
-byte cache is within a percent or two of the float cache on both builds: 7.22
-tokens a second against 7.32 tuned, 5.87 against 6.03 default.
-What it costs besides is accuracy: the next token is never in doubt, and greedy
-decoding diverges at the first genuinely close call — around eighty characters
+quarter of the cache bytes it read as floats. It is within a percent or two of
+the float cache on both builds, because the cache is read blocked by row — once
+per row for the whole group of heads that shares it — rather than once per head.
+
+What it costs is accuracy: the next token is never in doubt, and greedy decoding
+diverges at the first genuinely close call — around eighty characters
 in on a short prompt, and inside twenty once the context is long enough for the
 sliding window to turn over.
 The `cache` task prints the calibrated ranges against the peaks a prompt
@@ -379,11 +374,15 @@ results to the bit.
 | `app_diff.py` | layer by layer comparison against the reference |
 | `run.py`      | install, build, test, run workflows            |
 | `GUIDE.md`    | a complete tour of the implementation          |
-| `CHANGES.md`  | development progress and rationale             |
-| `TODO.md`     | open development tasks                         |
+| `CHANGES.md`  | the archive: every version, its reasoning and its refusals |
+| `TODO.md`     | open items only, most consequential first      |
+| `AGENTS.md`   | the conventions all of the above are written to |
 | `model/`      | the vendored checkpoint, in Git LFS            |
 
-`GUIDE.md` is the place to start if you intend to read or extend the code.
+`GUIDE.md` is the place to start if you intend to read or extend the code, and
+`AGENTS.md` says how the repository is kept. `CHANGES.md` opens with the
+standing results — the hosts every number is quoted against, what a token and a
+picture and a clip cost, and the register of ideas measured and refused.
 
 ## Status
 
@@ -436,325 +435,29 @@ is absent, the vision tower agrees to a part in ten million.
 | `run.py parity --seam`                   | the join between them: the ids the reference's processor lays down around each run of soft tokens, and the distribution the whole graph reaches over them |
 | `run.py parity --seam --model model`     | the same join on the shipped export: every id and every soft token count, and every distribution that fits, each case in a process of its own. `--image` and `--audio` are repeatable here too, and two pictures of different shapes are a stronger case than one twice |
 
-On four cores of a 2017 desktop, against the reference's 0.16 tokens a second:
-decode runs at about 9.5 and prefill at about 12.4, and a build tuned for the
-host — `--tuned`, which selects the AVX2 path — reaches 13.2 and 21.2.
+### Where it stands
 
-The kernels have had four passes over them, and neither build is against the
-memory yet. A decode step reads 759.4 MiB — the projections, the output head,
-and one row of each embedding table, which is what `probe` and `bench` now
-report beside the 2334.8 MiB the export maps. At 14.2 tokens a second that is
-10.6 gigabytes a second against the 24.9 the same host hands over on a bare
-sequential read, so the tuned build uses 42% of the memory and the default build
-30%. The scaling says it independently: from one thread to four the memory gives
-1.5 times as much and decode produces 3.2 times as many tokens.
+**A rate means nothing without the host that produced it, so every row here
+carries one.** Four cores and the wide build in both:
 
-So what was left on both builds, at that point, was in spending fewer
-instructions as much as in reading fewer bytes. Six passes later 0.8.9 read the
-first half as finished; 0.8.10 measured a step part by part and found that it
-is not, on the rows this export actually has. `TODO.md` carries both halves.
-`CHANGES.md` 0.8.1 sets out how the earlier reading of this — that decode was at
-the wall — came of dividing by the key and value cache instead of the weights.
+| host | decode | prefill | that host's own sweep ceiling |
+| --- | --- | --- | --- |
+| AVX-512 with VNNI and GFNI, 2.1 GHz | **28.61 tok/s** | — | 67 tok/s |
+| AVX-512 with VNNI, 2.8 GHz | 21.88 | **105.5** | 41 tok/s |
 
-The third pass is 0.8.4's, and it is measured on a different machine, so it is
-not folded into the desktop's table above. The two bit decode — 366 MiB of the
-727.5 a step sweeps — now spends one broadcast per sixteen codes where it spent
-two, which is worth 21% of decode at one thread on that machine and 9% at four,
-and does not move a single bit of any result. 0.8.4 also closes two of the
-candidates `TODO.md` was carrying: the per-group gain mirror has nothing to
-convert on an export whose scales are already one `F32` a row, and the byte
-cache's gather is confirmed as the wrong read rather than merely suspected.
+The ceiling is arithmetic, not ambition. A decode step reads **784.4 MiB** — the
+projections, the output head, and one row of each embedding table, which is what
+`probe` and `bench` report beside the 2334.8 MiB the export maps — so a token
+that spent nothing at all outside the memory would take 24 ms on a host that
+sweeps at 32.18 GiB/s, and 14.9 on one that sweeps at 49.80. **Nothing that
+reads the weights once per token can beat that**, and a rate quoted without its
+host's sweep is not a ratio.
 
-The fourth pass is 0.8.5's, on the same machine as the third, and it is a
-restructuring rather than a kernel: the cache is read blocked by row instead of
-by head, so a row shared by eight heads is read — and on a byte cache decoded —
-once for all of them instead of once each. Three adjacent pairs a configuration,
-every pair of one sign: decode 5.91 to 7.22 tokens a second on the tuned build
-with `--cache 8` and 6.96 to 7.32 with floats, prefill 14.85 to 18.94 and 19.52
-to 19.69; on the default build decode 5.18 to 5.87 and 5.70 to 6.03. Not one bit
-of any result moves. What it takes back is most of what the byte cache cost:
-`--cache 8` was 15% behind floats on this host and is now 1%.
+Passing it needs more than one committed token per sweep, which is what
+`--guess` is for. On four AVX2 cores with no AVX-512 — where the multi-modal
+figures above were taken — the engine runs the whole graph without the integer
+kernels at all. The reference implementation, on a 2017 desktop, runs at 0.16
+tokens a second.
 
-The fifth pass is 0.8.8's, on a third machine, and it is not a kernel at all.
-Asking the four thread question the way `TODO.md` posed it — what are the decode
-paths waiting on — turned up an answer between the kernels rather than in them.
-Each path measured on its own streams the bytes a token needs in 38.9 ms at four
-threads, and the token took 95.1: the missing 56 ms were the fork and the join
-around every projection, of which decode issues 277 a token, at 120 microseconds
-apiece on that host. Both sides of the pool now spin briefly before they sleep,
-which takes the fork and join to 17.4 microseconds and decode at four threads
-from 10.51 tokens a second to 15.69 on the wide build, 8.37 to 11.21 on the
-tuned one and 6.19 to 7.26 on the default one. A pool with more threads than the
-host has cores does not spin, because there the core a spinner holds is one
-another worker needs. Not a bit of any result moves.
-
-0.8.8 also profiled a picture again, which is the other thing `TODO.md` asked
-for. At the export's full patch budget the tower takes 39.1 s single threaded —
-24.0 of projections, 6.5 of scoring, 5.0 of blend and 0.83 of softmax, the last
-being 0.8.6's series where 0.8.4 measured 6.6 — and the 256 soft tokens it
-produces cost another 40.1 s to prefill through the text stack, which is half of
-what a picture costs and was in no reading of one before. Three ways of hurrying
-the projections were measured and none taken, and a fourth was: the batch's
-inner loop read the spread's scratch again for every one of its sixteen lanes,
-which is two loads for every multiply-add on a host that issues two of each a
-cycle. Four lanes now share the row's load, and prefill on an 1800 id prompt
-goes from 9.28 tokens a second to 11.40 on the default build, 16.75 to 17.80 on
-the tuned one and 17.75 to 18.41 on the wide one — the order being the argument,
-since the default build has no fused multiply-add and so the loads are the
-largest share of what it does. Every lane's sum is the float it was, bit for
-bit. `CHANGES.md` says which three were refused and why.
-
-The sixth pass is 0.8.9's, on the same machine as the fifth, and it stops
-spending instructions on arithmetic the checkpoint had already done. Every code
-plane in this export ships an `input_activation_scale`, and the engine has
-always rounded what goes into the product onto it — so an activation reaching a
-code plane is an integer between -128 and 127 times that step, and the sum the
-kernel wants is that step times an exact integer of two byte-sized factors. On a
-host with AVX-512 VNNI one instruction takes sixty-four of those products where
-the float loop unpacked, converted and multiplied sixteen. Against a bare sweep
-of 32.18 GiB/s at four threads, the two bit path goes from 12.26 GiB/s of codes
-to 25.90, the four bit from 17.37 to 29.47 and the eight bit from 23.17 to
-31.04: all three are now at the memory, which 0.8.9 read as the question the
-kernels can answer closed — and 0.8.10 reopened, because that bench is a row of
-12288 and a decode step mostly reads rows of 1536. On the shipped export at four threads, decode goes from 8.92
-tokens a second to 12.57 and prefill from 15.19 to 33.96; at one thread prefill
-is 5.21 to 16.86. A picture — the tower and the 256 soft tokens it lays down,
-prefilled — goes from 36.3 seconds to 20.7 at four threads and 105.0 to 48.3 at
-one.
-
-This one moves the numbers, and the integer sum is the exact one where a chain
-of a thousand float products is not. Held against the reference's own tower
-modules on the same weights, the vision tower goes from 2.871 off to 2.049,
-where the reference moves 2.945 against itself, and the audio tower from 7.739
-to 7.086 against its own 7.213. The logits are 35 layers and as many roundings
-onto the export's grid further on, so exactness buys no agreement there and does
-not claim any: both builds pass every check against the reference on the same
-four prompts, matching its leading token and following its greedy continuation,
-with gaps a little wider than before and inside the same bar. `CHANGES.md` 0.8.9
-gives both tables. Builds without the instruction — every `--tuned` build, and a
-`--wide` build on a host that lacks VNNI — produce the export's logits byte for
-byte as they did before.
-
-The seventh pass is 0.8.10's, on the same machine as the fifth and sixth, and
-it is the one that measures before it changes anything. Six passes had been
-argued from byte counts, and a byte count cannot see a part of a step that
-reads no bytes. `session_step` now closes one named part as it opens the next —
-one clock read a boundary, so the parts join edge to edge and sum to the step
-rather than sampling it — and `bench --verbose` prints them beside the bytes
-each sweeps.
-
-The first thing that fell out is that `TODO.md`'s standing question was
-mis-posed. It asked where 56 ms of an 80 ms token went and guessed: the norms,
-the residual adds, the rotary turn, the per-layer embedding lookup, the forks
-and joins. Measured, all of that together is under 2% of a step — the norms and
-the residual adds are 0.9%, the rotary turn and the cache write 0.6%. The step
-was never mostly outside the kernels.
-
-What was outside them was smaller and more specific, and three of the four
-things the table pointed at were taken. The attention's scoring and blend had
-never reached the pool at all: at a 4334 id prompt they were two fifths of the
-step, 38.4 ms at four threads against 39.7 at one. They are two jobs now, and
-the two divide along different axes deliberately — the scores by position,
-which are independent, and the blend by head, because a blend is a running sum
-down the span and dividing that by position would regroup its additions and
-make the engine's answer depend on the host's core count. So the export's
-logits are byte for byte what they were, at one, two and four threads, and the
-suite pins it with a bit comparison rather than a tolerance. The gelu between
-the feed-forward's halves was the other: an eighth of a decode step and a fifth
-of a prefill batch, on the calling thread, invisible to every profile before
-this one because it reads no weight.
-
-The fourth was the `tanhf` over all 262144 logits, and it was taken and put
-back. The same reasoning applied — an elementwise map, nothing to lose — and
-the measurement refused it: serial 3.94, 3.82, 3.87 ms against 5.20, 1.33, 5.21
-forked, one fork whose workers had just been joined on the output head and had
-not settled. A steady 3.87 beats a mean of 3.9 that swings by four
-milliseconds, and the numbers are kept in the comment where the next person to
-have the idea will find them.
-
-On the reference host at four threads, on a 288 id prompt: decode 15.5 tokens a
-second to 18.4 and prefill 43.1 to 54.8; on a 2004 id prompt decode 13.4 to
-15.5, and on a 4334 id one 10.1 to 13.0 with prefill 25.0 to 33.2. Not a bit of
-any logit moves.
-
-## Where a token goes now, and what the division was hiding
-
-0.8.11 acted on that table, and the largest thing in it turned out not to be a
-kernel at all. A row of a code plane ends in one gain, and fetching it was a
-call into the switch over every storage type, beside a second call to a
-remainder handler that had nothing to handle — with a `vzeroupper` and the
-whole caller-saved vector state spilled through the middle of the row loop for
-the two of them. A block of four output rows, the remainder call guarded, and
-the gain read directly where the scales are `F32`: mlp 25.90 GiB/s to 27.65,
-`attn out` 25.72 to 26.84, `ple feed` 15.04 to 16.89.
-
-Looking for it turned up three more of the same shape, none of them on the
-list. The logit cap and the gelu were both calling `tanhf` — 477184 calls a
-step between them — where `tanh y` is `1 - 2/(e^{2y}+1)` and the exponential is
-the series the softmax has carried since 0.8.6: **4.45 ms a step to 0.28 and
-2.40 to 0.29**. The gelu comes out *closer* to the closed form than the call it
-replaces — 3.64e-7 against 4.31e-7 over 200001 arguments — because writing it as
-`x t / (t + 1)` removes the subtraction that was losing the low bits; the cap
-keeps the subtraction and stays within two and a half parts in ten million of
-the cap, monotone, and exact at both ends. Neither moves the reference
-comparison: every logit gap it reports is what 0.8.10 recorded. And
-`kern_dot_real` had a vector path for `F32` and a scalar loop for `BF16`, while
-this export keeps 26.25 MiB of bf16 that every step reads in full: `ple lift`
-9.63 GiB/s to 23.30.
-
-Decode 21.8 tokens a second to **27.1** on a 374 id prompt and 23.1 to **29.3**
-on a short one, prefill 59.3 to **82.1**, the step 43.97 ms to 34.79.
-
-The last thing the table says is what it does *not* say. 0.8.9's kernel claim
-was reopened on the grounds that the output head reads 12.67 GiB/s where the
-mlp reads 20.14, so the kernels must be slower on short rows. They are not:
-`vpdpbusd` consumes sixty-four codes whatever their width, so a two bit plane
-spends the same instruction on 16 bytes that a four bit plane spends on 32, and
-**GiB/s cannot be compared across bit widths.** Counted in multiply-adds the
-output head is the *fastest* plane in the step — 60.6 G a second against the
-mlp's 59.0 — and the two that are really behind are the two smallest,
-`ple feed` at 18.0 and `ple lift` at 12.5. That is the first entry on `TODO.md`
-now.
-
-## How a block of rows closes
-
-0.8.12 took the first half of that entry, and the answer was in the last four
-instructions of a row rather than in its loop. A row of the integer path ends in
-a horizontal sum of its accumulator, a zero point correction, two multiplies and
-a store, and a block of four rows was closing each of its rows on its own —
-four `_mm512_reduce_add_epi32`, four sums arriving in general registers, four
-rows of scalar arithmetic to put them back into floats. On a 1536 column row
-that close is one epilogue against twenty-four blocks of dot product and it
-vanishes into them. On `per_layer_projection`, **1536 rows of 256 columns**, it
-is one against four and it costs more than what it closes.
-
-Widening the block does nothing on its own, which is why 0.8.11 measured eight
-rows against four and got a wash: eight rows of four blocks is eight closes
-against thirty-two dot products exactly as four rows is four against sixteen.
-The ratio is fixed by the columns. What moves it is closing the rows
-*together* — four accumulators folded into one vector of four sums in fourteen
-instructions instead of four reductions in near forty, four of those folds
-stacked into one vector of sixteen rows, and then one subtract, one load of
-sixteen gains, one broadcast and one store for the whole block. The dot products
-are still taken four rows at a time, so no more than four accumulators are ever
-live and the register pressure that made eight a wash never arises.
-
-The same fold closes the batched path's four lanes, which is where prefill's
-share comes from. On a second host — four cores of a Xeon at 2.1 GHz rather than
-the 2.8 the figures above were taken on, so these ratios are comparable and
-these absolute numbers are not — `ple feed` fell **9.8%**, `q k v` 5.5 to 6.8%,
-the step floor 2.4%, prefill went **87.2 tokens a second to 93.8** and decode
-24.7 to 25.3. Every logit gap the reference comparison reports is 0.8.11's to
-the last digit printed.
-
-It is not the entry closed. `ple feed` is 17.5 G multiply-adds a second to 19.4
-against the 50 to 61 the other four planes reach, and what is left of it is not
-the kernel at all. Two planes of 384 KiB a layer, each its own fork and join, is
-seventy of them a step, and an empty fork and join of the engine's own pool
-measures **2.95 us** — so 0.21 ms of the phase's 1.42, and 0.82 ms of the whole
-step's 277 forks. `TODO.md` carries the measurement and what the fix would have
-to be.
-
-0.8.12 also took the one hypothesis `TODO.md` had left for the output head — that
-the microbenchmark's 96 MiB stays swept because its page table entries stay hot,
-where the engine's is swept once with thirty-five layers in between — and tested
-it. The same 96 MiB of the mapped checkpoint costs **32.4 GiB/s back to back and
-43.4 with a gigabyte of the rest of the file swept in between**: no penalty, and
-anonymous memory of the same size is no faster than the file. The hypothesis is
-gone and the puzzle is not.
-
-## Where a picture goes, and the tiling that was not the answer
-
-`TODO.md` had carried an entry for the tower's own attention since 0.8.9 put the
-projections on the integer path and left the scoring and the blend on the float
-one, and it opened by refusing to be acted on: retake the profile first, because
-0.8.9 changed the shares the last one recorded.
-
-0.9.6 retook it. A 768 by 768 picture at the full patch budget is 2304 patches
-through 16 layers of width 768 and 12 heads, and on four threads it divides:
-**scoring, softmax and blend 52.7%**, the feed-forward 25.5%, `q k v` 13.0%,
-everything else under 5% each. So the entry's premise held, and understated
-itself — a picture had become mostly one phase.
-
-The phase is not waiting on memory, which is the thing that decided what to do
-about it. A gathered head is 590 KiB of keys and 590 KiB of values, and scoring
-and blending walk them in separate loops, so each sits inside this host's
-megabyte of private second level cache for a whole band. What the two loops were
-actually doing was reading that run **once per query** — 2304 times over, for a
-run every query in the band shares — and paying a horizontal reduction on every
-sixty-four column dot product, a close that costs about what the eight
-multiply-adds it closes cost.
-
-`RESEARCH.md`'s idea for this was flash attention's schedule: tile the keys,
-carry a running maximum and normalizer between tiles, and never materialize the
-2304 by 2304 score matrix. **That is refused, and the reason is worth keeping.**
-A band here holds one score row and never held the grid, so the memory the
-tiling exists to save was never spent — the schedule arrives with nothing to
-save and a change to the order of every sum to pay for it. llama.cpp's tiled
-kernel is written against a runtime that does materialize the matrix.
-
-The axis that was actually loose was the other one. Four queries share every
-byte both loops read, and shared nothing. So a band now takes **four queries at
-a time**: one key row loaded into four queries' accumulators, four closes folded
-into the three instructions one close took, one value row folded into four
-queries' running sums, and the softmax still per query in between.
-
-**Nothing is reassociated, and that is the point rather than a caveat.** Each
-lane keeps the same accumulators over the same slots in the same order; the
-four-lane close pairs exactly the floats `kern_dot_total` pairs, in its order;
-and the blend's multiply and add stay a multiply and an add. The fused
-multiply-add is the obvious next instruction and it is **deliberately not
-taken** — it measured 2.2x against the 1.4x the unfused form gives, and it drops
-the intermediate rounding, so a picture's rows would stop being the rows that
-ship. It is also the slower kernel on a plain AVX2 host, where sixteen
-accumulators and four value registers do not fit in sixteen registers.
-
-The phase goes **5.26–5.61 s to 2.72–3.01 s**, about 1.9x, with no overlap
-between the two builds' ranges over six alternating runs. A picture through the
-tower is **10.64 s to 8.10 s**. `logits` after a picture, after a clip, after
-both and after neither is byte for byte what it was, and two tests in the
-`kernel` group hold each new kernel to the one it is a block of for equality
-rather than for nearness — swapping the blend's multiply-and-add for the fused
-form fails one of them, which is what it is there for.
-
-One thing the table above does not say, and the control is why. `q k v` and the
-feed-forward appeared to move five to ten percent between the two builds, in
-code neither of them touches; running the same series with the order of the
-builds reversed put the first run of *whichever* build went first ahead of the
-runs after it. That is the host drifting over a series, not the change.
-
-## Asking twice about one photograph
-
-A picture costs the tower once. Since 0.9.7 it costs it once *in total*: the
-rows the projector hands the text stack are kept on the model against an
-identity of the picture, so the second question about the same photograph skips
-the resize, the patch cut, all sixteen encoder layers, the pooling and the
-projector, and gets the rows the tower made bit for bit.
-
-**This is not fresh-image acceleration.** A picture the engine has not seen
-costs exactly what it cost before, and a miss costs under 2% more for taking the
-identity and copying the rows in. What changes is the second time. A photograph,
-a question, `/new`, the same photograph and another question goes **53.53 s to
-39.72 s**, with the two conversations byte for byte identical.
-
-It lives on the model rather than on a session, because the rows are the
-weights' answer to a picture and not a conversation's — so a second conversation
-has them, which is the case `--keep` and `chat --loop` cannot reach: both of
-those match on rows the tower has already been run to make. Four pictures are
-kept, least-wanted first out, and each costs 1.5 MiB of the engine's own
-allocator, which `bench` reports without being asked.
-
-The identity is the whole of the risk, because the one thing a cache like this
-must never do is hand back rows for a picture that was never shown. It is taken
-on the **decoded raster** — so the container and the decoder are out of it, and
-the same photograph as a png and as a lossless bmp is one entry — over every
-sample, the raster's shape, and every part of the tower configuration that
-decides what the samples become. Two independent mixes run over the same bytes
-rather than one, which is a hundred and twenty-eight bits instead of sixty-four,
-and the raster's shape is compared exactly beside them. Both mixes together cost
-2.5 to 5.1 ms on a 6.8 MiB raster.
-
-The backend is deliberately not in the identity, and the reason is worth knowing
-before anyone extends this: the store is never written to a file, so a backend
-cannot change under an entry. `TODO.md` says what has to go in first if it ever
-is.
+`CHANGES.md` has every step of how these numbers were reached and what was
+refused on the way; `TODO.md` has what is left.
