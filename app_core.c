@@ -668,9 +668,11 @@ static int host_thread_count(void) {
   SYSTEM_INFO host_info;
   GetSystemInfo(&host_info);
   return (int)host_info.dwNumberOfProcessors;
-#else
+#elif defined(_SC_NPROCESSORS_ONLN)
   long count = sysconf(_SC_NPROCESSORS_ONLN);
   return count > 0 ? (int)count : 1;
+#else
+  return 1;
 #endif
 }
 
