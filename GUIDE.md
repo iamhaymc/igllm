@@ -16,6 +16,7 @@ and where an accelerator would attach.
 | `app_test.py` | parity and throughput comparison against transformers        |
 | `app_fake.py` | builds a synthetic checkpoint and quantizes it               |
 | `app_diff.py` | layer by layer comparison against transformers, and the seam |
+| `app_tune.py` | fine tunes the checkpoint with TRL, and repacks the result    |
 | `run.py`      | install, build, test, check, parity, run, clean workflows    |
 
 `app_core.c` is a single translation unit. `app_main.c` and `app_test.c`

@@ -23,8 +23,10 @@ results** before quoting a number or reopening an idea.
 | `GUIDE.md`   | a tour of the implementation, layer by layer                              | performance history                                 |
 | `AGENTS.md`  | this file                                                                 | anything specific to one change                     |
 
-The four `.py` files are the reference comparison and the build workflow, not
-part of the engine. `run.py` is the only build system there is.
+The five `.py` files are workflow helpers, not part of the engine: `app_test.py`
+compares against the reference, `app_fake.py` builds synthetic checkpoints,
+`app_diff.py` diffs layer by layer, and `app_tune.py` fine tunes the checkpoint
+with TRL over `data_tune.jsonl`. `run.py` is the only build system there is.
 
 **The file list is closed.** Do not add a source file, a header, or a build
 tool. `RESEARCH.md` used to exist and was folded into the end of `TODO.md`;

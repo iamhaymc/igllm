@@ -372,6 +372,7 @@ results to the bit.
 | `app_test.py` | comparison against the transformers reference  |
 | `app_fake.py` | builds a synthetic checkpoint and quantizes it |
 | `app_diff.py` | layer by layer comparison against the reference |
+| `app_tune.py` | fine tunes the checkpoint with TRL, and repacks the result |
 | `run.py`      | install, build, test, run workflows            |
 | `GUIDE.md`    | a complete tour of the implementation          |
 | `CHANGES.md`  | the archive: every version, its reasoning and its refusals |
@@ -461,3 +462,24 @@ tokens a second.
 
 `CHANGES.md` has every step of how these numbers were reached and what was
 refused on the way; `TODO.md` has what is left.
+
+## Fine tuning
+
+The engine has no trainer; a tune happens on the reference side and is handed
+back as a checkpoint the engine reads like any other. `app_tune.py` trains a
+LoRA adapter over the frozen base weights with TRL, then folds the adapter into
+the float weights so the ordinary packing path can take it:
+
+```sh
+python3 app_tune.py --model model --train   # adapter into build/tune/adapter
+python3 app_tune.py --model model --merge   # folded checkpoint into build/tune/merged
+python3 run.py run -- chat --model build/tune/merged --prompt "Hello!"
+```
+
+The dataset is `data_tune.jsonl`, one JSON object per line with `prompt` and
+`completion`. It is a minimal example to be extended: add lines, do not
+restructure it. The defaults — three epochs, rank 16, the attention projections
+only — are sized for a dozen lines, and the towers stay frozen. A tuned
+checkpoint is validated the same way as any other change: `run.py check --model
+build/tune/merged`, with the prompts the tune was meant to move added to the
+comparison.
