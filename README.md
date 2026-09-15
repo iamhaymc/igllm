@@ -1,4 +1,4 @@
-# igllm
+# INFERGEM
 
 A dependency-free inference engine for **Gemma 4 E2B IT QAT**, written in pure C11.
 
